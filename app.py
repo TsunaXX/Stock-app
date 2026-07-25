@@ -1852,6 +1852,11 @@ def calculate_risk_filter_result(row, direction, max_extension_atr, attention_co
         'detail': f'趨勢 {trend_score}/30｜乖離 {extension_score}/20｜K棒 {candle_score}/15｜風險 {risk_score}/20｜確認 {confirmation_score}/15'
     }
 
+RISK_METRIC_COLUMNS = [
+    '_risk_atr14', '_risk_ma20', '_risk_ma20_slope',
+    '_risk_close_position', '_risk_prev_high', '_risk_prev_low'
+]
+
 def get_tick_size(price):
     try: price = float(price)
     except: return 0.01
@@ -2316,6 +2321,44 @@ def fetch_stock_data_raw(code, name_hint="", extra_data=None, futures_set=None, 
         "_risk_close_position": risk_close_position, "_risk_prev_high": risk_prev_high, "_risk_prev_low": risk_prev_low
     }
 
+def refresh_risk_metrics_for_codes(stock_data, futures_set, saved_notes_dict, name_map_dict, sj_logged_in=False, sj_api=None):
+    """手動重抓日 K，僅回填風險篩選所需欄位，保留原本的表格與備註資料。"""
+    if stock_data.empty or '代號' not in stock_data.columns:
+        return stock_data, 0
+
+    futures_copy = dict(futures_set) if isinstance(futures_set, dict) else futures_set
+    notes_copy = dict(saved_notes_dict or {})
+    name_copy = dict(name_map_dict or {})
+    tasks = [
+        (str(row['代號']), str(row.get('名稱', '')))
+        for _, row in stock_data.iterrows()
+    ]
+
+    def fetch_metrics(task):
+        code, name = task
+        try:
+            time.sleep(API_REQUEST_GAP_SECONDS)
+            result = fetch_stock_data_raw(code, name, None, futures_copy, notes_copy, name_copy, sj_logged_in, sj_api)
+            if result:
+                return code, {column: result.get(column) for column in RISK_METRIC_COLUMNS}
+        except Exception:
+            pass
+        return code, None
+
+    with ThreadPoolExecutor(max_workers=ANALYSIS_MAX_WORKERS) as executor:
+        results = list(executor.map(fetch_metrics, tasks))
+
+    refreshed = stock_data.copy()
+    updated_count = 0
+    for code, metrics in results:
+        if not metrics or metrics.get('_risk_atr14') is None or metrics.get('_risk_ma20') is None:
+            continue
+        row_mask = refreshed['代號'].astype(str) == code
+        for column, value in metrics.items():
+            refreshed.loc[row_mask, column] = value
+        updated_count += int(row_mask.sum())
+    return refreshed, updated_count
+
 # ==========================================
 # 處理待加回的忽略股票 (防止 NameError & 提速)
 # ==========================================
@@ -2686,6 +2729,29 @@ with tab1:
                     risk_block_attention = st.checkbox("封鎖注意累計 ≥ 2", value=True, key="risk_filter_block_attention")
                 with risk_col3:
                     risk_show_only_eligible = st.checkbox("只顯示可操作候選", value=False, key="risk_filter_show_eligible")
+                    if st.button("📊 重抓日 K 並計算風險", key="refresh_risk_filter_metrics"):
+                        code_name_map, _ = load_local_stock_names()
+                        with st.spinner("正在重抓日 K 並回填風險指標..."):
+                            refreshed_data, updated_count = refresh_risk_metrics_for_codes(
+                                st.session_state.stock_data,
+                                st.session_state.get('futures_list', {}),
+                                st.session_state.get('saved_notes', {}),
+                                code_name_map,
+                                st.session_state.get('sj_logged_in', False),
+                                st.session_state.get('sj_api', None)
+                            )
+                        if updated_count:
+                            st.session_state.stock_data = refreshed_data
+                            save_data_cache(
+                                st.session_state.stock_data,
+                                st.session_state.ignored_stocks,
+                                st.session_state.all_candidates,
+                                st.session_state.saved_notes
+                            )
+                            st.toast(f"已回填 {updated_count} 檔的 20 日趨勢與 ATR 指標。", icon="✅")
+                            st.rerun()
+                        else:
+                            st.warning("沒有可回填的資料；請確認標的至少有 20 個交易日的日 K。")
                     if st.button("🔄 更新上市注意／處置名單", key="refresh_risk_filter_market_data"):
                         fetch_twse_market_risk_lists.clear()
                         with st.spinner("正在更新上市注意／處置名單..."):
@@ -2704,6 +2770,10 @@ with tab1:
                     st.warning("上市注意／處置名單暫時無法完整更新；本次僅保留技術面風險評分。")
                 else:
                     st.info("尚未更新上市注意／處置名單；資料未查核時不會被誤判為安全。")
+
+                risk_ready_mask = df_display.reindex(columns=RISK_METRIC_COLUMNS).notna().all(axis=1)
+                risk_ready_count = int(risk_ready_mask.sum())
+                st.caption(f"日 K 風險指標：{risk_ready_count} / {len(df_display)} 檔可計算；資料不足時，先按「重抓日 K 並計算風險」。")
 
             market_risk_data = st.session_state.risk_filter_market_data
             attention_counts = market_risk_data.get('attention', {})
