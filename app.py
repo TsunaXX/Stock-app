@@ -1718,6 +1718,140 @@ def fetch_futures_list():
     except: pass
     return {}
 
+@st.cache_data(ttl=900, max_entries=1, show_spinner=False)
+def fetch_twse_market_risk_lists():
+    """取得上市注意／處置名單；僅在使用者手動更新時呼叫。"""
+    attention_counts = {}
+    disposition_codes = set()
+    errors = []
+    headers = {'User-Agent': 'Mozilla/5.0'}
+
+    def parse_rows(payload, target, is_attention=False):
+        fields = payload.get('fields', [])
+        for values in payload.get('data', []):
+            record = dict(zip(fields, values))
+            raw_code = str(record.get('證券代號', record.get('有價證券代號', '')))
+            code_match = re.search(r'\d{4,6}', raw_code)
+            if not code_match:
+                continue
+            code = code_match.group(0)
+            if is_attention:
+                raw_count = str(record.get('累計次數', record.get('累計', '1')))
+                count_match = re.search(r'\d+', raw_count)
+                target[code] = max(target.get(code, 0), int(count_match.group()) if count_match else 1)
+            else:
+                target.add(code)
+
+    for url, target, is_attention in [
+        ('https://www.twse.com.tw/announcement/notice?response=json', attention_counts, True),
+        ('https://www.twse.com.tw/announcement/punish?response=json', disposition_codes, False),
+    ]:
+        try:
+            response = requests.get(url, headers=headers, timeout=5)
+            response.raise_for_status()
+            parse_rows(response.json(), target, is_attention)
+        except Exception as exc:
+            errors.append(str(exc))
+
+    return attention_counts, sorted(disposition_codes), errors
+
+def _as_float(value, default=None):
+    try:
+        number = float(value)
+        return default if math.isnan(number) else number
+    except (TypeError, ValueError):
+        return default
+
+def calculate_risk_filter_result(row, direction, max_extension_atr, attention_counts=None, disposition_codes=None, twse_lists_updated=False, block_attention=True):
+    """建立風險篩選預覽資料；不會改寫原本的選股資料或下單行為。"""
+    attention_counts = attention_counts or {}
+    disposition_codes = set(disposition_codes or [])
+    code = str(row.get('代號', '')).strip()
+    close = _as_float(row.get('收盤價'))
+    ma5 = _as_float(row.get('_ma5'))
+    ma20 = _as_float(row.get('_risk_ma20'))
+    ma20_slope = _as_float(row.get('_risk_ma20_slope'))
+    atr14 = _as_float(row.get('_risk_atr14'))
+    close_position = _as_float(row.get('_risk_close_position'))
+    previous_high = _as_float(row.get('_risk_prev_high'))
+    previous_low = _as_float(row.get('_risk_prev_low'))
+    is_long = direction == '多頭'
+
+    if close is None or ma5 is None or ma20 is None or atr14 is None or atr14 <= 0:
+        return {
+            'score': 0, 'risk': '⚪ 資料不足', 'extension': None,
+            'rule': '資料不足，維持原判斷', 'eligible': False,
+            'detail': '缺少計算 20 日趨勢或 ATR 所需資料。'
+        }
+
+    extension = (close - ma20) / atr14 if is_long else (ma20 - close) / atr14
+    trend_score = 0
+    if (is_long and close > ma5) or (not is_long and close < ma5):
+        trend_score += 10
+    if (is_long and close > ma20) or (not is_long and close < ma20):
+        trend_score += 10
+    if ma20_slope is not None and ((is_long and ma20_slope > 0) or (not is_long and ma20_slope < 0)):
+        trend_score += 10
+
+    if extension <= 1:
+        extension_score = 20
+    elif extension <= 1.5:
+        extension_score = 15
+    elif extension <= 2:
+        extension_score = 8
+    else:
+        extension_score = 0
+
+    candle_score = 5
+    if close_position is not None:
+        if (is_long and close_position >= 65) or (not is_long and close_position <= 35):
+            candle_score = 15
+        elif (is_long and close_position >= 50) or (not is_long and close_position <= 50):
+            candle_score = 10
+
+    attention_count = attention_counts.get(code, 0)
+    is_disposed = code in disposition_codes
+    try:
+        market = getattr(twstock.codes.get(code), 'market', '')
+    except Exception:
+        market = ''
+    if is_disposed:
+        risk_label, risk_score = '🚫 處置中', 0
+    elif attention_count >= 2:
+        risk_label, risk_score = f'🔴 注意 {attention_count}', 0
+    elif attention_count == 1:
+        risk_label, risk_score = '🟡 注意 1', 10
+    elif twse_lists_updated and market == '上市':
+        risk_label, risk_score = '🟢 上市名單未列示', 20
+    elif twse_lists_updated:
+        risk_label, risk_score = '⚪ 上櫃未查核', 12
+    else:
+        risk_label, risk_score = '⚪ 未查核', 12
+
+    has_breakout = previous_high is not None and close > previous_high if is_long else previous_low is not None and close < previous_low
+    confirmation_score = 15 if has_breakout else 5
+    score = trend_score + extension_score + candle_score + risk_score + confirmation_score
+    too_extended = extension > max_extension_atr
+    eligible = not is_disposed and (not block_attention or attention_count < 2) and not too_extended
+    if is_long:
+        rule = '突破昨高後站穩' if has_breakout else '回踩 5／10 日線止穩'
+    else:
+        rule = '跌破昨低後確認' if has_breakout else '反彈不過 5／10 日線'
+    if is_disposed:
+        rule = '排除：處置中'
+    elif attention_count >= 2 and block_attention:
+        rule = '排除：注意累計偏高'
+    elif attention_count >= 2:
+        rule = '高風險：僅等待確認'
+    elif too_extended:
+        rule = f'排除：乖離超過 {max_extension_atr:.1f} ATR'
+
+    return {
+        'score': score, 'risk': risk_label, 'extension': extension,
+        'rule': rule, 'eligible': eligible,
+        'detail': f'趨勢 {trend_score}/30｜乖離 {extension_score}/20｜K棒 {candle_score}/15｜風險 {risk_score}/20｜確認 {confirmation_score}/15'
+    }
+
 def get_tick_size(price):
     try: price = float(price)
     except: return 0.01
@@ -2049,6 +2183,29 @@ def fetch_stock_data_raw(code, name_hint="", extra_data=None, futures_set=None, 
 
     hist_strat = hist.copy()
 
+    # 風險篩選預覽所需指標：只沿用已取得的日 K，不增加任何資料請求。
+    risk_atr14 = risk_ma20 = risk_ma20_slope = risk_close_position = None
+    risk_prev_high = risk_prev_low = None
+    if len(hist_strat) >= 2:
+        prev_close_series = hist_strat['Close'].shift(1)
+        true_range = pd.concat([
+            hist_strat['High'] - hist_strat['Low'],
+            (hist_strat['High'] - prev_close_series).abs(),
+            (hist_strat['Low'] - prev_close_series).abs()
+        ], axis=1).max(axis=1)
+        risk_atr14 = float(true_range.tail(min(14, len(true_range))).mean())
+        risk_prev_high = float(hist_strat['High'].iloc[-2])
+        risk_prev_low = float(hist_strat['Low'].iloc[-2])
+        latest_range = float(hist_strat['High'].iloc[-1] - hist_strat['Low'].iloc[-1])
+        if latest_range > 0:
+            risk_close_position = float((hist_strat['Close'].iloc[-1] - hist_strat['Low'].iloc[-1]) / latest_range * 100)
+
+    if len(hist_strat) >= 20:
+        ma20_series = hist_strat['Close'].rolling(20).mean()
+        risk_ma20 = float(ma20_series.iloc[-1])
+        if len(ma20_series.dropna()) >= 6:
+            risk_ma20_slope = float(ma20_series.iloc[-1] - ma20_series.iloc[-6])
+
     strategy_base_price = hist_strat.iloc[-1]['Close']
     if len(hist_strat) >= 2: prev_of_base = hist_strat.iloc[-2]['Close']
     else: prev_of_base = strategy_base_price 
@@ -2154,7 +2311,9 @@ def fetch_stock_data_raw(code, name_hint="", extra_data=None, futures_set=None, 
     return {
         "代號": code, "名稱": final_name_display, "收盤價": round(live_base_price, 2), "漲跌幅": live_pct_change, "期貨": has_futures, 
         "當日漲停價": limit_up_show, "當日跌停價": limit_down_show, "自訂價(可修)": None,   
-        "戰略備註": strategy_note, "_points": full_calc_points, "狀態": "", "_auto_note": auto_note, "_ma5": ma5 if 'ma5' in locals() else None
+        "戰略備註": strategy_note, "_points": full_calc_points, "狀態": "", "_auto_note": auto_note, "_ma5": ma5 if 'ma5' in locals() else None,
+        "_risk_atr14": risk_atr14, "_risk_ma20": risk_ma20, "_risk_ma20_slope": risk_ma20_slope,
+        "_risk_close_position": risk_close_position, "_risk_prev_high": risk_prev_high, "_risk_prev_low": risk_prev_low
     }
 
 # ==========================================
@@ -2501,7 +2660,77 @@ with tab1:
                     try: df_display.at[i, '5日線價差'] = round(float(close_p) - float(ma5_val), 2)
                     except: pass
 
-        input_cols = ["移除", "代號", "名稱", "戰略備註", "自訂價(可修)", "狀態", "自訂價價差", "5日線價差", "當日漲停價", "當日跌停價", "收盤價", "漲跌幅", "期貨"]
+        # 預設關閉，關閉後維持既有選股表格與資料流程，不會篩掉任何候選。
+        risk_preview_enabled = st.checkbox(
+            "🛡️ 啟用風險篩選預覽（可隨時關閉回到原表）",
+            value=False,
+            key="risk_filter_preview_enabled",
+            help="僅提供選股風險評分與預覽，不會自動下單或改寫原始選股資料。"
+        )
+        risk_details = {}
+        risk_show_only_eligible = False
+
+        if risk_preview_enabled:
+            if 'risk_filter_market_data' not in st.session_state:
+                st.session_state.risk_filter_market_data = {
+                    'attention': {}, 'disposition': [], 'updated': None, 'errors': []
+                }
+
+            with st.expander("🛡️ 選股風險篩選設定", expanded=True):
+                risk_col1, risk_col2, risk_col3 = st.columns(3)
+                with risk_col1:
+                    risk_direction = st.radio("判斷方向", ["多頭", "空頭"], horizontal=True, key="risk_filter_direction")
+                    risk_min_score = st.slider("最低評分", min_value=60, max_value=90, value=75, key="risk_filter_min_score")
+                with risk_col2:
+                    risk_max_extension = st.slider("最大乖離（ATR）", min_value=1.0, max_value=3.0, value=2.0, step=0.1, key="risk_filter_max_extension")
+                    risk_block_attention = st.checkbox("封鎖注意累計 ≥ 2", value=True, key="risk_filter_block_attention")
+                with risk_col3:
+                    risk_show_only_eligible = st.checkbox("只顯示可操作候選", value=False, key="risk_filter_show_eligible")
+                    if st.button("🔄 更新上市注意／處置名單", key="refresh_risk_filter_market_data"):
+                        fetch_twse_market_risk_lists.clear()
+                        with st.spinner("正在更新上市注意／處置名單..."):
+                            attention, disposition, errors = fetch_twse_market_risk_lists()
+                        st.session_state.risk_filter_market_data = {
+                            'attention': attention,
+                            'disposition': disposition,
+                            'updated': datetime.now(pytz.timezone('Asia/Taipei')).strftime('%Y/%m/%d %H:%M:%S'),
+                            'errors': errors
+                        }
+
+                market_risk_data = st.session_state.risk_filter_market_data
+                if market_risk_data.get('updated') and not market_risk_data.get('errors'):
+                    st.caption(f"上市注意／處置名單更新：{market_risk_data['updated']}；上櫃標的請仍以『戰略資料庫 → 處置股』為準。")
+                elif market_risk_data.get('errors'):
+                    st.warning("上市注意／處置名單暫時無法完整更新；本次僅保留技術面風險評分。")
+                else:
+                    st.info("尚未更新上市注意／處置名單；資料未查核時不會被誤判為安全。")
+
+            market_risk_data = st.session_state.risk_filter_market_data
+            attention_counts = market_risk_data.get('attention', {})
+            disposition_codes = market_risk_data.get('disposition', [])
+            twse_lists_updated = bool(market_risk_data.get('updated')) and not market_risk_data.get('errors')
+
+            for i, row in df_display.iterrows():
+                result = calculate_risk_filter_result(
+                    row, risk_direction, risk_max_extension, attention_counts, disposition_codes,
+                    twse_lists_updated, risk_block_attention
+                )
+                code = str(row.get('代號', ''))
+                risk_details[code] = result
+                df_display.at[i, '風險'] = result['risk']
+                df_display.at[i, '評分'] = result['score']
+                df_display.at[i, '乖離'] = f"{result['extension']:+.1f} ATR" if result['extension'] is not None else "—"
+                df_display.at[i, '隔日規則'] = result['rule']
+                df_display.at[i, '_risk_eligible'] = result['eligible'] and result['score'] >= risk_min_score
+
+            if risk_show_only_eligible:
+                df_display = df_display[df_display['_risk_eligible']].reset_index(drop=True)
+                if df_display.empty:
+                    st.warning("目前沒有符合門檻的候選；可降低最低評分、放寬最大乖離，或切換回原表。")
+
+            input_cols = ["移除", "代號", "名稱", "風險", "評分", "乖離", "隔日規則", "戰略備註", "自訂價(可修)", "狀態", "自訂價價差", "5日線價差", "當日漲停價", "當日跌停價", "收盤價", "漲跌幅", "期貨"]
+        else:
+            input_cols = ["移除", "代號", "名稱", "戰略備註", "自訂價(可修)", "狀態", "自訂價價差", "5日線價差", "當日漲停價", "當日跌停價", "收盤價", "漲跌幅", "期貨"]
         for col in input_cols:
             if col not in df_display.columns: df_display[col] = None
 
@@ -2526,13 +2755,14 @@ with tab1:
 
         df_display = df_display.reset_index(drop=True)
         for col in input_cols:
-             if col != "移除": df_display[col] = df_display[col].astype(str)
+             if col not in ["移除", "評分"]: df_display[col] = df_display[col].astype(str)
 
         # 定義上色邏輯
         def style_tab1_df(row):
             styles = [''] * len(row)
             note = str(row.get('戰略備註', ''))
             st_val = str(row.get('狀態', ''))
+            risk_val = str(row.get('風險', ''))
             
             if st_val == "漲停":
                 name_c = 'background-color: #ff4b4b; color: #ffffff; font-weight: bold;'
@@ -2564,13 +2794,30 @@ with tab1:
                         elif f_val < 0: styles[idx] = 'color: #00e676;'
                         else: styles[idx] = 'color: white;'
                     except: pass
+                elif col == "風險":
+                    if risk_val.startswith('🚫') or risk_val.startswith('🔴'):
+                        styles[idx] = 'color: #ff4b4b; font-weight: bold;'
+                    elif risk_val.startswith('🟡'):
+                        styles[idx] = 'color: #ffeb3b; font-weight: bold;'
+                    elif risk_val.startswith('🟢'):
+                        styles[idx] = 'color: #00e676;'
             return styles
             
         styled_df = df_display[input_cols].style.apply(style_tab1_df, axis=1)
 
+        risk_column_config = {}
+        if risk_preview_enabled:
+            risk_column_config = {
+                "風險": st.column_config.TextColumn(width=115, disabled=True),
+                "評分": st.column_config.ProgressColumn("評分", min_value=0, max_value=100, format="%d", width=90),
+                "乖離": st.column_config.TextColumn(width=85, disabled=True),
+                "隔日規則": st.column_config.TextColumn(width=150, disabled=True),
+            }
+
         edited_df = st.data_editor(
             styled_df,
             column_config={
+                **risk_column_config,
                 "移除": st.column_config.CheckboxColumn("刪除", width=40, help="勾選後刪除並自動遞補"),
                 "代號": st.column_config.TextColumn(disabled=True, width=50), 
                 "名稱": st.column_config.TextColumn(disabled=True, width="small"),
@@ -2585,8 +2832,18 @@ with tab1:
                 "狀態": None, # 設定為 None 即可在資料編輯器中隱藏該欄位
                 "戰略備註": st.column_config.TextColumn("戰略備註 ✏️", width=note_width_px, disabled=False),
             },
-            hide_index=True, width='content', num_rows="fixed", key="main_editor"
+            hide_index=True, width='stretch' if risk_preview_enabled else 'content', num_rows="fixed", key="main_editor"
         )
+
+        if risk_preview_enabled and risk_details:
+            detail_options = {
+                f"{row['代號']} {row['名稱']}": str(row['代號'])
+                for _, row in df_display.iterrows()
+            }
+            if detail_options:
+                selected_risk_label = st.selectbox("查看風險評分明細", list(detail_options), key="risk_filter_detail_code")
+                selected_risk = risk_details[detail_options[selected_risk_label]]
+                st.caption(f"{selected_risk['detail']}｜隔日規則：{selected_risk['rule']}。僅供策略篩選與回測，不構成買賣建議。")
         
         if not edited_df.empty:
             trigger_rerun = False
