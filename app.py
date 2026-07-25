@@ -1719,14 +1719,14 @@ def fetch_futures_list():
     return {}
 
 @st.cache_data(ttl=900, max_entries=1, show_spinner=False)
-def fetch_twse_market_risk_lists():
-    """取得上市注意／處置名單；僅在使用者手動更新時呼叫。"""
+def fetch_market_risk_lists():
+    """取得上市、上櫃注意／處置名單；僅在使用者手動更新時呼叫。"""
     attention_counts = {}
     disposition_codes = set()
     errors = []
     headers = {'User-Agent': 'Mozilla/5.0'}
 
-    def parse_rows(payload, target, is_attention=False):
+    def parse_twse_rows(payload, target, is_attention=False):
         fields = payload.get('fields', [])
         for values in payload.get('data', []):
             record = dict(zip(fields, values))
@@ -1742,16 +1742,38 @@ def fetch_twse_market_risk_lists():
             else:
                 target.add(code)
 
-    for url, target, is_attention in [
-        ('https://www.twse.com.tw/announcement/notice?response=json', attention_counts, True),
-        ('https://www.twse.com.tw/announcement/punish?response=json', disposition_codes, False),
+    for name, url, target, is_attention in [
+        ('上市注意', 'https://www.twse.com.tw/announcement/notice?response=json', attention_counts, True),
+        ('上市處置', 'https://www.twse.com.tw/announcement/punish?response=json', disposition_codes, False),
     ]:
         try:
             response = requests.get(url, headers=headers, timeout=5)
             response.raise_for_status()
-            parse_rows(response.json(), target, is_attention)
+            parse_twse_rows(response.json(), target, is_attention)
         except Exception as exc:
-            errors.append(str(exc))
+            errors.append(f'{name}: {exc}')
+
+    for name, url, is_attention, is_accumulated_note in [
+        ('上櫃注意', 'https://www.tpex.org.tw/openapi/v1/tpex_trading_warning_information', True, False),
+        ('上櫃注意累計異常', 'https://www.tpex.org.tw/openapi/v1/tpex_trading_warning_note', True, True),
+        ('上櫃處置', 'https://www.tpex.org.tw/openapi/v1/tpex_disposal_information', False, False),
+    ]:
+        try:
+            response = requests.get(url, headers=headers, timeout=5)
+            response.raise_for_status()
+            for record in response.json():
+                code_match = re.search(r'\d{4,6}', str(record.get('SecuritiesCompanyCode', '')))
+                if not code_match:
+                    continue
+                code = code_match.group(0)
+                if is_attention:
+                    # 累計異常名單表示隔日再列注意時可能進入處置，至少以 2 次標示。
+                    count = 2 if is_accumulated_note else 1
+                    attention_counts[code] = max(attention_counts.get(code, 0), count)
+                else:
+                    disposition_codes.add(code)
+        except Exception as exc:
+            errors.append(f'{name}: {exc}')
 
     return attention_counts, sorted(disposition_codes), errors
 
@@ -1762,7 +1784,7 @@ def _as_float(value, default=None):
     except (TypeError, ValueError):
         return default
 
-def calculate_risk_filter_result(row, direction, max_extension_atr, attention_counts=None, disposition_codes=None, twse_lists_updated=False, block_attention=True):
+def calculate_risk_filter_result(row, direction, max_extension_atr, attention_counts=None, disposition_codes=None, market_lists_updated=False, block_attention=True):
     """建立風險篩選預覽資料；不會改寫原本的選股資料或下單行為。"""
     attention_counts = attention_counts or {}
     disposition_codes = set(disposition_codes or [])
@@ -1811,20 +1833,14 @@ def calculate_risk_filter_result(row, direction, max_extension_atr, attention_co
 
     attention_count = attention_counts.get(code, 0)
     is_disposed = code in disposition_codes
-    try:
-        market = getattr(twstock.codes.get(code), 'market', '')
-    except Exception:
-        market = ''
     if is_disposed:
         risk_label, risk_score = '🚫 處置中', 0
     elif attention_count >= 2:
         risk_label, risk_score = f'🔴 注意 {attention_count}', 0
     elif attention_count == 1:
         risk_label, risk_score = '🟡 注意 1', 10
-    elif twse_lists_updated and market == '上市':
-        risk_label, risk_score = '🟢 上市名單未列示', 20
-    elif twse_lists_updated:
-        risk_label, risk_score = '⚪ 上櫃未查核', 12
+    elif market_lists_updated:
+        risk_label, risk_score = '🟢 官方名單未列示', 20
     else:
         risk_label, risk_score = '⚪ 未查核', 12
 
@@ -2752,10 +2768,10 @@ with tab1:
                             st.rerun()
                         else:
                             st.warning("沒有可回填的資料；請確認標的至少有 20 個交易日的日 K。")
-                    if st.button("🔄 更新上市注意／處置名單", key="refresh_risk_filter_market_data"):
-                        fetch_twse_market_risk_lists.clear()
-                        with st.spinner("正在更新上市注意／處置名單..."):
-                            attention, disposition, errors = fetch_twse_market_risk_lists()
+                    if st.button("🔄 更新上市／上櫃注意與處置名單", key="refresh_risk_filter_market_data"):
+                        fetch_market_risk_lists.clear()
+                        with st.spinner("正在更新上市／上櫃注意與處置名單..."):
+                            attention, disposition, errors = fetch_market_risk_lists()
                         st.session_state.risk_filter_market_data = {
                             'attention': attention,
                             'disposition': disposition,
@@ -2765,25 +2781,33 @@ with tab1:
 
                 market_risk_data = st.session_state.risk_filter_market_data
                 if market_risk_data.get('updated') and not market_risk_data.get('errors'):
-                    st.caption(f"上市注意／處置名單更新：{market_risk_data['updated']}；上櫃標的請仍以『戰略資料庫 → 處置股』為準。")
+                    st.caption(f"上市／上櫃注意與處置名單更新：{market_risk_data['updated']}。")
                 elif market_risk_data.get('errors'):
-                    st.warning("上市注意／處置名單暫時無法完整更新；本次僅保留技術面風險評分。")
+                    st.warning("注意／處置名單暫時無法完整更新；本次不會將未查核資料誤標為安全。")
                 else:
-                    st.info("尚未更新上市注意／處置名單；資料未查核時不會被誤判為安全。")
+                    st.info("尚未更新上市／上櫃注意與處置名單；資料未查核時不會被誤判為安全。")
 
                 risk_ready_mask = df_display.reindex(columns=RISK_METRIC_COLUMNS).notna().all(axis=1)
                 risk_ready_count = int(risk_ready_mask.sum())
                 st.caption(f"日 K 風險指標：{risk_ready_count} / {len(df_display)} 檔可計算；資料不足時，先按「重抓日 K 並計算風險」。")
+                st.markdown("""
+##### 📖 ATR、處置風險與評分怎麼看
+
+- **ATR（14 日平均真實波幅）**衡量的是日 K 的正常波動幅度，不判斷多空。`乖離`在多頭為「收盤價高於 20 日線幾個 ATR」；空頭則為「收盤價低於 20 日線幾個 ATR」。乖離越大，代表越可能追在延伸段；預設超過 2 ATR 不列為可操作候選。
+- **風險**只代表官方的注意／處置查核結果：`🚫` 已處置、`🔴` 注意累計異常、`🟡` 單次注意、`🟢` 已更新名單且未列示、`⚪` 尚未完整查核。它不是股價會漲或跌的預測。
+- **評分越高**只表示該檔股票與你目前選擇的多頭或空頭方向較一致：趨勢、乖離、K 棒收盤位置、官方風險與昨高／昨低確認條件較佳；不代表保證獲利。切換「多頭／空頭」後，同一檔股票的分數會重新計算。
+- **操作順序**：先重抓日 K → 更新注意／處置名單 → 設定方向與門檻 → 僅將高分、非紅燈標的列為候選，再等待「隔日規則」真的出現才評估進場。請用歷史交易紀錄回測門檻，不以分數單獨下單。
+""")
 
             market_risk_data = st.session_state.risk_filter_market_data
             attention_counts = market_risk_data.get('attention', {})
             disposition_codes = market_risk_data.get('disposition', [])
-            twse_lists_updated = bool(market_risk_data.get('updated')) and not market_risk_data.get('errors')
+            market_lists_updated = bool(market_risk_data.get('updated')) and not market_risk_data.get('errors')
 
             for i, row in df_display.iterrows():
                 result = calculate_risk_filter_result(
                     row, risk_direction, risk_max_extension, attention_counts, disposition_codes,
-                    twse_lists_updated, risk_block_attention
+                    market_lists_updated, risk_block_attention
                 )
                 code = str(row.get('代號', ''))
                 risk_details[code] = result
@@ -2798,7 +2822,7 @@ with tab1:
                 if df_display.empty:
                     st.warning("目前沒有符合門檻的候選；可降低最低評分、放寬最大乖離，或切換回原表。")
 
-            input_cols = ["移除", "代號", "名稱", "風險", "評分", "乖離", "隔日規則", "戰略備註", "自訂價(可修)", "狀態", "自訂價價差", "5日線價差", "當日漲停價", "當日跌停價", "收盤價", "漲跌幅", "期貨"]
+            input_cols = ["移除", "代號", "名稱", "戰略備註", "自訂價(可修)", "狀態", "自訂價價差", "5日線價差", "當日漲停價", "當日跌停價", "收盤價", "漲跌幅", "期貨", "風險", "評分", "乖離", "隔日規則"]
         else:
             input_cols = ["移除", "代號", "名稱", "戰略備註", "自訂價(可修)", "狀態", "自訂價價差", "5日線價差", "當日漲停價", "當日跌停價", "收盤價", "漲跌幅", "期貨"]
         for col in input_cols:
@@ -2878,10 +2902,10 @@ with tab1:
         risk_column_config = {}
         if risk_preview_enabled:
             risk_column_config = {
-                "風險": st.column_config.TextColumn(width=115, disabled=True),
-                "評分": st.column_config.ProgressColumn("評分", min_value=0, max_value=100, format="%d", width=90),
-                "乖離": st.column_config.TextColumn(width=85, disabled=True),
-                "隔日規則": st.column_config.TextColumn(width=150, disabled=True),
+                "風險": st.column_config.TextColumn("處置／注意", width=125, disabled=True, help="官方注意與處置查核結果；不預測漲跌方向。"),
+                "評分": st.column_config.ProgressColumn("方向適配分", min_value=0, max_value=100, format="%d", width=100, help="分數越高，代表越符合目前選擇的多頭或空頭條件；不代表保證獲利。"),
+                "乖離": st.column_config.TextColumn(width=90, disabled=True, help="收盤價相對 20 日線的 ATR 距離；數值越大越不宜追價或追空。"),
+                "隔日規則": st.column_config.TextColumn(width=160, disabled=True, help="僅在隔日條件成真時才列入評估，不是自動買賣指令。"),
             }
 
         edited_df = st.data_editor(
