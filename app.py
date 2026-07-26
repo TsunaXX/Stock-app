@@ -9,6 +9,7 @@ import os
 import itertools
 import json
 import re
+import html
 from datetime import datetime, time as dt_time, timedelta, date
 import pytz
 from decimal import Decimal, ROUND_HALF_UP
@@ -86,6 +87,252 @@ def is_warrant(code):
     c = str(code)
     if c.startswith('00'): return False
     return len(c) > 4
+
+# ==========================================
+# 網路同步行事曆資料來源（僅供「股市行事曆」分頁使用）
+# ==========================================
+CALENDAR_HTTP_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; TaiwanMarketCalendar/1.0)",
+    "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+}
+TWSE_HOLIDAY_URL = "https://www.twse.com.tw/holidaySchedule/holidaySchedule?response=json&queryYear={roc_year}"
+TWSE_NEWS_URL = "https://www.twse.com.tw/news/newsList?response=json"
+FOMC_CALENDAR_URL = "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm"
+BLS_CPI_URL = "https://www.bls.gov/schedule/news_release/cpi.htm"
+
+
+def _calendar_get(url):
+    """取得公開行事曆來源；失敗時回傳 None，讓既有行事曆仍可使用。"""
+    try:
+        response = requests.get(url, headers=CALENDAR_HTTP_HEADERS, timeout=12)
+        response.raise_for_status()
+        return response
+    except requests.RequestException:
+        return None
+
+
+def _twse_announcement_detail(row, fallback):
+    """僅在偵測到全市場休市時讀取公告 PDF，補足休市原因。"""
+    for identifier in row[4:2:-1]:
+        if not identifier:
+            continue
+        response = _calendar_get(f"https://www.twse.com.tw/staticFiles/news/news/tsecnews/{identifier}.pdf")
+        if not response or not response.content.startswith(b"%PDF"):
+            continue
+        try:
+            document = fitz.open(stream=response.content, filetype="pdf")
+            text_value = " ".join(page.get_text("text") for page in document)
+            document.close()
+            if text_value.strip():
+                return re.sub(r"\s+", " ", text_value).strip()
+        except (RuntimeError, ValueError):
+            continue
+    return fallback
+
+
+def _taiwan_time_from_eastern(year, month, day, hour, minute=0):
+    eastern = pytz.timezone("US/Eastern")
+    taipei = pytz.timezone("Asia/Taipei")
+    return eastern.localize(datetime(year, month, day, hour, minute)).astimezone(taipei)
+
+
+@st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
+def fetch_twse_holiday_events(year):
+    """同步臺灣證券交易所的年度開休市日，保留官方名稱與說明。"""
+    response = _calendar_get(TWSE_HOLIDAY_URL.format(roc_year=year - 1911))
+    if not response:
+        return []
+    try:
+        payload = response.json()
+        if payload.get("stat") != "ok":
+            return []
+        events = []
+        for row in payload.get("data", []):
+            if len(row) < 2:
+                continue
+            event_date = pd.to_datetime(row[0], errors="coerce")
+            if pd.isna(event_date):
+                continue
+            title = str(row[1]).strip()
+            detail = str(row[2]).strip() if len(row) > 2 else ""
+            # TWSE 年度表列出的「開始交易／最後交易日」可交易；其餘列皆為休市或非交易日。
+            is_closed = not any(word in title for word in ("開始交易", "最後交易日", "封關日"))
+            events.append({
+                "date": event_date.date().isoformat(),
+                "title": title,
+                "detail": detail,
+                "closed": is_closed,
+                "temporary": False,
+                "source": "TWSE 年度開休市日期",
+            })
+        return events
+    except (ValueError, TypeError, KeyError):
+        return []
+
+
+@st.cache_data(ttl=60 * 15, show_spinner=False)
+def fetch_twse_temporary_closure_events():
+    """從證交所最新公告辨識已宣布的突發休市（颱風、天災等）。"""
+    response = _calendar_get(TWSE_NEWS_URL)
+    if not response:
+        return []
+    try:
+        rows = response.json().get("data", [])
+    except (ValueError, AttributeError):
+        return []
+
+    events = []
+    seen = set()
+    date_pattern = re.compile(r"(\d{2,3})年\s*(\d{1,2})月\s*(\d{1,2})日")
+    keywords = ("休市", "停止交易", "暫停交易", "市場無交易")
+    for row in rows:
+        title = str(row[1]).strip() if len(row) > 1 else ""
+        if not title or not any(keyword in title for keyword in keywords):
+            continue
+        # 排除「個別上市公司暫停交易」；只處理證交所的全市場交易狀態。
+        if not any(scope in title for scope in ("集中交易市場", "證券市場", "全市場")):
+            continue
+        # 年度開休市表的公告不是突發事件，避免覆蓋層重複顯示。
+        if "開休市日期" in title:
+            continue
+        # 連假期間的「自 X 日至 Y 日休市」屬年度排程，交由開休市表處理。
+        if re.search(r"\d{1,2}月\s*\d{1,2}日\s*至", title):
+            continue
+        match = date_pattern.search(title)
+        if not match:
+            continue
+        roc_year, month, day = map(int, match.groups())
+        actual_year = roc_year + 1911 if roc_year < 1911 else roc_year
+        try:
+            closure_date = date(actual_year, month, day)
+        except ValueError:
+            continue
+        if closure_date in seen:
+            continue
+        seen.add(closure_date)
+        announcement_detail = _twse_announcement_detail(row, title)
+        if "颱風" in announcement_detail or "天然災害" in announcement_detail:
+            reason = "颱風／天然災害"
+        elif "地震" in announcement_detail:
+            reason = "地震"
+        elif "豪雨" in announcement_detail:
+            reason = "豪雨"
+        else:
+            reason = "證交所公告"
+        events.append({
+            "date": closure_date.isoformat(),
+            "title": f"⚠️ 台股突發休市｜{reason}",
+            "detail": announcement_detail[:220],
+            "closed": True,
+            "temporary": True,
+            "source": "TWSE 最新公告",
+        })
+    return events
+
+
+@st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
+def fetch_fomc_events(year):
+    """由 Fed 官方會議日程轉成台灣時間的利率決議時間。"""
+    response = _calendar_get(FOMC_CALENDAR_URL)
+    if not response:
+        return []
+    soup = BeautifulSoup(response.text, "html.parser")
+    heading = soup.find(string=re.compile(fr"{year}\s+FOMC Meetings", re.I))
+    if not heading:
+        return []
+    heading_tag = heading.find_parent(["h2", "h3", "h4", "h5"])
+    if not heading_tag:
+        return []
+    month_numbers = {name: index for index, name in enumerate(
+        ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"], 1
+    )}
+    pattern = re.compile(r"^(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2})\s*[-–]\s*(\d{1,2})", re.I)
+    events = []
+    for sibling in heading_tag.find_all_next():
+        if sibling.name in ("h2", "h3", "h4", "h5") and sibling is not heading_tag:
+            break
+        if sibling.name != "div":
+            continue
+        text_value = sibling.get_text(" ", strip=True)
+        match = pattern.match(text_value)
+        if not match:
+            continue
+        month = month_numbers[match.group(1).title()]
+        decision_day = int(match.group(3))
+        taiwan_dt = _taiwan_time_from_eastern(year, month, decision_day, 14)
+        events.append({
+            "date": taiwan_dt.date().isoformat(),
+            "title": f"FOMC 利率決議（{taiwan_dt:%H:%M}）",
+            "detail": f"Fed 官方會議：{match.group(1)} {match.group(2)}–{decision_day}；以台灣時間顯示公布時點。",
+            "closed": False,
+            "temporary": False,
+            "source": "Federal Reserve",
+        })
+    return events
+
+
+@st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
+def fetch_bls_cpi_events(year):
+    """解析 BLS 官方 CPI 發布日程並轉為台灣時間。"""
+    response = _calendar_get(BLS_CPI_URL)
+    if not response or "Access Denied" in response.text:
+        return []
+    text_value = BeautifulSoup(response.text, "html.parser").get_text(" ", strip=True)
+    month_lookup = {name: index for index, name in enumerate(
+        ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"], 1
+    )}
+    # BLS 版面通常以「Jun. 10, 2026 08:30 AM」呈現，允許中間有參考月份文字。
+    pattern = re.compile(r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.\s*(\d{1,2}),\s*(\d{4})\s*(\d{1,2}):(\d{2})\s*(AM|PM)", re.I)
+    events = []
+    seen = set()
+    for match in pattern.finditer(text_value):
+        month_name, day, event_year, hour, minute, meridiem = match.groups()
+        if int(event_year) != year:
+            continue
+        hour = int(hour) % 12 + (12 if meridiem.upper() == "PM" else 0)
+        taiwan_dt = _taiwan_time_from_eastern(year, month_lookup[month_name.title()], int(day), hour, int(minute))
+        if taiwan_dt.date() in seen:
+            continue
+        seen.add(taiwan_dt.date())
+        events.append({
+            "date": taiwan_dt.date().isoformat(),
+            "title": f"美國 CPI 公布（{taiwan_dt:%H:%M}）",
+            "detail": "BLS 官方排程；以台灣時間顯示。",
+            "closed": False,
+            "temporary": False,
+            "source": "U.S. Bureau of Labor Statistics",
+        })
+    return events
+
+
+@st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
+def fetch_earnings_events(tickers):
+    """查詢使用者指定標的的下一次財報日（Yahoo Finance / yfinance）。"""
+    events = []
+    for ticker in tickers:
+        ticker = str(ticker).strip().upper()
+        if not ticker:
+            continue
+        try:
+            calendar_data = yf.Ticker(ticker).calendar
+            earnings_dates = calendar_data.get("Earnings Date", []) if isinstance(calendar_data, dict) else []
+            if not isinstance(earnings_dates, (list, tuple, pd.Series, np.ndarray)):
+                earnings_dates = [earnings_dates]
+            for earnings_date in earnings_dates:
+                parsed_date = pd.to_datetime(earnings_date, errors="coerce")
+                if pd.isna(parsed_date):
+                    continue
+                events.append({
+                    "date": parsed_date.date().isoformat(),
+                    "title": f"{ticker} 財報預估日",
+                    "detail": "資料由 Yahoo Finance 提供；日期可能為預估值，請以公司公告為準。",
+                    "closed": False,
+                    "temporary": False,
+                    "source": "Yahoo Finance",
+                })
+        except Exception:
+            continue
+    return events
 
 # ==========================================
 # 永豐 API (Shioaji) 擷取核心
@@ -4989,6 +5236,35 @@ with tab3:
     # 新增：自訂行事曆存取與 UI 介面
     # ==========================================
     CAL_OVERRIDE_FILE = "cal_override.json"
+    CAL_PREFERENCES_FILE = "cal_preferences.json"
+    CALENDAR_EVENT_OPTIONS = [
+        "台股開休市",
+        "台股突發休市公告",
+        "FOMC 利率決議",
+        "美國 CPI",
+        "指定股票財報",
+    ]
+
+    def load_calendar_preferences():
+        default_preferences = {"events": CALENDAR_EVENT_OPTIONS[:4], "tickers": "2330.TW"}
+        if not os.path.exists(CAL_PREFERENCES_FILE):
+            return default_preferences
+        try:
+            with open(CAL_PREFERENCES_FILE, "r", encoding="utf-8") as file:
+                saved = json.load(file)
+            return {
+                "events": [item for item in saved.get("events", default_preferences["events"]) if item in CALENDAR_EVENT_OPTIONS],
+                "tickers": str(saved.get("tickers", default_preferences["tickers"])),
+            }
+        except (OSError, ValueError, TypeError):
+            return default_preferences
+
+    def save_calendar_preferences(events, tickers):
+        try:
+            with open(CAL_PREFERENCES_FILE, "w", encoding="utf-8") as file:
+                json.dump({"events": events, "tickers": tickers}, file, ensure_ascii=False, indent=2)
+        except OSError:
+            pass
     
     def load_cal_overrides():
         if os.path.exists(CAL_OVERRIDE_FILE):
@@ -5015,6 +5291,8 @@ with tab3:
 
     if 'cal_overrides' not in st.session_state:
         st.session_state.cal_overrides = load_cal_overrides()
+    if 'calendar_preferences' not in st.session_state:
+        st.session_state.calendar_preferences = load_calendar_preferences()
 
     with st.expander("🛠️ 自訂與校正行事曆事件"):
         st.info("若發現系統預設日期或時間有誤，可在此手動新增或覆寫事件（例如：提前休市、自訂總經數據時間）。")
@@ -5040,6 +5318,38 @@ with tab3:
             st.toast("自訂行事曆已儲存！", icon="✅")
             st.rerun()
     st.markdown("---")
+
+    with st.expander("🌐 網路同步與追蹤事件", expanded=True):
+        st.caption("台股開休市與突發休市以臺灣證券交易所（TWSE）官方資料為準；FOMC、CPI 取自 Fed／BLS 官方排程。")
+        selected_event_types = st.multiselect(
+            "要顯示的自動同步事件",
+            options=CALENDAR_EVENT_OPTIONS,
+            default=st.session_state.calendar_preferences["events"],
+            key="calendar_event_types",
+        )
+        ticker_input = st.text_input(
+            "財報追蹤代碼（用逗號分隔，例如 2330.TW, AAPL）",
+            value=st.session_state.calendar_preferences["tickers"],
+            key="calendar_earnings_tickers",
+            disabled="指定股票財報" not in selected_event_types,
+        )
+        update_col, save_col = st.columns(2)
+        with update_col:
+            if st.button("🔄 立即更新網路資料", key="refresh_calendar_network"):
+                fetch_twse_holiday_events.clear()
+                fetch_twse_temporary_closure_events.clear()
+                fetch_fomc_events.clear()
+                fetch_bls_cpi_events.clear()
+                fetch_earnings_events.clear()
+                st.toast("已重新向資料來源查詢。", icon="🔄")
+                st.rerun()
+        with save_col:
+            if st.button("💾 儲存追蹤設定", key="save_calendar_preferences"):
+                st.session_state.calendar_preferences = {"events": selected_event_types, "tickers": ticker_input}
+                save_calendar_preferences(selected_event_types, ticker_input)
+                st.toast("追蹤設定已儲存。", icon="✅")
+
+    st.caption("資料來源：TWSE 市場開休市日期與最新公告、Federal Reserve、U.S. BLS、Yahoo Finance（財報預估日）。網路來源暫時無法連線時，會保留既有預設與手動校正資料。")
 
     def change_month(delta):
         st.session_state.cal_month += delta
@@ -5076,7 +5386,32 @@ with tab3:
     with col_next: st.button("▶️", on_click=change_month, args=(1,), width='stretch')
     with col_header: st.markdown(f"<div class='calendar-header'>{sel_year}/{sel_month:02}</div>", unsafe_allow_html=True)
 
-    current_holidays = get_holidays(sel_year)
+    # 每次切換月份都以 TWSE 年度資料重新建立交易日判定；網路暫不可用才退回既有固定表。
+    twse_holiday_events = fetch_twse_holiday_events(sel_year)
+    twse_temporary_events = fetch_twse_temporary_closure_events()
+    current_holidays = {
+        (pd.Timestamp(event["date"]).month, pd.Timestamp(event["date"]).day): event["title"]
+        for event in twse_holiday_events if event["closed"]
+    }
+    if not current_holidays:
+        current_holidays = get_holidays(sel_year)
+    temporary_closures = {
+        pd.Timestamp(event["date"]).date(): event for event in twse_temporary_events
+    }
+
+    # 將使用者選擇的資料來源合併成統一事件格式；台股突發休市永遠覆蓋交易日狀態。
+    network_events = list(twse_temporary_events)
+    if "台股開休市" in selected_event_types:
+        network_events.extend(twse_holiday_events)
+    if "FOMC 利率決議" in selected_event_types:
+        network_events.extend(fetch_fomc_events(sel_year))
+    if "美國 CPI" in selected_event_types:
+        network_events.extend(fetch_bls_cpi_events(sel_year))
+    if "指定股票財報" in selected_event_types:
+        ticker_symbols = tuple(symbol.strip().upper() for symbol in ticker_input.split(",") if symbol.strip())
+        if ticker_symbols:
+            network_events.extend(fetch_earnings_events(ticker_symbols))
+
     def get_us_events(y, m):
         events = {}
         def add_evt(d, txt, color):
@@ -5167,10 +5502,20 @@ with tab3:
         
         return events
 
-    # 取得本月美國重要事件
-    us_events = get_us_events(sel_year, sel_month)
+    # 不再以程式內的固定日期作為主要來源；保留函數僅相容既有程式結構。
+    us_events = {}
+    network_event_dict = {}
+    for event in network_events:
+        try:
+            event_date = pd.Timestamp(event["date"]).date()
+            if event_date.year == sel_year and event_date.month == sel_month:
+                network_event_dict.setdefault(event_date, []).append(event)
+        except (KeyError, TypeError, ValueError):
+            continue
+
     def is_market_closed_func(d_date):
         if d_date.weekday() >= 5: return True
+        if d_date in temporary_closures: return True
         name = current_holidays.get((d_date.month, d_date.day), "")
         if name and name != "封關日": return True
         return False
@@ -5267,8 +5612,29 @@ with tab3:
             border_style = "today-border" if curr_date == now_tw.date() else ""
             
             content_html = [f"<b>{day}</b>"]
-            if holiday_name and holiday_name != "封關日": content_html.append(f"<div class='holiday-tag'>{holiday_name}</div>")
-            if holiday_name == "封關日": content_html.append(f"<div style='color:#ff9800; font-size:0.8em;'>{holiday_name}</div>")
+            if holiday_name and holiday_name != "封關日": content_html.append(f"<div class='holiday-tag'>{html.escape(holiday_name)}</div>")
+            if holiday_name == "封關日": content_html.append(f"<div style='color:#ff9800; font-size:0.8em;'>{html.escape(holiday_name)}</div>")
+
+            # 網路同步事件：突發休市會強制使用紅色底，並附上官方公告中的原因。
+            for event in network_event_dict.get(curr_date, []):
+                if event.get("closed") and not event.get("temporary"):
+                    # 已由 holiday_name 顯示，避免年度休市名稱重複。
+                    continue
+                if event.get("temporary"):
+                    prefix = "<div style='background:#B71C1C; color:#FFFFFF; padding:2px; margin-top:3px; font-size:0.78em; font-weight:900;'>"
+                    suffix = "</div>"
+                    detail = html.escape(str(event.get("detail", "")))
+                    content_html.append(f"{prefix}{html.escape(event.get('title', '台股突發休市'))}{suffix}")
+                    if detail:
+                        content_html.append(f"<div style='color:#FFCDD2; font-size:0.72em; margin-top:2px;'>{detail}</div>")
+                else:
+                    color = "#FF7043" if event.get("source") == "Federal Reserve" else "#00E5FF"
+                    if "財報" in event.get("title", ""):
+                        color = "#FFD700"
+                    content_html.append(
+                        f"<div style='color:{color}; font-size:0.8em; margin-top:2px; font-weight:bold;'>"
+                        f"{html.escape(event.get('title', '未命名事件'))}</div>"
+                    )
             
             # 加入外國重要股市事件
             if day in us_events:
