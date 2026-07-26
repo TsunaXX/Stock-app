@@ -1997,7 +1997,10 @@ def calculate_daytrade_filter_result(row, direction, attention_counts=None, disp
 
     return {
         'score': score, 'rule': rule, 'eligible': eligible,
-        'vwap_status': '多方在 VWAP 上' if close > vwap else '空方在 VWAP 下',
+        'vwap_status': (
+            '偏多：站上 VWAP' if close > vwap
+            else ('偏空：跌破 VWAP' if close < vwap else '中性：貼近 VWAP')
+        ),
         'opening_range': f'{opening_low:.2f}－{opening_high:.2f}',
         'detail': f'日 K 趨勢 {daily_trend_score}/25｜VWAP {vwap_score}/25｜量能 {volume_score}/20｜開盤區間 {range_score}/15｜風險 {risk_score}/15',
         'data_time': row.get('_daytrade_data_time')
@@ -2896,7 +2899,7 @@ with tab1:
 
             with st.expander("🛡️ 選股風險篩選設定", expanded=True):
                 strategy_mode = st.radio(
-                    "策略模式", ["隔日／波段", "當沖預覽"], horizontal=True,
+                    "策略模式", ["當沖預覽", "隔日／波段"], horizontal=True,
                     key="risk_filter_strategy_mode",
                     help="隔日／波段維持原有規則；當沖預覽以 5 分 K、VWAP 與開盤區間顯示盤中條件，不會自動下單。"
                 )
@@ -3075,6 +3078,7 @@ with tab1:
             note = str(row.get('戰略備註', ''))
             st_val = str(row.get('狀態', ''))
             risk_val = str(row.get('風險', ''))
+            vwap_val = str(row.get('VWAP 狀態', ''))
             
             if st_val == "漲停":
                 name_c = 'background-color: #ff4b4b; color: #ffffff; font-weight: bold;'
@@ -3113,6 +3117,13 @@ with tab1:
                         styles[idx] = 'color: #ffeb3b; font-weight: bold;'
                     elif risk_val.startswith('🟢'):
                         styles[idx] = 'color: #00e676;'
+                elif col == "VWAP 狀態":
+                    if vwap_val.startswith('偏多'):
+                        styles[idx] = 'color: #ff4b4b; font-weight: bold;'
+                    elif vwap_val.startswith('偏空'):
+                        styles[idx] = 'color: #00e676; font-weight: bold;'
+                    elif vwap_val.startswith('中性'):
+                        styles[idx] = 'color: #ffeb3b;'
             return styles
             
         styled_df = df_display[input_cols].style.apply(style_tab1_df, axis=1)
