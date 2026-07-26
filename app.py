@@ -1873,6 +1873,136 @@ RISK_METRIC_COLUMNS = [
     '_risk_close_position', '_risk_prev_high', '_risk_prev_low'
 ]
 
+# 當沖預覽只在使用者手動更新 5 分 K 時回填，避免影響原本選股載入速度。
+DAYTRADE_METRIC_COLUMNS = [
+    '_daytrade_vwap', '_daytrade_or_high', '_daytrade_or_low',
+    '_daytrade_volume_ratio', '_daytrade_close', '_daytrade_data_time'
+]
+
+def calculate_daytrade_metrics(intraday_df):
+    """由同一交易日的 5 分 K 計算 VWAP、開盤區間與相對量能。"""
+    required_columns = {'High', 'Low', 'Close', 'Volume'}
+    if intraday_df is None or intraday_df.empty or not required_columns.issubset(intraday_df.columns):
+        return None
+
+    data = intraday_df.copy().sort_index()
+    data = data[(data.index.time >= dt_time(9, 0)) & (data.index.time <= dt_time(13, 30))]
+    data = data.dropna(subset=['High', 'Low', 'Close', 'Volume'])
+    if data.empty:
+        return None
+
+    latest_day = data.index.normalize().max()
+    today = data[data.index.normalize() == latest_day].copy()
+    if len(today) < 3 or float(today['Volume'].sum()) <= 0:
+        return None
+
+    typical_price = (today['High'] + today['Low'] + today['Close']) / 3
+    cumulative_volume = today['Volume'].cumsum()
+    vwap = float((typical_price * today['Volume']).cumsum().iloc[-1] / cumulative_volume.iloc[-1])
+    opening_range = today[(today.index.time >= dt_time(9, 0)) & (today.index.time < dt_time(9, 15))]
+    if opening_range.empty:
+        return None
+
+    # 以最近三個交易日相同的盤中截止時間比較累積量，避免直接拿全天量誤判。
+    cutoff_time = today.index[-1].time()
+    daily_volume_to_cutoff = []
+    for trading_day, frame in data.groupby(data.index.normalize()):
+        if trading_day == latest_day:
+            continue
+        comparable = frame[frame.index.time <= cutoff_time]
+        if not comparable.empty:
+            daily_volume_to_cutoff.append(float(comparable['Volume'].sum()))
+    average_prior_volume = np.mean(daily_volume_to_cutoff[-2:]) if daily_volume_to_cutoff else np.nan
+    volume_ratio = float(today['Volume'].sum() / average_prior_volume) if average_prior_volume and average_prior_volume > 0 else None
+
+    return {
+        '_daytrade_vwap': round(vwap, 2),
+        '_daytrade_or_high': round(float(opening_range['High'].max()), 2),
+        '_daytrade_or_low': round(float(opening_range['Low'].min()), 2),
+        '_daytrade_volume_ratio': round(volume_ratio, 2) if volume_ratio is not None else None,
+        '_daytrade_close': round(float(today['Close'].iloc[-1]), 2),
+        '_daytrade_data_time': today.index[-1].strftime('%Y/%m/%d %H:%M'),
+    }
+
+def calculate_daytrade_filter_result(row, direction, attention_counts=None, disposition_codes=None, market_lists_updated=False, block_attention=True):
+    """建立當沖用的盤中預覽；分數代表條件一致性，並非交易指令。"""
+    attention_counts = attention_counts or {}
+    disposition_codes = set(disposition_codes or [])
+    code = str(row.get('代號', '')).strip()
+    is_long = direction == '多頭'
+    close = _as_float(row.get('_daytrade_close'))
+    vwap = _as_float(row.get('_daytrade_vwap'))
+    opening_high = _as_float(row.get('_daytrade_or_high'))
+    opening_low = _as_float(row.get('_daytrade_or_low'))
+    volume_ratio = _as_float(row.get('_daytrade_volume_ratio'))
+    ma5 = _as_float(row.get('_ma5'))
+    ma20 = _as_float(row.get('_risk_ma20'))
+    ma20_slope = _as_float(row.get('_risk_ma20_slope'))
+
+    if None in (close, vwap, opening_high, opening_low):
+        return {
+            'score': 0, 'rule': '資料不足：先重抓 5 分 K', 'eligible': False,
+            'vwap_status': '—', 'opening_range': '—',
+            'detail': '尚未取得足夠的 5 分 K、VWAP 或開盤區間資料。', 'data_time': None
+        }
+
+    daily_trend_score = 0
+    daily_close = _as_float(row.get('收盤價'))
+    if daily_close is not None and ma5 is not None and ((is_long and daily_close > ma5) or (not is_long and daily_close < ma5)):
+        daily_trend_score += 10
+    if daily_close is not None and ma20 is not None and ((is_long and daily_close > ma20) or (not is_long and daily_close < ma20)):
+        daily_trend_score += 10
+    if ma20_slope is not None and ((is_long and ma20_slope > 0) or (not is_long and ma20_slope < 0)):
+        daily_trend_score += 5
+
+    vwap_aligned = close > vwap if is_long else close < vwap
+    vwap_score = 25 if vwap_aligned else 0
+    range_broken = close > opening_high if is_long else close < opening_low
+    range_score = 15 if range_broken else 0
+    if volume_ratio is None:
+        volume_score = 8
+    elif volume_ratio >= 1.5:
+        volume_score = 20
+    elif volume_ratio >= 1.0:
+        volume_score = 12
+    else:
+        volume_score = 0
+
+    attention_count = attention_counts.get(code, 0)
+    is_disposed = code in disposition_codes
+    if is_disposed or attention_count >= 2:
+        risk_score = 0
+    elif attention_count == 1:
+        risk_score = 7
+    elif market_lists_updated:
+        risk_score = 15
+    else:
+        risk_score = 8
+
+    score = daily_trend_score + vwap_score + volume_score + range_score + risk_score
+    risk_blocked = is_disposed or (block_attention and attention_count >= 2)
+    eligible = not risk_blocked and vwap_aligned and range_broken and (volume_ratio is None or volume_ratio >= 1.0)
+    direction_text = '站上' if is_long else '跌破'
+    range_text = '開盤區間高' if is_long else '開盤區間低'
+    if risk_blocked:
+        rule = '不交易：處置／注意風險'
+    elif not vwap_aligned:
+        rule = f'觀察：價格需{direction_text} VWAP'
+    elif not range_broken:
+        rule = f'觀察：需{direction_text}{range_text}'
+    elif volume_ratio is not None and volume_ratio < 1.0:
+        rule = '觀察：量能未達近期同時段平均'
+    else:
+        rule = f'觸發：{direction_text} VWAP＋{direction_text}{range_text}'
+
+    return {
+        'score': score, 'rule': rule, 'eligible': eligible,
+        'vwap_status': '多方在 VWAP 上' if close > vwap else '空方在 VWAP 下',
+        'opening_range': f'{opening_low:.2f}－{opening_high:.2f}',
+        'detail': f'日 K 趨勢 {daily_trend_score}/25｜VWAP {vwap_score}/25｜量能 {volume_score}/20｜開盤區間 {range_score}/15｜風險 {risk_score}/15',
+        'data_time': row.get('_daytrade_data_time')
+    }
+
 def get_tick_size(price):
     try: price = float(price)
     except: return 0.01
@@ -2375,6 +2505,35 @@ def refresh_risk_metrics_for_codes(stock_data, futures_set, saved_notes_dict, na
         updated_count += int(row_mask.sum())
     return refreshed, updated_count
 
+def refresh_daytrade_metrics_for_codes(stock_data, sj_logged_in=False, sj_api=None):
+    """手動抓取 5 分 K 並回填當沖預覽欄位；不改動原本選股或下單資料。"""
+    if stock_data.empty or '代號' not in stock_data.columns or not sj_logged_in or sj_api is None:
+        return stock_data, 0
+
+    codes = stock_data['代號'].astype(str).tolist()
+
+    def fetch_metrics(code):
+        try:
+            time.sleep(API_REQUEST_GAP_SECONDS)
+            intraday_df = fetch_shioaji_data(sj_api, code, interval='5m', lookback_days=3)
+            return code, calculate_daytrade_metrics(intraday_df)
+        except Exception:
+            return code, None
+
+    with ThreadPoolExecutor(max_workers=ANALYSIS_MAX_WORKERS) as executor:
+        results = list(executor.map(fetch_metrics, codes))
+
+    refreshed = stock_data.copy()
+    updated_count = 0
+    for code, metrics in results:
+        if not metrics:
+            continue
+        row_mask = refreshed['代號'].astype(str) == code
+        for column, value in metrics.items():
+            refreshed.loc[row_mask, column] = value
+        updated_count += int(row_mask.sum())
+    return refreshed, updated_count
+
 # ==========================================
 # 處理待加回的忽略股票 (防止 NameError & 提速)
 # ==========================================
@@ -2736,10 +2895,16 @@ with tab1:
                 }
 
             with st.expander("🛡️ 選股風險篩選設定", expanded=True):
+                strategy_mode = st.radio(
+                    "策略模式", ["隔日／波段", "當沖預覽"], horizontal=True,
+                    key="risk_filter_strategy_mode",
+                    help="隔日／波段維持原有規則；當沖預覽以 5 分 K、VWAP 與開盤區間顯示盤中條件，不會自動下單。"
+                )
+                is_daytrade_mode = strategy_mode == "當沖預覽"
                 risk_col1, risk_col2, risk_col3 = st.columns(3)
                 with risk_col1:
                     risk_direction = st.radio("判斷方向", ["多頭", "空頭"], horizontal=True, key="risk_filter_direction")
-                    risk_min_score = st.slider("最低評分", min_value=60, max_value=90, value=75, key="risk_filter_min_score")
+                    risk_min_score = st.slider("最低當沖評分" if is_daytrade_mode else "最低評分", min_value=60, max_value=90, value=75, key="risk_filter_min_score")
                 with risk_col2:
                     risk_max_extension = st.slider("最大乖離（ATR）", min_value=1.0, max_value=3.0, value=2.0, step=0.1, key="risk_filter_max_extension")
                     risk_block_attention = st.checkbox("封鎖注意累計 ≥ 2", value=True, key="risk_filter_block_attention")
@@ -2768,6 +2933,29 @@ with tab1:
                             st.rerun()
                         else:
                             st.warning("沒有可回填的資料；請確認標的至少有 20 個交易日的日 K。")
+                    if is_daytrade_mode:
+                        if st.button("📈 重抓 5 分 K 並更新當沖條件", key="refresh_daytrade_filter_metrics"):
+                            if not st.session_state.get('sj_logged_in', False) or st.session_state.get('sj_api') is None:
+                                st.warning("當沖預覽需要先登入永豐 Shioaji，才能使用較即時的 5 分 K 資料。")
+                            else:
+                                with st.spinner("正在重抓 5 分 K、計算 VWAP 與開盤區間..."):
+                                    refreshed_data, updated_count = refresh_daytrade_metrics_for_codes(
+                                        st.session_state.stock_data,
+                                        st.session_state.get('sj_logged_in', False),
+                                        st.session_state.get('sj_api', None)
+                                    )
+                                if updated_count:
+                                    st.session_state.stock_data = refreshed_data
+                                    save_data_cache(
+                                        st.session_state.stock_data,
+                                        st.session_state.ignored_stocks,
+                                        st.session_state.all_candidates,
+                                        st.session_state.saved_notes
+                                    )
+                                    st.toast(f"已更新 {updated_count} 檔的 5 分 K、VWAP 與開盤區間", icon="📈")
+                                    st.rerun()
+                                else:
+                                    st.warning("沒有取得足夠的盤中 5 分 K；請確認 Shioaji 連線與交易時段資料。")
                     if st.button("🔄 更新上市／上櫃注意與處置名單", key="refresh_risk_filter_market_data"):
                         fetch_market_risk_lists.clear()
                         with st.spinner("正在更新上市／上櫃注意與處置名單..."):
@@ -2790,13 +2978,19 @@ with tab1:
                 risk_ready_mask = df_display.reindex(columns=RISK_METRIC_COLUMNS).notna().all(axis=1)
                 risk_ready_count = int(risk_ready_mask.sum())
                 st.caption(f"日 K 風險指標：{risk_ready_count} / {len(df_display)} 檔可計算；資料不足時，先按「重抓日 K 並計算風險」。")
+                if is_daytrade_mode:
+                    daytrade_ready_mask = df_display.reindex(columns=DAYTRADE_METRIC_COLUMNS).notna().all(axis=1)
+                    daytrade_ready_count = int(daytrade_ready_mask.sum())
+                    st.caption(f"當沖 5 分 K 指標：{daytrade_ready_count} / {len(df_display)} 檔可計算；僅在你手動按「重抓 5 分 K」時更新，不影響原本載入速度。")
                 st.markdown("""
-##### 📖 ATR、處置風險與評分怎麼看
+##### 📖 ATR、VWAP、處置風險與評分怎麼看
 
 - **ATR（14 日平均真實波幅）**衡量的是日 K 的正常波動幅度，不判斷多空。`乖離`在多頭為「收盤價高於 20 日線幾個 ATR」；空頭則為「收盤價低於 20 日線幾個 ATR」。乖離越大，代表越可能追在延伸段；預設超過 2 ATR 不列為可操作候選。
+- **VWAP（成交量加權平均價）**是把盤中每一段成交價依成交量加權後的平均成本。當沖預覽中，價格在 VWAP 上方偏多、下方偏空；它是盤中強弱與成本位置的參考，不是保證會反轉或續漲／續跌的支撐壓力線。
+- **開盤區間**預設採 09:00–09:15 的高低點。多方會觀察站上 VWAP 後突破區間高點；空方則觀察跌破 VWAP 後跌破區間低點。量能以最近交易日「相同盤中截止時間」的累積量比較，避免直接拿全天量判斷。
 - **風險**只代表官方的注意／處置查核結果：`🚫` 已處置、`🔴` 注意累計異常、`🟡` 單次注意、`🟢` 已更新名單且未列示、`⚪` 尚未完整查核。它不是股價會漲或跌的預測。
 - **評分越高**只表示該檔股票與你目前選擇的多頭或空頭方向較一致：趨勢、乖離、K 棒收盤位置、官方風險與昨高／昨低確認條件較佳；不代表保證獲利。切換「多頭／空頭」後，同一檔股票的分數會重新計算。
-- **操作順序**：先重抓日 K → 更新注意／處置名單 → 設定方向與門檻 → 僅將高分、非紅燈標的列為候選，再等待「隔日規則」真的出現才評估進場。請用歷史交易紀錄回測門檻，不以分數單獨下單。
+- **當沖操作順序**：先重抓日 K → 更新注意／處置名單 → 重抓 5 分 K → 設定方向與門檻 → 只將高分、非紅燈標的列為候選，再等「盤中觸發」成立。VWAP 與開盤區間應每個交易日重新計算，請以模擬／歷史紀錄驗證門檻，不以分數單獨下單。
 """)
 
             market_risk_data = st.session_state.risk_filter_market_data
@@ -2805,16 +2999,37 @@ with tab1:
             market_lists_updated = bool(market_risk_data.get('updated')) and not market_risk_data.get('errors')
 
             for i, row in df_display.iterrows():
-                result = calculate_risk_filter_result(
+                result = calculate_daytrade_filter_result(
+                    row, risk_direction, attention_counts, disposition_codes,
+                    market_lists_updated, risk_block_attention
+                ) if is_daytrade_mode else calculate_risk_filter_result(
                     row, risk_direction, risk_max_extension, attention_counts, disposition_codes,
                     market_lists_updated, risk_block_attention
                 )
                 code = str(row.get('代號', ''))
                 risk_details[code] = result
-                df_display.at[i, '風險'] = result['risk']
-                df_display.at[i, '評分'] = result['score']
-                df_display.at[i, '乖離'] = f"{result['extension']:+.1f} ATR" if result['extension'] is not None else "—"
-                df_display.at[i, '隔日規則'] = result['rule']
+                if is_daytrade_mode:
+                    daily_risk = calculate_risk_filter_result(
+                        row, risk_direction, risk_max_extension, attention_counts, disposition_codes,
+                        market_lists_updated, risk_block_attention
+                    )
+                    # 日 ATR 乖離與官方風險是當沖的盤前門檻；盤中訊號成立也不放行過度延伸標的。
+                    if not daily_risk['eligible']:
+                        result['eligible'] = False
+                        if result['rule'].startswith('觸發：'):
+                            result['rule'] = f"不交易：盤前門檻未通過（{daily_risk['rule']}）"
+                    df_display.at[i, '風險'] = daily_risk['risk']
+                    df_display.at[i, 'VWAP 狀態'] = result['vwap_status']
+                    df_display.at[i, '開盤區間'] = result['opening_range']
+                    volume_ratio = _as_float(row.get('_daytrade_volume_ratio'))
+                    df_display.at[i, '量能'] = f"{volume_ratio:.2f}x" if volume_ratio is not None else "資料不足"
+                    df_display.at[i, '當沖評分'] = result['score']
+                    df_display.at[i, '盤中觸發'] = result['rule']
+                else:
+                    df_display.at[i, '風險'] = result['risk']
+                    df_display.at[i, '評分'] = result['score']
+                    df_display.at[i, '乖離'] = f"{result['extension']:+.1f} ATR" if result['extension'] is not None else "—"
+                    df_display.at[i, '隔日規則'] = result['rule']
                 df_display.at[i, '_risk_eligible'] = result['eligible'] and result['score'] >= risk_min_score
 
             if risk_show_only_eligible:
@@ -2822,7 +3037,10 @@ with tab1:
                 if df_display.empty:
                     st.warning("目前沒有符合門檻的候選；可降低最低評分、放寬最大乖離，或切換回原表。")
 
-            input_cols = ["移除", "代號", "名稱", "戰略備註", "自訂價(可修)", "狀態", "自訂價價差", "5日線價差", "當日漲停價", "當日跌停價", "收盤價", "漲跌幅", "期貨", "風險", "評分", "乖離", "隔日規則"]
+            if is_daytrade_mode:
+                input_cols = ["移除", "代號", "名稱", "戰略備註", "自訂價(可修)", "狀態", "自訂價價差", "5日線價差", "當日漲停價", "當日跌停價", "收盤價", "漲跌幅", "期貨", "風險", "VWAP 狀態", "開盤區間", "量能", "當沖評分", "盤中觸發"]
+            else:
+                input_cols = ["移除", "代號", "名稱", "戰略備註", "自訂價(可修)", "狀態", "自訂價價差", "5日線價差", "當日漲停價", "當日跌停價", "收盤價", "漲跌幅", "期貨", "風險", "評分", "乖離", "隔日規則"]
         else:
             input_cols = ["移除", "代號", "名稱", "戰略備註", "自訂價(可修)", "狀態", "自訂價價差", "5日線價差", "當日漲停價", "當日跌停價", "收盤價", "漲跌幅", "期貨"]
         for col in input_cols:
@@ -2849,7 +3067,7 @@ with tab1:
 
         df_display = df_display.reset_index(drop=True)
         for col in input_cols:
-             if col not in ["移除", "評分"]: df_display[col] = df_display[col].astype(str)
+             if col not in ["移除", "評分", "當沖評分"]: df_display[col] = df_display[col].astype(str)
 
         # 定義上色邏輯
         def style_tab1_df(row):
@@ -2903,10 +3121,21 @@ with tab1:
         if risk_preview_enabled:
             risk_column_config = {
                 "風險": st.column_config.TextColumn("處置／注意", width=125, disabled=True, help="官方注意與處置查核結果；不預測漲跌方向。"),
-                "評分": st.column_config.ProgressColumn("方向適配分", min_value=0, max_value=100, format="%d", width=100, help="分數越高，代表越符合目前選擇的多頭或空頭條件；不代表保證獲利。"),
-                "乖離": st.column_config.TextColumn(width=90, disabled=True, help="收盤價相對 20 日線的 ATR 距離；數值越大越不宜追價或追空。"),
-                "隔日規則": st.column_config.TextColumn(width=160, disabled=True, help="僅在隔日條件成真時才列入評估，不是自動買賣指令。"),
             }
+            if is_daytrade_mode:
+                risk_column_config.update({
+                    "VWAP 狀態": st.column_config.TextColumn(width=125, disabled=True, help="價格相對成交量加權平均價的位置；上方偏多、下方偏空。"),
+                    "開盤區間": st.column_config.TextColumn(width=105, disabled=True, help="09:00–09:15 的低點－高點。"),
+                    "量能": st.column_config.TextColumn(width=80, disabled=True, help="目前累積量相對最近交易日同時段平均量。"),
+                    "當沖評分": st.column_config.ProgressColumn("當沖適配分", min_value=0, max_value=100, format="%d", width=105, help="日 K 趨勢、VWAP、量能、開盤區間與官方風險的一致性；不代表保證獲利。"),
+                    "盤中觸發": st.column_config.TextColumn(width=190, disabled=True, help="僅在盤中條件同時成立時提供觀察提示，不是自動買賣指令。"),
+                })
+            else:
+                risk_column_config.update({
+                    "評分": st.column_config.ProgressColumn("方向適配分", min_value=0, max_value=100, format="%d", width=100, help="分數越高，代表越符合目前選擇的多頭或空頭條件；不代表保證獲利。"),
+                    "乖離": st.column_config.TextColumn(width=90, disabled=True, help="收盤價相對 20 日線的 ATR 距離；數值越大越不宜追價或追空。"),
+                    "隔日規則": st.column_config.TextColumn(width=160, disabled=True, help="僅在隔日條件成真時才列入評估，不是自動買賣指令。"),
+                })
 
         edited_df = st.data_editor(
             styled_df,
@@ -2937,7 +3166,9 @@ with tab1:
             if detail_options:
                 selected_risk_label = st.selectbox("查看風險評分明細", list(detail_options), key="risk_filter_detail_code")
                 selected_risk = risk_details[detail_options[selected_risk_label]]
-                st.caption(f"{selected_risk['detail']}｜隔日規則：{selected_risk['rule']}。僅供策略篩選與回測，不構成買賣建議。")
+                rule_label = "盤中觸發" if is_daytrade_mode else "隔日規則"
+                data_time_text = f"｜5 分 K 更新：{selected_risk['data_time']}" if is_daytrade_mode and selected_risk.get('data_time') else ""
+                st.caption(f"{selected_risk['detail']}｜{rule_label}：{selected_risk['rule']}{data_time_text}。僅供策略篩選與回測，不構成買賣建議。")
         
         if not edited_df.empty:
             trigger_rerun = False
