@@ -305,34 +305,134 @@ def fetch_bls_cpi_events(year):
     return events
 
 
+EARNINGS_TICKER_ALIASES = {
+    "META": ("META", "Meta Platforms（Facebook）"),
+    "FACEBOOK": ("META", "Meta Platforms（Facebook）"),
+    "FB": ("META", "Meta Platforms（Facebook）"),
+    "GOOGLE": ("GOOGL", "Alphabet（Google）"),
+    "ALPHABET": ("GOOGL", "Alphabet（Google）"),
+    "GOOG": ("GOOGL", "Alphabet（Google）"),
+    "GOOGL": ("GOOGL", "Alphabet（Google）"),
+    "TESLA": ("TSLA", "Tesla"),
+    "TSLA": ("TSLA", "Tesla"),
+    "TSMC": ("2330.TW", "台積電（TSMC）"),
+    "TAIWAN SEMICONDUCTOR": ("2330.TW", "台積電（TSMC）"),
+    "APPLE": ("AAPL", "Apple"),
+    "AMAZON": ("AMZN", "Amazon"),
+    "MICROSOFT": ("MSFT", "Microsoft"),
+    "NVIDIA": ("NVDA", "NVIDIA"),
+}
+
+
+def resolve_earnings_ticker(user_input):
+    """將公司俗稱、台股代碼或 Yahoo 代碼轉成可查詢的財報標的。"""
+    raw = str(user_input).strip()
+    normalized = re.sub(r"\s+", " ", raw.upper())
+    if normalized in EARNINGS_TICKER_ALIASES:
+        ticker, display_name = EARNINGS_TICKER_ALIASES[normalized]
+        return {"input": raw, "display_name": display_name, "candidates": (ticker,)}
+
+    # 台股公司中文名稱與代碼使用本機名單；純數字先查上市，再嘗試上櫃。
+    try:
+        code_map, name_map = load_local_stock_names()
+    except Exception:
+        code_map, name_map = {}, {}
+    if raw in name_map:
+        code = name_map[raw]
+        return {"input": raw, "display_name": f"{raw}（{code}）", "candidates": (f"{code}.TW", f"{code}.TWO")}
+    if normalized.isdigit() and len(normalized) in (4, 5, 6):
+        display_name = code_map.get(normalized, normalized)
+        return {"input": raw, "display_name": f"{display_name}（{normalized}）", "candidates": (f"{normalized}.TW", f"{normalized}.TWO")}
+
+    # 已輸入台股市場尾碼時仍補上公司名稱；其他市場尾碼則不改寫。
+    if normalized.endswith((".TW", ".TWO")):
+        code = normalized.split(".", 1)[0]
+        display_name = code_map.get(code, code)
+        return {"input": raw, "display_name": f"{display_name}（{code}）", "candidates": (normalized,)}
+    # 其他輸入視為 Yahoo Finance 可識別的美股代碼。
+    return {"input": raw, "display_name": normalized, "candidates": (normalized,)}
+
+
+def _format_earnings_time(raw_datetime):
+    """將 Yahoo 的日期／時間轉為台灣時間，並標明美股公布時段。"""
+    parsed = pd.to_datetime(raw_datetime, errors="coerce")
+    if pd.isna(parsed):
+        return None, None
+
+    has_explicit_time = bool(parsed.hour or parsed.minute or parsed.second)
+    if not has_explicit_time:
+        return parsed.date(), "公布時間待公司公告"
+
+    eastern = pytz.timezone("US/Eastern")
+    taipei = pytz.timezone("Asia/Taipei")
+    if parsed.tzinfo is None:
+        eastern_dt = eastern.localize(parsed.to_pydatetime())
+    else:
+        eastern_dt = parsed.tz_convert(eastern)
+    taiwan_dt = eastern_dt.astimezone(taipei)
+    eastern_hour = eastern_dt.hour + eastern_dt.minute / 60
+    if eastern_hour >= 16:
+        session = "美股收盤後"
+    elif eastern_hour < 9.5:
+        session = "美股盤前"
+    else:
+        session = "美股盤中"
+    return taiwan_dt.date(), f"{session}（台灣時間 {taiwan_dt:%m/%d %H:%M}）"
+
+
+def _get_earnings_dates(ticker_object):
+    """優先採 Yahoo 財報行事曆的帶時間資料，無資料時退回 calendar 欄位。"""
+    try:
+        earnings_table = ticker_object.get_earnings_dates(limit=8)
+        if isinstance(earnings_table, pd.DataFrame) and not earnings_table.empty:
+            return list(earnings_table.index)
+    except Exception:
+        pass
+    try:
+        calendar_data = ticker_object.calendar
+        dates = calendar_data.get("Earnings Date", []) if isinstance(calendar_data, dict) else []
+        return list(dates) if isinstance(dates, (list, tuple, pd.Series, np.ndarray)) else [dates]
+    except Exception:
+        return []
+
+
 @st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
-def fetch_earnings_events(tickers):
-    """查詢使用者指定標的的下一次財報日（Yahoo Finance / yfinance）。"""
-    events = []
-    for ticker in tickers:
-        ticker = str(ticker).strip().upper()
-        if not ticker:
-            continue
-        try:
-            calendar_data = yf.Ticker(ticker).calendar
-            earnings_dates = calendar_data.get("Earnings Date", []) if isinstance(calendar_data, dict) else []
-            if not isinstance(earnings_dates, (list, tuple, pd.Series, np.ndarray)):
-                earnings_dates = [earnings_dates]
-            for earnings_date in earnings_dates:
-                parsed_date = pd.to_datetime(earnings_date, errors="coerce")
-                if pd.isna(parsed_date):
+def fetch_earnings_events(inputs):
+    """查詢指定公司財報日，回傳事件與未找到日期的輸入，避免靜默漏顯示。"""
+    events, resolved, missing = [], [], []
+    today = datetime.now(pytz.timezone("Asia/Taipei")).date()
+    for user_input in inputs:
+        item = resolve_earnings_ticker(user_input)
+        candidate_events = []
+        selected_ticker = None
+        for ticker in item["candidates"]:
+            for earnings_date in _get_earnings_dates(yf.Ticker(ticker)):
+                event_date, time_label = _format_earnings_time(earnings_date)
+                if event_date is None or event_date < today:
                     continue
-                events.append({
-                    "date": parsed_date.date().isoformat(),
-                    "title": f"{ticker} 財報預估日",
-                    "detail": "資料由 Yahoo Finance 提供；日期可能為預估值，請以公司公告為準。",
-                    "closed": False,
-                    "temporary": False,
-                    "source": "Yahoo Finance",
-                })
-        except Exception:
+                candidate_events.append((event_date, time_label))
+            if candidate_events:
+                selected_ticker = ticker
+                break
+        if not candidate_events:
+            missing.append(f"{item['input']} → {item['display_name']}（尚無 Yahoo 財報日期）")
             continue
-    return events
+
+        resolved.append(f"{item['input']} → {item['display_name']}（{selected_ticker}）")
+        seen_dates = set()
+        for event_date, time_label in candidate_events:
+            if event_date in seen_dates:
+                continue
+            seen_dates.add(event_date)
+            events.append({
+                "date": event_date.isoformat(),
+                "title": f"{item['display_name']} 財報預估日",
+                "detail": f"Yahoo Finance｜{time_label}；日期可能為預估值，請以公司公告為準。",
+                "closed": False,
+                "temporary": False,
+                "source": "Yahoo Finance",
+            })
+    return {"events": events, "resolved": resolved, "missing": missing}
 
 # ==========================================
 # 永豐 API (Shioaji) 擷取核心
@@ -5328,11 +5428,18 @@ with tab3:
             key="calendar_event_types",
         )
         ticker_input = st.text_input(
-            "財報追蹤代碼（用逗號分隔，例如 2330.TW, AAPL）",
+            "財報追蹤公司／代碼（用逗號分隔，例如 台積電, META, Google, Tesla）",
             value=st.session_state.calendar_preferences["tickers"],
             key="calendar_earnings_tickers",
             disabled="指定股票財報" not in selected_event_types,
         )
+        if "指定股票財報" in selected_event_types and ticker_input.strip():
+            ticker_preview = [item.strip() for item in ticker_input.split(",") if item.strip()]
+            resolved_preview = [resolve_earnings_ticker(item) for item in ticker_preview]
+            st.caption("辨識結果：" + "； ".join(
+                f"{item['input']} → {item['display_name']}（{item['candidates'][0]}）" for item in resolved_preview
+            ))
+            st.caption("支援 META／Facebook、Google／Alphabet、Tesla／TSLA、2330／台積電／TSMC；公布時段會顯示盤前、盤後或待公司確認。")
         update_col, save_col = st.columns(2)
         with update_col:
             if st.button("🔄 立即更新網路資料", key="refresh_calendar_network"):
@@ -5410,7 +5517,12 @@ with tab3:
     if "指定股票財報" in selected_event_types:
         ticker_symbols = tuple(symbol.strip().upper() for symbol in ticker_input.split(",") if symbol.strip())
         if ticker_symbols:
-            network_events.extend(fetch_earnings_events(ticker_symbols))
+            earnings_result = fetch_earnings_events(ticker_symbols)
+            network_events.extend(earnings_result["events"])
+            if earnings_result["resolved"]:
+                st.caption("財報查詢：" + "； ".join(earnings_result["resolved"]))
+            if earnings_result["missing"]:
+                st.warning("尚未取得財報日期：" + "； ".join(earnings_result["missing"]) + "。可稍後按「立即更新網路資料」再查詢。")
 
     def get_us_events(y, m):
         events = {}
@@ -5635,6 +5747,12 @@ with tab3:
                         f"<div style='color:{color}; font-size:0.8em; margin-top:2px; font-weight:bold;'>"
                         f"{html.escape(event.get('title', '未命名事件'))}</div>"
                     )
+                    if event.get("source") == "Yahoo Finance":
+                        time_note = str(event.get("detail", "")).split("；", 1)[0].replace("Yahoo Finance｜", "")
+                        content_html.append(
+                            f"<div style='color:#B0BEC5; font-size:0.72em; margin-top:1px;'>"
+                            f"{html.escape(time_note)}</div>"
+                        )
             
             # 加入外國重要股市事件
             if day in us_events:
