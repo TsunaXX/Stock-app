@@ -3366,7 +3366,12 @@ with tab1:
         st.session_state.auto_update_last_row = auto_update
         if auto_update:
             col_delay, _ = st.columns([2, 8])
-            with col_delay: st.session_state.update_delay_sec = st.number_input("⏳ 緩衝秒數", min_value=0.0, max_value=5.0, step=0.1, value=st.session_state.update_delay_sec)
+            with col_delay:
+                st.session_state.update_delay_sec = st.number_input(
+                    "⏳ 寫入前等待（秒）", min_value=0.0, max_value=5.0, step=0.1,
+                    value=st.session_state.update_delay_sec,
+                    help="只在啟用「最後一列自動更新」且最後一列被編輯時生效；等待後才寫入快取並重新整理。設為 0 會立即寫入。"
+                )
 
         if 'last_rt_update_time' in st.session_state:
             st.markdown(f"<div style='text-align: left; color: #888; font-size: 14px; margin-top: 5px; margin-bottom: 10px;'>透過永豐API即時更新報價(更新時間:{st.session_state.last_rt_update_time})</div>", unsafe_allow_html=True)
@@ -3388,36 +3393,38 @@ with tab1:
              st.rerun()
 
         st.markdown("### ⚡獨立計算")
-        if 'risk_filter_market_data' not in st.session_state:
-            st.session_state.risk_filter_market_data = {
-                'attention': {}, 'disposition': [], 'updated': None, 'errors': []
-            }
-        indep_ctrl1, indep_ctrl2, indep_ctrl3 = st.columns(3)
-        with indep_ctrl1:
-            indep_strategy_mode = st.radio(
-                "獨立計算模式", ["當沖預覽", "隔日／波段"], horizontal=True,
-                key="indep_strategy_mode",
-                help="當沖預覽會在執行時額外抓取 5 分 K，計算 VWAP、開盤區間與量能。"
-            )
-            indep_direction = st.radio("判斷方向", ["多頭", "空頭"], horizontal=True, key="indep_risk_direction")
-        with indep_ctrl2:
-            indep_min_score = st.slider("最低當沖評分" if indep_strategy_mode == "當沖預覽" else "最低評分", 60, 90, 75, key="indep_risk_min_score")
-            indep_max_extension = st.slider("最大乖離（ATR）", 1.0, 3.0, 2.0, 0.1, key="indep_risk_max_extension")
-        with indep_ctrl3:
-            indep_block_attention = st.checkbox("封鎖注意累計 ≥ 2", value=True, key="indep_risk_block_attention")
-            indep_show_only_eligible = st.checkbox("只顯示可操作候選", value=False, key="indep_risk_show_eligible")
-            if st.button("🔄 更新注意／處置名單", key="refresh_indep_market_risk_data"):
-                fetch_market_risk_lists.clear()
-                with st.spinner("正在更新上市／上櫃注意與處置名單..."):
-                    attention, disposition, errors = fetch_market_risk_lists()
+        indep_strategy_mode = None
+        if risk_preview_enabled:
+            if 'risk_filter_market_data' not in st.session_state:
                 st.session_state.risk_filter_market_data = {
-                    'attention': attention,
-                    'disposition': disposition,
-                    'updated': datetime.now(pytz.timezone('Asia/Taipei')).strftime('%Y/%m/%d %H:%M:%S'),
-                    'errors': errors
+                    'attention': {}, 'disposition': [], 'updated': None, 'errors': []
                 }
-        if indep_strategy_mode == "當沖預覽":
-            st.caption("VWAP 判讀：偏多＝站上 VWAP（紅色）；偏空＝跌破 VWAP（綠色）。執行分析時會手動取得 5 分 K。")
+            indep_ctrl1, indep_ctrl2, indep_ctrl3 = st.columns(3)
+            with indep_ctrl1:
+                indep_strategy_mode = st.radio(
+                    "獨立計算模式", ["當沖預覽", "隔日／波段"], horizontal=True,
+                    key="indep_strategy_mode",
+                    help="當沖預覽會在執行時額外抓取 5 分 K，計算 VWAP、開盤區間與量能。"
+                )
+                indep_direction = st.radio("判斷方向", ["多頭", "空頭"], horizontal=True, key="indep_risk_direction")
+            with indep_ctrl2:
+                indep_min_score = st.slider("最低當沖評分" if indep_strategy_mode == "當沖預覽" else "最低評分", 60, 90, 75, key="indep_risk_min_score")
+                indep_max_extension = st.slider("最大乖離（ATR）", 1.0, 3.0, 2.0, 0.1, key="indep_risk_max_extension")
+            with indep_ctrl3:
+                indep_block_attention = st.checkbox("封鎖注意累計 ≥ 2", value=True, key="indep_risk_block_attention")
+                indep_show_only_eligible = st.checkbox("只顯示可操作候選", value=False, key="indep_risk_show_eligible")
+                if st.button("🔄 更新注意／處置名單", key="refresh_indep_market_risk_data"):
+                    fetch_market_risk_lists.clear()
+                    with st.spinner("正在更新上市／上櫃注意與處置名單..."):
+                        attention, disposition, errors = fetch_market_risk_lists()
+                    st.session_state.risk_filter_market_data = {
+                        'attention': attention,
+                        'disposition': disposition,
+                        'updated': datetime.now(pytz.timezone('Asia/Taipei')).strftime('%Y/%m/%d %H:%M:%S'),
+                        'errors': errors
+                    }
+            if indep_strategy_mode == "當沖預覽":
+                st.caption("VWAP 判讀：偏多＝站上 VWAP（紅色）；偏空＝跌破 VWAP（綠色）。執行分析時會手動取得 5 分 K。")
         col_q1, col_q2 = st.columns([5, 1.5])
         with col_q1:
             indep_selection = st.multiselect(
@@ -3454,7 +3461,7 @@ with tab1:
                         q_code, q_name, None, f_set, notes_copy, # <--- 這裡改用提取出來的 notes_copy
                         c_map_q, sj_logged, sj_api_obj
                     )
-                    if result and indep_strategy_mode == "當沖預覽" and sj_logged and sj_api_obj is not None:
+                    if result and risk_preview_enabled and indep_strategy_mode == "當沖預覽" and sj_logged and sj_api_obj is not None:
                         time.sleep(API_REQUEST_GAP_SECONDS)
                         intraday_df = fetch_shioaji_data(sj_api_obj, q_code, interval='5m', lookback_days=3)
                         daytrade_metrics = calculate_daytrade_metrics(intraday_df)
@@ -3468,15 +3475,16 @@ with tab1:
                         
             if indep_data:
                 df_indep = pd.DataFrame(indep_data)
-                indep_market_risk_data = st.session_state.risk_filter_market_data
-                indep_attention_counts = indep_market_risk_data.get('attention', {})
-                indep_disposition_codes = indep_market_risk_data.get('disposition', [])
-                indep_market_lists_updated = bool(indep_market_risk_data.get('updated')) and not indep_market_risk_data.get('errors')
-                indep_is_daytrade = indep_strategy_mode == "當沖預覽"
+                indep_is_daytrade = risk_preview_enabled and indep_strategy_mode == "當沖預覽"
                 indep_risk_details = {}
 
-                if indep_is_daytrade and (not sj_logged or sj_api_obj is None):
-                    st.info("當沖預覽需要登入永豐 Shioaji 才能取得 5 分 K；目前仍會顯示日 K 資料，但盤中條件會標示為資料不足。")
+                if risk_preview_enabled:
+                    indep_market_risk_data = st.session_state.risk_filter_market_data
+                    indep_attention_counts = indep_market_risk_data.get('attention', {})
+                    indep_disposition_codes = indep_market_risk_data.get('disposition', [])
+                    indep_market_lists_updated = bool(indep_market_risk_data.get('updated')) and not indep_market_risk_data.get('errors')
+                    if indep_is_daytrade and (not sj_logged or sj_api_obj is None):
+                        st.info("當沖預覽需要登入永豐 Shioaji 才能取得 5 分 K；目前仍會顯示日 K 資料，但盤中條件會標示為資料不足。")
                 
                 # 重新套用戰略備註與價差邏輯
                 for i, row in df_indep.iterrows():
@@ -3498,48 +3506,51 @@ with tab1:
                             try: df_indep.at[i, '5日線價差'] = round(float(close_p) - float(ma5_val), 2)
                             except: pass
 
-                for i, row in df_indep.iterrows():
-                    result = calculate_daytrade_filter_result(
-                        row, indep_direction, indep_attention_counts, indep_disposition_codes,
-                        indep_market_lists_updated, indep_block_attention
-                    ) if indep_is_daytrade else calculate_risk_filter_result(
-                        row, indep_direction, indep_max_extension, indep_attention_counts, indep_disposition_codes,
-                        indep_market_lists_updated, indep_block_attention
-                    )
-                    code = str(row.get('代號', ''))
-                    indep_risk_details[code] = result
-                    if indep_is_daytrade:
-                        daily_risk = calculate_risk_filter_result(
+                if risk_preview_enabled:
+                    for i, row in df_indep.iterrows():
+                        result = calculate_daytrade_filter_result(
+                            row, indep_direction, indep_attention_counts, indep_disposition_codes,
+                            indep_market_lists_updated, indep_block_attention
+                        ) if indep_is_daytrade else calculate_risk_filter_result(
                             row, indep_direction, indep_max_extension, indep_attention_counts, indep_disposition_codes,
                             indep_market_lists_updated, indep_block_attention
                         )
-                        if not daily_risk['eligible']:
-                            result['eligible'] = False
-                            if result['rule'].startswith('觸發：'):
-                                result['rule'] = f"不交易：盤前門檻未通過（{daily_risk['rule']}）"
-                        df_indep.at[i, '風險'] = daily_risk['risk']
-                        df_indep.at[i, 'VWAP 狀態'] = result['vwap_status']
-                        df_indep.at[i, '開盤區間'] = result['opening_range']
-                        volume_ratio = _as_float(row.get('_daytrade_volume_ratio'))
-                        df_indep.at[i, '量能'] = f"{volume_ratio:.2f}x" if volume_ratio is not None else "資料不足"
-                        df_indep.at[i, '當沖評分'] = result['score']
-                        df_indep.at[i, '盤中觸發'] = result['rule']
+                        code = str(row.get('代號', ''))
+                        indep_risk_details[code] = result
+                        if indep_is_daytrade:
+                            daily_risk = calculate_risk_filter_result(
+                                row, indep_direction, indep_max_extension, indep_attention_counts, indep_disposition_codes,
+                                indep_market_lists_updated, indep_block_attention
+                            )
+                            if not daily_risk['eligible']:
+                                result['eligible'] = False
+                                if result['rule'].startswith('觸發：'):
+                                    result['rule'] = f"不交易：盤前門檻未通過（{daily_risk['rule']}）"
+                            df_indep.at[i, '風險'] = daily_risk['risk']
+                            df_indep.at[i, 'VWAP 狀態'] = result['vwap_status']
+                            df_indep.at[i, '開盤區間'] = result['opening_range']
+                            volume_ratio = _as_float(row.get('_daytrade_volume_ratio'))
+                            df_indep.at[i, '量能'] = f"{volume_ratio:.2f}x" if volume_ratio is not None else "資料不足"
+                            df_indep.at[i, '當沖評分'] = result['score']
+                            df_indep.at[i, '盤中觸發'] = result['rule']
+                        else:
+                            df_indep.at[i, '風險'] = result['risk']
+                            df_indep.at[i, '評分'] = result['score']
+                            df_indep.at[i, '乖離'] = f"{result['extension']:+.1f} ATR" if result['extension'] is not None else "—"
+                            df_indep.at[i, '隔日規則'] = result['rule']
+                        df_indep.at[i, '_indep_eligible'] = result['eligible'] and result['score'] >= indep_min_score
+
+                    if indep_show_only_eligible:
+                        df_indep = df_indep[df_indep['_indep_eligible']].reset_index(drop=True)
+                        if df_indep.empty:
+                            st.warning("目前沒有符合門檻的候選；可降低最低評分、放寬最大乖離，或改看完整結果。")
+
+                    if indep_is_daytrade:
+                        input_cols = ["代號", "名稱", "戰略備註", "5日線價差", "當日漲停價", "當日跌停價", "收盤價", "漲跌幅", "期貨", "風險", "VWAP 狀態", "開盤區間", "量能", "當沖評分", "盤中觸發"]
                     else:
-                        df_indep.at[i, '風險'] = result['risk']
-                        df_indep.at[i, '評分'] = result['score']
-                        df_indep.at[i, '乖離'] = f"{result['extension']:+.1f} ATR" if result['extension'] is not None else "—"
-                        df_indep.at[i, '隔日規則'] = result['rule']
-                    df_indep.at[i, '_indep_eligible'] = result['eligible'] and result['score'] >= indep_min_score
-
-                if indep_show_only_eligible:
-                    df_indep = df_indep[df_indep['_indep_eligible']].reset_index(drop=True)
-                    if df_indep.empty:
-                        st.warning("目前沒有符合門檻的候選；可降低最低評分、放寬最大乖離，或改看完整結果。")
-
-                if indep_is_daytrade:
-                    input_cols = ["代號", "名稱", "戰略備註", "5日線價差", "當日漲停價", "當日跌停價", "收盤價", "漲跌幅", "期貨", "風險", "VWAP 狀態", "開盤區間", "量能", "當沖評分", "盤中觸發"]
+                        input_cols = ["代號", "名稱", "戰略備註", "5日線價差", "當日漲停價", "當日跌停價", "收盤價", "漲跌幅", "期貨", "風險", "評分", "乖離", "隔日規則"]
                 else:
-                    input_cols = ["代號", "名稱", "戰略備註", "5日線價差", "當日漲停價", "當日跌停價", "收盤價", "漲跌幅", "期貨", "風險", "評分", "乖離", "隔日規則"]
+                    input_cols = ["代號", "名稱", "戰略備註", "5日線價差", "當日漲停價", "當日跌停價", "收盤價", "漲跌幅", "期貨"]
                 for col in input_cols:
                     if col not in df_indep.columns: df_indep[col] = None
                     
@@ -3569,23 +3580,23 @@ with tab1:
 
                 # 套用與主表格完全一致的顏色邏輯
                 styled_indep = df_indep[input_cols].style.apply(style_tab1_df, axis=1)
-                indep_column_config = {
-                    "風險": st.column_config.TextColumn("處置／注意", width=125, disabled=True, help="官方注意與處置查核結果；不預測漲跌方向。"),
-                }
-                if indep_is_daytrade:
-                    indep_column_config.update({
-                        "VWAP 狀態": st.column_config.TextColumn(width=125, disabled=True, help="偏多：站上 VWAP；偏空：跌破 VWAP。"),
-                        "開盤區間": st.column_config.TextColumn(width=105, disabled=True, help="09:00–09:15 的低點－高點。"),
-                        "量能": st.column_config.TextColumn(width=80, disabled=True, help="目前累積量相對最近交易日同時段平均量。"),
-                        "當沖評分": st.column_config.ProgressColumn("當沖適配分", min_value=0, max_value=100, format="%d", width=105, help="日 K 趨勢、VWAP、量能、開盤區間與官方風險的一致性。"),
-                        "盤中觸發": st.column_config.TextColumn(width=190, disabled=True, help="僅為盤中觀察提示，不是自動買賣指令。"),
-                    })
-                else:
-                    indep_column_config.update({
-                        "評分": st.column_config.ProgressColumn("方向適配分", min_value=0, max_value=100, format="%d", width=100),
-                        "乖離": st.column_config.TextColumn(width=90, disabled=True),
-                        "隔日規則": st.column_config.TextColumn(width=160, disabled=True),
-                    })
+                indep_column_config = {}
+                if risk_preview_enabled:
+                    indep_column_config["風險"] = st.column_config.TextColumn("處置／注意", width=125, disabled=True, help="官方注意與處置查核結果；不預測漲跌方向。")
+                    if indep_is_daytrade:
+                        indep_column_config.update({
+                            "VWAP 狀態": st.column_config.TextColumn(width=125, disabled=True, help="偏多：站上 VWAP；偏空：跌破 VWAP。"),
+                            "開盤區間": st.column_config.TextColumn(width=105, disabled=True, help="09:00–09:15 的低點－高點。"),
+                            "量能": st.column_config.TextColumn(width=80, disabled=True, help="目前累積量相對最近交易日同時段平均量。"),
+                            "當沖評分": st.column_config.ProgressColumn("當沖適配分", min_value=0, max_value=100, format="%d", width=105, help="日 K 趨勢、VWAP、量能、開盤區間與官方風險的一致性。"),
+                            "盤中觸發": st.column_config.TextColumn(width=190, disabled=True, help="僅為盤中觀察提示，不是自動買賣指令。"),
+                        })
+                    else:
+                        indep_column_config.update({
+                            "評分": st.column_config.ProgressColumn("方向適配分", min_value=0, max_value=100, format="%d", width=100),
+                            "乖離": st.column_config.TextColumn(width=90, disabled=True),
+                            "隔日規則": st.column_config.TextColumn(width=160, disabled=True),
+                        })
 
                 st.dataframe(
                     styled_indep,
