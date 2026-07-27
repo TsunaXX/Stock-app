@@ -4482,7 +4482,6 @@ with tab2:
             )
 
     with tab2_2:
-        st.markdown("##### 📊 波段信用室")
         c2_1, c2_2, c2_3, c2_4, c2_5 = st.columns(5)
         with c2_1:
             swing_calc_price = st.number_input("基準價格", value=None, step=0.5, format="%.2f", key="input_swing_base_price", placeholder="請輸入...")
@@ -4734,7 +4733,6 @@ with tab2:
                 )
 
     with tab2_3:
-        st.markdown("##### 📈 期權交易室")
         st.markdown("""
         <style>
         .opt-card {
@@ -4762,28 +4760,34 @@ with tab2:
             color: #00e676 !important;
             font-weight: bold !important;
         }
+        .futures-expiry-reminder {
+            display: flex;
+            align-items: baseline;
+            flex-wrap: wrap;
+            gap: 10px;
+            padding: 8px 12px;
+            margin: 2px 0 12px;
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.12);
+            border-radius: 8px;
+        }
+        .futures-expiry-contract { font-size: 16px; font-weight: 700; color: #f5f5f5; }
+        .futures-expiry-date { font-size: 18px; font-weight: 600; color: #e6e6e6; }
+        .futures-expiry-countdown { font-size: 16px; color: #ffcc80; font-weight: 600; }
+        .futures-expiry-days { font-size: 22px; font-weight: 800; color: #ff9800; line-height: 1; }
         </style>
         """, unsafe_allow_html=True)
 
         near_settlement_date = get_near_month_futures_settlement()
         days_to_settlement = (near_settlement_date - datetime.now(pytz.timezone('Asia/Taipei')).date()).days
-        st.markdown("###### ⏰ 近月期貨結算提醒")
-        expiry_tx_col, expiry_tsmc_col = st.columns(2)
-        with expiry_tx_col:
-            st.metric(
-                "台指期",
-                f"{near_settlement_date:%m/%d} 結算",
-                f"倒數 {days_to_settlement} 日",
-                delta_color="off"
-            )
-        with expiry_tsmc_col:
-            st.metric(
-                "小台積電期貨",
-                f"{near_settlement_date:%m/%d} 結算",
-                f"倒數 {days_to_settlement} 日",
-                delta_color="off"
-            )
-        st.caption("近月月契約結算日依到期月份第三個星期三計算。")
+        st.markdown(
+            f"<div class='futures-expiry-reminder'>"
+            f"<span class='futures-expiry-contract'>台指期近月結算</span>"
+            f"<span class='futures-expiry-date'>{near_settlement_date:%m/%d} 結算</span>"
+            f"<span class='futures-expiry-countdown'>⏱ 倒數 <span class='futures-expiry-days'>{days_to_settlement}</span> 日</span>"
+            f"</div>",
+            unsafe_allow_html=True
+        )
 
         # ---------------- 回呼函數定義 ----------------
         def sync_taifex_margin():
