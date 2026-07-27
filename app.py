@@ -462,7 +462,36 @@ def _signed_percent(value):
 
 def _thousand_currency(value):
     number = _to_number(value)
-    return "--" if number is None else f"{number:,.0f} 千元"
+    if number is None:
+        return "--"
+    amount_ntd = int(round(number * 1000))
+    hundred_millions, remainder = divmod(abs(amount_ntd), 100_000_000)
+    ten_millions = int(round(remainder / 10_000_000))
+    if ten_millions == 10:
+        hundred_millions += 1
+        ten_millions = 0
+    sign = "-" if amount_ntd < 0 else ""
+    if hundred_millions:
+        return f"{sign}{hundred_millions:,}億{ten_millions:,}千萬元"
+    return f"{sign}{ten_millions:,}千萬元"
+
+
+def _percent_color(value):
+    number = _to_number(str(value).replace("%", ""))
+    if number is None:
+        return "#B0BEC5"
+    return "#FF5252" if number >= 0 else "#00E676"
+
+
+def _usd_currency(value):
+    number = _to_number(value)
+    if number is None:
+        return "--"
+    if abs(number) >= 1_000_000_000:
+        return f"US${number / 1_000_000_000:,.2f}B"
+    if abs(number) >= 1_000_000:
+        return f"US${number / 1_000_000:,.2f}M"
+    return f"US${number:,.0f}"
 
 
 @st.cache_data(ttl=60 * 60 * 4, show_spinner=False)
@@ -532,6 +561,87 @@ def fetch_taiwan_monthly_revenue_events(inputs):
             "source": "TWSE OpenAPI（MOPS 每月營收）",
             "revenue": revenue_data,
         })
+    return {"events": events, "missing": missing}
+
+
+def _income_statement_revenue(statement):
+    """從 Yahoo 財報表取出 Total Revenue 列，兼容不同版本的欄位大小寫。"""
+    if not isinstance(statement, pd.DataFrame) or statement.empty:
+        return None
+    for index in statement.index:
+        normalised_index = re.sub(r"[^a-z]", "", str(index).lower())
+        if normalised_index in {"totalrevenue", "operatingrevenue"}:
+            return statement.loc[index]
+    return None
+
+
+def _growth_percent(current, comparison):
+    current_number, comparison_number = _to_number(current), _to_number(comparison)
+    if current_number is None or comparison_number in (None, 0):
+        return None
+    return (current_number - comparison_number) / abs(comparison_number) * 100
+
+
+@st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
+def fetch_us_revenue_events(inputs):
+    """取得美股最新已公告季度與年度營收；美股沒有統一月營收，改以 QoQ／YoY 呈現。"""
+    events, missing = [], []
+    for user_input in inputs:
+        item = resolve_earnings_ticker(user_input)
+        ticker = next((symbol for symbol in item["candidates"] if not re.fullmatch(r"\d{4,6}\.(?:TW|TWO)", symbol)), None)
+        if not ticker:
+            continue
+        try:
+            ticker_obj = yf.Ticker(ticker)
+            quarterly_row = _income_statement_revenue(ticker_obj.quarterly_income_stmt)
+            annual_row = _income_statement_revenue(ticker_obj.income_stmt)
+            if quarterly_row is None:
+                missing.append(f"{item['display_name']}（尚無可用季度營收資料）")
+                continue
+            quarter_columns = sorted(quarterly_row.index, reverse=True)
+            quarter_values = [(pd.Timestamp(column), quarterly_row[column]) for column in quarter_columns if pd.notna(quarterly_row[column])]
+            if not quarter_values:
+                missing.append(f"{item['display_name']}（季度營收欄位為空）")
+                continue
+            period_end, quarter_revenue = quarter_values[0]
+            previous_quarter = quarter_values[1][1] if len(quarter_values) > 1 else None
+            year_ago_quarter = quarter_values[4][1] if len(quarter_values) > 4 else None
+            qoq_value = _growth_percent(quarter_revenue, previous_quarter)
+            yoy_value = _growth_percent(quarter_revenue, year_ago_quarter)
+            annual_values = []
+            if annual_row is not None:
+                annual_columns = sorted(annual_row.index, reverse=True)
+                annual_values = [(pd.Timestamp(column), annual_row[column]) for column in annual_columns if pd.notna(annual_row[column])]
+            annual_revenue = annual_values[0][1] if annual_values else None
+            previous_annual = annual_values[1][1] if len(annual_values) > 1 else None
+            annual_yoy_value = _growth_percent(annual_revenue, previous_annual)
+            qoq = "--" if qoq_value is None else f"{qoq_value:+.2f}%"
+            yoy = "--" if yoy_value is None else f"{yoy_value:+.2f}%"
+            annual_yoy = "--" if annual_yoy_value is None else f"{annual_yoy_value:+.2f}%"
+            revenue_data = {
+                "company": item["display_name"],
+                "ticker": ticker,
+                "period_end": period_end.date().isoformat(),
+                "quarter_revenue": quarter_revenue,
+                "previous_quarter": previous_quarter,
+                "year_ago_quarter": year_ago_quarter,
+                "qoq": qoq,
+                "yoy": yoy,
+                "annual_revenue": annual_revenue,
+                "previous_annual": previous_annual,
+                "annual_yoy": annual_yoy,
+            }
+            events.append({
+                "date": period_end.date().isoformat(),
+                "title": f"{item['display_name']} 季營收（期末）QoQ{qoq}／YOY{yoy}",
+                "detail": f"最新已公告財報期間截至 {period_end:%Y/%m/%d}；點擊事件名稱查看季度及年度營收。",
+                "closed": False,
+                "temporary": False,
+                "source": "Yahoo Finance（季度／年度營收）",
+                "revenue": revenue_data,
+            })
+        except Exception:
+            missing.append(f"{item['display_name']}（查詢季度／年度營收失敗）")
     return {"events": events, "missing": missing}
 
 # ==========================================
@@ -5444,17 +5554,23 @@ with tab3:
         "美國 CPI",
         "指定股票財報",
         "台股月營收",
+        "美股季度／年度營收",
     ]
 
     def load_calendar_preferences():
-        default_preferences = {"events": CALENDAR_EVENT_OPTIONS[:4] + ["台股月營收"], "tickers": "2330.TW"}
+        default_preferences = {"events": CALENDAR_EVENT_OPTIONS[:4] + ["台股月營收", "美股季度／年度營收"], "tickers": "2330.TW"}
         if not os.path.exists(CAL_PREFERENCES_FILE):
             return default_preferences
         try:
             with open(CAL_PREFERENCES_FILE, "r", encoding="utf-8") as file:
                 saved = json.load(file)
+            events = [item for item in saved.get("events", default_preferences["events"]) if item in CALENDAR_EVENT_OPTIONS]
+            if int(saved.get("calendar_events_version", 0)) < 2:
+                for new_event in ("台股月營收", "美股季度／年度營收"):
+                    if new_event not in events:
+                        events.append(new_event)
             return {
-                "events": [item for item in saved.get("events", default_preferences["events"]) if item in CALENDAR_EVENT_OPTIONS],
+                "events": events,
                 "tickers": str(saved.get("tickers", default_preferences["tickers"])),
             }
         except (OSError, ValueError, TypeError):
@@ -5463,7 +5579,7 @@ with tab3:
     def save_calendar_preferences(events, tickers):
         try:
             with open(CAL_PREFERENCES_FILE, "w", encoding="utf-8") as file:
-                json.dump({"events": events, "tickers": tickers}, file, ensure_ascii=False, indent=2)
+                json.dump({"events": events, "tickers": tickers, "calendar_events_version": 2}, file, ensure_ascii=False, indent=2)
         except OSError:
             pass
     
@@ -5532,15 +5648,15 @@ with tab3:
             "財報／台股月營收追蹤公司或代碼（用逗號分隔，例如 台積電, META, Google, Tesla）",
             value=st.session_state.calendar_preferences["tickers"],
             key="calendar_earnings_tickers",
-            disabled=not {"指定股票財報", "台股月營收"}.intersection(selected_event_types),
+            disabled=not {"指定股票財報", "台股月營收", "美股季度／年度營收"}.intersection(selected_event_types),
         )
-        if {"指定股票財報", "台股月營收"}.intersection(selected_event_types) and ticker_input.strip():
+        if {"指定股票財報", "台股月營收", "美股季度／年度營收"}.intersection(selected_event_types) and ticker_input.strip():
             ticker_preview = [item.strip() for item in ticker_input.split(",") if item.strip()]
             resolved_preview = [resolve_earnings_ticker(item) for item in ticker_preview]
             st.caption("辨識結果：" + "； ".join(
                 f"{item['input']} → {item['display_name']}（{item['candidates'][0]}）" for item in resolved_preview
             ))
-            st.caption("支援 META／Facebook、Google／Alphabet、Tesla／TSLA、2330／台積電／TSMC；財報會顯示盤前、盤後或待公司確認，台股月營收採 MOPS 公開資料。")
+            st.caption("支援 META／Facebook、Google／Alphabet、Tesla／TSLA、2330／台積電／TSMC；財報會顯示盤前、盤後或待公司確認，台股月營收採 MOPS，美股營收採季度／年度資料。")
         update_col, save_col = st.columns(2)
         with update_col:
             if st.button("🔄 立即更新網路資料", key="refresh_calendar_network"):
@@ -5551,6 +5667,7 @@ with tab3:
                 fetch_earnings_events.clear()
                 fetch_twse_monthly_revenue_rows.clear()
                 fetch_taiwan_monthly_revenue_events.clear()
+                fetch_us_revenue_events.clear()
                 st.toast("已重新向資料來源查詢。", icon="🔄")
                 st.rerun()
         with save_col:
@@ -5612,6 +5729,7 @@ with tab3:
     # 將使用者選擇的資料來源合併成統一事件格式；台股突發休市永遠覆蓋交易日狀態。
     network_events = list(twse_temporary_events)
     monthly_revenue_result = {"events": [], "missing": []}
+    us_revenue_result = {"events": [], "missing": []}
     ticker_symbols = tuple(symbol.strip().upper() for symbol in ticker_input.split(",") if symbol.strip())
     if "台股開休市" in selected_event_types:
         network_events.extend(twse_holiday_events)
@@ -5632,6 +5750,11 @@ with tab3:
         network_events.extend(monthly_revenue_result["events"])
         if monthly_revenue_result["missing"]:
             st.info("台股月營收：" + "； ".join(monthly_revenue_result["missing"]) + "。美股沒有統一的月營收申報制度，請以財報事件的季度營收為準。")
+    if "美股季度／年度營收" in selected_event_types and ticker_symbols:
+        us_revenue_result = fetch_us_revenue_events(ticker_symbols)
+        network_events.extend(us_revenue_result["events"])
+        if us_revenue_result["missing"]:
+            st.info("美股季度／年度營收：" + "； ".join(us_revenue_result["missing"]))
 
     def get_us_events(y, m):
         events = {}
@@ -5853,10 +5976,24 @@ with tab3:
                     if "財報" in event.get("title", ""):
                         color = "#FFD700"
                     if event.get("source") == "TWSE OpenAPI（MOPS 每月營收）":
+                        revenue = event.get("revenue", {})
+                        mom, yoy = revenue.get("mom", "--"), revenue.get("yoy", "--")
                         content_html.append(
-                            "<div style='color:#00E676; font-size:0.8em; margin-top:2px; font-weight:bold;'>"
-                            f"<a href='#monthly-revenue-details' style='color:#00E676; text-decoration:underline;'>"
-                            f"{html.escape(event.get('title', '月營收事件'))}</a></div>"
+                            "<div style='font-size:0.8em; margin-top:2px; font-weight:bold;'>"
+                            f"<a href='#monthly-revenue-details' style='text-decoration:underline; color:#00E676;'>"
+                            f"{html.escape(revenue.get('company', '月營收事件'))} 月營收</a> "
+                            f"<span style='color:{_percent_color(mom)};'>MoM{html.escape(mom)}</span>／"
+                            f"<span style='color:{_percent_color(yoy)};'>YoY{html.escape(yoy)}</span></div>"
+                        )
+                    elif event.get("source") == "Yahoo Finance（季度／年度營收）":
+                        revenue = event.get("revenue", {})
+                        qoq, yoy = revenue.get("qoq", "--"), revenue.get("yoy", "--")
+                        content_html.append(
+                            "<div style='font-size:0.8em; margin-top:2px; font-weight:bold;'>"
+                            f"<a href='#us-revenue-details' style='text-decoration:underline; color:#FFD700;'>"
+                            f"{html.escape(revenue.get('company', '美股營收事件'))} 季營收</a> "
+                            f"<span style='color:{_percent_color(qoq)};'>QoQ{html.escape(qoq)}</span>／"
+                            f"<span style='color:{_percent_color(yoy)};'>YoY{html.escape(yoy)}</span></div>"
                         )
                     else:
                         content_html.append(
@@ -5902,9 +6039,15 @@ with tab3:
             revenue = event["revenue"]
             st.markdown(f"#### {revenue['company']}（{revenue['code']}）｜{revenue['revenue_month']} 月營收")
             metric_cols = st.columns(3)
-            metric_cols[0].metric("當月營收", _thousand_currency(revenue["current_month"]), revenue["mom"] + " MoM")
-            metric_cols[1].metric("去年當月營收", _thousand_currency(revenue["last_year_month"]), revenue["yoy"] + " YoY")
-            metric_cols[2].metric("本年累計營收", _thousand_currency(revenue["ytd"]), revenue["ytd_yoy"] + " 累計 YoY")
+            metric_cols[0].metric("當月營收", _thousand_currency(revenue["current_month"]), revenue["mom"] + " MoM", delta_color="inverse")
+            metric_cols[1].metric("去年當月營收", _thousand_currency(revenue["last_year_month"]), revenue["yoy"] + " YoY", delta_color="inverse")
+            metric_cols[2].metric("本年累計營收", _thousand_currency(revenue["ytd"]), revenue["ytd_yoy"] + " 累計 YoY", delta_color="inverse")
+            st.markdown(
+                f"<span style='color:{_percent_color(revenue['mom'])}; font-weight:800;'>MoM {revenue['mom']}</span>　"
+                f"<span style='color:{_percent_color(revenue['yoy'])}; font-weight:800;'>YoY {revenue['yoy']}</span>　"
+                f"<span style='color:{_percent_color(revenue['ytd_yoy'])}; font-weight:800;'>累計 YoY {revenue['ytd_yoy']}</span>",
+                unsafe_allow_html=True,
+            )
             revenue_table = pd.DataFrame([{
                 "資料年月": revenue["revenue_month"],
                 "當月營收（千元）": _thousand_currency(revenue["current_month"]),
@@ -5913,5 +6056,35 @@ with tab3:
                 "本年累計營收（千元）": _thousand_currency(revenue["ytd"]),
                 "去年累計營收（千元）": _thousand_currency(revenue["last_year_ytd"]),
                 "備註": revenue["note"],
+            }])
+            st.dataframe(revenue_table, hide_index=True, use_container_width=True)
+
+    current_month_us_revenue_events = [
+        event for event in us_revenue_result["events"]
+        if pd.Timestamp(event["date"]).year == sel_year and pd.Timestamp(event["date"]).month == sel_month
+    ]
+    if current_month_us_revenue_events:
+        st.markdown("<div id='us-revenue-details'></div>", unsafe_allow_html=True)
+        st.subheader("🌎 美股季度／年度營收明細")
+        st.caption("美股沒有統一月營收申報；以下為最新已公告財報期間的季度與年度營收，金額單位為美元。")
+        for event in current_month_us_revenue_events:
+            revenue = event["revenue"]
+            st.markdown(f"#### {revenue['company']}（{revenue['ticker']}）｜財報期間截至 {revenue['period_end']}")
+            metric_cols = st.columns(3)
+            metric_cols[0].metric("季度營收", _usd_currency(revenue["quarter_revenue"]), revenue["qoq"] + " QoQ", delta_color="inverse")
+            metric_cols[1].metric("去年同期季營收", _usd_currency(revenue["year_ago_quarter"]), revenue["yoy"] + " YoY", delta_color="inverse")
+            metric_cols[2].metric("年度營收", _usd_currency(revenue["annual_revenue"]), revenue["annual_yoy"] + " 年 YoY", delta_color="inverse")
+            st.markdown(
+                f"<span style='color:{_percent_color(revenue['qoq'])}; font-weight:800;'>QoQ {revenue['qoq']}</span>　"
+                f"<span style='color:{_percent_color(revenue['yoy'])}; font-weight:800;'>YoY {revenue['yoy']}</span>　"
+                f"<span style='color:{_percent_color(revenue['annual_yoy'])}; font-weight:800;'>年度 YoY {revenue['annual_yoy']}</span>",
+                unsafe_allow_html=True,
+            )
+            revenue_table = pd.DataFrame([{
+                "季度營收": _usd_currency(revenue["quarter_revenue"]),
+                "前一季營收": _usd_currency(revenue["previous_quarter"]),
+                "去年同期季營收": _usd_currency(revenue["year_ago_quarter"]),
+                "年度營收": _usd_currency(revenue["annual_revenue"]),
+                "前年度營收": _usd_currency(revenue["previous_annual"]),
             }])
             st.dataframe(revenue_table, hide_index=True, use_container_width=True)
