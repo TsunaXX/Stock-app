@@ -465,15 +465,17 @@ def _thousand_currency(value):
     if number is None:
         return "--"
     amount_ntd = int(round(number * 1000))
-    hundred_millions, remainder = divmod(abs(amount_ntd), 100_000_000)
-    ten_millions = int(round(remainder / 10_000_000))
-    if ten_millions == 10:
-        hundred_millions += 1
-        ten_millions = 0
+    trillions, remainder = divmod(abs(amount_ntd), 1_000_000_000_000)
+    hundred_millions, remainder = divmod(remainder, 100_000_000)
+    ten_thousands = remainder // 10_000
     sign = "-" if amount_ntd < 0 else ""
-    if hundred_millions:
-        return f"{sign}{hundred_millions:,}億{ten_millions:,}千萬元"
-    return f"{sign}{ten_millions:,}千萬元"
+    parts = []
+    if trillions:
+        parts.append(f"{trillions:,}兆")
+    if hundred_millions or parts:
+        parts.append(f"{hundred_millions:,}億")
+    parts.append(f"{ten_thousands:,}萬元")
+    return sign + "".join(parts)
 
 
 def _percent_color(value):
@@ -481,6 +483,21 @@ def _percent_color(value):
     if number is None:
         return "#B0BEC5"
     return "#FF5252" if number >= 0 else "#00E676"
+
+
+def _revenue_metric_html(label, value, change_text):
+    """以較緊湊的營收卡顯示箭頭增減；正紅、負綠符合台股慣例。"""
+    match = re.search(r"[+-]?\d+(?:\.\d+)?", str(change_text))
+    number = float(match.group()) if match else None
+    arrow = "↑" if number is not None and number >= 0 else "↓" if number is not None else "–"
+    color = _percent_color(str(number)) if number is not None else "#B0BEC5"
+    return (
+        "<div class='revenue-metric-card'>"
+        f"<div class='revenue-metric-label'>{html.escape(label)}</div>"
+        f"<div class='revenue-metric-value'>{html.escape(value)}</div>"
+        f"<div class='revenue-metric-delta' style='color:{color};'>{arrow} {html.escape(change_text)}</div>"
+        "</div>"
+    )
 
 
 def _usd_currency(value):
@@ -6035,19 +6052,21 @@ with tab3:
         st.markdown("<div id='monthly-revenue-details'></div>", unsafe_allow_html=True)
         st.subheader("🏢 台股月營收明細")
         st.caption("資料來源：證交所 OpenAPI（公開資訊觀測站 MOPS 每月營收彙總表）。金額單位：新臺幣千元。")
+        st.markdown("""
+        <style>
+        .revenue-metric-card { padding: 0.15rem 0 0.55rem; min-height: 6rem; }
+        .revenue-metric-label { font-size: 0.78rem; font-weight: 700; color: #F5F5F5; }
+        .revenue-metric-value { font-size: 1.55rem; line-height: 1.45; font-weight: 650; color: #FFFFFF; white-space: nowrap; }
+        .revenue-metric-delta { display: inline-block; margin-top: 0.18rem; font-size: 0.72rem; font-weight: 750; background: rgba(128,128,128,.16); border-radius: .6rem; padding: .08rem .34rem; }
+        </style>
+        """, unsafe_allow_html=True)
         for event in current_month_revenue_events:
             revenue = event["revenue"]
             st.markdown(f"#### {revenue['company']}（{revenue['code']}）｜{revenue['revenue_month']} 月營收")
             metric_cols = st.columns(3)
-            metric_cols[0].metric("當月營收", _thousand_currency(revenue["current_month"]), revenue["mom"] + " MoM", delta_color="inverse")
-            metric_cols[1].metric("去年當月營收", _thousand_currency(revenue["last_year_month"]), revenue["yoy"] + " YoY", delta_color="inverse")
-            metric_cols[2].metric("本年累計營收", _thousand_currency(revenue["ytd"]), revenue["ytd_yoy"] + " 累計 YoY", delta_color="inverse")
-            st.markdown(
-                f"<span style='color:{_percent_color(revenue['mom'])}; font-weight:800;'>MoM {revenue['mom']}</span>　"
-                f"<span style='color:{_percent_color(revenue['yoy'])}; font-weight:800;'>YoY {revenue['yoy']}</span>　"
-                f"<span style='color:{_percent_color(revenue['ytd_yoy'])}; font-weight:800;'>累計 YoY {revenue['ytd_yoy']}</span>",
-                unsafe_allow_html=True,
-            )
+            metric_cols[0].markdown(_revenue_metric_html("當月營收", _thousand_currency(revenue["current_month"]), revenue["mom"] + " MoM"), unsafe_allow_html=True)
+            metric_cols[1].markdown(_revenue_metric_html("去年當月營收", _thousand_currency(revenue["last_year_month"]), revenue["yoy"] + " YoY"), unsafe_allow_html=True)
+            metric_cols[2].markdown(_revenue_metric_html("本年累計營收", _thousand_currency(revenue["ytd"]), revenue["ytd_yoy"] + " 累計 YoY"), unsafe_allow_html=True)
             revenue_table = pd.DataFrame([{
                 "資料年月": revenue["revenue_month"],
                 "當月營收（千元）": _thousand_currency(revenue["current_month"]),
@@ -6067,19 +6086,21 @@ with tab3:
         st.markdown("<div id='us-revenue-details'></div>", unsafe_allow_html=True)
         st.subheader("🌎 美股季度／年度營收明細")
         st.caption("美股沒有統一月營收申報；以下為最新已公告財報期間的季度與年度營收，金額單位為美元。")
+        st.markdown("""
+        <style>
+        .revenue-metric-card { padding: 0.15rem 0 0.55rem; min-height: 6rem; }
+        .revenue-metric-label { font-size: 0.78rem; font-weight: 700; color: #F5F5F5; }
+        .revenue-metric-value { font-size: 1.55rem; line-height: 1.45; font-weight: 650; color: #FFFFFF; white-space: nowrap; }
+        .revenue-metric-delta { display: inline-block; margin-top: 0.18rem; font-size: 0.72rem; font-weight: 750; background: rgba(128,128,128,.16); border-radius: .6rem; padding: .08rem .34rem; }
+        </style>
+        """, unsafe_allow_html=True)
         for event in current_month_us_revenue_events:
             revenue = event["revenue"]
             st.markdown(f"#### {revenue['company']}（{revenue['ticker']}）｜財報期間截至 {revenue['period_end']}")
             metric_cols = st.columns(3)
-            metric_cols[0].metric("季度營收", _usd_currency(revenue["quarter_revenue"]), revenue["qoq"] + " QoQ", delta_color="inverse")
-            metric_cols[1].metric("去年同期季營收", _usd_currency(revenue["year_ago_quarter"]), revenue["yoy"] + " YoY", delta_color="inverse")
-            metric_cols[2].metric("年度營收", _usd_currency(revenue["annual_revenue"]), revenue["annual_yoy"] + " 年 YoY", delta_color="inverse")
-            st.markdown(
-                f"<span style='color:{_percent_color(revenue['qoq'])}; font-weight:800;'>QoQ {revenue['qoq']}</span>　"
-                f"<span style='color:{_percent_color(revenue['yoy'])}; font-weight:800;'>YoY {revenue['yoy']}</span>　"
-                f"<span style='color:{_percent_color(revenue['annual_yoy'])}; font-weight:800;'>年度 YoY {revenue['annual_yoy']}</span>",
-                unsafe_allow_html=True,
-            )
+            metric_cols[0].markdown(_revenue_metric_html("季度營收", _usd_currency(revenue["quarter_revenue"]), revenue["qoq"] + " QoQ"), unsafe_allow_html=True)
+            metric_cols[1].markdown(_revenue_metric_html("去年同期季營收", _usd_currency(revenue["year_ago_quarter"]), revenue["yoy"] + " YoY"), unsafe_allow_html=True)
+            metric_cols[2].markdown(_revenue_metric_html("年度營收", _usd_currency(revenue["annual_revenue"]), revenue["annual_yoy"] + " 年 YoY"), unsafe_allow_html=True)
             revenue_table = pd.DataFrame([{
                 "季度營收": _usd_currency(revenue["quarter_revenue"]),
                 "前一季營收": _usd_currency(revenue["previous_quarter"]),
