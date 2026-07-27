@@ -83,6 +83,35 @@ def get_futures_trading_date(now_dt):
         trading_date += pd.Timedelta(days=1)
     return trading_date.normalize()
 
+def get_near_month_futures_settlement(reference_dt=None):
+    """回傳台指與股票期貨近月契約的第三個星期三結算日。"""
+    tz_tw = pytz.timezone('Asia/Taipei')
+    now_tw = reference_dt or datetime.now(tz_tw)
+    if now_tw.tzinfo is None:
+        now_tw = tz_tw.localize(now_tw)
+    else:
+        now_tw = now_tw.astimezone(tz_tw)
+
+    def third_wednesday(year, month):
+        wednesdays = [
+            day for week in calendar.monthcalendar(year, month)
+            if (day := week[calendar.WEDNESDAY]) != 0
+        ]
+        return date(year, month, wednesdays[2])
+
+    settlement_date = third_wednesday(now_tw.year, now_tw.month)
+    # 到期日一般交易於 13:30 結束；之後提醒下一個近月契約。
+    if now_tw.date() > settlement_date or (
+        now_tw.date() == settlement_date and now_tw.time() >= dt_time(13, 30)
+    ):
+        next_month = now_tw.month + 1
+        next_year = now_tw.year
+        if next_month == 13:
+            next_month, next_year = 1, next_year + 1
+        settlement_date = third_wednesday(next_year, next_month)
+
+    return settlement_date
+
 def is_warrant(code):
     c = str(code)
     if c.startswith('00'): return False
@@ -2580,6 +2609,75 @@ def calculate_daytrade_filter_result(row, direction, attention_counts=None, disp
         'data_time': row.get('_daytrade_data_time')
     }
 
+def build_trade_plan(row, direction, is_daytrade_mode, filter_result):
+    """依已通過的篩選條件建立觀察用進場、停損與目標價，不執行下單。"""
+    if not filter_result.get('eligible'):
+        return {
+            'summary': '—',
+            'detail': f"未通過條件，不預判點位（{filter_result.get('rule', '資料不足')}）"
+        }
+
+    is_long = direction == '多頭'
+
+    def _round(value):
+        return round_to_tick(max(0.01, value))
+
+    def _format_plan(entry, stop, target, trigger_text):
+        if is_long and not (stop < entry < target):
+            return {'summary': '—', 'detail': '風險距離不足，不預判點位。'}
+        if not is_long and not (target < entry < stop):
+            return {'summary': '—', 'detail': '風險距離不足，不預判點位。'}
+        summary = f"進 {fmt_price(entry)}｜停 {fmt_price(stop)}｜目 {fmt_price(target)}"
+        return {
+            'summary': summary,
+            'detail': f"{trigger_text}；預判進場 {fmt_price(entry)}、停損 {fmt_price(stop)}、第一目標 {fmt_price(target)}（約 1:1.5 風報比）"
+        }
+
+    if is_daytrade_mode:
+        vwap = _as_float(row.get('_daytrade_vwap'))
+        opening_high = _as_float(row.get('_daytrade_or_high'))
+        opening_low = _as_float(row.get('_daytrade_or_low'))
+        if None in (vwap, opening_high, opening_low):
+            return {'summary': '—', 'detail': '缺少 VWAP 或開盤區間，不預判點位。'}
+
+        if is_long:
+            entry = _round(opening_high + get_tick_size(opening_high))
+            stop = _round(max(vwap, opening_low))
+            if stop >= entry:
+                stop = _round(entry - get_tick_size(entry) * 2)
+            target = _round(entry + (entry - stop) * 1.5)
+            limit_up = _as_float(row.get('當日漲停價'))
+            if limit_up is not None and limit_up > entry:
+                target = min(target, _round(limit_up))
+            return _format_plan(entry, stop, target, '開盤區間高點突破後，維持 VWAP 上方')
+
+        entry = _round(opening_low - get_tick_size(opening_low))
+        stop = _round(min(vwap, opening_high))
+        if stop <= entry:
+            stop = _round(entry + get_tick_size(entry) * 2)
+        target = _round(entry - (stop - entry) * 1.5)
+        limit_down = _as_float(row.get('當日跌停價'))
+        if limit_down is not None and 0 < limit_down < entry:
+            target = max(target, _round(limit_down))
+        return _format_plan(entry, stop, target, '開盤區間低點跌破後，維持 VWAP 下方')
+
+    atr14 = _as_float(row.get('_risk_atr14'))
+    previous_high = _as_float(row.get('_risk_prev_high'))
+    previous_low = _as_float(row.get('_risk_prev_low'))
+    if atr14 is None or atr14 <= 0 or previous_high is None or previous_low is None:
+        return {'summary': '—', 'detail': '缺少 ATR 或昨高／昨低，不預判次日開盤點位。'}
+
+    if is_long:
+        entry = _round(previous_high + get_tick_size(previous_high))
+        stop = _round(entry - atr14)
+        target = _round(entry + (entry - stop) * 1.5)
+        return _format_plan(entry, stop, target, '次日開盤站穩昨高後再觀察進場')
+
+    entry = _round(previous_low - get_tick_size(previous_low))
+    stop = _round(entry + atr14)
+    target = _round(entry - (stop - entry) * 1.5)
+    return _format_plan(entry, stop, target, '次日開盤跌破昨低後再觀察進場')
+
 def get_tick_size(price):
     try: price = float(price)
     except: return 0.01
@@ -3565,6 +3663,7 @@ with tab1:
 - **ATR（14 日平均真實波幅）**衡量的是日 K 的正常波動幅度，不判斷多空。`乖離`在多頭為「收盤價高於 20 日線幾個 ATR」；空頭則為「收盤價低於 20 日線幾個 ATR」。乖離越大，代表越可能追在延伸段；預設超過 2 ATR 不列為可操作候選。
 - **VWAP（成交量加權平均價）**是把盤中每一段成交價依成交量加權後的平均成本。當沖預覽中，價格在 VWAP 上方偏多、下方偏空；它是盤中強弱與成本位置的參考，不是保證會反轉或續漲／續跌的支撐壓力線。
 - **開盤區間**預設採 09:00–09:15 的高低點。多方會觀察站上 VWAP 後突破區間高點；空方則觀察跌破 VWAP 後跌破區間低點。量能以最近交易日「相同盤中截止時間」的累積量比較，避免直接拿全天量判斷。
+- **進出場預判**只會在風險與方向條件通過時顯示：當沖以開盤區間突破／跌破與 VWAP 推估；隔日／波段以次日開盤突破昨高／昨低與 1 ATR 停損推估。`進`、`停`、`目`分別是觀察進場、停損與第一目標價，預設約 1:1.5 風報比，不是自動下單或保證成交價。
 - **風險**只代表官方的注意／處置查核結果：`🚫` 已處置、`🔴` 注意累計異常、`🟡` 單次注意、`🟢` 已更新名單且未列示、`⚪` 尚未完整查核。它不是股價會漲或跌的預測。
 - **評分越高**只表示該檔股票與你目前選擇的多頭或空頭方向較一致：趨勢、乖離、K 棒收盤位置、官方風險與昨高／昨低確認條件較佳；不代表保證獲利。切換「多頭／空頭」後，同一檔股票的分數會重新計算。
 - **當沖操作順序**：先重抓日 K → 更新注意／處置名單 → 重抓 5 分 K → 設定方向與門檻 → 只將高分、非紅燈標的列為候選，再等「盤中觸發」成立。VWAP 與開盤區間應每個交易日重新計算，請以模擬／歷史紀錄驗證門檻，不以分數單獨下單。
@@ -3584,7 +3683,6 @@ with tab1:
                     market_lists_updated, risk_block_attention
                 )
                 code = str(row.get('代號', ''))
-                risk_details[code] = result
                 if is_daytrade_mode:
                     daily_risk = calculate_risk_filter_result(
                         row, risk_direction, risk_max_extension, attention_counts, disposition_codes,
@@ -3607,6 +3705,10 @@ with tab1:
                     df_display.at[i, '評分'] = result['score']
                     df_display.at[i, '乖離'] = f"{result['extension']:+.1f} ATR" if result['extension'] is not None else "—"
                     df_display.at[i, '隔日規則'] = result['rule']
+                trade_plan = build_trade_plan(row, risk_direction, is_daytrade_mode, result)
+                result['trade_plan'] = trade_plan
+                risk_details[code] = result
+                df_display.at[i, '進出場預判'] = trade_plan['summary']
                 df_display.at[i, '_risk_eligible'] = result['eligible'] and result['score'] >= risk_min_score
 
             if risk_show_only_eligible:
@@ -3615,9 +3717,9 @@ with tab1:
                     st.warning("目前沒有符合門檻的候選；可降低最低評分、放寬最大乖離，或切換回原表。")
 
             if is_daytrade_mode:
-                input_cols = ["移除", "代號", "名稱", "戰略備註", "自訂價(可修)", "狀態", "自訂價價差", "5日線價差", "當日漲停價", "當日跌停價", "收盤價", "漲跌幅", "期貨", "風險", "VWAP 狀態", "開盤區間", "量能", "當沖評分", "盤中觸發"]
+                input_cols = ["移除", "代號", "名稱", "戰略備註", "自訂價(可修)", "狀態", "自訂價價差", "5日線價差", "當日漲停價", "當日跌停價", "收盤價", "漲跌幅", "期貨", "風險", "VWAP 狀態", "開盤區間", "量能", "當沖評分", "盤中觸發", "進出場預判"]
             else:
-                input_cols = ["移除", "代號", "名稱", "戰略備註", "自訂價(可修)", "狀態", "自訂價價差", "5日線價差", "當日漲停價", "當日跌停價", "收盤價", "漲跌幅", "期貨", "風險", "評分", "乖離", "隔日規則"]
+                input_cols = ["移除", "代號", "名稱", "戰略備註", "自訂價(可修)", "狀態", "自訂價價差", "5日線價差", "當日漲停價", "當日跌停價", "收盤價", "漲跌幅", "期貨", "風險", "評分", "乖離", "隔日規則", "進出場預判"]
         else:
             input_cols = ["移除", "代號", "名稱", "戰略備註", "自訂價(可修)", "狀態", "自訂價價差", "5日線價差", "當日漲停價", "當日跌停價", "收盤價", "漲跌幅", "期貨"]
         for col in input_cols:
@@ -3714,12 +3816,14 @@ with tab1:
                     "量能": st.column_config.TextColumn(width=80, disabled=True, help="目前累積量相對最近交易日同時段平均量。"),
                     "當沖評分": st.column_config.ProgressColumn("當沖適配分", min_value=0, max_value=100, format="%d", width=105, help="日 K 趨勢、VWAP、量能、開盤區間與官方風險的一致性；不代表保證獲利。"),
                     "盤中觸發": st.column_config.TextColumn(width=190, disabled=True, help="僅在盤中條件同時成立時提供觀察提示，不是自動買賣指令。"),
+                    "進出場預判": st.column_config.TextColumn(width=195, disabled=True, help="通過風險條件後，以開盤區間與 VWAP 推估的進場、停損與第一目標；僅供觀察與回測。"),
                 })
             else:
                 risk_column_config.update({
                     "評分": st.column_config.ProgressColumn("方向適配分", min_value=0, max_value=100, format="%d", width=100, help="分數越高，代表越符合目前選擇的多頭或空頭條件；不代表保證獲利。"),
                     "乖離": st.column_config.TextColumn(width=90, disabled=True, help="收盤價相對 20 日線的 ATR 距離；數值越大越不宜追價或追空。"),
                     "隔日規則": st.column_config.TextColumn(width=160, disabled=True, help="僅在隔日條件成真時才列入評估，不是自動買賣指令。"),
+                    "進出場預判": st.column_config.TextColumn(width=195, disabled=True, help="通過風險條件後，以次日開盤突破昨高／昨低與 ATR 推估的進場、停損與第一目標；僅供觀察與回測。"),
                 })
 
         edited_df = st.data_editor(
@@ -3753,7 +3857,8 @@ with tab1:
                 selected_risk = risk_details[detail_options[selected_risk_label]]
                 rule_label = "盤中觸發" if is_daytrade_mode else "隔日規則"
                 data_time_text = f"｜5 分 K 更新：{selected_risk['data_time']}" if is_daytrade_mode and selected_risk.get('data_time') else ""
-                st.caption(f"{selected_risk['detail']}｜{rule_label}：{selected_risk['rule']}{data_time_text}。僅供策略篩選與回測，不構成買賣建議。")
+                plan_text = selected_risk.get('trade_plan', {}).get('detail', '尚未預判點位。')
+                st.caption(f"{selected_risk['detail']}｜{rule_label}：{selected_risk['rule']}｜進出場預判：{plan_text}{data_time_text}。僅供策略篩選與回測，不構成買賣建議。")
         
         if not edited_df.empty:
             trigger_rerun = False
@@ -4090,7 +4195,6 @@ with tab1:
                             indep_market_lists_updated, indep_block_attention
                         )
                         code = str(row.get('代號', ''))
-                        indep_risk_details[code] = result
                         if indep_is_daytrade:
                             daily_risk = calculate_risk_filter_result(
                                 row, indep_direction, indep_max_extension, indep_attention_counts, indep_disposition_codes,
@@ -4112,6 +4216,10 @@ with tab1:
                             df_indep.at[i, '評分'] = result['score']
                             df_indep.at[i, '乖離'] = f"{result['extension']:+.1f} ATR" if result['extension'] is not None else "—"
                             df_indep.at[i, '隔日規則'] = result['rule']
+                        trade_plan = build_trade_plan(row, indep_direction, indep_is_daytrade, result)
+                        result['trade_plan'] = trade_plan
+                        indep_risk_details[code] = result
+                        df_indep.at[i, '進出場預判'] = trade_plan['summary']
                         df_indep.at[i, '_indep_eligible'] = result['eligible'] and result['score'] >= indep_min_score
 
                     if indep_show_only_eligible:
@@ -4120,9 +4228,9 @@ with tab1:
                             st.warning("目前沒有符合門檻的候選；可降低最低評分、放寬最大乖離，或改看完整結果。")
 
                     if indep_is_daytrade:
-                        input_cols = ["代號", "名稱", "戰略備註", "5日線價差", "當日漲停價", "當日跌停價", "收盤價", "漲跌幅", "期貨", "風險", "VWAP 狀態", "開盤區間", "量能", "當沖評分", "盤中觸發"]
+                        input_cols = ["代號", "名稱", "戰略備註", "5日線價差", "當日漲停價", "當日跌停價", "收盤價", "漲跌幅", "期貨", "風險", "VWAP 狀態", "開盤區間", "量能", "當沖評分", "盤中觸發", "進出場預判"]
                     else:
-                        input_cols = ["代號", "名稱", "戰略備註", "5日線價差", "當日漲停價", "當日跌停價", "收盤價", "漲跌幅", "期貨", "風險", "評分", "乖離", "隔日規則"]
+                        input_cols = ["代號", "名稱", "戰略備註", "5日線價差", "當日漲停價", "當日跌停價", "收盤價", "漲跌幅", "期貨", "風險", "評分", "乖離", "隔日規則", "進出場預判"]
                 else:
                     input_cols = ["代號", "名稱", "戰略備註", "5日線價差", "當日漲停價", "當日跌停價", "收盤價", "漲跌幅", "期貨"]
                 for col in input_cols:
@@ -4164,12 +4272,14 @@ with tab1:
                             "量能": st.column_config.TextColumn(width=80, disabled=True, help="目前累積量相對最近交易日同時段平均量。"),
                             "當沖評分": st.column_config.ProgressColumn("當沖適配分", min_value=0, max_value=100, format="%d", width=105, help="日 K 趨勢、VWAP、量能、開盤區間與官方風險的一致性。"),
                             "盤中觸發": st.column_config.TextColumn(width=190, disabled=True, help="僅為盤中觀察提示，不是自動買賣指令。"),
+                            "進出場預判": st.column_config.TextColumn(width=195, disabled=True, help="通過風險條件後，以開盤區間與 VWAP 推估的進場、停損與第一目標；僅供觀察與回測。"),
                         })
                     else:
                         indep_column_config.update({
                             "評分": st.column_config.ProgressColumn("方向適配分", min_value=0, max_value=100, format="%d", width=100),
                             "乖離": st.column_config.TextColumn(width=90, disabled=True),
                             "隔日規則": st.column_config.TextColumn(width=160, disabled=True),
+                            "進出場預判": st.column_config.TextColumn(width=195, disabled=True, help="通過風險條件後，以次日開盤突破昨高／昨低與 ATR 推估的進場、停損與第一目標；僅供觀察與回測。"),
                         })
 
                 st.dataframe(
@@ -4201,7 +4311,8 @@ with tab1:
                     selected_result = indep_risk_details[detail_options[selected_label]]
                     rule_label = "盤中觸發" if indep_is_daytrade else "隔日規則"
                     data_time_text = f"｜5 分 K 更新：{selected_result['data_time']}" if indep_is_daytrade and selected_result.get('data_time') else ""
-                    st.caption(f"{selected_result['detail']}｜{rule_label}：{selected_result['rule']}{data_time_text}。僅供策略篩選與回測，不構成買賣建議。")
+                    plan_text = selected_result.get('trade_plan', {}).get('detail', '尚未預判點位。')
+                    st.caption(f"{selected_result['detail']}｜{rule_label}：{selected_result['rule']}｜進出場預判：{plan_text}{data_time_text}。僅供策略篩選與回測，不構成買賣建議。")
 
 with tab2:
     tab2_1, tab2_2, tab2_3 = st.tabs(["當沖損益室", "波段信用室", "期權交易室"])
@@ -4653,6 +4764,26 @@ with tab2:
         }
         </style>
         """, unsafe_allow_html=True)
+
+        near_settlement_date = get_near_month_futures_settlement()
+        days_to_settlement = (near_settlement_date - datetime.now(pytz.timezone('Asia/Taipei')).date()).days
+        st.markdown("###### ⏰ 近月期貨結算提醒")
+        expiry_tx_col, expiry_tsmc_col = st.columns(2)
+        with expiry_tx_col:
+            st.metric(
+                "台指期",
+                f"{near_settlement_date:%m/%d} 結算",
+                f"倒數 {days_to_settlement} 日",
+                delta_color="off"
+            )
+        with expiry_tsmc_col:
+            st.metric(
+                "小台積電期貨",
+                f"{near_settlement_date:%m/%d} 結算",
+                f"倒數 {days_to_settlement} 日",
+                delta_color="off"
+            )
+        st.caption("近月月契約結算日依到期月份第三個星期三計算。")
 
         # ---------------- 回呼函數定義 ----------------
         def sync_taifex_margin():
