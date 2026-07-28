@@ -953,6 +953,22 @@ def merge_market_temperature_snapshot(df, api, code):
         if close <= 0:
             return df
 
+        # 夜盤跨交易日時，快照的官方漲跌基準不一定等於前一根日 K 收盤。
+        # 優先以 change_price 反推參考價，再退回合約 reference。
+        reference_close = None
+        try:
+            change_price = getattr(snap, 'change_price', getattr(snap, 'change', None))
+            if change_price is not None:
+                inferred_reference = close - float(change_price)
+                if inferred_reference > 0:
+                    reference_close = inferred_reference
+            if reference_close is None:
+                contract_reference = float(getattr(contract, 'reference', 0) or 0)
+                if contract_reference > 0:
+                    reference_close = contract_reference
+        except (TypeError, ValueError):
+            pass
+
         open_price = float(getattr(snap, 'open', close) or close)
         high = float(getattr(snap, 'high', close) or close)
         low = float(getattr(snap, 'low', close) or close)
@@ -972,6 +988,8 @@ def merge_market_temperature_snapshot(df, api, code):
             result.at[result.index[-1], 'High'] = max(float(result['High'].iloc[-1]), high)
             result.at[result.index[-1], 'Low'] = min(float(result['Low'].iloc[-1]), low)
             result.at[result.index[-1], 'Volume'] = max(float(result['Volume'].iloc[-1]), volume)
+        if reference_close is not None:
+            result.attrs['market_temperature_reference_close'] = reference_close
         return result
     except Exception:
         return df
@@ -1003,7 +1021,11 @@ def fetch_market_temperature_data(code, lookback_days=90):
         except Exception:
             df = pd.DataFrame()
 
-    return df.sort_index(), source
+    reference_close = df.attrs.get('market_temperature_reference_close')
+    result = df.sort_index()
+    if reference_close is not None:
+        result.attrs['market_temperature_reference_close'] = reference_close
+    return result, source
 
 
 def calculate_market_temperature(df):
@@ -1047,7 +1069,13 @@ def calculate_market_temperature(df):
 
     momentum = 0.0 if len(close) <= 5 else (latest / float(close.iloc[-6]) - 1) * 100
     momentum_score = 50 + momentum * 20
-    previous = float(close.iloc[-2])
+    # 期貨夜盤使用券商快照的官方參考價；未取得快照時才退回前一根日 K。
+    reference_close = df.attrs.get('market_temperature_reference_close')
+    try:
+        reference_close = float(reference_close)
+    except (TypeError, ValueError):
+        reference_close = None
+    previous = reference_close if reference_close is not None and reference_close > 0 else float(close.iloc[-2])
     change_value = latest - previous
     change_pct = (change_value / previous * 100) if previous else 0.0
     if change_value > 0:
@@ -1081,6 +1109,7 @@ def calculate_market_temperature(df):
         'rsi': rsi, 'range_score': range_score, 'ma20': ma20,
         'ma60': ma60, 'momentum': momentum, 'updated_at': data.index[-1],
         'change': change_value, 'change_pct': change_pct,
+        'reference_close': previous,
         'price_color': price_color, 'price_arrow': price_arrow
     }
 
