@@ -916,6 +916,192 @@ def round_to_tick(price):
     rounded = (p_dec / t_dec).quantize(Decimal("1"), rounding=ROUND_HALF_UP) * t_dec
     return float(rounded)
 
+# ==========================================
+# 臺灣市場溫度計
+# ==========================================
+def merge_market_temperature_snapshot(df, api, code):
+    """Merge the current Shioaji snapshot into a daily series.
+
+    Futures snapshots after 15:00 are assigned to the following trading date,
+    so the thermometer follows the same night-session convention as the chart.
+    """
+    if df.empty or api is None:
+        return df
+
+    try:
+        is_future = code == "TWF=F"
+        now_tw = datetime.now(pytz.timezone('Asia/Taipei'))
+        if code == "^TWII":
+            # Do not create a synthetic index bar from a stale snapshot before
+            # the cash session opens or on a non-trading day.
+            if is_market_closed_func(now_tw.date()) or now_tw.time() < dt_time(9, 0):
+                return df
+            contract = api.Contracts.Indices.TSE.TSE01
+            trading_date = pd.Timestamp(now_tw.date())
+        elif is_future:
+            contract = api.Contracts.Futures.TXF.TXFR1
+            trading_date = get_futures_trading_date(now_tw)
+        else:
+            return df
+
+        snapshots = api.snapshots([contract])
+        if not snapshots:
+            return df
+
+        snap = snapshots[0]
+        close = float(getattr(snap, 'close', 0) or 0)
+        if close <= 0:
+            return df
+
+        open_price = float(getattr(snap, 'open', close) or close)
+        high = float(getattr(snap, 'high', close) or close)
+        low = float(getattr(snap, 'low', close) or close)
+        volume = float(getattr(snap, 'total_volume', 0) or 0)
+        trading_date = pd.Timestamp(trading_date).normalize()
+
+        result = df.copy()
+        last_date = pd.Timestamp(result.index[-1]).normalize()
+        if last_date < trading_date:
+            current_bar = pd.DataFrame(
+                [{'Open': open_price, 'High': high, 'Low': low, 'Close': close, 'Volume': volume}],
+                index=[trading_date]
+            )
+            result = pd.concat([result, current_bar])
+        elif last_date == trading_date:
+            result.at[result.index[-1], 'Close'] = close
+            result.at[result.index[-1], 'High'] = max(float(result['High'].iloc[-1]), high)
+            result.at[result.index[-1], 'Low'] = min(float(result['Low'].iloc[-1]), low)
+            result.at[result.index[-1], 'Volume'] = max(float(result['Volume'].iloc[-1]), volume)
+        return result
+    except Exception:
+        return df
+
+
+def fetch_market_temperature_data(code, lookback_days=90):
+    """Fetch a daily OHLCV series for the thermometer, preferring Shioaji."""
+    source = ""
+    df = pd.DataFrame()
+    api = st.session_state.get('sj_api')
+
+    if st.session_state.get('sj_logged_in', False) and api is not None:
+        df = fetch_shioaji_data(api, code, interval='1d', lookback_days=lookback_days)
+        if not df.empty:
+            df = merge_market_temperature_snapshot(df, api, code)
+            source = "永豐 Shioaji 全盤資料"
+
+    # 加權指數在未登入時仍可用 Yahoo 歷史資料；期貨為了避免混用不同
+    # 的連續契約口徑，不以第三方資料替代。
+    if df.empty and code == '^TWII':
+        try:
+            df = yf.Ticker('^TWII').history(period='6mo', interval='1d')
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.droplevel(1)
+            if df.index.tz is not None:
+                df.index = df.index.tz_convert('Asia/Taipei').tz_localize(None)
+            df = df[['Open', 'High', 'Low', 'Close', 'Volume']].dropna()
+            source = "Yahoo 歷史資料（未登入永豐）"
+        except Exception:
+            df = pd.DataFrame()
+
+    return df.sort_index(), source
+
+
+def calculate_market_temperature(df):
+    """Return a transparent 0-100 trend / momentum temperature score."""
+    required = {'High', 'Low', 'Close'}
+    if df.empty or not required.issubset(df.columns):
+        return None
+
+    data = df.dropna(subset=['High', 'Low', 'Close']).copy()
+    if len(data) < 25:
+        return None
+
+    close = data['Close'].astype(float)
+    high = data['High'].astype(float)
+    low = data['Low'].astype(float)
+    latest = float(close.iloc[-1])
+
+    window = min(60, len(data))
+    range_high = float(high.tail(window).max())
+    range_low = float(low.tail(window).min())
+    range_score = 50.0 if range_high == range_low else (latest - range_low) / (range_high - range_low) * 100
+
+    change = close.diff()
+    gains = change.clip(lower=0).rolling(14, min_periods=10).mean()
+    losses = (-change.clip(upper=0)).rolling(14, min_periods=10).mean()
+    relative_strength = gains / losses.replace(0, np.nan)
+    rsi = float((100 - 100 / (1 + relative_strength)).iloc[-1])
+    if not np.isfinite(rsi):
+        rsi = 50.0
+
+    previous_close = close.shift(1)
+    true_range = pd.concat([
+        high - low,
+        (high - previous_close).abs(),
+        (low - previous_close).abs()
+    ], axis=1).max(axis=1)
+    atr = float(true_range.rolling(14, min_periods=10).mean().iloc[-1])
+    ma20 = float(close.rolling(20, min_periods=15).mean().iloc[-1])
+    ma60 = float(close.rolling(60, min_periods=20).mean().iloc[-1])
+    trend_score = 50.0 if not np.isfinite(atr) or atr <= 0 else 50 + (latest - ma20) / atr * 10
+
+    momentum = 0.0 if len(close) <= 5 else (latest / float(close.iloc[-6]) - 1) * 100
+    momentum_score = 50 + momentum * 20
+
+    clip = lambda value: float(np.clip(value, 0, 100))
+    score = round(clip(0.40 * range_score + 0.25 * rsi + 0.25 * trend_score + 0.10 * momentum_score))
+
+    bullish = score >= 60 and latest >= ma20 and ma20 >= ma60
+    bearish = score <= 40 and latest <= ma20 and ma20 <= ma60
+    if bullish:
+        status, color = "偏多", "#00c853"
+        entry = "回測短均線後止穩，可觀察順勢切入；溫度高於 80 時不追價。"
+        exit_rule = "跌破 MA20 或溫度回落至 55 以下，應收緊停損／減碼。"
+    elif bearish:
+        status, color = "偏空", "#ff5252"
+        entry = "反彈至短均線受壓再觀察；既有多單宜保守，不宜逆勢攤平。"
+        exit_rule = "站回 MA20 且溫度回升至 45 以上，應撤除空方／觀望。"
+    else:
+        status, color = "區間盤整", "#ffc107"
+        entry = "等待溫度突破 60 或跌破 40，再配合價格突破確認方向。"
+        exit_rule = "區間中段不追價；接近區間兩端才規畫分批停利或停損。"
+
+    return {
+        'score': score, 'status': status, 'color': color,
+        'entry': entry, 'exit_rule': exit_rule, 'close': latest,
+        'rsi': rsi, 'range_score': range_score, 'ma20': ma20,
+        'ma60': ma60, 'momentum': momentum, 'updated_at': data.index[-1]
+    }
+
+
+def build_market_temperature_gauge(label, result):
+    fig = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=result['score'],
+        number={'suffix': '°', 'font': {'size': 54, 'color': result['color']}},
+        title={'text': f"<b>{label}</b><br><span style='font-size:18px;color:{result['color']}'>{result['status']}</span>"},
+        gauge={
+            'shape': 'angular',
+            'axis': {'range': [0, 100], 'tickvals': [0, 20, 40, 60, 80, 100], 'tickfont': {'size': 12}},
+            'bar': {'color': '#f8f9fa', 'thickness': 0.20},
+            'bgcolor': 'rgba(0,0,0,0)',
+            'borderwidth': 0,
+            'steps': [
+                {'range': [0, 20], 'color': '#8b1e3f'},
+                {'range': [20, 40], 'color': '#d95d39'},
+                {'range': [40, 60], 'color': '#c99700'},
+                {'range': [60, 80], 'color': '#4f8a10'},
+                {'range': [80, 100], 'color': '#087f5b'},
+            ],
+            'threshold': {'line': {'color': result['color'], 'width': 6}, 'thickness': 0.8, 'value': result['score']}
+        }
+    ))
+    fig.update_layout(
+        height=330, margin=dict(l=22, r=22, t=65, b=0),
+        paper_bgcolor='rgba(0,0,0,0)', font=dict(color='#dfe6e9')
+    )
+    return fig
+
 def plot_fibonacci_chart(symbol, interval, lookback=60, font_size=15, ma_flags=None, ma_width=1.5, show_vol=True):
     if ma_flags is None:
         ma_flags = {'5': True, '10': True, '20': True, '60': True}
@@ -3271,7 +3457,7 @@ gc.collect()
 # ==========================================
 # 主介面 (Tabs)
 # ==========================================
-tab1, tab2, tab_fibo, tab_db, tab3 = st.tabs(["⚡ 當沖戰略室 ⚡", "💰 交易損益室 💰", "📈 費波計算", "📚 戰略資料庫", "📅 股市行事曆與公司事件"])
+tab1, tab2, tab_fibo, tab_db, tab3 = st.tabs(["⚡ 當沖戰略室 ⚡", "💰 交易損益室 💰", "📈 技術分析", "📚 戰略資料庫", "📅 股市行事曆與公司事件"])
 
 with tab1:
     col_search, col_file = st.columns([2, 1])
@@ -5395,7 +5581,69 @@ with tab_fibo:
                 st.session_state[key] = f"{best_match[0]}({best_match[1]})"
         save_fibo_config()
     
-    tab_fibo_chart, tab_fibo_manual = st.tabs(["📊 圖表分析", "🧮 手動計算"])
+    tab_fibo_thermometer, tab_fibo_chart, tab_fibo_manual = st.tabs(["🌡️ 市場溫度計", "📊 費波圖表", "🧮 手動費波"])
+
+    with tab_fibo_thermometer:
+        title_col, refresh_col = st.columns([6, 1])
+        with title_col:
+            st.subheader("臺灣加權／期貨溫度計")
+            st.caption("以 60 日位置、RSI、均線趨勢與 5 日動能合成 0–100 分；期貨納入夜盤至次日日盤的未完成交易日 K。")
+        with refresh_col:
+            if st.button("🔄 更新", key="refresh_market_temperature", width='stretch'):
+                st.rerun()
+
+        thermometer_specs = [
+            ("加權股價指數", "^TWII"),
+            ("臺股期貨", "TWF=F"),
+        ]
+        thermometer_data = []
+        for label, code in thermometer_specs:
+            temp_df, source = fetch_market_temperature_data(code)
+            result = calculate_market_temperature(temp_df)
+            thermometer_data.append((label, code, temp_df, source, result))
+
+        gauge_cols = st.columns(2)
+        summary_rows = []
+        for column, (label, code, temp_df, source, result) in zip(gauge_cols, thermometer_data):
+            with column:
+                if result is None:
+                    if code == "TWF=F":
+                        st.warning("臺股期貨溫度計需要登入永豐 Shioaji，才能取得含夜盤的完整資料。")
+                    else:
+                        st.warning("目前無法取得足夠的加權指數資料。")
+                    continue
+
+                st.plotly_chart(build_market_temperature_gauge(label, result), width='stretch', config={'displayModeBar': False})
+                m1, m2, m3 = st.columns(3)
+                m1.metric("最新", f"{result['close']:,.0f}")
+                m2.metric("RSI(14)", f"{result['rsi']:.1f}")
+                m3.metric("5日動能", f"{result['momentum']:+.2f}%")
+                st.markdown(f"**狀態：** <span style='color:{result['color']}; font-size:18px; font-weight:700'>{result['status']}</span>", unsafe_allow_html=True)
+                st.info(f"入場觀察：{result['entry']}")
+                st.warning(f"出場／風控：{result['exit_rule']}")
+                if source:
+                    st.caption(f"資料來源：{source}｜最新交易日：{pd.Timestamp(result['updated_at']).strftime('%Y/%m/%d')}")
+
+                summary_rows.append({
+                    "市場": label,
+                    "溫度": result['score'],
+                    "狀態": result['status'],
+                    "60日位置": f"{result['range_score']:.1f}",
+                    "MA20": f"{result['ma20']:,.0f}",
+                    "MA60": f"{result['ma60']:,.0f}",
+                })
+
+        if summary_rows:
+            st.markdown("#### 判讀摘要")
+            st.dataframe(pd.DataFrame(summary_rows), width='stretch', hide_index=True)
+
+        with st.expander("溫度計判讀規則"):
+            st.markdown("""
+            - 0–39：空方動能較強；40–59：區間盤整；60–100：多方動能較強。
+            - 「偏多／偏空」還會確認價格相對 MA20、MA60 的位置，避免只因單日急漲急跌就翻轉趨勢。
+            - 期貨在 15:00 後會建立下一交易日的夜盤未完成日 K，隔日日盤會累加到同一根，因此可直接用於夜盤支撐壓力判讀。
+            - 此為規則型技術判讀與風險提示，不構成投資建議；實際交易仍應搭配停損、部位與流動性管理。
+            """)
 
     with tab_fibo_chart:
         code_map_fibo, name_map_fibo = load_local_stock_names()
