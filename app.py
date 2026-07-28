@@ -1047,6 +1047,15 @@ def calculate_market_temperature(df):
 
     momentum = 0.0 if len(close) <= 5 else (latest / float(close.iloc[-6]) - 1) * 100
     momentum_score = 50 + momentum * 20
+    previous = float(close.iloc[-2])
+    change_value = latest - previous
+    change_pct = (change_value / previous * 100) if previous else 0.0
+    if change_value > 0:
+        price_color, price_arrow = "#ff4b4b", "▲"
+    elif change_value < 0:
+        price_color, price_arrow = "#00c853", "▼"
+    else:
+        price_color, price_arrow = "#dfe6e9", "◆"
 
     clip = lambda value: float(np.clip(value, 0, 100))
     score = round(clip(0.40 * range_score + 0.25 * rsi + 0.25 * trend_score + 0.10 * momentum_score))
@@ -1054,11 +1063,11 @@ def calculate_market_temperature(df):
     bullish = score >= 60 and latest >= ma20 and ma20 >= ma60
     bearish = score <= 40 and latest <= ma20 and ma20 <= ma60
     if bullish:
-        status, color = "偏多", "#00c853"
+        status, color = "偏多", "#ff4b4b"
         entry = "回測短均線後止穩，可觀察順勢切入；溫度高於 80 時不追價。"
         exit_rule = "跌破 MA20 或溫度回落至 55 以下，應收緊停損／減碼。"
     elif bearish:
-        status, color = "偏空", "#ff5252"
+        status, color = "偏空", "#00c853"
         entry = "反彈至短均線受壓再觀察；既有多單宜保守，不宜逆勢攤平。"
         exit_rule = "站回 MA20 且溫度回升至 45 以上，應撤除空方／觀望。"
     else:
@@ -1070,7 +1079,9 @@ def calculate_market_temperature(df):
         'score': score, 'status': status, 'color': color,
         'entry': entry, 'exit_rule': exit_rule, 'close': latest,
         'rsi': rsi, 'range_score': range_score, 'ma20': ma20,
-        'ma60': ma60, 'momentum': momentum, 'updated_at': data.index[-1]
+        'ma60': ma60, 'momentum': momentum, 'updated_at': data.index[-1],
+        'change': change_value, 'change_pct': change_pct,
+        'price_color': price_color, 'price_arrow': price_arrow
     }
 
 
@@ -1079,7 +1090,7 @@ def build_market_temperature_gauge(label, result):
         mode="gauge+number",
         value=result['score'],
         number={'suffix': '°', 'font': {'size': 54, 'color': result['color']}},
-        title={'text': f"<b>{label}</b><br><span style='font-size:18px;color:{result['color']}'>{result['status']}</span>"},
+        title={'text': f"<b>{label}</b><br><br><span style='font-size:18px;color:{result['color']}'>{result['status']}</span>"},
         gauge={
             'shape': 'angular',
             'axis': {'range': [0, 100], 'tickvals': [0, 20, 40, 60, 80, 100], 'tickfont': {'size': 12}},
@@ -1087,17 +1098,17 @@ def build_market_temperature_gauge(label, result):
             'bgcolor': 'rgba(0,0,0,0)',
             'borderwidth': 0,
             'steps': [
-                {'range': [0, 20], 'color': '#8b1e3f'},
-                {'range': [20, 40], 'color': '#d95d39'},
+                {'range': [0, 20], 'color': '#087f5b'},
+                {'range': [20, 40], 'color': '#66bb6a'},
                 {'range': [40, 60], 'color': '#c99700'},
-                {'range': [60, 80], 'color': '#4f8a10'},
-                {'range': [80, 100], 'color': '#087f5b'},
+                {'range': [60, 80], 'color': '#ff8a80'},
+                {'range': [80, 100], 'color': '#d90429'},
             ],
             'threshold': {'line': {'color': result['color'], 'width': 6}, 'thickness': 0.8, 'value': result['score']}
         }
     ))
     fig.update_layout(
-        height=330, margin=dict(l=22, r=22, t=65, b=0),
+        height=330, margin=dict(l=22, r=22, t=88, b=0),
         paper_bgcolor='rgba(0,0,0,0)', font=dict(color='#dfe6e9')
     )
     return fig
@@ -5615,7 +5626,14 @@ with tab_fibo:
 
                 st.plotly_chart(build_market_temperature_gauge(label, result), width='stretch', config={'displayModeBar': False})
                 m1, m2, m3 = st.columns(3)
-                m1.metric("最新", f"{result['close']:,.0f}")
+                m1.markdown(
+                    f"""<div style='line-height:1.25'>
+                    <div style='font-size:14px;font-weight:600;color:#dfe6e9'>最新</div>
+                    <div style='font-size:31px;font-weight:700;color:{result['price_color']}'>{result['close']:,.0f}</div>
+                    <div style='font-size:15px;font-weight:700;color:{result['price_color']}'>{result['price_arrow']} {abs(result['change']):,.0f} ({result['change_pct']:+.2f}%)</div>
+                    </div>""",
+                    unsafe_allow_html=True
+                )
                 m2.metric("RSI(14)", f"{result['rsi']:.1f}")
                 m3.metric("5日動能", f"{result['momentum']:+.2f}%")
                 st.markdown(f"**狀態：** <span style='color:{result['color']}; font-size:18px; font-weight:700'>{result['status']}</span>", unsafe_allow_html=True)
