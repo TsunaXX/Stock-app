@@ -954,18 +954,26 @@ def merge_market_temperature_snapshot(df, api, code):
             return df
 
         # 夜盤跨交易日時，快照的官方漲跌基準不一定等於前一根日 K 收盤。
-        # 優先以 change_price 反推參考價，再退回合約 reference。
+        # 保留券商直接提供的漲跌點數／幅度，避免由未完成日 K 再次推算。
         reference_close = None
+        snapshot_change = None
+        snapshot_change_pct = None
         try:
-            change_price = getattr(snap, 'change_price', getattr(snap, 'change', None))
+            change_price = getattr(snap, 'change_price', None)
             if change_price is not None:
+                snapshot_change = float(change_price)
                 inferred_reference = close - float(change_price)
                 if inferred_reference > 0:
                     reference_close = inferred_reference
+            change_rate = getattr(snap, 'change_rate', None)
+            if change_rate is not None:
+                snapshot_change_pct = float(change_rate)
             if reference_close is None:
+                snapshot_reference = float(getattr(snap, 'reference', 0) or 0)
                 contract_reference = float(getattr(contract, 'reference', 0) or 0)
-                if contract_reference > 0:
-                    reference_close = contract_reference
+                reference_close = snapshot_reference if snapshot_reference > 0 else contract_reference
+                if reference_close <= 0:
+                    reference_close = None
         except (TypeError, ValueError):
             pass
 
@@ -990,6 +998,10 @@ def merge_market_temperature_snapshot(df, api, code):
             result.at[result.index[-1], 'Volume'] = max(float(result['Volume'].iloc[-1]), volume)
         if reference_close is not None:
             result.attrs['market_temperature_reference_close'] = reference_close
+        if snapshot_change is not None:
+            result.attrs['market_temperature_change'] = snapshot_change
+        if snapshot_change_pct is not None:
+            result.attrs['market_temperature_change_pct'] = snapshot_change_pct
         return result
     except Exception:
         return df
@@ -1021,10 +1033,12 @@ def fetch_market_temperature_data(code, lookback_days=90):
         except Exception:
             df = pd.DataFrame()
 
-    reference_close = df.attrs.get('market_temperature_reference_close')
+    temperature_attrs = {
+        key: value for key, value in df.attrs.items()
+        if key.startswith('market_temperature_')
+    }
     result = df.sort_index()
-    if reference_close is not None:
-        result.attrs['market_temperature_reference_close'] = reference_close
+    result.attrs.update(temperature_attrs)
     return result, source
 
 
@@ -1076,8 +1090,18 @@ def calculate_market_temperature(df):
     except (TypeError, ValueError):
         reference_close = None
     previous = reference_close if reference_close is not None and reference_close > 0 else float(close.iloc[-2])
-    change_value = latest - previous
-    change_pct = (change_value / previous * 100) if previous else 0.0
+    snapshot_change = df.attrs.get('market_temperature_change')
+    snapshot_change_pct = df.attrs.get('market_temperature_change_pct')
+    try:
+        snapshot_change = float(snapshot_change)
+    except (TypeError, ValueError):
+        snapshot_change = None
+    try:
+        snapshot_change_pct = float(snapshot_change_pct)
+    except (TypeError, ValueError):
+        snapshot_change_pct = None
+    change_value = snapshot_change if snapshot_change is not None and np.isfinite(snapshot_change) else latest - previous
+    change_pct = snapshot_change_pct if snapshot_change_pct is not None and np.isfinite(snapshot_change_pct) else ((change_value / previous * 100) if previous else 0.0)
     if change_value > 0:
         price_color, price_arrow = "#ff4b4b", "▲"
     elif change_value < 0:
@@ -1298,11 +1322,13 @@ def plot_fibonacci_chart(symbol, interval, lookback=60, font_size=15, ma_flags=N
                     snap = st.session_state.sj_api.snapshots([contract_snap])
                     if snap and len(snap) > 0:
                         s = snap[0]
-                        rt_price = s.close
-                        rt_open = s.open
-                        rt_high = s.high
-                        rt_low = s.low
-                        rt_vol = s.total_volume 
+                        # 指數快照有時不提供成交量，close 也可能在開盤瞬間尚未
+                        # 寫入；以 open 作為價格備援，避免整段即時更新被略過。
+                        rt_price = float(getattr(s, 'close', 0) or getattr(s, 'open', 0) or 0)
+                        rt_open = float(getattr(s, 'open', 0) or rt_price)
+                        rt_high = float(getattr(s, 'high', 0) or rt_price)
+                        rt_low = float(getattr(s, 'low', 0) or rt_price)
+                        rt_vol = float(getattr(s, 'total_volume', 0) or 0)
                         
                         # 擷取永豐快照的正確昨日參考價，避免計算漲跌幅異常
                         try:
@@ -1343,7 +1369,9 @@ def plot_fibonacci_chart(symbol, interval, lookback=60, font_size=15, ma_flags=N
                                     is_temporary_closed = True
                                 elif (current_time >= dt_time(15, 5) or current_time < dt_time(5, 0)) and rt_vol == 0:
                                     is_temporary_closed = True
-                            else:
+                            elif not ticker.startswith("^TWII"):
+                                # 加權指數快照的 total_volume 可能固定為 0，不能
+                                # 用它判定休市，否則盤中即時 K 棒會被阻擋。
                                 if current_time >= dt_time(9, 5) and rt_vol == 0:
                                     is_temporary_closed = True
 
