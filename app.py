@@ -161,7 +161,48 @@ def fetch_twse_taiex_daily_history(lookback_days=180):
     return pd.DataFrame(records).drop_duplicates(subset=['ts'], keep='last').set_index('ts').sort_index()
 
 
-def merge_taiex_history_with_shioaji(twse_df, shioaji_df):
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_twse_market_turnovers(trading_dates):
+    """Return official daily TWSE market turnover in hundred-million TWD."""
+    headers = {'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json'}
+
+    def parse_turnover(trade_date):
+        try:
+            response = requests.get(
+                'https://www.twse.com.tw/exchangeReport/MI_INDEX',
+                params={'response': 'json', 'date': trade_date, 'type': 'MS'},
+                headers=headers,
+                timeout=8,
+                verify=False,
+            )
+            payload = response.json()
+            tables = [payload] + list(payload.get('tables', []))
+            for table in tables:
+                fields = table.get('fields', [])
+                data = table.get('data', [])
+                amount_idx = next((i for i, field in enumerate(fields) if '成交金額' in str(field)), None)
+                if amount_idx is None:
+                    continue
+                for row in data:
+                    if len(row) <= amount_idx:
+                        continue
+                    raw_amount = str(row[amount_idx]).replace(',', '').replace('元', '').strip()
+                    amount = float(raw_amount)
+                    if amount > 0:
+                        return trade_date, amount / 100_000_000
+        except (requests.RequestException, ValueError, TypeError, KeyError):
+            pass
+        return trade_date, np.nan
+
+    date_list = list(trading_dates)
+    if not date_list:
+        return {}
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        pairs = list(executor.map(parse_turnover, date_list))
+    return dict(pairs)
+
+
+def merge_taiex_history_with_shioaji(twse_df, shioaji_df, include_turnover=False):
     """Keep official index OHLC while retaining available Shioaji turnover data."""
     if twse_df.empty:
         return shioaji_df
@@ -171,6 +212,13 @@ def merge_taiex_history_with_shioaji(twse_df, shioaji_df):
         for column in ('Volume', 'Amount'):
             if column in shioaji_df.columns:
                 result.loc[shared_dates, column] = shioaji_df.loc[shared_dates, column]
+
+    if include_turnover:
+        turnover_dates = tuple(result.index[-70:].strftime('%Y%m%d'))
+        turnovers = fetch_twse_market_turnovers(turnover_dates)
+        if turnovers:
+            result['Volume'] = [turnovers.get(ts.strftime('%Y%m%d'), value) for ts, value in result['Volume'].items()]
+            result.attrs['volume_unit'] = '億'
     return result
 
 def get_near_month_futures_settlement(reference_dt=None):
@@ -1237,8 +1285,10 @@ def calculate_market_temperature(df):
     clip = lambda value: float(np.clip(value, 0, 100))
     score = round(clip(0.40 * range_score + 0.25 * rsi + 0.25 * trend_score + 0.10 * momentum_score))
 
-    bullish = score >= 60 and latest >= ma20 and ma20 >= ma60
-    bearish = score <= 40 and latest <= ma20 and ma20 <= ma60
+    # 狀態以溫度區間為主；均線僅作入／出場規則輔助。否則溫度已落在
+    # 0 度這類極端空方值時，仍可能因均線排序暫未翻轉而誤顯示盤整。
+    bullish = score >= 60
+    bearish = score <= 40
     if bullish:
         status, color = "偏多", "#ff4b4b"
         entry = "回測短均線後止穩，可觀察順勢切入；溫度高於 80 時不追價。"
@@ -1366,7 +1416,9 @@ def plot_fibonacci_chart(symbol, interval, lookback=60, font_size=15, ma_flags=N
         if ticker.startswith("^TWII") and interval == "1d":
             twse_df = fetch_twse_taiex_daily_history(lookback_days=180)
             if not twse_df.empty:
-                df = merge_taiex_history_with_shioaji(twse_df, df if sj_kbars_used else None)
+                df = merge_taiex_history_with_shioaji(
+                    twse_df, df if sj_kbars_used else None, include_turnover=True
+                )
                 twse_taiex_used = True
 
         # 已登入時，加權指數必須維持永豐單一來源。若直接退回 Yahoo，
