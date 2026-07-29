@@ -771,8 +771,12 @@ def fetch_shioaji_data(api, code, interval='1d', lookback_days=10):
         end_date = now.strftime("%Y-%m-%d")
         
         if is_future or is_index:
-            if interval in ['1d', '1wk', '1mo']:
-                actual_lookback = min(lookback_days, 90)
+            if interval == '1d':
+                # 日 K 會自動分段請求；不可再以 90 天截斷，否則加權指數
+                # 無法湊齊費波與 MA60 所需的交易日數。
+                actual_lookback = min(lookback_days, 370)
+            elif interval in ['1wk', '1mo']:
+                actual_lookback = min(lookback_days, 370)
             elif interval == '60m':
                 actual_lookback = min(lookback_days, 12)
             elif interval == '15m':
@@ -793,7 +797,7 @@ def fetch_shioaji_data(api, code, interval='1d', lookback_days=10):
         # 費波樣本可能不完整。分 K 使用較短區間以控制單次資料量。
         max_chunk_days = 15 if interval in ['1m', '5m', '15m', '60m'] else 30
         if actual_lookback > max_chunk_days:
-            all_ts, all_open, all_high, all_low, all_close, all_vol = [], [], [], [], [], []
+            all_ts, all_open, all_high, all_low, all_close, all_vol, all_amount = [], [], [], [], [], [], []
             curr_end = now
             chunks = []
             
@@ -817,6 +821,9 @@ def fetch_shioaji_data(api, code, interval='1d', lookback_days=10):
                             all_low.extend(k.Low)
                             all_close.extend(k.Close)
                             all_vol.extend(k.Volume)
+                            amount = getattr(k, 'Amount', None)
+                            if amount is not None:
+                                all_amount.extend(amount)
                             break
                         time.sleep(0.3)
                     except:
@@ -827,6 +834,8 @@ def fetch_shioaji_data(api, code, interval='1d', lookback_days=10):
                     'ts': all_ts, 'Open': all_open, 'High': all_high,
                     'Low': all_low, 'Close': all_close, 'Volume': all_vol
                 }
+                if len(all_amount) == len(all_ts):
+                    kbars_dict['Amount'] = all_amount
         else:
             # 關鍵修正：分K (短天數) 直接單次抓取，不經過複雜的迴圈切割，速度最快且最穩
             for attempt in range(3):
@@ -834,6 +843,9 @@ def fetch_shioaji_data(api, code, interval='1d', lookback_days=10):
                     kbars = api.kbars(contract=contract, start=start_date, end=end_date)
                     if kbars and hasattr(kbars, 'ts') and len(kbars.ts) > 0:
                         kbars_dict = {**kbars}
+                        amount = getattr(kbars, 'Amount', None)
+                        if amount is not None:
+                            kbars_dict['Amount'] = amount
                         break
                     time.sleep(0.5)
                 except Exception:
@@ -854,7 +866,7 @@ def fetch_shioaji_data(api, code, interval='1d', lookback_days=10):
         df.set_index('ts', inplace=True)
         
         # 確保擁有官方的開高低收量欄位
-        agg_dict = {'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'}
+        agg_dict = {'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum', 'Amount': 'sum'}
         agg_dict = {k: v for k, v in agg_dict.items() if k in df.columns}
 
         # 5. K棒週期重取樣
@@ -906,6 +918,7 @@ def fetch_shioaji_data(api, code, interval='1d', lookback_days=10):
             
             if is_future:
                 df.index = df.index.normalize()
+
         else:
             resample_map = {'5m': '5min', '15m': '15min', '60m': '60min'}
             if interval in resample_map:
@@ -922,6 +935,12 @@ def fetch_shioaji_data(api, code, interval='1d', lookback_days=10):
                 else:
                     # 個股：開盤第一筆為 09:00:00，若用 closed='right' 會被誤分到上一根空K棒，必須維持 closed='left'
                     df = df.resample(resample_map[interval], closed='left', label='left').agg(agg_dict).dropna()
+
+        # 加權指數的「量」應顯示大盤成交金額。Shioaji K 棒的 Volume 是
+        # 原始成交量，不可直接標為「億」；將 Amount 轉為億元後統一供圖表使用。
+        if is_index and 'Amount' in df.columns:
+            df['Volume'] = df['Amount'].astype(float) / 100_000_000
+            df.attrs['volume_unit'] = '億'
 
         # 保留資料實際來源，讓圖表可以驗證商品與連續契約是否正確。
         df.attrs['shioaji_contract_code'] = getattr(contract, 'code', '')
@@ -1043,7 +1062,7 @@ def merge_market_temperature_snapshot(df, api, code):
         return df
 
 
-def fetch_market_temperature_data(code, lookback_days=90):
+def fetch_market_temperature_data(code, lookback_days=180):
     """Fetch a daily OHLCV series for the thermometer, preferring Shioaji."""
     source = ""
     df = pd.DataFrame()
@@ -1373,7 +1392,18 @@ def plot_fibonacci_chart(symbol, interval, lookback=60, font_size=15, ma_flags=N
                         rt_open = float(getattr(s, 'open', 0) or rt_price)
                         rt_high = float(getattr(s, 'high', 0) or rt_price)
                         rt_low = float(getattr(s, 'low', 0) or rt_price)
-                        rt_vol = float(getattr(s, 'total_volume', 0) or 0)
+                        if ticker.startswith("^TWII"):
+                            # 加權指數以成交金額呈現；轉成「億」後須與歷史
+                            # K 棒 Amount 的轉換口徑一致。
+                            index_turnover = (
+                                getattr(s, 'total_amount', 0)
+                                or getattr(s, 'amount_sum', 0)
+                                or getattr(s, 'AmountSum', 0)
+                                or 0
+                            )
+                            rt_vol = float(index_turnover) / 100_000_000
+                        else:
+                            rt_vol = float(getattr(s, 'total_volume', 0) or 0)
                         
                         # 擷取永豐快照的正確昨日參考價，避免計算漲跌幅異常
                         try:
@@ -1732,11 +1762,11 @@ def plot_fibonacci_chart(symbol, interval, lookback=60, font_size=15, ma_flags=N
 
         if is_index:
             if ticker == '^TWII':
-                if vol == 0 or pd.isna(vol):
+                if 'Amount' not in df.columns or vol == 0 or pd.isna(vol):
                     vol_num = "無資料(缺漏)"
                     vol_unit = ""
                 else:
-                    vol_num = f"{vol/100000000:.2f}" if vol > 100000000 else f"{vol:,.2f}"
+                    vol_num = f"{vol:,.2f}"
                     vol_unit = " 億"
             else:
                 vol_num = f"{vol:,.0f}"
