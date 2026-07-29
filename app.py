@@ -83,6 +83,40 @@ def get_futures_trading_date(now_dt):
         trading_date += pd.Timedelta(days=1)
     return trading_date.normalize()
 
+
+def get_taiex_contract(api):
+    """Return the TAIEX contract across supported Shioaji contract layouts."""
+    if api is None:
+        return None
+
+    # Shioaji 1.7+ uses the exchange index code IX0001.  Older applications
+    # may still expose the legacy Contracts tree, so keep narrowly-scoped
+    # compatibility fallbacks without ever substituting another market source.
+    try:
+        contract = api.contracts.get("IX0001")
+        if contract is not None:
+            return contract
+    except (AttributeError, KeyError, TypeError):
+        pass
+
+    try:
+        legacy_contracts = api.Contracts
+        for group_name in ("Indexs", "Indices"):
+            group = getattr(legacy_contracts, group_name, None)
+            tse = getattr(group, "TSE", None)
+            if tse is None:
+                continue
+            for code in ("IX0001", "001", "TSE01"):
+                try:
+                    contract = tse[code]
+                except (KeyError, TypeError, AttributeError):
+                    contract = getattr(tse, code, None)
+                if contract is not None:
+                    return contract
+    except AttributeError:
+        pass
+    return None
+
 def get_near_month_futures_settlement(reference_dt=None):
     """回傳台指與股票期貨近月契約的第三個星期三結算日。"""
     tz_tw = pytz.timezone('Asia/Taipei')
@@ -703,7 +737,7 @@ def fetch_shioaji_data(api, code, interval='1d', lookback_days=10):
         is_index = False
         
         if code in ["^TWII", "加權指數", "TSE", "加權指數(^TWII)"]:
-            contract = api.Contracts.Indices.TSE.TSE01
+            contract = get_taiex_contract(api)
             is_index = True
         elif code in ["TWF=F", "台指期貨", "TXF", "台指期貨(TWF=F)", "台指(全)", "台指期(全)", "台指期貨(全)"]:
             is_future = True
@@ -936,7 +970,9 @@ def merge_market_temperature_snapshot(df, api, code):
             # the cash session opens or on a non-trading day.
             if is_market_closed_func(now_tw.date()) or now_tw.time() < dt_time(9, 0):
                 return df
-            contract = api.Contracts.Indices.TSE.TSE01
+            contract = get_taiex_contract(api)
+            if contract is None:
+                return df
             trading_date = pd.Timestamp(now_tw.date())
         elif is_future:
             contract = api.Contracts.Futures.TXF.TXFR1
@@ -1019,9 +1055,9 @@ def fetch_market_temperature_data(code, lookback_days=90):
             df = merge_market_temperature_snapshot(df, api, code)
             source = "永豐 Shioaji 全盤資料"
 
-    # 加權指數在未登入時仍可用 Yahoo 歷史資料；期貨為了避免混用不同
-    # 的連續契約口徑，不以第三方資料替代。
-    if df.empty and code == '^TWII':
+    # 僅未登入永豐時，才允許加權指數以 Yahoo 作為歷史資料備援。登入後
+    # 必須維持單一券商資料源，避免快照與歷史 K 棒混用而產生錯誤漲跌。
+    if df.empty and code == '^TWII' and not st.session_state.get('sj_logged_in', False):
         try:
             df = yf.Ticker('^TWII').history(period='6mo', interval='1d')
             if isinstance(df.columns, pd.MultiIndex):
@@ -1235,7 +1271,16 @@ def plot_fibonacci_chart(symbol, interval, lookback=60, font_size=15, ma_flags=N
                     df = sj_df
                     sj_kbars_used = True
 
-        # 若永豐未登入、沒抓到，直接退回使用 yfinance (已移除 cnyes 判斷)
+        # 已登入時，加權指數必須維持永豐單一來源。若直接退回 Yahoo，
+        # 會把不同供應商／不同時間點的 K 棒混入費波與漲跌計算。
+        if not sj_kbars_used and st.session_state.get('sj_logged_in', False) and ticker.startswith("^TWII"):
+            st.warning(
+                "無法取得永豐加權指數資料，已停止繪圖以避免混用 Yahoo 歷史數據。"
+                f" 詳細錯誤：{st.session_state.get('sj_last_error', '無')}"
+            )
+            return
+
+        # 若永豐未登入或其他商品的永豐資料不足，才退回使用 yfinance。
         if not sj_kbars_used:
             import time
             for attempt in range(3):
@@ -1300,7 +1345,7 @@ def plot_fibonacci_chart(symbol, interval, lookback=60, font_size=15, ma_flags=N
             try:
                 contract_snap = None
                 if ticker.startswith("^TWII"):
-                    contract_snap = st.session_state.sj_api.Contracts.Indices.TSE.TSE01
+                    contract_snap = get_taiex_contract(st.session_state.sj_api)
                 elif ticker == "TWF=F":
                     try:
                         contract_snap = min(
