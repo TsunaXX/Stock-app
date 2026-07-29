@@ -117,6 +117,62 @@ def get_taiex_contract(api):
         pass
     return None
 
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_twse_taiex_daily_history(lookback_days=180):
+    """Fetch official TWSE monthly TAIEX OHLC history (no Yahoo fallback)."""
+    tz_tw = pytz.timezone('Asia/Taipei')
+    end_date = pd.Timestamp(datetime.now(tz_tw).date())
+    start_date = end_date - pd.Timedelta(days=lookback_days)
+    months = pd.period_range(start=start_date.to_period('M'), end=end_date.to_period('M'), freq='M')
+    records = []
+    headers = {'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json'}
+
+    for month in months:
+        try:
+            response = requests.get(
+                'https://www.twse.com.tw/indicesReport/MI_5MINS_HIST',
+                params={'response': 'json', 'date': month.start_time.strftime('%Y%m%d')},
+                headers=headers,
+                timeout=10,
+                verify=False,
+            )
+            payload = response.json()
+            rows = payload.get('data', [])
+            for row in rows:
+                if len(row) < 5:
+                    continue
+                date_parts = str(row[0]).strip().split('/')
+                if len(date_parts) != 3:
+                    continue
+                trade_date = pd.Timestamp(year=int(date_parts[0]) + 1911, month=int(date_parts[1]), day=int(date_parts[2]))
+                if trade_date < start_date or trade_date > end_date:
+                    continue
+                values = [float(str(value).replace(',', '').strip()) for value in row[1:5]]
+                records.append({
+                    'ts': trade_date, 'Open': values[0], 'High': values[1],
+                    'Low': values[2], 'Close': values[3], 'Volume': np.nan,
+                })
+        except (requests.RequestException, ValueError, TypeError, KeyError):
+            continue
+
+    if not records:
+        return pd.DataFrame()
+    return pd.DataFrame(records).drop_duplicates(subset=['ts'], keep='last').set_index('ts').sort_index()
+
+
+def merge_taiex_history_with_shioaji(twse_df, shioaji_df):
+    """Keep official index OHLC while retaining available Shioaji turnover data."""
+    if twse_df.empty:
+        return shioaji_df
+    result = twse_df.copy()
+    if shioaji_df is not None and not shioaji_df.empty:
+        shared_dates = result.index.intersection(shioaji_df.index)
+        for column in ('Volume', 'Amount'):
+            if column in shioaji_df.columns:
+                result.loc[shared_dates, column] = shioaji_df.loc[shared_dates, column]
+    return result
+
 def get_near_month_futures_settlement(reference_dt=None):
     """回傳台指與股票期貨近月契約的第三個星期三結算日。"""
     tz_tw = pytz.timezone('Asia/Taipei')
@@ -1070,9 +1126,23 @@ def fetch_market_temperature_data(code, lookback_days=180):
 
     if st.session_state.get('sj_logged_in', False) and api is not None:
         df = fetch_shioaji_data(api, code, interval='1d', lookback_days=lookback_days)
+        if code == '^TWII':
+            twse_df = fetch_twse_taiex_daily_history(lookback_days=lookback_days)
+            if not twse_df.empty:
+                df = merge_taiex_history_with_shioaji(twse_df, df)
+                source = "證交所官方歷史日K + 永豐 Shioaji 即時快照"
         if not df.empty:
             df = merge_market_temperature_snapshot(df, api, code)
-            source = "永豐 Shioaji 全盤資料"
+            if not source:
+                source = "永豐 Shioaji 全盤資料"
+
+    # 加權指數的日 K 優先由證交所官方資料補齊；即使永豐尚未登入，
+    # 也不會因資料不足而改用 Yahoo 的不同口徑。
+    if df.empty and code == '^TWII':
+        twse_df = fetch_twse_taiex_daily_history(lookback_days=lookback_days)
+        if not twse_df.empty:
+            df = twse_df
+            source = "證交所官方歷史日K"
 
     # 僅未登入永豐時，才允許加權指數以 Yahoo 作為歷史資料備援。登入後
     # 必須維持單一券商資料源，避免快照與歷史 K 棒混用而產生錯誤漲跌。
@@ -1275,6 +1345,7 @@ def plot_fibonacci_chart(symbol, interval, lookback=60, font_size=15, ma_flags=N
         df = pd.DataFrame()
         raw_code = ticker_code.split('.')[0]
         sj_kbars_used = False
+        twse_taiex_used = False
         sj_snap_used = False
         
         twstock_used = False
@@ -1290,9 +1361,17 @@ def plot_fibonacci_chart(symbol, interval, lookback=60, font_size=15, ma_flags=N
                     df = sj_df
                     sj_kbars_used = True
 
+        # 永豐指數 K 棒在部分帳號／版本只保留近月資料。日 K 的歷史區段
+        # 改以證交所官方資料補齊，盤中仍由永豐快照覆寫最新一根。
+        if ticker.startswith("^TWII") and interval == "1d":
+            twse_df = fetch_twse_taiex_daily_history(lookback_days=180)
+            if not twse_df.empty:
+                df = merge_taiex_history_with_shioaji(twse_df, df if sj_kbars_used else None)
+                twse_taiex_used = True
+
         # 已登入時，加權指數必須維持永豐單一來源。若直接退回 Yahoo，
         # 會把不同供應商／不同時間點的 K 棒混入費波與漲跌計算。
-        if not sj_kbars_used and st.session_state.get('sj_logged_in', False) and ticker.startswith("^TWII"):
+        if not sj_kbars_used and not twse_taiex_used and st.session_state.get('sj_logged_in', False) and ticker.startswith("^TWII"):
             st.warning(
                 "無法取得永豐加權指數資料，已停止繪圖以避免混用 Yahoo 歷史數據。"
                 f" 詳細錯誤：{st.session_state.get('sj_last_error', '無')}"
@@ -1300,7 +1379,7 @@ def plot_fibonacci_chart(symbol, interval, lookback=60, font_size=15, ma_flags=N
             return
 
         # 若永豐未登入或其他商品的永豐資料不足，才退回使用 yfinance。
-        if not sj_kbars_used:
+        if not sj_kbars_used and not twse_taiex_used:
             import time
             for attempt in range(3):
                 try:
@@ -1396,9 +1475,9 @@ def plot_fibonacci_chart(symbol, interval, lookback=60, font_size=15, ma_flags=N
                             # 加權指數以成交金額呈現；轉成「億」後須與歷史
                             # K 棒 Amount 的轉換口徑一致。
                             index_turnover = (
-                                getattr(s, 'total_amount', 0)
-                                or getattr(s, 'amount_sum', 0)
+                                getattr(s, 'amount_sum', 0)
                                 or getattr(s, 'AmountSum', 0)
+                                or getattr(s, 'total_amount', 0)
                                 or 0
                             )
                             rt_vol = float(index_turnover) / 100_000_000
@@ -1762,7 +1841,8 @@ def plot_fibonacci_chart(symbol, interval, lookback=60, font_size=15, ma_flags=N
 
         if is_index:
             if ticker == '^TWII':
-                if 'Amount' not in df.columns or vol == 0 or pd.isna(vol):
+                has_turnover_amount = twse_taiex_used or 'Amount' in df.columns or df.attrs.get('volume_unit') == '億'
+                if not has_turnover_amount or vol == 0 or pd.isna(vol):
                     vol_num = "無資料(缺漏)"
                     vol_unit = ""
                 else:
@@ -1817,7 +1897,9 @@ def plot_fibonacci_chart(symbol, interval, lookback=60, font_size=15, ma_flags=N
     
     fetch_time_str = datetime.now(pytz.timezone('Asia/Taipei')).strftime('%Y-%m-%d %H:%M:%S')
     
-    if sj_kbars_used:
+    if twse_taiex_used:
+        data_source_text = "證交所官方歷史日K + 永豐即時快照"
+    elif sj_kbars_used:
         contract_code = df.attrs.get('shioaji_contract_code', '')
         target_code = df.attrs.get('shioaji_target_code', '')
         resolved_contract = f" → {target_code}" if target_code else ""
