@@ -1335,6 +1335,208 @@ def get_futures_intraday_confirmation(api, direction):
     return "方向未明，暫不觸發進場。", False
 
 
+def get_near_futures_contract(api, product='TMF'):
+    """Resolve the live near-month futures contract used by the trade plan."""
+    if api is None:
+        return None
+    try:
+        if product == 'TMF':
+            return api.Contracts.Futures.TMF.TMFR1
+        candidates = [c for c in api.Contracts.Futures.TXF if c.code[-2:] not in ('R1', 'R2') and '/' not in c.code]
+        return min(candidates, key=lambda c: getattr(c, 'delivery_date', '999999'))
+    except (AttributeError, ValueError):
+        return None
+
+
+def get_live_futures_snapshot(api, product='TMF'):
+    """Return an immediately refreshed futures price and official change fields."""
+    contract = get_near_futures_contract(api, product)
+    if contract is None:
+        return None
+    try:
+        snapshots = api.snapshots([contract])
+        if not snapshots:
+            return None
+        snapshot = snapshots[0]
+        price = float(getattr(snapshot, 'close', 0) or getattr(snapshot, 'open', 0) or 0)
+        if price <= 0:
+            return None
+        change = getattr(snapshot, 'change_price', None)
+        try:
+            change = float(change)
+        except (TypeError, ValueError):
+            change = None
+        reference = price - change if change is not None else float(getattr(contract, 'reference', 0) or 0)
+        change_pct = getattr(snapshot, 'change_rate', None)
+        try:
+            change_pct = float(change_pct)
+        except (TypeError, ValueError):
+            change_pct = ((price - reference) / reference * 100) if reference > 0 else None
+        if change is None and reference > 0:
+            change = price - reference
+        if change is None:
+            change = 0.0
+        return {
+            'price': price, 'change': change, 'change_pct': change_pct or 0.0,
+            'color': '#ff4b4b' if change > 0 else ('#00c853' if change < 0 else '#dfe6e9'),
+            'arrow': '▲' if change > 0 else ('▼' if change < 0 else '◆'),
+            'contract_code': getattr(contract, 'code', 'TMF'),
+        }
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_taifex_index_margin_map():
+    """Read current initial margin requirements from the TAIFEX OpenAPI."""
+    margin_map = {}
+    try:
+        response = requests.get(
+            'https://openapi.taifex.com.tw/v1/IndexFuturesAndOptionsMargining',
+            headers={'accept': 'application/json', 'If-Modified-Since': 'Mon, 26 Jul 1997 05:00:00 GMT'},
+            timeout=8,
+            verify=False,
+        )
+        for item in response.json() if response.status_code == 200 else []:
+            raw_name = str(item.get('Contract', '')).replace(' ', '')
+            raw_margin = str(item.get('InitialMargin', '0')).replace(',', '')
+            try:
+                margin = float(raw_margin)
+            except ValueError:
+                continue
+            if raw_name in ('TMF', 'MXF') or '微型臺' in raw_name or '微型台' in raw_name:
+                margin_map['TMF'] = margin
+            elif raw_name == 'TX' or '臺股期貨' in raw_name or '台指期貨' in raw_name:
+                margin_map['TX'] = margin
+    except (requests.RequestException, ValueError, TypeError):
+        pass
+    return margin_map
+
+
+def calculate_short_wave_plan(api, direction):
+    """Calculate a compact 5-minute support/resistance plan for intraday observation."""
+    if api is None or direction not in ('偏多', '偏空'):
+        return None
+    try:
+        data = fetch_shioaji_data(api, 'TWF=F', interval='5m', lookback_days=3)
+        data = data.dropna(subset=['Open', 'High', 'Low', 'Close']).tail(30)
+        if len(data) < 15:
+            return None
+        previous = data['Close'].shift(1)
+        atr = float(pd.concat([
+            data['High'] - data['Low'],
+            (data['High'] - previous).abs(),
+            (data['Low'] - previous).abs(),
+        ], axis=1).max(axis=1).rolling(14, min_periods=10).mean().iloc[-1])
+        if not np.isfinite(atr) or atr <= 0:
+            return None
+        latest = float(data['Close'].iloc[-1])
+        recent = data.tail(12)
+        range_low = float(recent['Low'].min())
+        range_high = float(recent['High'].max())
+        zone = max(10.0, atr * 0.20)
+        if direction == '偏多':
+            entry, stop, target = range_low, range_low - atr * 0.55, range_high
+            trigger = f"回測 {entry:,.0f} ± {zone:,.0f} 後，5 分 K 收紅並高過前一根收盤。"
+        else:
+            entry, stop, target = range_high, range_high + atr * 0.55, range_low
+            trigger = f"反彈至 {entry:,.0f} ± {zone:,.0f} 後，5 分 K 收黑並低於前一根收盤。"
+        return {
+            'latest': latest, 'entry': entry, 'stop': stop, 'target': target,
+            'zone': zone, 'risk': abs(entry - stop), 'reward': abs(target - entry),
+            'rr': (abs(target - entry) / abs(entry - stop)) if entry != stop else None,
+            'trigger': trigger,
+        }
+    except Exception:
+        return None
+
+
+def get_txo_spread_quote(api, plan, expiry_choice):
+    """Find an OTM defined-risk TXO spread and conservatively price both legs."""
+    if api is None or plan is None or plan['direction'] not in ('偏多', '偏空'):
+        return None
+    try:
+        options = list(api.contracts.options('TXO'))
+    except (AttributeError, TypeError):
+        try:
+            options = list(api.Contracts.Options.TXO)
+        except (AttributeError, TypeError):
+            return None
+
+    today = datetime.now(pytz.timezone('Asia/Taipei')).date()
+    def expiry_date(contract):
+        value = getattr(contract, 'delivery_date', getattr(contract, 'last_trading_date', None))
+        try:
+            return pd.Timestamp(value).date()
+        except (TypeError, ValueError):
+            return None
+    def right_value(contract):
+        right = getattr(contract, 'option_right', '')
+        value = str(getattr(right, 'value', right)).upper()
+        if value in ('P', 'PUT') or value.endswith('.PUT'):
+            return 'P'
+        if value in ('C', 'CALL') or value.endswith('.CALL'):
+            return 'C'
+        return value
+    def is_weekday(contract, weekday):
+        value = str(getattr(getattr(contract, 'expiry_weekday', ''), 'value', getattr(contract, 'expiry_weekday', ''))).lower()
+        return weekday in value
+    def is_monthly(contract):
+        value = getattr(contract, 'week_of_month', 0)
+        normalized = str(getattr(value, 'value', value)).lower()
+        return normalized in ('3', 'third') or normalized.endswith('.third')
+    active = [c for c in options if expiry_date(c) is not None and expiry_date(c) >= today]
+    if expiry_choice == '週三選':
+        active = [c for c in active if is_weekday(c, 'wed') and not is_monthly(c)]
+    elif expiry_choice == '週五選':
+        active = [c for c in active if is_weekday(c, 'fri')]
+    elif expiry_choice == '月選':
+        active = [c for c in active if is_monthly(c)]
+    if not active:
+        return None
+    selected_expiry = min(expiry_date(c) for c in active)
+    expiry_options = [c for c in active if expiry_date(c) == selected_expiry]
+    is_bull_put = plan['direction'] == '偏多'
+    right = 'P' if is_bull_put else 'C'
+    contracts = [c for c in expiry_options if right_value(c) == right]
+    spot = plan['latest']
+    if is_bull_put:
+        desired = min(plan['invalidation'] - plan['zone_points'], spot - 1)
+        short_candidates = [c for c in contracts if float(getattr(c, 'strike_price', 0)) <= desired]
+        short_contract = max(short_candidates, key=lambda c: float(c.strike_price)) if short_candidates else None
+        long_candidates = [c for c in contracts if short_contract is not None and float(c.strike_price) < float(short_contract.strike_price)]
+        long_contract = max(long_candidates, key=lambda c: float(c.strike_price)) if long_candidates else None
+    else:
+        desired = max(plan['invalidation'] + plan['zone_points'], spot + 1)
+        short_candidates = [c for c in contracts if float(getattr(c, 'strike_price', 0)) >= desired]
+        short_contract = min(short_candidates, key=lambda c: float(c.strike_price)) if short_candidates else None
+        long_candidates = [c for c in contracts if short_contract is not None and float(c.strike_price) > float(short_contract.strike_price)]
+        long_contract = min(long_candidates, key=lambda c: float(c.strike_price)) if long_candidates else None
+    if short_contract is None or long_contract is None:
+        return None
+
+    short_price = long_price = None
+    try:
+        snapshots = api.snapshots([short_contract, long_contract])
+        if len(snapshots) == 2:
+            short_price = float(getattr(snapshots[0], 'buy_price', 0) or getattr(snapshots[0], 'close', 0) or 0)
+            long_price = float(getattr(snapshots[1], 'sell_price', 0) or getattr(snapshots[1], 'close', 0) or 0)
+    except Exception:
+        pass
+    width = abs(float(short_contract.strike_price) - float(long_contract.strike_price))
+    credit = ((short_price - long_price) * 50) if short_price is not None and long_price is not None else None
+    max_loss = width * 50 - credit if credit is not None else width * 50
+    dte = (selected_expiry - today).days
+    return {
+        'name': '賣權多頭價差（BP）' if is_bull_put else '買權空頭價差（BC）',
+        'right': 'Put' if is_bull_put else 'Call', 'short_contract': short_contract,
+        'long_contract': long_contract, 'short_strike': float(short_contract.strike_price),
+        'long_strike': float(long_contract.strike_price), 'expiry': selected_expiry,
+        'dte': dte, 'short_premium': short_price, 'long_premium': long_price,
+        'net_credit': credit, 'max_loss': max_loss, 'risk_level': '高' if dte <= 1 else ('中高' if dte <= 3 else '中'),
+    }
+
+
 def calculate_index_trade_plan(index_df, index_result, futures_df, futures_result):
     """Build a rule-based TAIEX futures plan from existing thermometer and Fibonacci data."""
     if futures_result is None or futures_df.empty:
@@ -5987,7 +6189,7 @@ with tab_fibo:
 
     with tab_trade_plan:
         st.subheader("指數操作計畫")
-        st.caption("以市場溫度決定方向、以 60 日費波區規畫進出，並以 15 分 K 作為確認條件。這是規則型觀察工具，不是自動下單或投資建議。")
+        st.caption("日線費波決定主方向，5 分 K 提供短波當沖點位；即時報價僅供觀察，不會自動下單或構成投資建議。")
         index_item = next((item for item in thermometer_data if item[1] == '^TWII'), None)
         futures_item = next((item for item in thermometer_data if item[1] == 'TWF=F'), None)
         plan = calculate_index_trade_plan(
@@ -5997,6 +6199,13 @@ with tab_fibo:
         if plan is None:
             st.warning("目前缺少足夠的加權或期貨日 K，暫時無法建立操作計畫。")
         else:
+            live_col, refresh_col = st.columns([6, 1])
+            with live_col:
+                live_snapshot = get_live_futures_snapshot(st.session_state.get('sj_api'), 'TMF')
+            with refresh_col:
+                if st.button("↻ 即時更新", key="refresh_trade_plan_live", width='stretch'):
+                    st.rerun()
+            live_price = live_snapshot['price'] if live_snapshot else plan['latest']
             confirmation_text, is_confirmed = get_futures_intraday_confirmation(
                 st.session_state.get('sj_api'), plan['direction']
             )
@@ -6008,10 +6217,22 @@ with tab_fibo:
                 </div>""", unsafe_allow_html=True
             )
             p1, p2, p3, p4 = st.columns(4)
-            p1.metric("最新期貨", f"{plan['latest']:,.0f}")
+            if live_snapshot:
+                p1.markdown(
+                    f"""<div style='line-height:1.25'>
+                    <div style='font-size:14px;font-weight:600;color:#dfe6e9'>最新微台（{live_snapshot['contract_code']}）</div>
+                    <div style='font-size:31px;font-weight:700;color:{live_snapshot['color']}'>{live_snapshot['price']:,.0f}</div>
+                    <div style='font-size:15px;font-weight:700;color:{live_snapshot['color']}'>{live_snapshot['arrow']} {abs(live_snapshot['change']):,.0f} ({live_snapshot['change_pct']:+.2f}%)</div>
+                    </div>""",
+                    unsafe_allow_html=True,
+                )
+            else:
+                p1.metric("最新期貨（日 K）", f"{plan['latest']:,.0f}")
             p2.metric("費波支撐", f"{plan['support']:,.0f}")
             p3.metric("費波壓力", f"{plan['resistance']:,.0f}")
             p4.metric("費波區寬", f"± {plan['zone_points']:,.0f} 點")
+            if live_snapshot:
+                st.caption(f"微台快照於 {datetime.now(pytz.timezone('Asia/Taipei')).strftime('%H:%M:%S')} 擷取；按「即時更新」可重新讀取夜盤／日盤最新報價。")
 
             st.markdown("#### 進出依據")
             st.info(f"**進場確認：** {plan['trigger']}")
@@ -6028,28 +6249,79 @@ with tab_fibo:
             else:
                 st.info("目前不建立方向部位；等待加權與期貨方向一致，且價格靠近支撐或壓力。")
 
+            st.markdown("#### 短波當沖（5 分 K）")
+            short_wave = calculate_short_wave_plan(st.session_state.get('sj_api'), plan['direction'])
+            if short_wave:
+                sw1, sw2, sw3, sw4 = st.columns(4)
+                sw1.metric("短波進場區", f"{short_wave['entry']:,.0f} ± {short_wave['zone']:,.0f}")
+                sw2.metric("短波停損", f"{short_wave['stop']:,.0f}")
+                sw3.metric("短波目標", f"{short_wave['target']:,.0f}")
+                sw4.metric("短波風報比", f"1 : {short_wave['rr']:.2f}" if short_wave['rr'] is not None else "—")
+                st.info(f"**快速進場條件：** {short_wave['trigger']}")
+                st.caption(
+                    f"以最新 12 根 5 分 K 區間計算；單口預估停損 ${short_wave['risk'] * 10:,.0f}，"
+                    f"兩口 ${short_wave['risk'] * 20:,.0f}。日線方向轉為區間盤整時，短波訊號不採用。"
+                )
+            elif plan['direction'] in ('偏多', '偏空'):
+                st.info("尚未取得足夠的 5 分 K，短波當沖只保留日線費波的觀察計畫。")
+            else:
+                st.info("主方向為區間盤整，暫不提供順勢短波當沖點位。")
+
             st.markdown("#### 微型臺指風險換算")
-            st.caption("以觀察進場區到失效點計算；微台每點 10 元。僅在停損可承受且風報比足夠時考慮操作。")
-            r1, r2, r3 = st.columns(3)
+            st.caption("以觀察進場區到失效點計算；微台每點 10 元。保證金為交易所公告原始保證金，實際可用額度仍以期貨商為準。")
+            margin_map = fetch_taifex_index_margin_map()
+            micro_margin = margin_map.get('TMF')
+            margin_risk_pct = (plan['micro_risk_1'] / micro_margin * 100) if micro_margin else None
+            margin_risk_label = "—" if margin_risk_pct is None else ("低" if margin_risk_pct < 10 else ("中" if margin_risk_pct < 20 else "高"))
+            r1, r2, r3, r4 = st.columns(4)
             r1.metric("停損距離", f"{plan['risk_points']:,.0f} 點")
             r2.metric("1 口最大風險", f"${plan['micro_risk_1']:,.0f}")
             r3.metric("2 口最大風險", f"${plan['micro_risk_2']:,.0f}")
+            r4.metric("1 口原始保證金", f"${micro_margin:,.0f}" if micro_margin else "查詢中")
+            if micro_margin:
+                st.caption(
+                    f"2 口原始保證金約 ${micro_margin * 2:,.0f}；本計畫單口停損約為保證金 {margin_risk_pct:.1f}%（風險：{margin_risk_label}）。"
+                )
+            else:
+                st.warning("暫時無法取得交易所保證金資料；下單前請在期貨商系統確認微台原始保證金。")
 
             st.markdown("#### 到期週選擇權：限定風險價差")
             if plan['short_strike'] is None:
                 st.info("方向尚未一致，不建立選擇權價差。避免在區間中段或訊號分歧時收權利金。")
             else:
-                short_leg = "賣出" if plan['direction'] == '偏多' else "賣出"
-                long_leg = "買進"
-                option_side = "Put" if plan['direction'] == '偏多' else "Call"
-                st.markdown(
-                    f"**{plan['option_name']}：** {short_leg} {plan['short_strike']:,} {option_side}，"
-                    f"{long_leg} {plan['long_strike']:,} {option_side}。"
+                expiry_choice = st.selectbox(
+                    "到期別", ["最近到期", "週三選", "週五選", "月選"], key="trade_plan_expiry_choice",
+                    help="系統會在所選到期別中，挑選位於費波失效點外、且仍為價外的履約價。"
                 )
-                st.caption(
-                    f"履約價差 100 點；未扣淨權利金的最大風險上限約 ${plan['max_spread_risk_before_credit']:,.0f}／組。"
-                    "到期週 Gamma 與流動性風險較高，若 15 分 K 有效突破失效點應優先退出，不留裸賣部位。"
-                )
+                quote_plan = {**plan, 'latest': live_price}
+                option_quote = get_txo_spread_quote(st.session_state.get('sj_api'), quote_plan, expiry_choice)
+                if option_quote:
+                    option_title = f"{option_quote['name']}｜{option_quote['expiry'].strftime('%Y/%m/%d')} 到期（剩 {option_quote['dte']} 天）"
+                    st.markdown(f"**{option_title}**")
+                    o1, o2, o3, o4 = st.columns(4)
+                    o1.metric("賣方價外履約價", f"{option_quote['short_strike']:,.0f} {option_quote['right']}")
+                    o2.metric("保護買方履約價", f"{option_quote['long_strike']:,.0f} {option_quote['right']}")
+                    o3.metric("預估淨權利金", f"${option_quote['net_credit']:,.0f}" if option_quote['net_credit'] is not None else "報價不足")
+                    o4.metric("單組最大風險", f"${option_quote['max_loss']:,.0f}")
+                    premium_detail = "即時買賣價不足，最大風險先以履約價差 × 50 元估算。"
+                    if option_quote['short_premium'] is not None and option_quote['long_premium'] is not None:
+                        premium_detail = (
+                            f"賣方權利金 {option_quote['short_premium']:.1f}、保護買方權利金 {option_quote['long_premium']:.1f}，"
+                            "以賣方買價與買方賣價保守估算。"
+                        )
+                    st.caption(
+                        f"風險指標：{option_quote['risk_level']}；{premium_detail} 到期週 Gamma 風險高，"
+                        "價格有效跌破／突破日線失效點時應優先退出，絕不留裸賣部位。"
+                    )
+                else:
+                    option_side = "Put" if plan['direction'] == '偏多' else "Call"
+                    st.info(
+                        f"尚未取得 {expiry_choice} 的即時選擇權契約／報價；暫以費波失效點外的預備履約價觀察："
+                        f"賣出 {plan['short_strike']:,} {option_side}、買進 {plan['long_strike']:,} {option_side}。"
+                    )
+                    st.caption(
+                        f"履約價差 100 點；未扣淨權利金的最大風險上限約 ${plan['max_spread_risk_before_credit']:,.0f}／組。"
+                    )
 
     with tab_fibo_thermometer:
         title_col, refresh_col = st.columns([6, 1])
