@@ -1459,13 +1459,15 @@ def get_txo_option_contracts(api):
     attempts = []
     try:
         attempts.append((list(api.contracts.options('TXO')), "永豐 Shioaji 選擇權契約檔"))
-    except (AttributeError, TypeError):
+    except Exception:
         pass
     try:
         legacy = api.Contracts.Options.TXO
-        raw_contracts = list(legacy.values()) if hasattr(legacy, 'values') else list(legacy)
+        # 部分 Shioaji 的動態契約容器對 hasattr/values 會回傳 KeyError；
+        # 直接迭代可同時處理新版 OptionInfo 與舊版 contract container。
+        raw_contracts = list(legacy)
         attempts.append((raw_contracts, "永豐 Shioaji 選擇權契約檔（相容模式）"))
-    except (AttributeError, TypeError):
+    except Exception:
         pass
 
     for raw_contracts, source in attempts:
@@ -1474,9 +1476,13 @@ def get_txo_option_contracts(api):
             if isinstance(contract, str):
                 try:
                     contract = api.contracts.get(contract)
-                except (AttributeError, TypeError):
+                except Exception:
                     continue
-            if getattr(contract, 'strike_price', None) is not None:
+            try:
+                has_strike = getattr(contract, 'strike_price', None) is not None
+            except Exception:
+                has_strike = False
+            if has_strike:
                 contracts.append(contract)
         if contracts:
             return contracts, source
