@@ -1726,6 +1726,143 @@ def get_txo_directional_quote(api, plan, expiry_choice):
     }
 
 
+def _taifex_number(value):
+    """Convert a TAIFEX table cell to float, retaining unavailable values as None."""
+    text = str(value).strip().replace(',', '')
+    if text in ('', '-', '—'):
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_taifex_txo_daily_quotes():
+    """Fetch official TXO daily rows as a fallback when Shioaji contracts are unavailable."""
+    try:
+        response = requests.get(
+            'https://www.taifex.com.tw/cht/3/optDailyMarketExcel?marketCode=1', timeout=15,
+        )
+        response.raise_for_status()
+        soup = BeautifulSoup(response.content, 'html.parser')
+        records = []
+        for row in soup.find_all('tr'):
+            cells = [cell.get_text(' ', strip=True) for cell in row.find_all(['td', 'th'])]
+            if len(cells) < 16 or cells[0] != 'TXO':
+                continue
+            expiry_text = str(cells[2]).strip()
+            try:
+                expiry = datetime.strptime(expiry_text, '%Y%m%d').date()
+            except ValueError:
+                continue
+            right = 'C' if cells[4].strip().lower() == 'call' else ('P' if cells[4].strip().lower() == 'put' else '')
+            strike = _taifex_number(cells[3])
+            if not right or strike is None:
+                continue
+            records.append({
+                'delivery_month': str(cells[1]).strip().upper(), 'expiry': expiry,
+                'strike': strike, 'right': right,
+                'last': _taifex_number(cells[8]), 'bid': _taifex_number(cells[14]),
+                'ask': _taifex_number(cells[15]),
+            })
+        return records
+    except (requests.RequestException, ValueError, TypeError):
+        return []
+
+
+def get_taifex_txo_records(expiry_choice):
+    """Return the requested expiry from official TAIFEX daily TXO rows."""
+    records = fetch_taifex_txo_daily_quotes()
+    target_specs = get_txo_target_contract_specs(expiry_choice)
+    if target_specs:
+        target = target_specs[0]
+        matches = [record for record in records if record['delivery_month'] == target['delivery_month']]
+        if matches:
+            return matches, target['expiry']
+        return [], None
+    today = datetime.now(pytz.timezone('Asia/Taipei')).date()
+    active = [record for record in records if record['expiry'] >= today]
+    if not active:
+        return [], None
+    expiry = min(record['expiry'] for record in active)
+    return [record for record in active if record['expiry'] == expiry], expiry
+
+
+def get_taifex_txo_directional_quote(plan, expiry_choice):
+    """Offer a delayed official-market fallback for a single BC/BP when Shioaji is unavailable."""
+    if plan is None or plan['direction'] not in ('偏多', '偏空'):
+        return None
+    records, expiry = get_taifex_txo_records(expiry_choice)
+    if not records:
+        return None
+    is_buy_call = plan['direction'] == '偏多'
+    right = 'C' if is_buy_call else 'P'
+    contracts = [record for record in records if record['right'] == right]
+    spot = plan['latest']
+    if is_buy_call:
+        candidates = [record for record in contracts if record['strike'] >= spot]
+        contract = min(candidates, key=lambda record: record['strike']) if candidates else None
+    else:
+        candidates = [record for record in contracts if record['strike'] <= spot]
+        contract = max(candidates, key=lambda record: record['strike']) if candidates else None
+    if contract is None:
+        return None
+    premium = contract['ask'] or contract['last']
+    dte = (expiry - datetime.now(pytz.timezone('Asia/Taipei')).date()).days
+    return {
+        'name': '買進 Call（BC）' if is_buy_call else '買進 Put（BP）',
+        'right': 'Call' if is_buy_call else 'Put', 'strike': contract['strike'],
+        'expiry': expiry, 'dte': dte, 'premium': premium,
+        'max_loss': premium * 50 if premium is not None else None,
+        'risk_level': '高' if dte <= 1 else ('中高' if dte <= 3 else '中'),
+        'source': '期交所每日選擇權行情備援（非永豐即時快照）',
+        'delivery_month': contract['delivery_month'],
+    }
+
+
+def get_taifex_txo_spread_quote(plan, expiry_choice):
+    """Offer a defined-risk TXO spread from official daily rows when needed."""
+    if plan is None or plan['direction'] not in ('偏多', '偏空'):
+        return None
+    records, expiry = get_taifex_txo_records(expiry_choice)
+    if not records:
+        return None
+    is_bull_put = plan['direction'] == '偏多'
+    right = 'P' if is_bull_put else 'C'
+    contracts = [record for record in records if record['right'] == right]
+    spot = plan['latest']
+    if is_bull_put:
+        desired = min(plan['invalidation'] - plan['zone_points'], spot - 1)
+        short_candidates = [record for record in contracts if record['strike'] <= desired]
+        short_contract = max(short_candidates, key=lambda record: record['strike']) if short_candidates else None
+        long_candidates = [record for record in contracts if short_contract and record['strike'] < short_contract['strike']]
+        long_contract = max(long_candidates, key=lambda record: record['strike']) if long_candidates else None
+    else:
+        desired = max(plan['invalidation'] + plan['zone_points'], spot + 1)
+        short_candidates = [record for record in contracts if record['strike'] >= desired]
+        short_contract = min(short_candidates, key=lambda record: record['strike']) if short_candidates else None
+        long_candidates = [record for record in contracts if short_contract and record['strike'] > short_contract['strike']]
+        long_contract = min(long_candidates, key=lambda record: record['strike']) if long_candidates else None
+    if short_contract is None or long_contract is None:
+        return None
+    short_premium = short_contract['bid'] or short_contract['last']
+    long_premium = long_contract['ask'] or long_contract['last']
+    credit = (short_premium - long_premium) * 50 if short_premium is not None and long_premium is not None else None
+    max_loss = abs(short_contract['strike'] - long_contract['strike']) * 50 - credit if credit is not None else abs(short_contract['strike'] - long_contract['strike']) * 50
+    dte = (expiry - datetime.now(pytz.timezone('Asia/Taipei')).date()).days
+    return {
+        'name': '賣權多頭價差（Bull Put Credit Spread）' if is_bull_put else '買權空頭價差（Bear Call Credit Spread）',
+        'right': 'Put' if is_bull_put else 'Call', 'short_strike': short_contract['strike'],
+        'long_strike': long_contract['strike'], 'expiry': expiry, 'dte': dte,
+        'short_premium': short_premium, 'long_premium': long_premium,
+        'net_credit': credit, 'max_loss': max_loss,
+        'risk_level': '高' if dte <= 1 else ('中高' if dte <= 3 else '中'),
+        'source': '期交所每日選擇權行情備援（非永豐即時快照）',
+        'delivery_month': short_contract['delivery_month'],
+    }
+
+
 def calculate_index_trade_plan(index_df, index_result, futures_df, futures_result):
     """Build a rule-based TAIEX futures plan from existing thermometer and Fibonacci data."""
     if futures_result is None or futures_df.empty:
@@ -6498,8 +6635,12 @@ with tab_fibo:
                 quote_plan = {**plan, 'latest': live_price}
                 if option_mode.startswith("價差單"):
                     option_quote = get_txo_spread_quote(st.session_state.get('sj_api'), quote_plan, expiry_choice)
+                    if option_quote is None:
+                        option_quote = get_taifex_txo_spread_quote(quote_plan, expiry_choice)
                 else:
                     option_quote = get_txo_directional_quote(st.session_state.get('sj_api'), quote_plan, expiry_choice)
+                    if option_quote is None:
+                        option_quote = get_taifex_txo_directional_quote(quote_plan, expiry_choice)
 
                 if option_quote and option_mode.startswith("價差單"):
                     option_title = f"{option_quote['name']}｜{option_quote['delivery_month']}｜{option_quote['expiry'].strftime('%Y/%m/%d')} 到期（剩 {option_quote['dte']} 天）"
