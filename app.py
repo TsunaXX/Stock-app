@@ -1313,6 +1313,119 @@ def calculate_market_temperature(df):
     }
 
 
+def get_futures_intraday_confirmation(api, direction):
+    """Return a simple 15-minute confirmation state for the trade-plan checklist."""
+    if api is None or not st.session_state.get('sj_logged_in', False):
+        return "尚未取得 15 分 K；進場前請確認價格在費波區止跌／受壓。", False
+    try:
+        intraday = fetch_shioaji_data(api, 'TWF=F', interval='15m', lookback_days=5)
+        intraday = intraday.dropna(subset=['Open', 'Close'])
+        if len(intraday) < 2:
+            return "15 分 K 資料不足，暫不觸發進場。", False
+        last = intraday.iloc[-1]
+        previous_close = float(intraday['Close'].iloc[-2])
+        is_up_bar = float(last['Close']) > float(last['Open']) and float(last['Close']) > previous_close
+        is_down_bar = float(last['Close']) < float(last['Open']) and float(last['Close']) < previous_close
+        if direction == '偏多':
+            return ("15 分 K 已出現止跌上收確認。" if is_up_bar else "等待 15 分 K 止跌上收確認。"), is_up_bar
+        if direction == '偏空':
+            return ("15 分 K 已出現受壓下收確認。" if is_down_bar else "等待 15 分 K 受壓下收確認。"), is_down_bar
+    except Exception:
+        pass
+    return "方向未明，暫不觸發進場。", False
+
+
+def calculate_index_trade_plan(index_df, index_result, futures_df, futures_result):
+    """Build a rule-based TAIEX futures plan from existing thermometer and Fibonacci data."""
+    if futures_result is None or futures_df.empty:
+        return None
+
+    now_tw = datetime.now(pytz.timezone('Asia/Taipei'))
+    is_night_session = now_tw.time() >= dt_time(15, 0) or now_tw.time() < dt_time(5, 0)
+    if is_night_session or index_result is None:
+        primary_df, primary_result, market_label = futures_df, futures_result, "臺股期貨（夜盤優先）"
+        direction = futures_result['status']
+        alignment_note = "夜盤以期貨日夜盤 K 與期貨溫度計判讀。"
+    elif index_result['status'] == futures_result['status']:
+        primary_df, primary_result, market_label = futures_df, futures_result, "加權／期貨一致"
+        direction = futures_result['status']
+        alignment_note = f"加權與期貨皆為「{direction}」，可等待費波位置確認。"
+    else:
+        primary_df, primary_result, market_label = futures_df, futures_result, "加權／期貨分歧"
+        direction = "觀望"
+        alignment_note = f"加權為「{index_result['status']}」、期貨為「{futures_result['status']}」，暫不建立方向部位。"
+
+    data = primary_df.dropna(subset=['High', 'Low', 'Close']).tail(60).copy()
+    if len(data) < 20:
+        return None
+    latest = float(data['Close'].iloc[-1])
+    swing_low = float(data['Low'].min())
+    swing_high = float(data['High'].max())
+    swing_range = swing_high - swing_low
+    if swing_range <= 0:
+        return None
+
+    ratios = [0.0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0]
+    levels = [swing_low + ratio * swing_range for ratio in ratios]
+    support_idx = max((i for i, level in enumerate(levels) if level <= latest), default=0)
+    resistance_idx = min((i for i, level in enumerate(levels) if level >= latest), default=len(levels) - 1)
+    support = levels[support_idx]
+    resistance = levels[resistance_idx]
+    prev_close = data['Close'].shift(1)
+    true_range = pd.concat([
+        data['High'] - data['Low'],
+        (data['High'] - prev_close).abs(),
+        (data['Low'] - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    atr = float(true_range.rolling(14, min_periods=10).mean().iloc[-1])
+    zone_points = max(20.0, (atr * 0.15) if np.isfinite(atr) else 20.0)
+
+    if direction == '偏多':
+        entry_level = support
+        invalidation = levels[max(0, support_idx - 1)] if support_idx > 0 else support - max(zone_points, atr * 0.5)
+        target = resistance if resistance > entry_level else levels[min(len(levels) - 1, support_idx + 1)]
+        action = "多方觀察"
+        action_color = "#ff4b4b"
+        trigger = f"價格回到 {entry_level:,.0f} ± {zone_points:,.0f} 點支撐區，且 15 分 K 止跌上收。"
+        option_name = "賣權多頭價差（Bull Put Spread）"
+        short_strike = int(math.floor((invalidation - zone_points) / 50) * 50)
+        long_strike = short_strike - 100
+    elif direction == '偏空':
+        entry_level = resistance
+        invalidation = levels[min(len(levels) - 1, resistance_idx + 1)] if resistance_idx < len(levels) - 1 else resistance + max(zone_points, atr * 0.5)
+        target = support if support < entry_level else levels[max(0, resistance_idx - 1)]
+        action = "空方觀察"
+        action_color = "#00c853"
+        trigger = f"價格反彈到 {entry_level:,.0f} ± {zone_points:,.0f} 點壓力區，且 15 分 K 受壓下收。"
+        option_name = "買權空頭價差（Bear Call Spread）"
+        short_strike = int(math.ceil((invalidation + zone_points) / 50) * 50)
+        long_strike = short_strike + 100
+    else:
+        entry_level = support
+        invalidation = support - max(zone_points, atr * 0.5)
+        target = resistance
+        action = "等待"
+        action_color = "#ffc107"
+        trigger = "加權與期貨方向分歧，或溫度為區間盤整；等待價格到區間邊緣再判讀。"
+        option_name = "不建立價差部位"
+        short_strike = long_strike = None
+
+    risk_points = max(0.0, abs(entry_level - invalidation))
+    reward_points = max(0.0, abs(target - entry_level))
+    return {
+        'market_label': market_label, 'alignment_note': alignment_note,
+        'direction': direction, 'action': action, 'action_color': action_color,
+        'latest': latest, 'swing_low': swing_low, 'swing_high': swing_high,
+        'support': support, 'resistance': resistance, 'entry_level': entry_level,
+        'invalidation': invalidation, 'target': target, 'zone_points': zone_points,
+        'trigger': trigger, 'risk_points': risk_points, 'reward_points': reward_points,
+        'rr_ratio': (reward_points / risk_points) if risk_points > 0 else None,
+        'micro_risk_1': risk_points * 10, 'micro_risk_2': risk_points * 20,
+        'option_name': option_name, 'short_strike': short_strike,
+        'long_strike': long_strike, 'max_spread_risk_before_credit': (abs(short_strike - long_strike) * 50) if short_strike is not None else None,
+    }
+
+
 def build_market_temperature_gauge(label, result):
     fig = go.Figure(go.Indicator(
         mode="gauge+number",
@@ -5858,7 +5971,85 @@ with tab_fibo:
                 st.session_state[key] = f"{best_match[0]}({best_match[1]})"
         save_fibo_config()
     
-    tab_fibo_thermometer, tab_fibo_chart, tab_fibo_manual = st.tabs(["🌡️ 市場溫度計", "📊 費波圖表", "🧮 手動費波"])
+    tab_trade_plan, tab_fibo_thermometer, tab_fibo_chart, tab_fibo_manual = st.tabs([
+        "🧭 指數操作計畫", "🌡️ 市場溫度計", "📊 費波圖表", "🧮 手動費波"
+    ])
+
+    thermometer_specs = [
+        ("加權股價指數", "^TWII"),
+        ("臺股期貨", "TWF=F"),
+    ]
+    thermometer_data = []
+    for label, code in thermometer_specs:
+        temp_df, source = fetch_market_temperature_data(code)
+        result = calculate_market_temperature(temp_df)
+        thermometer_data.append((label, code, temp_df, source, result))
+
+    with tab_trade_plan:
+        st.subheader("指數操作計畫")
+        st.caption("以市場溫度決定方向、以 60 日費波區規畫進出，並以 15 分 K 作為確認條件。這是規則型觀察工具，不是自動下單或投資建議。")
+        index_item = next((item for item in thermometer_data if item[1] == '^TWII'), None)
+        futures_item = next((item for item in thermometer_data if item[1] == 'TWF=F'), None)
+        plan = calculate_index_trade_plan(
+            index_item[2] if index_item else pd.DataFrame(), index_item[4] if index_item else None,
+            futures_item[2] if futures_item else pd.DataFrame(), futures_item[4] if futures_item else None,
+        )
+        if plan is None:
+            st.warning("目前缺少足夠的加權或期貨日 K，暫時無法建立操作計畫。")
+        else:
+            confirmation_text, is_confirmed = get_futures_intraday_confirmation(
+                st.session_state.get('sj_api'), plan['direction']
+            )
+            st.markdown(
+                f"""<div style='border-left:5px solid {plan['action_color']};background:#151a22;padding:14px 18px;border-radius:7px;margin-bottom:12px'>
+                <div style='font-size:14px;color:#b7c0cc'>{plan['market_label']}</div>
+                <div style='font-size:26px;font-weight:800;color:{plan['action_color']}'>{plan['action']}</div>
+                <div style='font-size:14px;color:#dfe6e9;margin-top:4px'>{plan['alignment_note']}</div>
+                </div>""", unsafe_allow_html=True
+            )
+            p1, p2, p3, p4 = st.columns(4)
+            p1.metric("最新期貨", f"{plan['latest']:,.0f}")
+            p2.metric("費波支撐", f"{plan['support']:,.0f}")
+            p3.metric("費波壓力", f"{plan['resistance']:,.0f}")
+            p4.metric("費波區寬", f"± {plan['zone_points']:,.0f} 點")
+
+            st.markdown("#### 進出依據")
+            st.info(f"**進場確認：** {plan['trigger']}")
+            c_entry, c_stop, c_target, c_rr = st.columns(4)
+            c_entry.metric("觀察進場區", f"{plan['entry_level']:,.0f}")
+            c_stop.metric("失效／停損", f"{plan['invalidation']:,.0f}")
+            c_target.metric("第一目標", f"{plan['target']:,.0f}")
+            c_rr.metric("預估風報比", f"1 : {plan['rr_ratio']:.2f}" if plan['rr_ratio'] is not None else "—")
+            if plan['direction'] in ('偏多', '偏空'):
+                if is_confirmed:
+                    st.success(f"15 分 K：{confirmation_text} 仍須確認價格位於觀察進場區。")
+                else:
+                    st.warning(f"15 分 K：{confirmation_text} 目前僅列為觀察，不觸發進場。")
+            else:
+                st.info("目前不建立方向部位；等待加權與期貨方向一致，且價格靠近支撐或壓力。")
+
+            st.markdown("#### 微型臺指風險換算")
+            st.caption("以觀察進場區到失效點計算；微台每點 10 元。僅在停損可承受且風報比足夠時考慮操作。")
+            r1, r2, r3 = st.columns(3)
+            r1.metric("停損距離", f"{plan['risk_points']:,.0f} 點")
+            r2.metric("1 口最大風險", f"${plan['micro_risk_1']:,.0f}")
+            r3.metric("2 口最大風險", f"${plan['micro_risk_2']:,.0f}")
+
+            st.markdown("#### 到期週選擇權：限定風險價差")
+            if plan['short_strike'] is None:
+                st.info("方向尚未一致，不建立選擇權價差。避免在區間中段或訊號分歧時收權利金。")
+            else:
+                short_leg = "賣出" if plan['direction'] == '偏多' else "賣出"
+                long_leg = "買進"
+                option_side = "Put" if plan['direction'] == '偏多' else "Call"
+                st.markdown(
+                    f"**{plan['option_name']}：** {short_leg} {plan['short_strike']:,} {option_side}，"
+                    f"{long_leg} {plan['long_strike']:,} {option_side}。"
+                )
+                st.caption(
+                    f"履約價差 100 點；未扣淨權利金的最大風險上限約 ${plan['max_spread_risk_before_credit']:,.0f}／組。"
+                    "到期週 Gamma 與流動性風險較高，若 15 分 K 有效突破失效點應優先退出，不留裸賣部位。"
+                )
 
     with tab_fibo_thermometer:
         title_col, refresh_col = st.columns([6, 1])
@@ -5868,16 +6059,6 @@ with tab_fibo:
         with refresh_col:
             if st.button("🔄 更新", key="refresh_market_temperature", width='stretch'):
                 st.rerun()
-
-        thermometer_specs = [
-            ("加權股價指數", "^TWII"),
-            ("臺股期貨", "TWF=F"),
-        ]
-        thermometer_data = []
-        for label, code in thermometer_specs:
-            temp_df, source = fetch_market_temperature_data(code)
-            result = calculate_market_temperature(temp_df)
-            thermometer_data.append((label, code, temp_df, source, result))
 
         gauge_cols = st.columns(2)
         summary_rows = []
