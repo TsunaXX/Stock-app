@@ -10,6 +10,7 @@ import itertools
 import json
 import re
 import html
+from types import SimpleNamespace
 from datetime import datetime, time as dt_time, timedelta, date
 import pytz
 from decimal import Decimal, ROUND_HALF_UP
@@ -1481,12 +1482,38 @@ def get_txo_target_contract_specs(expiry_choice, today=None):
 
 
 def get_txo_option_contracts(api, requested_delivery_months=None):
-    """Load current TXO option contracts from SinoPac Shioaji, with legacy fallback."""
+    """Load only requested TXO contracts first, following the Shioaji contract API."""
     if api is None:
         return [], "永豐 Shioaji 尚未登入"
 
     attempts = []
+    # Shioaji 1.7 documents a filtered options endpoint.  Querying it first avoids
+    # downloading the entire TXO contract universe just to find one weekly expiry.
     for delivery_month in requested_delivery_months or []:
+        try:
+            response = requests.get(
+                'http://127.0.0.1:8080/api/v1/data/contracts/options',
+                params={'root': 'TXO', 'delivery_month': delivery_month}, timeout=2,
+            )
+            if response.status_code == 200:
+                payload = response.json()
+                if isinstance(payload, dict):
+                    payload = payload.get('contracts', payload.get('data', []))
+                if isinstance(payload, list) and payload:
+                    compact_contracts = []
+                    for item in payload:
+                        if not isinstance(item, dict) or not item.get('code'):
+                            continue
+                        try:
+                            shioaji_contract = api.contracts.get(item['code'])
+                        except Exception:
+                            shioaji_contract = None
+                        if shioaji_contract is not None:
+                            compact_contracts.append(SimpleNamespace(**item, shioaji_contract=shioaji_contract))
+                    if compact_contracts:
+                        attempts.append((compact_contracts, f"永豐 Shioaji 指定契約 API（{delivery_month}）"))
+        except (requests.RequestException, ValueError, TypeError):
+            pass
         try:
             filtered_contracts = list(api.contracts.options('TXO', delivery_month=delivery_month))
             if filtered_contracts:
@@ -1494,8 +1521,10 @@ def get_txo_option_contracts(api, requested_delivery_months=None):
         except Exception:
             # 某些舊版 SDK 不支援 options(..., delivery_month=...)，下面改用完整契約檔篩選。
             pass
+    # The documented Python SDK form is options("TXO").  It is retained as a
+    # compatibility fallback when the optional local filtered endpoint is absent.
     try:
-        attempts.append((list(api.contracts.options('TXO')), "永豐 Shioaji 選擇權契約檔"))
+        attempts.append((list(api.contracts.options('TXO')), "永豐 Shioaji 選擇權契約檔（完整商品根目錄備援）"))
     except Exception:
         pass
     try:
@@ -1541,6 +1570,12 @@ def select_txo_expiry(api, expiry_choice):
     options, source = get_txo_option_contracts(api, requested_delivery_months)
     today = datetime.now(pytz.timezone('Asia/Taipei')).date()
 
+    def save_diagnostic(message):
+        try:
+            st.session_state['txo_contract_diagnostic'] = message
+        except Exception:
+            pass
+
     def expiry_date(contract):
         value = getattr(contract, 'delivery_date', getattr(contract, 'last_trading_date', None))
         try:
@@ -1566,6 +1601,7 @@ def select_txo_expiry(api, expiry_choice):
     for spec in target_specs:
         exact_contracts = [contract for contract in options if delivery_month(contract) == spec['delivery_month']]
         if exact_contracts:
+            save_diagnostic(f"{source}｜已取得 {len(exact_contracts)} 筆 {spec['delivery_month']} 契約")
             return exact_contracts, spec['expiry'], source
 
     active = [(contract, expiry_date(contract)) for contract in options]
@@ -1577,10 +1613,16 @@ def select_txo_expiry(api, expiry_choice):
     elif expiry_choice == '月選':
         active = [(contract, expiry) for contract, expiry in active if is_monthly(contract, expiry)]
     if not active:
+        available_months = sorted({delivery_month(contract) for contract in options if delivery_month(contract)})
+        available_text = '、'.join(available_months[:8]) if available_months else '無可辨識交割月份'
+        expected_text = '、'.join(requested_delivery_months) if requested_delivery_months else '最近到期'
+        save_diagnostic(f"{source}｜共取得 {len(options)} 筆 TXO 契約｜預期 {expected_text}｜實際可見：{available_text}")
         return [], None, source
 
     selected_expiry = min(expiry for _, expiry in active)
-    return [contract for contract, expiry in active if expiry == selected_expiry], selected_expiry, source
+    selected_contracts = [contract for contract, expiry in active if expiry == selected_expiry]
+    save_diagnostic(f"{source}｜已取得 {len(selected_contracts)} 筆 {selected_expiry:%Y/%m/%d} 到期契約")
+    return selected_contracts, selected_expiry, source
 
 
 def txo_right_value(contract):
@@ -1597,7 +1639,8 @@ def get_txo_snapshot_prices(api, contracts, sides):
     """Read executable-side option prices from Shioaji snapshots, falling back to close."""
     prices = [None] * len(contracts)
     try:
-        snapshots = api.snapshots(contracts)
+        snapshot_contracts = [getattr(contract, 'shioaji_contract', contract) for contract in contracts]
+        snapshots = api.snapshots(snapshot_contracts)
         for index, (snapshot, side) in enumerate(zip(snapshots, sides)):
             field = 'buy_price' if side == 'sell' else 'sell_price'
             price = float(getattr(snapshot, field, 0) or getattr(snapshot, 'close', 0) or 0)
@@ -6508,6 +6551,10 @@ with tab_fibo:
                         f"永豐 Shioaji 尚未取得 {expiry_choice}（預期 `{expected_contract}`） 的可用選擇權契約／報價，暫不推薦單買 {operation}。"
                         "請確認已登入期貨帳戶，並在交易日重新載入永豐契約檔。"
                     )
+                if not option_quote:
+                    diagnostic = st.session_state.get('txo_contract_diagnostic')
+                    if diagnostic:
+                        st.caption(f"契約讀取診斷：{diagnostic}")
 
     with tab_fibo_thermometer:
         title_col, refresh_col = st.columns([6, 1])
