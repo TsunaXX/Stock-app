@@ -1454,34 +1454,58 @@ def calculate_short_wave_plan(api, direction):
 
 def get_txo_target_contract_specs(expiry_choice, today=None):
     """Return TAIFEX delivery-month keys and settlement dates for a requested expiry."""
-    today = today or datetime.now(pytz.timezone('Asia/Taipei')).date()
+    now_tw = datetime.now(pytz.timezone('Asia/Taipei'))
+    today = today or now_tw.date()
+    passed_expiry_cutoff = today == now_tw.date() and now_tw.time() >= dt_time(13, 30)
 
     def next_weekday(weekday):
-        return today + timedelta(days=(weekday - today.weekday()) % 7)
+        days_ahead = (weekday - today.weekday()) % 7
+        if days_ahead == 0 and passed_expiry_cutoff:
+            days_ahead = 7
+        return today + timedelta(days=days_ahead)
 
     def week_of_month(value):
         return (value.day - 1) // 7 + 1
 
-    if expiry_choice == '週三選':
+    def wednesday_spec():
         expiry = next_weekday(2)
-        return [{'delivery_month': f"{expiry:%Y%m}W{week_of_month(expiry)}", 'expiry': expiry}]
-    if expiry_choice == '週五選':
+        week = week_of_month(expiry)
+        root_map = {1: 'TX1', 2: 'TX2', 4: 'TX4', 5: 'TX5'}
+        # 第三個星期三是月選，不是週選。
+        if week == 3:
+            expiry += timedelta(days=7)
+            week = week_of_month(expiry)
+        return {'root': root_map[week], 'delivery_month': f"{expiry:%Y%m}W{week}", 'expiry': expiry}
+
+    def friday_spec():
         expiry = next_weekday(4)
-        return [{'delivery_month': f"{expiry:%Y%m}F{week_of_month(expiry)}", 'expiry': expiry}]
-    if expiry_choice == '月選':
+        week = week_of_month(expiry)
+        root_map = {1: 'TXU', 2: 'TXV', 3: 'TXX', 4: 'TXY', 5: 'TXZ'}
+        return {'root': root_map[week], 'delivery_month': f"{expiry:%Y%m}F{week}", 'expiry': expiry}
+
+    def monthly_spec():
         year, month = today.year, today.month
         first_day = date(year, month, 1)
         first_wednesday = first_day + timedelta(days=(2 - first_day.weekday()) % 7)
         expiry = first_wednesday + timedelta(days=14)
-        if expiry < today:
+        if expiry < today or (expiry == today and passed_expiry_cutoff):
             next_month = date(year + (month == 12), 1 if month == 12 else month + 1, 1)
             first_wednesday = next_month + timedelta(days=(2 - next_month.weekday()) % 7)
             expiry = first_wednesday + timedelta(days=14)
-        return [{'delivery_month': f"{expiry:%Y%m}", 'expiry': expiry}]
+        return {'root': 'TXO', 'delivery_month': f"{expiry:%Y%m}", 'expiry': expiry}
+
+    if expiry_choice == '週三選':
+        return [wednesday_spec()]
+    if expiry_choice == '週五選':
+        return [friday_spec()]
+    if expiry_choice == '月選':
+        return [monthly_spec()]
+    if expiry_choice == '最近到期':
+        return sorted([wednesday_spec(), friday_spec(), monthly_spec()], key=lambda item: item['expiry'])
     return []
 
 
-def get_txo_option_contracts(api, requested_delivery_months=None):
+def get_txo_option_contracts(api, requested_specs=None):
     """Load only requested TXO contracts first, following the Shioaji contract API."""
     if api is None:
         return [], "永豐 Shioaji 尚未登入"
@@ -1489,11 +1513,14 @@ def get_txo_option_contracts(api, requested_delivery_months=None):
     attempts = []
     # Shioaji 1.7 documents a filtered options endpoint.  Querying it first avoids
     # downloading the entire TXO contract universe just to find one weekly expiry.
-    for delivery_month in requested_delivery_months or []:
+    specs = requested_specs or [{'root': 'TXO', 'delivery_month': None}]
+    for spec in specs:
+        root = spec['root']
+        delivery_month = spec.get('delivery_month')
         try:
             response = requests.get(
                 'http://127.0.0.1:8080/api/v1/data/contracts/options',
-                params={'root': 'TXO', 'delivery_month': delivery_month}, timeout=2,
+                params={'root': root, 'delivery_month': delivery_month}, timeout=2,
             )
             if response.status_code == 200:
                 payload = response.json()
@@ -1511,30 +1538,28 @@ def get_txo_option_contracts(api, requested_delivery_months=None):
                         if shioaji_contract is not None:
                             compact_contracts.append(SimpleNamespace(**item, shioaji_contract=shioaji_contract))
                     if compact_contracts:
-                        attempts.append((compact_contracts, f"永豐 Shioaji 指定契約 API（{delivery_month}）"))
+                        attempts.append((compact_contracts, f"永豐 Shioaji {root} 指定契約 API（{delivery_month}）"))
         except (requests.RequestException, ValueError, TypeError):
             pass
         try:
-            filtered_contracts = list(api.contracts.options('TXO', delivery_month=delivery_month))
+            filtered_contracts = list(api.contracts.options(root, delivery_month=delivery_month))
             if filtered_contracts:
-                attempts.append((filtered_contracts, f"永豐 Shioaji TXO {delivery_month} 契約檔"))
+                attempts.append((filtered_contracts, f"永豐 Shioaji {root} {delivery_month} 契約檔"))
         except Exception:
             # 某些舊版 SDK 不支援 options(..., delivery_month=...)，下面改用完整契約檔篩選。
             pass
-    # The documented Python SDK form is options("TXO").  It is retained as a
-    # compatibility fallback when the optional local filtered endpoint is absent.
-    try:
-        attempts.append((list(api.contracts.options('TXO')), "永豐 Shioaji 選擇權契約檔（完整商品根目錄備援）"))
-    except Exception:
-        pass
-    try:
-        legacy = api.Contracts.Options.TXO
-        # 部分 Shioaji 的動態契約容器對 hasattr/values 會回傳 KeyError；
-        # 直接迭代可同時處理新版 OptionInfo 與舊版 contract container。
-        raw_contracts = list(legacy)
-        attempts.append((raw_contracts, "永豐 Shioaji 選擇權契約檔（相容模式）"))
-    except Exception:
-        pass
+    for root in dict.fromkeys(spec['root'] for spec in specs):
+        # 官方 Python SDK：每個商品 root 分開查詢，避免把週選誤查成 TXO 月選。
+        try:
+            attempts.append((list(api.contracts.options(root)), f"永豐 Shioaji {root} 商品根目錄"))
+        except Exception:
+            pass
+        try:
+            legacy = getattr(api.Contracts.Options, root)
+            raw_contracts = list(legacy)
+            attempts.append((raw_contracts, f"永豐 Shioaji {root} 契約檔（相容模式）"))
+        except Exception:
+            pass
 
     for raw_contracts, source in attempts:
         contracts = []
@@ -1567,7 +1592,7 @@ def select_txo_expiry(api, expiry_choice):
     """
     target_specs = get_txo_target_contract_specs(expiry_choice)
     requested_delivery_months = [item['delivery_month'] for item in target_specs]
-    options, source = get_txo_option_contracts(api, requested_delivery_months)
+    options, source = get_txo_option_contracts(api, target_specs)
     today = datetime.now(pytz.timezone('Asia/Taipei')).date()
 
     def save_diagnostic(message):
@@ -1616,7 +1641,7 @@ def select_txo_expiry(api, expiry_choice):
         available_months = sorted({delivery_month(contract) for contract in options if delivery_month(contract)})
         available_text = '、'.join(available_months[:8]) if available_months else '無可辨識交割月份'
         expected_text = '、'.join(requested_delivery_months) if requested_delivery_months else '最近到期'
-        save_diagnostic(f"{source}｜共取得 {len(options)} 筆 TXO 契約｜預期 {expected_text}｜實際可見：{available_text}")
+        save_diagnostic(f"{source}｜共取得 {len(options)} 筆選擇權契約｜預期 {expected_text}｜實際可見：{available_text}")
         return [], None, source
 
     selected_expiry = min(expiry for _, expiry in active)
@@ -6626,7 +6651,7 @@ with tab_fibo:
                 expected_contract = target_specs[0]['delivery_month'] if target_specs else "依永豐最近到期契約"
                 if target_specs:
                     st.caption(
-                        f"目標契約：`{expected_contract}`｜預定到期日：{target_specs[0]['expiry'].strftime('%Y/%m/%d')}"
+                        f"永豐商品根：`{target_specs[0]['root']}`｜目標契約：`{expected_contract}`｜預定到期日：{target_specs[0]['expiry'].strftime('%Y/%m/%d')}"
                         f"｜剩餘 {(target_specs[0]['expiry'] - datetime.now(pytz.timezone('Asia/Taipei')).date()).days} 天"
                     )
                 option_mode = st.radio(
@@ -6638,12 +6663,8 @@ with tab_fibo:
                 quote_plan = {**plan, 'latest': live_price}
                 if option_mode.startswith("價差單"):
                     option_quote = get_txo_spread_quote(st.session_state.get('sj_api'), quote_plan, expiry_choice)
-                    if option_quote is None:
-                        option_quote = get_taifex_txo_spread_quote(quote_plan, expiry_choice)
                 else:
                     option_quote = get_txo_directional_quote(st.session_state.get('sj_api'), quote_plan, expiry_choice)
-                    if option_quote is None:
-                        option_quote = get_taifex_txo_directional_quote(quote_plan, expiry_choice)
 
                 if option_quote and option_mode.startswith("價差單"):
                     option_title = f"{option_quote['name']}｜{option_quote['delivery_month']}｜{option_quote['expiry'].strftime('%Y/%m/%d')} 到期（剩 {option_quote['dte']} 天）"
@@ -6685,13 +6706,9 @@ with tab_fibo:
                         f"資料來源：{option_quote['source']}（契約與報價）。"
                     )
                 elif option_mode.startswith("價差單"):
-                    option_side = "Put" if plan['direction'] == '偏多' else "Call"
-                    st.info(
-                        f"永豐 Shioaji 尚未取得 {expiry_choice}（預期 `{expected_contract}`） 的可用選擇權契約／報價；暫以費波失效點外的預備履約價觀察："
-                        f"賣出 {plan['short_strike']:,} {option_side}、買進 {plan['long_strike']:,} {option_side}。"
-                    )
-                    st.caption(
-                        f"履約價差 100 點；未扣淨權利金的最大風險上限約 ${plan['max_spread_risk_before_credit']:,.0f}／組。"
+                    st.warning(
+                        f"永豐 Shioaji 尚未取得 {expiry_choice}（預期 `{expected_contract}`）的夜盤即時契約／報價，"
+                        "本次不提供價差單履約價與權利金建議，避免使用日盤資料造成誤判。"
                     )
                 else:
                     operation = "BC（買進 Call）" if plan['direction'] == '偏多' else "BP（買進 Put）"
