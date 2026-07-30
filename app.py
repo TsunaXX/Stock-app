@@ -1451,54 +1451,111 @@ def calculate_short_wave_plan(api, direction):
         return None
 
 
-def get_txo_spread_quote(api, plan, expiry_choice):
-    """Find an OTM defined-risk TXO spread and conservatively price both legs."""
-    if api is None or plan is None or plan['direction'] not in ('偏多', '偏空'):
-        return None
-    try:
-        options = list(api.contracts.options('TXO'))
-    except (AttributeError, TypeError):
-        try:
-            options = list(api.Contracts.Options.TXO)
-        except (AttributeError, TypeError):
-            return None
+def get_txo_option_contracts(api):
+    """Load current TXO option contracts from SinoPac Shioaji, with legacy fallback."""
+    if api is None:
+        return [], "永豐 Shioaji 尚未登入"
 
+    attempts = []
+    try:
+        attempts.append((list(api.contracts.options('TXO')), "永豐 Shioaji 選擇權契約檔"))
+    except (AttributeError, TypeError):
+        pass
+    try:
+        legacy = api.Contracts.Options.TXO
+        raw_contracts = list(legacy.values()) if hasattr(legacy, 'values') else list(legacy)
+        attempts.append((raw_contracts, "永豐 Shioaji 選擇權契約檔（相容模式）"))
+    except (AttributeError, TypeError):
+        pass
+
+    for raw_contracts, source in attempts:
+        contracts = []
+        for contract in raw_contracts:
+            if isinstance(contract, str):
+                try:
+                    contract = api.contracts.get(contract)
+                except (AttributeError, TypeError):
+                    continue
+            if getattr(contract, 'strike_price', None) is not None:
+                contracts.append(contract)
+        if contracts:
+            return contracts, source
+    return [], "永豐 Shioaji 未提供 TXO 選擇權契約檔"
+
+
+def select_txo_expiry(api, expiry_choice):
+    """Choose the nearest requested TXO expiry using the contract delivery date.
+
+    Delivery dates are used as the primary filter because they remain stable across
+    Shioaji SDK versions, unlike enum/string representations of expiry metadata.
+    """
+    options, source = get_txo_option_contracts(api)
     today = datetime.now(pytz.timezone('Asia/Taipei')).date()
+
     def expiry_date(contract):
         value = getattr(contract, 'delivery_date', getattr(contract, 'last_trading_date', None))
         try:
             return pd.Timestamp(value).date()
         except (TypeError, ValueError):
             return None
-    def right_value(contract):
-        right = getattr(contract, 'option_right', '')
-        value = str(getattr(right, 'value', right)).upper()
-        if value in ('P', 'PUT') or value.endswith('.PUT'):
-            return 'P'
-        if value in ('C', 'CALL') or value.endswith('.CALL'):
-            return 'C'
-        return value
-    def is_weekday(contract, weekday):
-        value = str(getattr(getattr(contract, 'expiry_weekday', ''), 'value', getattr(contract, 'expiry_weekday', ''))).lower()
-        return weekday in value
-    def is_monthly(contract):
-        value = getattr(contract, 'week_of_month', 0)
-        normalized = str(getattr(value, 'value', value)).lower()
-        return normalized in ('3', 'third') or normalized.endswith('.third')
-    active = [c for c in options if expiry_date(c) is not None and expiry_date(c) >= today]
+
+    def is_monthly(contract, expiry):
+        week_value = getattr(contract, 'week_of_month', None)
+        normalized = str(getattr(week_value, 'value', week_value)).lower()
+        if normalized in ('3', 'third') or normalized.endswith('.third'):
+            return True
+        return expiry.weekday() == 2 and 15 <= expiry.day <= 21
+
+    active = [(contract, expiry_date(contract)) for contract in options]
+    active = [(contract, expiry) for contract, expiry in active if expiry is not None and expiry >= today]
     if expiry_choice == '週三選':
-        active = [c for c in active if is_weekday(c, 'wed') and not is_monthly(c)]
+        active = [(contract, expiry) for contract, expiry in active if expiry.weekday() == 2 and not is_monthly(contract, expiry)]
     elif expiry_choice == '週五選':
-        active = [c for c in active if is_weekday(c, 'fri')]
+        active = [(contract, expiry) for contract, expiry in active if expiry.weekday() == 4]
     elif expiry_choice == '月選':
-        active = [c for c in active if is_monthly(c)]
+        active = [(contract, expiry) for contract, expiry in active if is_monthly(contract, expiry)]
     if not active:
+        return [], None, source
+
+    selected_expiry = min(expiry for _, expiry in active)
+    return [contract for contract, expiry in active if expiry == selected_expiry], selected_expiry, source
+
+
+def txo_right_value(contract):
+    right = getattr(contract, 'option_right', '')
+    value = str(getattr(right, 'value', right)).upper()
+    if value in ('P', 'PUT') or value.endswith('.PUT'):
+        return 'P'
+    if value in ('C', 'CALL') or value.endswith('.CALL'):
+        return 'C'
+    return value
+
+
+def get_txo_snapshot_prices(api, contracts, sides):
+    """Read executable-side option prices from Shioaji snapshots, falling back to close."""
+    prices = [None] * len(contracts)
+    try:
+        snapshots = api.snapshots(contracts)
+        for index, (snapshot, side) in enumerate(zip(snapshots, sides)):
+            field = 'buy_price' if side == 'sell' else 'sell_price'
+            price = float(getattr(snapshot, field, 0) or getattr(snapshot, 'close', 0) or 0)
+            prices[index] = price if price > 0 else None
+    except Exception:
+        pass
+    return prices
+
+
+def get_txo_spread_quote(api, plan, expiry_choice):
+    """Find an OTM defined-risk credit spread for the selected TXO expiry."""
+    if api is None or plan is None or plan['direction'] not in ('偏多', '偏空'):
         return None
-    selected_expiry = min(expiry_date(c) for c in active)
-    expiry_options = [c for c in active if expiry_date(c) == selected_expiry]
+    expiry_options, selected_expiry, source = select_txo_expiry(api, expiry_choice)
+    if not expiry_options:
+        return None
+
     is_bull_put = plan['direction'] == '偏多'
     right = 'P' if is_bull_put else 'C'
-    contracts = [c for c in expiry_options if right_value(c) == right]
+    contracts = [contract for contract in expiry_options if txo_right_value(contract) == right]
     spot = plan['latest']
     if is_bull_put:
         desired = min(plan['invalidation'] - plan['zone_points'], spot - 1)
@@ -1515,25 +1572,52 @@ def get_txo_spread_quote(api, plan, expiry_choice):
     if short_contract is None or long_contract is None:
         return None
 
-    short_price = long_price = None
-    try:
-        snapshots = api.snapshots([short_contract, long_contract])
-        if len(snapshots) == 2:
-            short_price = float(getattr(snapshots[0], 'buy_price', 0) or getattr(snapshots[0], 'close', 0) or 0)
-            long_price = float(getattr(snapshots[1], 'sell_price', 0) or getattr(snapshots[1], 'close', 0) or 0)
-    except Exception:
-        pass
+    short_price, long_price = get_txo_snapshot_prices(api, [short_contract, long_contract], ['sell', 'buy'])
     width = abs(float(short_contract.strike_price) - float(long_contract.strike_price))
     credit = ((short_price - long_price) * 50) if short_price is not None and long_price is not None else None
     max_loss = width * 50 - credit if credit is not None else width * 50
-    dte = (selected_expiry - today).days
+    dte = (selected_expiry - datetime.now(pytz.timezone('Asia/Taipei')).date()).days
     return {
-        'name': '賣權多頭價差（BP）' if is_bull_put else '買權空頭價差（BC）',
+        'name': '賣權多頭價差（Bull Put Credit Spread）' if is_bull_put else '買權空頭價差（Bear Call Credit Spread）',
         'right': 'Put' if is_bull_put else 'Call', 'short_contract': short_contract,
         'long_contract': long_contract, 'short_strike': float(short_contract.strike_price),
         'long_strike': float(long_contract.strike_price), 'expiry': selected_expiry,
         'dte': dte, 'short_premium': short_price, 'long_premium': long_price,
         'net_credit': credit, 'max_loss': max_loss, 'risk_level': '高' if dte <= 1 else ('中高' if dte <= 3 else '中'),
+        'source': source,
+    }
+
+
+def get_txo_directional_quote(api, plan, expiry_choice):
+    """Find the nearest OTM buy-call (BC) or buy-put (BP) from SinoPac data."""
+    if api is None or plan is None or plan['direction'] not in ('偏多', '偏空'):
+        return None
+    expiry_options, selected_expiry, source = select_txo_expiry(api, expiry_choice)
+    if not expiry_options:
+        return None
+
+    is_buy_call = plan['direction'] == '偏多'
+    right = 'C' if is_buy_call else 'P'
+    contracts = [contract for contract in expiry_options if txo_right_value(contract) == right]
+    spot = plan['latest']
+    if is_buy_call:
+        candidates = [c for c in contracts if float(getattr(c, 'strike_price', 0)) >= spot]
+        contract = min(candidates, key=lambda c: float(c.strike_price)) if candidates else None
+    else:
+        candidates = [c for c in contracts if float(getattr(c, 'strike_price', 0)) <= spot]
+        contract = max(candidates, key=lambda c: float(c.strike_price)) if candidates else None
+    if contract is None:
+        return None
+
+    premium = get_txo_snapshot_prices(api, [contract], ['buy'])[0]
+    dte = (selected_expiry - datetime.now(pytz.timezone('Asia/Taipei')).date()).days
+    return {
+        'name': '買進 Call（BC）' if is_buy_call else '買進 Put（BP）',
+        'right': 'Call' if is_buy_call else 'Put', 'contract': contract,
+        'strike': float(contract.strike_price), 'expiry': selected_expiry, 'dte': dte,
+        'premium': premium, 'max_loss': premium * 50 if premium is not None else None,
+        'risk_level': '高' if dte <= 1 else ('中高' if dte <= 3 else '中'),
+        'source': source,
     }
 
 
@@ -6285,17 +6369,27 @@ with tab_fibo:
             else:
                 st.warning("暫時無法取得交易所保證金資料；下單前請在期貨商系統確認微台原始保證金。")
 
-            st.markdown("#### 到期週選擇權：限定風險價差")
+            st.markdown("#### 到期週選擇權操作")
             if plan['short_strike'] is None:
-                st.info("方向尚未一致，不建立選擇權價差。避免在區間中段或訊號分歧時收權利金。")
+                st.info("方向尚未一致，不建立選擇權操作。避免在區間中段或訊號分歧時進場。")
             else:
                 expiry_choice = st.selectbox(
                     "到期別", ["最近到期", "週三選", "週五選", "月選"], key="trade_plan_expiry_choice",
-                    help="系統會在所選到期別中，挑選位於費波失效點外、且仍為價外的履約價。"
+                    help="週三／週五／月選均由永豐 Shioaji 的 TXO 契約到期日篩選；預設挑選最近可交易到期日。"
+                )
+                option_mode = st.radio(
+                    "操作方式",
+                    ["價差單（限定風險，偏結算）", "單買 BC／BP（低成本高波動，短線）"],
+                    horizontal=True,
+                    key="trade_plan_option_mode",
                 )
                 quote_plan = {**plan, 'latest': live_price}
-                option_quote = get_txo_spread_quote(st.session_state.get('sj_api'), quote_plan, expiry_choice)
-                if option_quote:
+                if option_mode.startswith("價差單"):
+                    option_quote = get_txo_spread_quote(st.session_state.get('sj_api'), quote_plan, expiry_choice)
+                else:
+                    option_quote = get_txo_directional_quote(st.session_state.get('sj_api'), quote_plan, expiry_choice)
+
+                if option_quote and option_mode.startswith("價差單"):
                     option_title = f"{option_quote['name']}｜{option_quote['expiry'].strftime('%Y/%m/%d')} 到期（剩 {option_quote['dte']} 天）"
                     st.markdown(f"**{option_title}**")
                     o1, o2, o3, o4 = st.columns(4)
@@ -6313,14 +6407,37 @@ with tab_fibo:
                         f"風險指標：{option_quote['risk_level']}；{premium_detail} 到期週 Gamma 風險高，"
                         "價格有效跌破／突破日線失效點時應優先退出，絕不留裸賣部位。"
                     )
-                else:
+                    st.caption(f"資料來源：{option_quote['source']}（契約與即時快照）")
+                elif option_quote:
+                    option_title = f"{option_quote['name']}｜{option_quote['expiry'].strftime('%Y/%m/%d')} 到期（剩 {option_quote['dte']} 天）"
+                    st.markdown(f"**{option_title}**")
+                    o1, o2, o3, o4 = st.columns(4)
+                    o1.metric("建議買進", f"{option_quote['strike']:,.0f} {option_quote['right']}")
+                    o2.metric("預估權利金", f"{option_quote['premium']:.1f} 點" if option_quote['premium'] is not None else "報價不足")
+                    o3.metric("所需權利金", f"${option_quote['max_loss']:,.0f}" if option_quote['max_loss'] is not None else "報價不足")
+                    o4.metric("最大風險", f"${option_quote['max_loss']:,.0f}" if option_quote['max_loss'] is not None else "權利金全額")
+                    st.warning(
+                        f"風險指標：{option_quote['risk_level']}。此為單買 {option_quote['name'].split('（')[1].rstrip('）')} 的快進快出方案；"
+                        "僅在 5 分 K 確認後進場，標的觸及日線失效點或權利金回落約 40% 時優先退出。"
+                    )
+                    st.caption(
+                        "履約價挑選為最接近現價的價外契約，兼顧低成本與成交機會；不以遠價外的極低權利金取代進場確認。"
+                        f"資料來源：{option_quote['source']}（契約與即時快照）。"
+                    )
+                elif option_mode.startswith("價差單"):
                     option_side = "Put" if plan['direction'] == '偏多' else "Call"
                     st.info(
-                        f"尚未取得 {expiry_choice} 的即時選擇權契約／報價；暫以費波失效點外的預備履約價觀察："
+                        f"永豐 Shioaji 尚未取得 {expiry_choice} 的可用選擇權契約／報價；暫以費波失效點外的預備履約價觀察："
                         f"賣出 {plan['short_strike']:,} {option_side}、買進 {plan['long_strike']:,} {option_side}。"
                     )
                     st.caption(
                         f"履約價差 100 點；未扣淨權利金的最大風險上限約 ${plan['max_spread_risk_before_credit']:,.0f}／組。"
+                    )
+                else:
+                    operation = "BC（買進 Call）" if plan['direction'] == '偏多' else "BP（買進 Put）"
+                    st.warning(
+                        f"永豐 Shioaji 尚未取得 {expiry_choice} 的可用選擇權契約／報價，暫不推薦單買 {operation}。"
+                        "請確認已登入期貨帳戶，並在交易日重新載入永豐契約檔。"
                     )
 
     with tab_fibo_thermometer:
