@@ -1717,12 +1717,13 @@ def get_txo_directional_quote(api, plan, expiry_choice):
     premium = get_txo_snapshot_prices(api, [contract], ['buy'])[0]
     dte = (selected_expiry - datetime.now(pytz.timezone('Asia/Taipei')).date()).days
     return {
-        'name': '買進 Call（BC）' if is_buy_call else '買進 Put（BP）',
+        'name': '單買買權（BC / Buy Call）' if is_buy_call else '單買賣權（BP / Buy Put）',
         'right': 'Call' if is_buy_call else 'Put', 'contract': contract,
         'strike': float(contract.strike_price), 'expiry': selected_expiry, 'dte': dte,
         'premium': premium, 'max_loss': premium * 50 if premium is not None else None,
         'risk_level': '高' if dte <= 1 else ('中高' if dte <= 3 else '中'),
         'source': source, 'delivery_month': str(getattr(contract, 'delivery_month', '')),
+        'premium_basis': '永豐 Shioaji 快照：最佳賣價，缺值時以最後成交價替代',
     }
 
 
@@ -1808,16 +1809,18 @@ def get_taifex_txo_directional_quote(plan, expiry_choice):
         contract = max(candidates, key=lambda record: record['strike']) if candidates else None
     if contract is None:
         return None
-    premium = contract['ask'] or contract['last']
+    premium = contract['ask'] if contract['ask'] is not None else contract['last']
+    premium_basis = '期交所最後最佳賣價' if contract['ask'] is not None else '期交所最後成交價（當時無最佳賣價）'
     dte = (expiry - datetime.now(pytz.timezone('Asia/Taipei')).date()).days
     return {
-        'name': '買進 Call（BC）' if is_buy_call else '買進 Put（BP）',
+        'name': '單買買權（BC / Buy Call）' if is_buy_call else '單買賣權（BP / Buy Put）',
         'right': 'Call' if is_buy_call else 'Put', 'strike': contract['strike'],
         'expiry': expiry, 'dte': dte, 'premium': premium,
         'max_loss': premium * 50 if premium is not None else None,
         'risk_level': '高' if dte <= 1 else ('中高' if dte <= 3 else '中'),
         'source': '期交所每日選擇權行情備援（非永豐即時快照）',
         'delivery_month': contract['delivery_month'],
+        'premium_basis': premium_basis,
     }
 
 
@@ -6666,16 +6669,20 @@ with tab_fibo:
                     st.markdown(f"**{option_title}**")
                     o1, o2, o3, o4 = st.columns(4)
                     o1.metric("建議買進", f"{option_quote['strike']:,.0f} {option_quote['right']}")
-                    o2.metric("預估權利金", f"{option_quote['premium']:.1f} 點" if option_quote['premium'] is not None else "報價不足")
-                    o3.metric("所需權利金", f"${option_quote['max_loss']:,.0f}" if option_quote['max_loss'] is not None else "報價不足")
-                    o4.metric("最大風險", f"${option_quote['max_loss']:,.0f}" if option_quote['max_loss'] is not None else "權利金全額")
+                    o2.metric("買進參考價", f"{option_quote['premium']:.1f} 點" if option_quote['premium'] is not None else "報價不足")
+                    o3.metric("單口權利金成本", f"${option_quote['max_loss']:,.0f}" if option_quote['max_loss'] is not None else "報價不足")
+                    o4.metric("最大風險（權利金）", f"${option_quote['max_loss']:,.0f}" if option_quote['max_loss'] is not None else "權利金全額")
                     st.warning(
-                        f"風險指標：{option_quote['risk_level']}。此為單買 {option_quote['name'].split('（')[1].rstrip('）')} 的快進快出方案；"
+                        f"風險指標：{option_quote['risk_level']}。此為 {option_quote['name']} 的快進快出方案；"
                         "僅在 5 分 K 確認後進場，標的觸及日線失效點或權利金回落約 40% 時優先退出。"
                     )
                     st.caption(
+                        f"報價依據：{option_quote.get('premium_basis', '最後成交價')}。單口權利金成本 = 參考價 × 50 元，"
+                        "未含手續費與交易稅；買方最大風險即已付權利金。"
+                    )
+                    st.caption(
                         "履約價挑選為最接近現價的價外契約，兼顧低成本與成交機會；不以遠價外的極低權利金取代進場確認。"
-                        f"資料來源：{option_quote['source']}（契約與即時快照）。"
+                        f"資料來源：{option_quote['source']}（契約與報價）。"
                     )
                 elif option_mode.startswith("價差單"):
                     option_side = "Put" if plan['direction'] == '偏多' else "Call"
