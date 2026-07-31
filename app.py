@@ -1314,26 +1314,175 @@ def calculate_market_temperature(df):
     }
 
 
-def get_futures_intraday_confirmation(api, direction):
-    """Return a simple 15-minute confirmation state for the trade-plan checklist."""
+def get_futures_intraday_state(api, direction):
+    """Return 15-minute confirmation, VWAP and active-session opening range."""
+    empty_state = {
+        'available': False, 'confirmation_text': "尚未取得 15 分 K；進場前請確認價格在費波區止跌／受壓。",
+        'confirmed': False, 'is_up_bar': False, 'is_down_bar': False,
+        'bullish_break': False, 'bearish_break': False,
+        'vwap': None, 'opening_high': None, 'opening_low': None, 'latest': None,
+    }
     if api is None or not st.session_state.get('sj_logged_in', False):
-        return "尚未取得 15 分 K；進場前請確認價格在費波區止跌／受壓。", False
+        return empty_state
     try:
         intraday = fetch_shioaji_data(api, 'TWF=F', interval='15m', lookback_days=5)
-        intraday = intraday.dropna(subset=['Open', 'Close'])
+        intraday = intraday.dropna(subset=['Open', 'High', 'Low', 'Close']).sort_index()
         if len(intraday) < 2:
-            return "15 分 K 資料不足，暫不觸發進場。", False
-        last = intraday.iloc[-1]
-        previous_close = float(intraday['Close'].iloc[-2])
+            return {**empty_state, 'confirmation_text': "15 分 K 資料不足，暫不觸發進場。"}
+
+        now_tw = datetime.now(pytz.timezone('Asia/Taipei')).replace(tzinfo=None)
+        index_dates = pd.DatetimeIndex(intraday.index)
+        if dt_time(8, 45) <= now_tw.time() <= dt_time(13, 45):
+            session_mask = (
+                (index_dates.date == now_tw.date())
+                & (index_dates.time >= dt_time(8, 45))
+                & (index_dates.time <= dt_time(13, 45))
+            )
+        elif now_tw.time() >= dt_time(15, 0):
+            session_mask = (index_dates.date == now_tw.date()) & (index_dates.time >= dt_time(15, 0))
+        elif now_tw.time() < dt_time(5, 0):
+            previous_date = (now_tw - timedelta(days=1)).date()
+            session_mask = (
+                ((index_dates.date == previous_date) & (index_dates.time >= dt_time(15, 0)))
+                | ((index_dates.date == now_tw.date()) & (index_dates.time < dt_time(5, 0)))
+            )
+        else:
+            session_mask = np.zeros(len(intraday), dtype=bool)
+
+        session = intraday.loc[session_mask].copy()
+        if len(session) < 2:
+            session = intraday.tail(min(12, len(intraday))).copy()
+        last = session.iloc[-1]
+        previous_close = float(session['Close'].iloc[-2])
         is_up_bar = float(last['Close']) > float(last['Open']) and float(last['Close']) > previous_close
         is_down_bar = float(last['Close']) < float(last['Open']) and float(last['Close']) < previous_close
+        opening_high = float(session['High'].iloc[0])
+        opening_low = float(session['Low'].iloc[0])
+        latest = float(last['Close'])
+        volume = pd.to_numeric(session.get('Volume', pd.Series(0, index=session.index)), errors='coerce').fillna(0)
+        typical_price = (session['High'] + session['Low'] + session['Close']) / 3
+        vwap = float((typical_price * volume).sum() / volume.sum()) if volume.sum() > 0 else float(session['Close'].mean())
+        bullish_break = latest > vwap and latest > opening_high and is_up_bar
+        bearish_break = latest < vwap and latest < opening_low and is_down_bar
         if direction == '偏多':
-            return ("15 分 K 已出現止跌上收確認。" if is_up_bar else "等待 15 分 K 止跌上收確認。"), is_up_bar
-        if direction == '偏空':
-            return ("15 分 K 已出現受壓下收確認。" if is_down_bar else "等待 15 分 K 受壓下收確認。"), is_down_bar
+            confirmation_text = "15 分 K 已出現止跌上收確認。" if is_up_bar else "等待 15 分 K 止跌上收確認。"
+            confirmed = is_up_bar
+        elif direction == '偏空':
+            confirmation_text = "15 分 K 已出現受壓下收確認。" if is_down_bar else "等待 15 分 K 受壓下收確認。"
+            confirmed = is_down_bar
+        else:
+            confirmation_text = "方向未明，等待區間邊緣或突破回測確認。"
+            confirmed = False
+        return {
+            'available': True, 'confirmation_text': confirmation_text, 'confirmed': confirmed,
+            'is_up_bar': is_up_bar, 'is_down_bar': is_down_bar,
+            'bullish_break': bullish_break, 'bearish_break': bearish_break,
+            'vwap': vwap, 'opening_high': opening_high, 'opening_low': opening_low, 'latest': latest,
+        }
     except Exception:
-        pass
-    return "方向未明，暫不觸發進場。", False
+        return empty_state
+
+
+def evaluate_trade_entry_state(plan, live_price, live_change, intraday_state, temperature_delta=0.0):
+    """Separate the lagging trend regime from the immediate entry permission."""
+    atr = max(float(plan.get('atr', 0) or 0), 1.0)
+    shock_ratio = float(live_change or 0) / atr
+    direction = plan['direction']
+    zone_tolerance = max(float(plan['zone_points']), atr * 0.25)
+    near_entry = abs(float(live_price) - float(plan['entry_level'])) <= zone_tolerance
+    bullish_break = bool(intraday_state.get('bullish_break'))
+    bearish_break = bool(intraday_state.get('bearish_break'))
+    is_up_bar = bool(intraday_state.get('is_up_bar'))
+    is_down_bar = bool(intraday_state.get('is_down_bar'))
+
+    state = {
+        'stage': '等待確認', 'permission': '等待進場', 'color': '#ffc107',
+        'can_enter': False, 'execution_direction': None,
+        'reason': '等待價格接近費波位置，並由 15 分 K 確認方向。',
+        'shock_ratio': shock_ratio, 'temperature_delta': float(temperature_delta or 0),
+        'entry_level': float(plan['entry_level']), 'invalidation': float(plan['invalidation']),
+        'target': float(plan['target']),
+    }
+
+    def finalize(result):
+        risk = abs(float(result['entry_level']) - float(result['invalidation']))
+        reward = abs(float(result['target']) - float(result['entry_level']))
+        result['risk_points'] = risk
+        result['reward_points'] = reward
+        result['rr_ratio'] = (reward / risk) if risk > 0 else None
+        return result
+
+    # A large move against the lagging daily regime takes priority over every
+    # continuation signal. It prevents an oversold rebound from being sold only
+    # because RSI, MA and the 60-day range still read bearish (and vice versa).
+    if direction == '偏空' and shock_ratio >= 1.5:
+        state.update(
+            stage='超跌反彈', permission='禁止追空', color='#ffc107',
+            reason='反向上漲已達日 ATR 的 1.5 倍；原偏空趨勢屬落後背景，先等待反彈失敗或重新跌破 VWAP。',
+        )
+        if bullish_break:
+            state['reason'] += ' 目前 15 分 K 已站上 VWAP 與本段開盤區間高點。'
+        return finalize(state)
+    if direction == '偏多' and shock_ratio <= -1.5:
+        state.update(
+            stage='過熱回落', permission='禁止追多', color='#ffc107',
+            reason='反向下跌已達日 ATR 的 1.5 倍；原偏多趨勢暫停使用，先等待止跌或重新站回 VWAP。',
+        )
+        if bearish_break:
+            state['reason'] += ' 目前 15 分 K 已跌破 VWAP 與本段開盤區間低點。'
+        return finalize(state)
+    if direction == '偏空' and temperature_delta >= 15 and bullish_break:
+        state.update(
+            stage='空方快速升溫', permission='暫停做空', color='#ffc107',
+            reason='溫度單日快速回升且 15 分 K 站上 VWAP／開盤區間高點，等待反彈失敗後再評估空方。',
+        )
+        return finalize(state)
+    if direction == '偏多' and temperature_delta <= -15 and bearish_break:
+        state.update(
+            stage='多方快速降溫', permission='暫停做多', color='#ffc107',
+            reason='溫度單日快速下降且 15 分 K 跌破 VWAP／開盤區間低點，等待止跌後再評估多方。',
+        )
+        return finalize(state)
+
+    if direction not in ('偏多', '偏空'):
+        lower_edge = float(live_price) <= float(plan['support']) + zone_tolerance
+        upper_edge = float(live_price) >= float(plan['resistance']) - zone_tolerance
+        if lower_edge and is_up_bar:
+            state.update(
+                stage='區間下緣止跌', permission='允許試多', color='#ff4b4b', can_enter=True,
+                execution_direction='偏多', reason='價格位於費波支撐邊緣且 15 分 K 止跌；採區間反彈，不視為趨勢翻多。',
+            )
+        elif upper_edge and is_down_bar:
+            state.update(
+                stage='區間上緣受壓', permission='允許試空', color='#00c853', can_enter=True,
+                execution_direction='偏空', reason='價格位於費波壓力邊緣且 15 分 K 轉弱；採區間回落，不視為趨勢翻空。',
+                entry_level=float(plan['resistance']),
+                invalidation=float(plan['resistance']) + max(float(plan['zone_points']), atr * 0.5),
+                target=float(plan['support']),
+            )
+        elif float(live_price) > float(plan['resistance']) and bullish_break:
+            state.update(stage='向上突破', permission='等待回測', reason='已突破費波壓力；等待回測原壓力不破，避免追在短線過熱處。')
+        elif float(live_price) < float(plan['support']) and bearish_break:
+            state.update(stage='向下跌破', permission='等待反抽', reason='已跌破費波支撐；等待反抽原支撐不過，避免追在短線超跌處。')
+        else:
+            state.update(stage='區間盤整', reason='價格未在區間邊緣形成確認，區間中段不建立方向部位。')
+        return finalize(state)
+
+    if direction == '偏多':
+        if shock_ratio >= 1.5 or float(live_price) > float(plan['resistance']) + atr * 0.5:
+            state.update(stage='多方過熱', permission='禁止追多', reason='漲幅或價格延伸已過大；等待回測費波支撐後再評估。')
+        elif bearish_break:
+            state.update(stage='多方轉弱', permission='暫停做多', reason='15 分 K 已跌破 VWAP 與本段開盤區間低點，先等待重新站回。')
+        elif near_entry and is_up_bar:
+            state.update(stage='多方延續', permission='允許進場', color='#ff4b4b', can_enter=True, execution_direction='偏多', reason='價格位於費波支撐觀察區，且 15 分 K 止跌上收。')
+    else:
+        if shock_ratio <= -1.5 or float(live_price) < float(plan['support']) - atr * 0.5:
+            state.update(stage='空方過熱', permission='禁止追空', reason='跌幅或價格延伸已過大；等待反彈至費波壓力後再評估。')
+        elif bullish_break:
+            state.update(stage='空方反彈轉強', permission='暫停做空', reason='15 分 K 已站上 VWAP 與本段開盤區間高點，先等待反彈失敗。')
+        elif near_entry and is_down_bar:
+            state.update(stage='空方延續', permission='允許進場', color='#00c853', can_enter=True, execution_direction='偏空', reason='價格位於費波壓力觀察區，且 15 分 K 受壓下收。')
+    return finalize(state)
 
 
 def get_near_futures_contract(api, product='TMF'):
@@ -1974,7 +2123,7 @@ def calculate_index_trade_plan(index_df, index_result, futures_df, futures_resul
         'latest': latest, 'swing_low': swing_low, 'swing_high': swing_high,
         'support': support, 'resistance': resistance, 'entry_level': entry_level,
         'invalidation': invalidation, 'target': target, 'zone_points': zone_points,
-        'trigger': trigger, 'risk_points': risk_points, 'reward_points': reward_points,
+        'trigger': trigger, 'atr': atr, 'risk_points': risk_points, 'reward_points': reward_points,
         'rr_ratio': (reward_points / risk_points) if risk_points > 0 else None,
         'micro_risk_1': risk_points * 10, 'micro_risk_2': risk_points * 20,
         'option_name': option_name, 'short_strike': short_strike,
@@ -6568,17 +6717,30 @@ with tab_fibo:
                 if st.button("↻ 即時更新", key="refresh_trade_plan_live", width='stretch'):
                     st.rerun()
             live_price = live_snapshot['price'] if live_snapshot else plan['latest']
-            confirmation_text, is_confirmed = get_futures_intraday_confirmation(
-                st.session_state.get('sj_api'), plan['direction']
+            live_change = live_snapshot['change'] if live_snapshot else float((futures_item[4] or {}).get('change', 0))
+            intraday_state = get_futures_intraday_state(
+                st.session_state.get('sj_api'), plan['direction'],
             )
+            previous_temperature = None
+            if futures_item is not None and len(futures_item[2]) > 20:
+                previous_temperature = calculate_market_temperature(futures_item[2].iloc[:-1].copy())
+            temperature_delta = (
+                float(futures_item[4]['score']) - float(previous_temperature['score'])
+                if futures_item and futures_item[4] and previous_temperature else 0.0
+            )
+            trade_state = evaluate_trade_entry_state(
+                plan, live_price, live_change, intraday_state, temperature_delta,
+            )
+            confirmation_text = intraday_state['confirmation_text']
             st.markdown(
                 f"""<div style='border-left:5px solid {plan['action_color']};background:#151a22;padding:14px 18px;border-radius:7px;margin-bottom:12px'>
                 <div style='font-size:14px;color:#b7c0cc'>{plan['market_label']}</div>
-                <div style='font-size:21px;font-weight:800;color:{plan['action_color']}'>{plan['action']}</div>
-                <div style='font-size:15px;font-weight:700;color:{direction_color};margin-top:3px'>市場判讀：{display_direction}</div>
+                <div style='font-size:15px;font-weight:700;color:{direction_color};margin-top:3px'>趨勢背景：{display_direction}</div>
+                <div style='font-size:21px;font-weight:800;color:{trade_state['color']};margin-top:3px'>{trade_state['stage']}｜{trade_state['permission']}</div>
                 <div style='font-size:14px;color:#dfe6e9;margin-top:4px'>{plan['alignment_note']}</div>
                 </div>""", unsafe_allow_html=True
             )
+            st.info(f"**即時判斷：** {trade_state['reason']}")
             p1, p2, p3, p4 = st.columns(4)
             if live_snapshot:
                 p1.markdown(
@@ -6655,22 +6817,32 @@ with tab_fibo:
                 help="此設定會連動更新下方的微台停損金額、所需原始保證金與短波當沖風險。",
             )
             c_entry, c_stop, c_target, c_rr = st.columns(4)
-            c_entry.metric("觀察進場區", f"{plan['entry_level']:,.0f}")
-            c_stop.metric("失效／停損", f"{plan['invalidation']:,.0f}")
-            c_target.metric("第一目標", f"{plan['target']:,.0f}")
-            c_rr.metric("預估風報比", f"1 : {plan['rr_ratio']:.2f}" if plan['rr_ratio'] is not None else "—")
-            if plan['direction'] in ('偏多', '偏空'):
-                if is_confirmed:
-                    st.info(f"15 分 K：{confirmation_text} 仍須確認價格位於觀察進場區。")
-                else:
-                    st.warning(f"15 分 K：{confirmation_text} 目前僅列為觀察，不觸發進場。")
+            c_entry.metric("觀察進場區", f"{trade_state['entry_level']:,.0f}")
+            c_stop.metric("失效／停損", f"{trade_state['invalidation']:,.0f}")
+            c_target.metric("第一目標", f"{trade_state['target']:,.0f}")
+            c_rr.metric("預估風報比", f"1 : {trade_state['rr_ratio']:.2f}" if trade_state['rr_ratio'] is not None else "—")
+            if trade_state['can_enter']:
+                st.info(f"15 分 K：{confirmation_text} 目前符合「{trade_state['permission']}」條件，仍須依設定停損控制部位。")
+            elif plan['direction'] in ('偏多', '偏空'):
+                st.warning(f"15 分 K：{confirmation_text} 目前狀態為「{trade_state['permission']}」，不觸發進場。")
             else:
-                st.info("目前不建立方向部位；等待加權與期貨方向一致，且價格靠近支撐或壓力。")
+                st.info(f"區間策略：{trade_state['reason']}")
+
+            signal_details = []
+            if intraday_state['available']:
+                signal_details.append(f"15 分 K VWAP {intraday_state['vwap']:,.0f}")
+                signal_details.append(
+                    f"本段開盤區間 {intraday_state['opening_low']:,.0f}–{intraday_state['opening_high']:,.0f}"
+                )
+            signal_details.append(f"即時漲跌為日 ATR 的 {trade_state['shock_ratio']:+.2f} 倍")
+            signal_details.append(f"溫度變化 {trade_state['temperature_delta']:+.0f} 度")
+            st.caption("｜".join(signal_details))
 
             st.divider()
             st.markdown("#### ⚡ 短波當沖（5 分 K）")
-            st.caption("僅在日線方向明確時啟用；使用最新 5 分 K 區間規劃短線進出。")
-            short_wave = calculate_short_wave_plan(st.session_state.get('sj_api'), plan['direction'])
+            st.caption("僅在即時進場許可通過時啟用；使用最新 5 分 K 區間規劃短線進出。")
+            short_wave_direction = trade_state['execution_direction'] if trade_state['can_enter'] else None
+            short_wave = calculate_short_wave_plan(st.session_state.get('sj_api'), short_wave_direction)
             if short_wave:
                 sw1, sw2, sw3, sw4 = st.columns(4)
                 sw1.metric("短波進場區", f"{short_wave['entry']:,.0f} ± {short_wave['zone']:,.0f}")
@@ -6682,22 +6854,22 @@ with tab_fibo:
                     f"以最新 12 根 5 分 K 區間計算；依目前選擇的 {position_count} 口，"
                     f"預估停損 ${short_wave['risk'] * 10 * position_count:,.0f}。日線方向轉為區間盤整時，短波訊號不採用。"
                 )
-            elif plan['direction'] in ('偏多', '偏空'):
-                st.info("尚未取得足夠的 5 分 K，短波當沖只保留日線費波的觀察計畫。")
+            elif trade_state['can_enter']:
+                st.info("即時條件已通過，但尚未取得足夠的 5 分 K，暫不提供短波點位。")
             else:
-                st.info("主方向為區間盤整，暫不提供順勢短波當沖點位。")
+                st.info(f"目前為「{trade_state['permission']}」；短波當沖不啟用，避免在反轉、過熱或區間中段追價。")
 
             st.divider()
             st.markdown("#### 🛡️ 微型臺指風險換算")
             st.caption("以觀察進場區到失效點計算；微台每點 10 元。保證金為交易所公告原始保證金，實際可用額度仍以期貨商為準。")
             margin_map = fetch_taifex_index_margin_map()
             micro_margin = margin_map.get('TMF')
-            position_risk = plan['risk_points'] * 10 * position_count
+            position_risk = trade_state['risk_points'] * 10 * position_count
             position_margin = micro_margin * position_count if micro_margin else None
             margin_risk_pct = (position_risk / position_margin * 100) if position_margin else None
             margin_risk_label = "—" if margin_risk_pct is None else ("低" if margin_risk_pct < 10 else ("中" if margin_risk_pct < 20 else "高"))
             r1, r2, r3, r4 = st.columns(4)
-            r1.metric("停損距離", f"{plan['risk_points']:,.0f} 點")
+            r1.metric("停損距離", f"{trade_state['risk_points']:,.0f} 點")
             r2.metric(f"{position_count} 口最大風險", f"${position_risk:,.0f}")
             r3.metric(f"{position_count} 口原始保證金", f"${position_margin:,.0f}" if position_margin else "查詢中")
             r4.metric("1 口原始保證金", f"${micro_margin:,.0f}" if micro_margin else "查詢中")
@@ -6711,8 +6883,13 @@ with tab_fibo:
 
             st.divider()
             st.markdown("#### 📅 到期選擇權操作")
-            st.caption("依目前方向與即時選擇權契約報價，提供限定風險的價差單或短線單買參考。")
-            if plan['short_strike'] is None:
+            st.caption("僅在即時進場許可通過時，才依選擇權契約報價提供價差單或短線單買參考。")
+            if not trade_state['can_enter']:
+                st.info(
+                    f"目前為「{trade_state['stage']}／{trade_state['permission']}」，暫停產生選擇權履約價與權利金建議。"
+                    "等待費波位置與盤中確認一致後再啟用。"
+                )
+            elif trade_state['execution_direction'] not in ('偏多', '偏空'):
                 st.info("方向尚未一致，不建立選擇權操作。避免在區間中段或訊號分歧時進場。")
             else:
                 expiry_choice = st.selectbox(
@@ -6736,7 +6913,14 @@ with tab_fibo:
                     horizontal=True,
                     key="trade_plan_option_mode",
                 )
-                quote_plan = {**plan, 'latest': live_price}
+                quote_plan = {
+                    **plan,
+                    'latest': live_price,
+                    'direction': trade_state['execution_direction'],
+                    'entry_level': trade_state['entry_level'],
+                    'invalidation': trade_state['invalidation'],
+                    'target': trade_state['target'],
+                }
                 if option_mode.startswith("價差單"):
                     option_quote = get_txo_spread_quote(st.session_state.get('sj_api'), quote_plan, expiry_choice)
                 else:
@@ -6787,7 +6971,7 @@ with tab_fibo:
                         "本次不提供價差單履約價與權利金建議，避免使用日盤資料造成誤判。"
                     )
                 else:
-                    operation = "BC（買進 Call）" if plan['direction'] == '偏多' else "BP（買進 Put）"
+                    operation = "BC（買進 Call）" if quote_plan['direction'] == '偏多' else "BP（買進 Put）"
                     st.warning(
                         f"永豐 Shioaji 尚未取得 {expiry_choice}（預期 `{expected_contract}`） 的可用選擇權契約／報價，暫不推薦單買 {operation}。"
                         "請確認已登入期貨帳戶，並在交易日重新載入永豐契約檔。"
@@ -6851,7 +7035,8 @@ with tab_fibo:
         with st.expander("溫度計判讀規則"):
             st.markdown("""
             - 0–39：空方動能較強；40–59：區間盤整；60–100：多方動能較強。
-            - 「偏多／偏空」還會確認價格相對 MA20、MA60 的位置，避免只因單日急漲急跌就翻轉趨勢。
+            - 溫度屬於日線「趨勢背景」，不是立即進場訊號；操作計畫會另外確認費波位置、15 分 K、VWAP、開盤區間及 ATR 反轉幅度。
+            - 反向漲跌達約 1.5 日 ATR，或溫度快速反轉並突破盤中結構時，會先暫停原趨勢方向，避免在超跌反彈追空或過熱回落追多。
             - 期貨在 15:00 後會建立下一交易日的夜盤未完成日 K，隔日日盤會累加到同一根，因此可直接用於夜盤支撐壓力判讀。
             - 此為規則型技術判讀與風險提示，不構成投資建議；實際交易仍應搭配停損、部位與流動性管理。
             """)
