@@ -5038,6 +5038,8 @@ def render_futures_strategy_room():
         st.session_state.futures_strategy_live_time = None
     if 'futures_strategy_custom_prices' not in st.session_state:
         st.session_state.futures_strategy_custom_prices = load_futures_custom_prices()
+    if 'futures_strategy_editor_revision' not in st.session_state:
+        st.session_state.futures_strategy_editor_revision = 0
     if int(st.session_state.get('futures_minimum_volume', 1) or 1) < 1:
         st.session_state.futures_minimum_volume = 1
 
@@ -5111,10 +5113,7 @@ def render_futures_strategy_room():
     cache = st.session_state.futures_strategy_live_cache
     custom_prices = st.session_state.futures_strategy_custom_prices
     display_rows['自訂價(可修)'] = display_rows.apply(
-        lambda row: custom_prices.get(
-            str(row['契約鍵']),
-            _safe_number(cache.get(str(row['契約鍵']), {}).get('收盤價')) or _safe_number(row.get('收盤價'))
-        ), axis=1
+        lambda row: custom_prices.get(str(row['契約鍵'])), axis=1
     )
 
     for index, row in display_rows.iterrows():
@@ -5122,7 +5121,7 @@ def render_futures_strategy_room():
         cached = cache.get(contract_key)
         if cached:
             for column, value in cached.items():
-                if column == '自訂價(可修)' and contract_key in custom_prices:
+                if column == '自訂價(可修)':
                     continue
                 if column in display_rows.columns or column in ('支撐壓力', '進出場點位', '方向', '觸發條件', '實際契約'):
                     display_rows.at[index, column] = value
@@ -5169,6 +5168,11 @@ def render_futures_strategy_room():
         change = _safe_number(row.get('漲跌幅'), 0) or 0
         direction = str(row.get('方向', ''))
         price = _safe_number(row.get('自訂價(可修)'))
+        latest_price = _safe_number(row.get('收盤價'))
+        reference_price = None
+        if latest_price is not None and abs(100 + change) > 1e-9:
+            reference_price = latest_price / (1 + change / 100)
+        price_change = (price - reference_price) if price is not None and reference_price is not None else None
         limit_up = _safe_number(row.get('當日漲停價'))
         limit_down = _safe_number(row.get('當日跌停價'))
         if price is not None and limit_up is not None and price >= limit_up:
@@ -5180,7 +5184,9 @@ def render_futures_strategy_room():
         for position, column in enumerate(row.index):
             if column == '名稱':
                 styles[position] = name_style
-            elif column in ('自訂價(可修)', '漲跌幅'):
+            elif column == '自訂價(可修)':
+                styles[position] = 'color:#ff4b4b;font-weight:bold;' if price_change and price_change > 0 else ('color:#00c853;font-weight:bold;' if price_change and price_change < 0 else '')
+            elif column == '漲跌幅':
                 styles[position] = 'color:#ff4b4b;font-weight:bold;' if change > 0 else ('color:#00c853;font-weight:bold;' if change < 0 else '')
             elif column == '方向':
                 styles[position] = 'color:#ff4b4b;font-weight:bold;' if direction == '偏多' else ('color:#00c853;font-weight:bold;' if direction == '偏空' else '')
@@ -5223,7 +5229,8 @@ def render_futures_strategy_room():
         edited = st.data_editor(
             display_rows[futures_display_columns].style.apply(style_futures_row, axis=1),
             column_config=futures_column_config(),
-            hide_index=True, width='stretch', row_height=30, key='futures_strategy_editor'
+            hide_index=True, width='stretch', row_height=30,
+            key=f"futures_strategy_editor_{st.session_state.futures_strategy_editor_revision}"
         )
         display_key_map = {
             f"{row['期貨代碼']}:{row['契約月份']}": str(row['契約鍵'])
@@ -5261,7 +5268,7 @@ def render_futures_strategy_room():
         save_custom_prices = st.button("💾 儲存手動自訂價", use_container_width=True, key='save_futures_custom_prices')
     with price_clear_col:
         clear_custom_prices = st.button("🗑️ 清除自訂價", use_container_width=True, key='clear_futures_custom_prices')
-    st.caption(f"目前有 {len(st.session_state.futures_strategy_custom_prices)} 檔自訂價；按儲存後，下次開啟仍會保留。")
+    st.caption(f"目前有 {len(st.session_state.futures_strategy_custom_prices)} 檔自訂價；按儲存後，下次開啟仍會保留。清除後分析會回退使用官方行情價。")
     if save_custom_prices:
         if save_futures_custom_prices(st.session_state.futures_strategy_custom_prices):
             st.toast("期貨手動自訂價已儲存", icon="💾")
@@ -5271,8 +5278,9 @@ def render_futures_strategy_room():
         st.session_state.futures_strategy_custom_prices = {}
         for cached_row in st.session_state.futures_strategy_live_cache.values():
             cached_row.pop('自訂價(可修)', None)
+        st.session_state.futures_strategy_editor_revision += 1
         if save_futures_custom_prices({}):
-            st.toast("期貨自訂價已清除，已回復至最新可用報價", icon="🗑️")
+            st.toast("期貨自訂價已清除，分析已回退官方行情價", icon="🗑️")
         else:
             st.warning("本次自訂價已清除，但無法寫入設定檔。")
         st.rerun()
@@ -5324,9 +5332,7 @@ def render_futures_strategy_room():
         keys = [option_map[label] for label in independent_labels]
         independent_rows = universe[universe['契約鍵'].isin(keys)].copy()
         independent_rows['自訂價(可修)'] = independent_rows.apply(
-            lambda row: st.session_state.futures_strategy_custom_prices.get(
-                str(row['契約鍵']), _safe_number(row.get('收盤價'))
-            ), axis=1
+            lambda row: st.session_state.futures_strategy_custom_prices.get(str(row['契約鍵'])), axis=1
         )
         if st.session_state.get('sj_logged_in', False) and st.session_state.get('sj_api') is not None:
             with st.spinner("正在取得實際契約報價與 K 棒..."):
