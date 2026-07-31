@@ -6553,6 +6553,10 @@ with tab_fibo:
         if plan is None:
             st.warning("目前缺少足夠的加權或期貨日 K，暫時無法建立操作計畫。")
         else:
+            display_direction, direction_color = {
+                '偏多': ('偏多', '#ff4b4b'),
+                '偏空': ('偏空', '#00c853'),
+            }.get(plan['direction'], ('區間盤整', '#ffc107'))
             live_col, refresh_col = st.columns([6, 1])
             with live_col:
                 live_snapshot = get_live_futures_snapshot(st.session_state.get('sj_api'), 'TMF')
@@ -6567,6 +6571,7 @@ with tab_fibo:
                 f"""<div style='border-left:5px solid {plan['action_color']};background:#151a22;padding:14px 18px;border-radius:7px;margin-bottom:12px'>
                 <div style='font-size:14px;color:#b7c0cc'>{plan['market_label']}</div>
                 <div style='font-size:21px;font-weight:800;color:{plan['action_color']}'>{plan['action']}</div>
+                <div style='font-size:15px;font-weight:700;color:{direction_color};margin-top:3px'>市場判讀：{display_direction}</div>
                 <div style='font-size:14px;color:#dfe6e9;margin-top:4px'>{plan['alignment_note']}</div>
                 </div>""", unsafe_allow_html=True
             )
@@ -6592,6 +6597,13 @@ with tab_fibo:
             st.markdown("#### 🎯 進出依據")
             st.caption("以日線費波支撐／壓力與 15 分 K 確認，作為順勢進場、停損與目標依據。")
             st.info(f"**進場確認：** {plan['trigger']}")
+            position_count = st.selectbox(
+                "預計進場口數",
+                options=[1, 2, 3, 4, 5],
+                format_func=lambda count: f"{count} 口微型臺指",
+                key="trade_plan_position_count",
+                help="此設定會連動更新下方的微台停損金額、所需原始保證金與短波當沖風險。",
+            )
             c_entry, c_stop, c_target, c_rr = st.columns(4)
             c_entry.metric("觀察進場區", f"{plan['entry_level']:,.0f}")
             c_stop.metric("失效／停損", f"{plan['invalidation']:,.0f}")
@@ -6599,7 +6611,7 @@ with tab_fibo:
             c_rr.metric("預估風報比", f"1 : {plan['rr_ratio']:.2f}" if plan['rr_ratio'] is not None else "—")
             if plan['direction'] in ('偏多', '偏空'):
                 if is_confirmed:
-                    st.success(f"15 分 K：{confirmation_text} 仍須確認價格位於觀察進場區。")
+                    st.info(f"15 分 K：{confirmation_text} 仍須確認價格位於觀察進場區。")
                 else:
                     st.warning(f"15 分 K：{confirmation_text} 目前僅列為觀察，不觸發進場。")
             else:
@@ -6617,8 +6629,8 @@ with tab_fibo:
                 sw4.metric("短波風報比", f"1 : {short_wave['rr']:.2f}" if short_wave['rr'] is not None else "—")
                 st.info(f"**快速進場條件：** {short_wave['trigger']}")
                 st.caption(
-                    f"以最新 12 根 5 分 K 區間計算；單口預估停損 ${short_wave['risk'] * 10:,.0f}，"
-                    f"兩口 ${short_wave['risk'] * 20:,.0f}。日線方向轉為區間盤整時，短波訊號不採用。"
+                    f"以最新 12 根 5 分 K 區間計算；依目前選擇的 {position_count} 口，"
+                    f"預估停損 ${short_wave['risk'] * 10 * position_count:,.0f}。日線方向轉為區間盤整時，短波訊號不採用。"
                 )
             elif plan['direction'] in ('偏多', '偏空'):
                 st.info("尚未取得足夠的 5 分 K，短波當沖只保留日線費波的觀察計畫。")
@@ -6630,16 +6642,19 @@ with tab_fibo:
             st.caption("以觀察進場區到失效點計算；微台每點 10 元。保證金為交易所公告原始保證金，實際可用額度仍以期貨商為準。")
             margin_map = fetch_taifex_index_margin_map()
             micro_margin = margin_map.get('TMF')
-            margin_risk_pct = (plan['micro_risk_1'] / micro_margin * 100) if micro_margin else None
+            position_risk = plan['risk_points'] * 10 * position_count
+            position_margin = micro_margin * position_count if micro_margin else None
+            margin_risk_pct = (position_risk / position_margin * 100) if position_margin else None
             margin_risk_label = "—" if margin_risk_pct is None else ("低" if margin_risk_pct < 10 else ("中" if margin_risk_pct < 20 else "高"))
             r1, r2, r3, r4 = st.columns(4)
             r1.metric("停損距離", f"{plan['risk_points']:,.0f} 點")
-            r2.metric("1 口最大風險", f"${plan['micro_risk_1']:,.0f}")
-            r3.metric("2 口最大風險", f"${plan['micro_risk_2']:,.0f}")
+            r2.metric(f"{position_count} 口最大風險", f"${position_risk:,.0f}")
+            r3.metric(f"{position_count} 口原始保證金", f"${position_margin:,.0f}" if position_margin else "查詢中")
             r4.metric("1 口原始保證金", f"${micro_margin:,.0f}" if micro_margin else "查詢中")
             if micro_margin:
                 st.caption(
-                    f"2 口原始保證金約 ${micro_margin * 2:,.0f}；本計畫單口停損約為保證金 {margin_risk_pct:.1f}%（風險：{margin_risk_label}）。"
+                    f"依 {position_count} 口估算，原始保證金約 ${position_margin:,.0f}；"
+                    f"本計畫停損約為保證金 {margin_risk_pct:.1f}%（風險：{margin_risk_label}）。"
                 )
             else:
                 st.warning("暫時無法取得交易所保證金資料；下單前請在期貨商系統確認微台原始保證金。")
