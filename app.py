@@ -3126,14 +3126,18 @@ if 'prefetch_cache' not in st.session_state: st.session_state.prefetch_cache = {
 if 'cached_notes' not in st.session_state: st.session_state.cached_notes = {}    
 
 
-# Fibo 標籤與狀態初始化
+# Fibo 標籤與狀態初始化。設定檔是標籤的最新來源；過去此處會先以雲端快取
+# （快取尚未同步時常是預設值）覆寫設定檔，導致瀏覽器重整後自訂標籤消失。
 saved_config = load_config()
-fibo_tags = saved_config.get('fibo_tags', list(DEFAULT_FIBO_TAGS))
-
-# 優先採用從 Google Sheets 載入回來的雲端快取標籤紀錄
-fibo_tags_source = st.session_state.get('fibo_tags', fibo_tags)
-if not fibo_tags_source or len(fibo_tags_source) < 5:
-    fibo_tags_source = fibo_tags
+configured_fibo_tags = saved_config.get('fibo_tags', [])
+cached_fibo_tags = st.session_state.get('fibo_tags', [])
+if isinstance(configured_fibo_tags, list) and len(configured_fibo_tags) >= 5:
+    fibo_tags_source = configured_fibo_tags
+elif isinstance(cached_fibo_tags, list) and len(cached_fibo_tags) >= 5:
+    fibo_tags_source = cached_fibo_tags
+else:
+    fibo_tags_source = list(DEFAULT_FIBO_TAGS)
+st.session_state.fibo_tags = list(fibo_tags_source)
 
 if 'fibo_search_input' not in st.session_state: st.session_state.fibo_search_input = ""
 if 'fibo_trigger_search' not in st.session_state: st.session_state.fibo_trigger_search = False
@@ -6592,6 +6596,52 @@ with tab_fibo:
             p4.metric("費波區寬", f"± {plan['zone_points']:,.0f} 點")
             if live_snapshot:
                 st.caption(f"微台快照於 {datetime.now(pytz.timezone('Asia/Taipei')).strftime('%H:%M:%S')} 擷取；按「即時更新」可重新讀取夜盤／日盤最新報價。")
+
+            index_result = index_item[4] if index_item else None
+            if index_result is not None:
+                index_price = float(index_result['close'])
+                basis = live_price - index_price
+                if basis > 0:
+                    basis_label, basis_color = "正價差", "#ff4b4b"
+                    basis_advice = (
+                        "期貨高於加權，反映期貨相對現貨偏強。僅在市場判讀同為偏多、"
+                        "且價格回測費波支撐後獲確認時，才考慮順勢做多；不可只因正價差追價。"
+                    )
+                elif basis < 0:
+                    basis_label, basis_color = "逆價差", "#00c853"
+                    basis_advice = (
+                        "期貨低於加權，反映期貨相對現貨偏弱。僅在市場判讀同為偏空、"
+                        "且價格反彈至費波壓力後受壓時，才考慮順勢做空；不可只因逆價差追空。"
+                    )
+                else:
+                    basis_label, basis_color = "平價", "#dfe6e9"
+                    basis_advice = "期現價格貼近，價差不提供方向優勢；以費波位置與 15 分 K 確認作為主要進出依據。"
+
+                now_tw = datetime.now(pytz.timezone('Asia/Taipei'))
+                updated_at = pd.Timestamp(index_result['updated_at']).date()
+                is_cash_snapshot = (
+                    updated_at == now_tw.date()
+                    and dt_time(9, 0) <= now_tw.time() < dt_time(13, 35)
+                    and index_item[3] and '即時快照' in index_item[3]
+                )
+                basis_reference = "加權盤中快照" if is_cash_snapshot else "最近加權日收盤"
+                st.markdown("##### ⚖️ 期現價差判讀")
+                b1, b2, b3 = st.columns(3)
+                b1.metric(basis_reference, f"{index_price:,.0f}")
+                b2.metric("期貨指數", f"{live_price:,.0f}")
+                b3.markdown(
+                    f"""<div style='line-height:1.25'>
+                    <div style='font-size:14px;font-weight:600;color:#dfe6e9'>期貨－加權價差</div>
+                    <div style='font-size:24px;font-weight:700;color:{basis_color}'>{basis:+,.0f} 點</div>
+                    <div style='font-size:14px;font-weight:700;color:{basis_color}'>{basis_label}</div>
+                    </div>""",
+                    unsafe_allow_html=True,
+                )
+                st.caption(
+                    f"計算：期貨 {live_price:,.0f} − {basis_reference} {index_price:,.0f} = {basis:+,.0f} 點。"
+                    "夜盤因現貨已收盤，價差主要反映夜盤預期與海外市場，不宜單獨作為交易訊號。"
+                )
+                st.info(f"**操作建議：** {basis_advice}")
 
             st.divider()
             st.markdown("#### 🎯 進出依據")
