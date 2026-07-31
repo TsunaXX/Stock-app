@@ -6542,6 +6542,8 @@ with tab_fibo:
         thermometer_data.append((label, code, temp_df, source, result))
 
     with tab_trade_plan:
+        st.subheader("指數操作計畫")
+        st.caption("日線費波決定主方向，5 分 K 提供短波當沖點位；即時報價僅供觀察，不會自動下單或構成投資建議。")
         index_item = next((item for item in thermometer_data if item[1] == '^TWII'), None)
         futures_item = next((item for item in thermometer_data if item[1] == 'TWF=F'), None)
         plan = calculate_index_trade_plan(
@@ -6549,22 +6551,8 @@ with tab_fibo:
             futures_item[2] if futures_item else pd.DataFrame(), futures_item[4] if futures_item else None,
         )
         if plan is None:
-            st.subheader("指數操作計畫")
-            st.caption("日線費波決定主方向，5 分 K 提供短波當沖點位；即時報價僅供觀察，不會自動下單或構成投資建議。")
             st.warning("目前缺少足夠的加權或期貨日 K，暫時無法建立操作計畫。")
         else:
-            direction_label, direction_color = {
-                '偏多': ('做多', '#ff4b4b'),
-                '偏空': ('做空', '#00c853'),
-            }.get(plan['direction'], ('等待進場', '#ffc107'))
-            st.markdown(
-                f"""<div style='display:flex;align-items:baseline;gap:14px;margin-bottom:2px'>
-                <span style='font-size:1.55rem;font-weight:700;color:#fafafa'>指數操作計畫</span>
-                <span style='font-size:1.05rem;font-weight:700;color:{direction_color}'>{direction_label}</span>
-                </div>""",
-                unsafe_allow_html=True,
-            )
-            st.caption("日線費波決定主方向，5 分 K 提供短波當沖點位；即時報價僅供觀察，不會自動下單或構成投資建議。")
             live_col, refresh_col = st.columns([6, 1])
             with live_col:
                 live_snapshot = get_live_futures_snapshot(st.session_state.get('sj_api'), 'TMF')
@@ -6600,7 +6588,9 @@ with tab_fibo:
             if live_snapshot:
                 st.caption(f"微台快照於 {datetime.now(pytz.timezone('Asia/Taipei')).strftime('%H:%M:%S')} 擷取；按「即時更新」可重新讀取夜盤／日盤最新報價。")
 
-            st.markdown("#### 進出依據")
+            st.divider()
+            st.markdown("#### 🎯 進出依據")
+            st.caption("以日線費波支撐／壓力與 15 分 K 確認，作為順勢進場、停損與目標依據。")
             st.info(f"**進場確認：** {plan['trigger']}")
             c_entry, c_stop, c_target, c_rr = st.columns(4)
             c_entry.metric("觀察進場區", f"{plan['entry_level']:,.0f}")
@@ -6615,7 +6605,9 @@ with tab_fibo:
             else:
                 st.info("目前不建立方向部位；等待加權與期貨方向一致，且價格靠近支撐或壓力。")
 
-            st.markdown("#### 短波當沖（5 分 K）")
+            st.divider()
+            st.markdown("#### ⚡ 短波當沖（5 分 K）")
+            st.caption("僅在日線方向明確時啟用；使用最新 5 分 K 區間規劃短線進出。")
             short_wave = calculate_short_wave_plan(st.session_state.get('sj_api'), plan['direction'])
             if short_wave:
                 sw1, sw2, sw3, sw4 = st.columns(4)
@@ -6633,7 +6625,8 @@ with tab_fibo:
             else:
                 st.info("主方向為區間盤整，暫不提供順勢短波當沖點位。")
 
-            st.markdown("#### 微型臺指風險換算")
+            st.divider()
+            st.markdown("#### 🛡️ 微型臺指風險換算")
             st.caption("以觀察進場區到失效點計算；微台每點 10 元。保證金為交易所公告原始保證金，實際可用額度仍以期貨商為準。")
             margin_map = fetch_taifex_index_margin_map()
             micro_margin = margin_map.get('TMF')
@@ -6651,7 +6644,9 @@ with tab_fibo:
             else:
                 st.warning("暫時無法取得交易所保證金資料；下單前請在期貨商系統確認微台原始保證金。")
 
-            st.markdown("#### 到期選擇權操作")
+            st.divider()
+            st.markdown("#### 📅 到期選擇權操作")
+            st.caption("依目前方向與即時選擇權契約報價，提供限定風險的價差單或短線單買參考。")
             if plan['short_strike'] is None:
                 st.info("方向尚未一致，不建立選擇權操作。避免在區間中段或訊號分歧時進場。")
             else:
