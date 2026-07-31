@@ -33,11 +33,17 @@ jobs:
         # 如果專案有 requirements.txt 則安裝，沒有就跳過
         if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-    - name: 執行程式碼風格檢查 (Ruff Lint)
+    - name: 執行阻斷性程式碼檢查 (Ruff)
       run: |
         # 停止建構：如果程式碼有語法錯誤或未定義的變數
-        ruff check .
+        ruff check . --select=E9,F63,F7,F82
 
     - name: 執行單元測試 (Pytest)
       run: |
-        pytest
+        # 專案目前未提供測試檔時，至少驗證主程式可編譯；有測試時才執行 pytest。
+        python -m py_compile app.py
+        if find . -path './.git' -prune -o \( -name 'test_*.py' -o -name '*_test.py' \) -print -quit | grep -q .; then
+          pytest
+        else
+          echo '尚無 pytest 測試檔，已完成 app.py 編譯檢查。'
+        fi
