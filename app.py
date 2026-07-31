@@ -5115,8 +5115,8 @@ def render_futures_strategy_room():
     display_rows['自訂價(可修)'] = display_rows.apply(
         lambda row: custom_prices.get(str(row['契約鍵'])), axis=1
     )
-    # NumberColumn 對 NaN 會顯示為真正的空白，避免空值被渲染成文字 None。
-    display_rows['自訂價(可修)'] = pd.to_numeric(display_rows['自訂價(可修)'], errors='coerce')
+    # TextColumn 以空字串呈現未填自訂價，避免表格渲染成文字 None。
+    display_rows['自訂價(可修)'] = display_rows['自訂價(可修)'].apply(fmt_price)
 
     for index, row in display_rows.iterrows():
         contract_key = str(row['契約鍵'])
@@ -5170,11 +5170,6 @@ def render_futures_strategy_room():
         change = _safe_number(row.get('漲跌幅'), 0) or 0
         direction = str(row.get('方向', ''))
         price = _safe_number(row.get('自訂價(可修)'))
-        latest_price = _safe_number(row.get('收盤價'))
-        reference_price = None
-        if latest_price is not None and abs(100 + change) > 1e-9:
-            reference_price = latest_price / (1 + change / 100)
-        price_change = (price - reference_price) if price is not None and reference_price is not None else None
         limit_up = _safe_number(row.get('當日漲停價'))
         limit_down = _safe_number(row.get('當日跌停價'))
         if price is not None and limit_up is not None and price >= limit_up:
@@ -5186,8 +5181,6 @@ def render_futures_strategy_room():
         for position, column in enumerate(row.index):
             if column == '名稱':
                 styles[position] = name_style
-            elif column == '自訂價(可修)':
-                styles[position] = 'color:#ff4b4b;font-weight:bold;' if price_change and price_change > 0 else ('color:#00c853;font-weight:bold;' if price_change and price_change < 0 else '')
             elif column == '漲跌幅':
                 styles[position] = 'color:#ff4b4b;font-weight:bold;' if change > 0 else ('color:#00c853;font-weight:bold;' if change < 0 else '')
             elif column == '方向':
@@ -5211,7 +5204,7 @@ def render_futures_strategy_room():
             '觸發條件': st.column_config.TextColumn(width=120, disabled=True, help='條件成立後才評估進場；未成立時不以預判價直接下單。'),
             '當日漲停價': st.column_config.NumberColumn(format='%.2f', width=80, disabled=True, help='依期交所漲跌資料反推參考價後估算；實際限制以期交所與券商下單畫面為準。'),
             '當日跌停價': st.column_config.NumberColumn(format='%.2f', width=80, disabled=True, help='依期交所漲跌資料反推參考價後估算；實際限制以期交所與券商下單畫面為準。'),
-            '自訂價(可修)': st.column_config.NumberColumn('自訂價 ✏️', format='%.2f', width=85, help='可手動調整；按即時更新時會改為最新報價。'),
+            '自訂價(可修)': st.column_config.TextColumn('自訂價 ✏️', width=85, help='可手動調整；按即時更新時會改為最新報價。'),
             '漲跌幅': st.column_config.NumberColumn(format='%+.2f%%', width=70, disabled=True),
             '所需保證金': st.column_config.NumberColumn(format='%,.0f', width=90, disabled=True),
             '維持保證金': st.column_config.NumberColumn(format='%,.0f', width=90, disabled=True),
@@ -5336,7 +5329,6 @@ def render_futures_strategy_room():
         independent_rows['自訂價(可修)'] = independent_rows.apply(
             lambda row: st.session_state.futures_strategy_custom_prices.get(str(row['契約鍵'])), axis=1
         )
-        independent_rows['自訂價(可修)'] = pd.to_numeric(independent_rows['自訂價(可修)'], errors='coerce')
         if st.session_state.get('sj_logged_in', False) and st.session_state.get('sj_api') is not None:
             with st.spinner("正在取得實際契約報價與 K 棒..."):
                 independent_rows, _ = update_futures_live_rows(
@@ -5352,8 +5344,10 @@ def render_futures_strategy_room():
         for column in independent_columns:
             if column not in independent_rows.columns:
                 independent_rows[column] = None
+        independent_display = independent_rows[independent_columns].copy()
+        independent_display['自訂價(可修)'] = independent_display['自訂價(可修)'].apply(fmt_price)
         st.dataframe(
-            independent_rows[independent_columns].style.apply(style_futures_row, axis=1),
+            independent_display.style.apply(style_futures_row, axis=1),
             column_config=futures_column_config(include_ignore=False),
             hide_index=True, width='stretch', row_height=30
         )
@@ -5864,15 +5858,9 @@ with stock_strategy_container:
                 name_c = 'color: #ff4b4b;' if "多" in note else ('color: #00e676;' if "空" in note else '')
             
             price_c = ''
-            custom_price_c = ''
             try:
                 c_val = float(str(row.get('漲跌幅', '0')).replace('%', '').replace('+', ''))
                 price_c = 'color: #ff4b4b;' if c_val > 0 else ('color: #00e676;' if c_val < 0 else '')
-                custom_price = _safe_number(row.get('自訂價(可修)'))
-                close_price = _safe_number(row.get('收盤價'))
-                reference_price = close_price / (1 + c_val / 100) if close_price is not None and abs(100 + c_val) > 1e-9 else None
-                if custom_price is not None and reference_price is not None:
-                    custom_price_c = 'color: #ff4b4b;' if custom_price > reference_price else ('color: #00e676;' if custom_price < reference_price else '')
             except: pass
             
             st_val = str(row.get('狀態', ''))
@@ -5881,7 +5869,6 @@ with stock_strategy_container:
             for idx, col in enumerate(row.index):
                 if col == "名稱": styles[idx] = name_c
                 elif col in ["收盤價", "漲跌幅"]: styles[idx] = price_c
-                elif col == "自訂價(可修)": styles[idx] = custom_price_c
                 elif col == "狀態": styles[idx] = status_c
                 elif col in ["自訂價價差", "5日線價差"]:
                     val = row[col]
