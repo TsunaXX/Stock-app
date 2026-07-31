@@ -3673,6 +3673,10 @@ def _safe_number(value, default=None):
 @st.cache_data(ttl=300, max_entries=1, show_spinner=False)
 def fetch_futures_strategy_universe():
     """整併期交所成交量、近月契約名稱與保證金，供期貨戰略室排序。"""
+    index_futures_roots = {
+        'TX', 'MTX', 'TMF', 'T5F', 'TE', 'ZEF', 'TF', 'ZFF', 'TBF', 'GTF',
+        'TQF', 'E4F', 'BTF', 'SOF', 'SHF', 'JTF', 'UDF', 'SPF', 'UNF', 'PUF', 'UKF'
+    }
     headers = {
         'Accept': 'application/json, text/plain, */*',
         'User-Agent': 'Mozilla/5.0 (compatible; StockApp/1.0; +https://openapi.taifex.com.tw/)',
@@ -3717,7 +3721,7 @@ def fetch_futures_strategy_universe():
             underlying_code = str(item.get('UnderlyingSecurityCode', '')).strip()
             is_small = '小型' in name
             product_meta[root] = {
-                '名稱': name, '標的代號': underlying_code, 'ETF期貨': False,
+                '名稱': name, '標的代號': underlying_code, 'ETF期貨': False, '指數期貨': False,
                 '小型期貨': is_small, '乘數': 100 if is_small else 2000,
                 '原始保證金率': _safe_number(item.get('InitialMarginRate'), 0) or 0,
                 '維持保證金率': _safe_number(item.get('MaintenanceMarginRate'), 0) or 0,
@@ -3738,7 +3742,7 @@ def fetch_futures_strategy_universe():
             is_small = '小型' in name
             product_meta[root] = {
                 '名稱': name or f'{underlying_code} ETF期貨', '標的代號': underlying_code,
-                'ETF期貨': True, '小型期貨': is_small,
+                'ETF期貨': True, '指數期貨': False, '小型期貨': is_small,
                 '乘數': 100 if is_small else 1000,
                 '原始保證金率': 0, '維持保證金率': 0,
                 '原始保證金固定': _safe_number(item.get('InitialMargin')),
@@ -3765,7 +3769,7 @@ def fetch_futures_strategy_universe():
                 continue
             root, is_small = match
             product_meta[root] = {
-                '名稱': raw_name, '標的代號': root, 'ETF期貨': False,
+                '名稱': raw_name, '標的代號': root, 'ETF期貨': False, '指數期貨': True,
                 '小型期貨': is_small, '乘數': 1,
                 '原始保證金率': 0, '維持保證金率': 0,
                 '原始保證金固定': _safe_number(item.get('InitialMargin')),
@@ -3790,7 +3794,8 @@ def fetch_futures_strategy_universe():
         if root not in product_meta:
             product_meta[root] = {
                 '名稱': f'{root} 期貨', '標的代號': root,
-                'ETF期貨': False, '小型期貨': root in {'MTX', 'TMF'},
+                'ETF期貨': False, '指數期貨': root in index_futures_roots,
+                '小型期貨': root in {'MTX', 'TMF'},
                 '乘數': 1, '原始保證金率': 0, '維持保證金率': 0,
                 '原始保證金固定': None, '維持保證金固定': None,
             }
@@ -3847,7 +3852,8 @@ def fetch_futures_strategy_universe():
             '當日漲停價': limit_up, '當日跌停價': limit_down,
             '所需保證金': initial_margin, '維持保證金': maintenance_margin,
             '原始保證金率': meta['原始保證金率'], '維持保證金率': meta['維持保證金率'],
-            '乘數': meta['乘數'], 'ETF期貨': meta['ETF期貨'], '小型期貨': meta['小型期貨'],
+            '乘數': meta['乘數'], 'ETF期貨': meta['ETF期貨'],
+            '指數期貨': meta.get('指數期貨', root in index_futures_roots), '小型期貨': meta['小型期貨'],
             '次月期貨': month_rank[(root, month)] > 0,
             '月份順位': month_rank[(root, month)],
             '交易時段': '日＋夜' if any(str(row.get('TradingSession', '')).strip() == '盤後' and (_safe_number(row.get('Volume'), 0) or 0) > 0 for row in rows) else '日盤',
@@ -3888,7 +3894,9 @@ def resolve_shioaji_futures_contract(api, root, contract_month):
 def calculate_futures_strategy_levels(row, strategy_mode='當沖', direction_choice='自動', kbars=None):
     """計算期貨支撐壓力與條件式進出場點位；無即時 K 棒時採官方日行情備援。"""
     root = str(row.get('期貨代碼', ''))
-    close = _safe_number(row.get('收盤價'))
+    close = _safe_number(row.get('自訂價(可修)'))
+    if close is None:
+        close = _safe_number(row.get('收盤價'))
     open_price = _safe_number(row.get('開盤價'))
     high = _safe_number(row.get('當日高'))
     low = _safe_number(row.get('當日低'))
@@ -3940,7 +3948,7 @@ def calculate_futures_strategy_levels(row, strategy_mode='當沖', direction_cho
         support, resistance = low, high
 
     if close is None or support is None or resistance is None:
-        return {'支撐壓力': '資料不足', '進出場點位': '資料不足', '方向': '—', '風報比': None}
+        return {'支撐壓力': '資料不足', '進出場點位': '資料不足', '方向': '—'}
 
     direction = direction_choice
     if direction == '自動':
@@ -3963,7 +3971,7 @@ def calculate_futures_strategy_levels(row, strategy_mode='當沖', direction_cho
     return {
         '支撐壓力': f'支 {fmt_price(support)}｜壓 {fmt_price(resistance)}',
         '進出場點位': f'進 {fmt_price(entry)}｜停 {fmt_price(stop)}｜目 {fmt_price(target)}',
-        '方向': direction, '風報比': 1.5, '觸發條件': trigger,
+        '方向': direction, '觸發條件': trigger,
         'VWAP': vwap, 'ATR': atr,
     }
 
@@ -4018,6 +4026,7 @@ def update_futures_live_rows(rows, api, strategy_mode, direction_choice, include
             price = _safe_number(getattr(snapshot, 'close', None)) or _safe_number(getattr(snapshot, 'open', None))
             if price is not None and price > 0:
                 updated.at[index, '收盤價'] = price
+                updated.at[index, '自訂價(可修)'] = price
                 change = _safe_number(getattr(snapshot, 'change_price', getattr(snapshot, 'change', None)), 0) or 0
                 reference = price - change
                 updated.at[index, '漲跌幅'] = (change / reference * 100) if reference > 0 else 0
@@ -5003,11 +5012,10 @@ def render_futures_strategy_room():
         st.session_state.futures_strategy_live_cache = {}
     if 'futures_strategy_live_time' not in st.session_state:
         st.session_state.futures_strategy_live_time = None
+    if 'futures_strategy_custom_prices' not in st.session_state:
+        st.session_state.futures_strategy_custom_prices = {}
     if int(st.session_state.get('futures_minimum_volume', 1) or 1) < 1:
         st.session_state.futures_minimum_volume = 1
-
-    st.markdown("### ⚡ 期貨流動性戰略")
-    st.caption("以期交所當日成交口數排序；預設只顯示近月。即時報價與 K 棒分析需登入 Shioaji，所有點位均為條件式觀察值，不會自動下單。")
 
     control1, control2, control3, control4 = st.columns(4)
     with control1:
@@ -5017,6 +5025,7 @@ def render_futures_strategy_room():
         limit_rows = st.number_input("顯示筆數", min_value=1, max_value=50, value=5, step=1, key="futures_strategy_limit")
         minimum_volume = st.number_input("最低成交口數", min_value=1, value=1, step=1, key="futures_minimum_volume")
     with control3:
+        hide_index = st.checkbox("隱藏指數期貨", value=True, key="futures_hide_index")
         hide_etf = st.checkbox("隱藏 ETF 期貨", value=False, key="futures_hide_etf")
         hide_small = st.checkbox("隱藏小型期貨", value=False, key="futures_hide_small")
         hide_next = st.checkbox("隱藏次月期貨", value=True, key="futures_hide_next")
@@ -5048,6 +5057,8 @@ def render_futures_strategy_room():
         st.warning("部分官方資料未完整取得：" + "｜".join(universe_meta['errors']))
 
     filtered = universe.copy()
+    if hide_index:
+        filtered = filtered[~filtered['指數期貨']]
     if hide_etf:
         filtered = filtered[~filtered['ETF期貨']]
     if hide_small:
@@ -5068,15 +5079,26 @@ def render_futures_strategy_room():
         manual_rows['_manual_order'] = manual_rows['契約鍵'].map(order_map)
         manual_rows = manual_rows.sort_values('_manual_order').drop(columns=['_manual_order'])
     display_rows = pd.concat([base_rows, manual_rows], ignore_index=True)
+    custom_prices = st.session_state.futures_strategy_custom_prices
+    display_rows['自訂價(可修)'] = display_rows.apply(
+        lambda row: custom_prices.get(str(row['契約鍵']), _safe_number(row.get('收盤價'))), axis=1
+    )
 
     cache = st.session_state.futures_strategy_live_cache
     for index, row in display_rows.iterrows():
-        cached = cache.get(str(row['契約鍵']))
+        contract_key = str(row['契約鍵'])
+        cached = cache.get(contract_key)
         if cached:
             for column, value in cached.items():
-                if column in display_rows.columns or column in ('支撐壓力', '進出場點位', '方向', '風報比', '觸發條件', '實際契約'):
+                if column == '自訂價(可修)' and contract_key in custom_prices:
+                    continue
+                if column in display_rows.columns or column in ('支撐壓力', '進出場點位', '方向', '觸發條件', '實際契約'):
                     display_rows.at[index, column] = value
-        if not cached or cached.get('_策略週期') != strategy_mode or cached.get('_分析方向') != direction_choice:
+        custom_price_changed = (
+            cached is not None
+            and _safe_number(display_rows.at[index, '自訂價(可修)']) != _safe_number(cached.get('自訂價(可修)'))
+        )
+        if not cached or cached.get('_策略週期') != strategy_mode or cached.get('_分析方向') != direction_choice or custom_price_changed:
             analysis = calculate_futures_strategy_levels(display_rows.loc[index], strategy_mode, direction_choice)
             for column, value in analysis.items():
                 display_rows.at[index, column] = value
@@ -5096,6 +5118,7 @@ def render_futures_strategy_room():
                 cached_row['_策略週期'] = strategy_mode
                 cached_row['_分析方向'] = direction_choice
                 st.session_state.futures_strategy_live_cache[str(updated_row['契約鍵'])] = cached_row
+                st.session_state.futures_strategy_custom_prices[str(updated_row['契約鍵'])] = _safe_number(updated_row.get('自訂價(可修)'))
             st.session_state.futures_strategy_live_time = datetime.now(pytz.timezone('Asia/Taipei')).strftime('%Y/%m/%d %H:%M:%S')
             if updated_count:
                 st.toast(f"已更新 {updated_count} 檔期貨報價與分析", icon="✅")
@@ -5110,7 +5133,7 @@ def render_futures_strategy_room():
         display_columns = [
             '忽略', '期貨代碼', '契約月份', '名稱', '交易時段', '當日成交口數', '未平倉量',
             '方向', '支撐壓力', '進出場點位', '觸發條件', '當日漲停價', '當日跌停價',
-            '收盤價', '漲跌幅', '所需保證金', '維持保證金', '風報比'
+            '自訂價(可修)', '漲跌幅', '所需保證金', '維持保證金'
         ]
         for column in display_columns:
             if column not in display_rows.columns:
@@ -5121,7 +5144,7 @@ def render_futures_strategy_room():
             change = _safe_number(row.get('漲跌幅'), 0) or 0
             direction = str(row.get('方向', ''))
             for position, column in enumerate(row.index):
-                if column in ('收盤價', '漲跌幅'):
+                if column in ('自訂價(可修)', '漲跌幅'):
                     styles[position] = 'color:#ff4b4b;font-weight:bold;' if change > 0 else ('color:#00c853;font-weight:bold;' if change < 0 else '')
                 elif column == '方向':
                     styles[position] = 'color:#ff4b4b;font-weight:bold;' if direction == '偏多' else ('color:#00c853;font-weight:bold;' if direction == '偏空' else '')
@@ -5133,36 +5156,54 @@ def render_futures_strategy_room():
             display_rows[display_columns].style.apply(style_futures_row, axis=1),
             column_config={
                 '忽略': st.column_config.CheckboxColumn('隱藏', width=45),
-                '期貨代碼': st.column_config.TextColumn(width=65, disabled=True),
-                '契約月份': st.column_config.TextColumn(width=80, disabled=True),
-                '名稱': st.column_config.TextColumn(width=145, disabled=True),
-                '交易時段': st.column_config.TextColumn(width=75, disabled=True),
-                '當日成交口數': st.column_config.NumberColumn(format='%d', width=105, disabled=True),
-                '未平倉量': st.column_config.NumberColumn(format='%d', width=90, disabled=True),
-                '方向': st.column_config.TextColumn(width=65, disabled=True),
-                '支撐壓力': st.column_config.TextColumn(width=165, disabled=True),
-                '進出場點位': st.column_config.TextColumn(width=220, disabled=True, help='進＝條件成立後觀察價；停＝失效點；目＝第一目標。'),
-                '觸發條件': st.column_config.TextColumn(width=150, disabled=True, help='條件成立後才評估進場；未成立時不以預判價直接下單。'),
-                '當日漲停價': st.column_config.NumberColumn(format='%.2f', width=100, disabled=True, help='依期交所漲跌資料反推參考價後估算；實際限制以期交所與券商下單畫面為準。'),
-                '當日跌停價': st.column_config.NumberColumn(format='%.2f', width=100, disabled=True, help='依期交所漲跌資料反推參考價後估算；實際限制以期交所與券商下單畫面為準。'),
-                '收盤價': st.column_config.NumberColumn(format='%.2f', width=85, disabled=True),
-                '漲跌幅': st.column_config.NumberColumn(format='%+.2f%%', width=85, disabled=True),
-                '所需保證金': st.column_config.NumberColumn(format='%,.0f', width=105, disabled=True),
-                '維持保證金': st.column_config.NumberColumn(format='%,.0f', width=105, disabled=True),
-                '風報比': st.column_config.NumberColumn(format='1 : %.1f', width=75, disabled=True),
+                '期貨代碼': st.column_config.TextColumn(width=55, disabled=True),
+                '契約月份': st.column_config.TextColumn(width=65, disabled=True),
+                '名稱': st.column_config.TextColumn(width=120, disabled=True),
+                '交易時段': st.column_config.TextColumn(width=55, disabled=True),
+                '當日成交口數': st.column_config.NumberColumn(format='%d', width=85, disabled=True),
+                '未平倉量': st.column_config.NumberColumn(format='%d', width=80, disabled=True),
+                '方向': st.column_config.TextColumn(width=55, disabled=True),
+                '支撐壓力': st.column_config.TextColumn(width=135, disabled=True),
+                '進出場點位': st.column_config.TextColumn(width=190, disabled=True, help='進＝條件成立後觀察價；停＝失效點；目＝第一目標。'),
+                '觸發條件': st.column_config.TextColumn(width=120, disabled=True, help='條件成立後才評估進場；未成立時不以預判價直接下單。'),
+                '當日漲停價': st.column_config.NumberColumn(format='%.2f', width=80, disabled=True, help='依期交所漲跌資料反推參考價後估算；實際限制以期交所與券商下單畫面為準。'),
+                '當日跌停價': st.column_config.NumberColumn(format='%.2f', width=80, disabled=True, help='依期交所漲跌資料反推參考價後估算；實際限制以期交所與券商下單畫面為準。'),
+                '自訂價(可修)': st.column_config.NumberColumn('自訂價 ✏️', format='%.2f', width=85, help='可手動調整；按即時更新時會改為最新報價。'),
+                '漲跌幅': st.column_config.NumberColumn(format='%+.2f%%', width=70, disabled=True),
+                '所需保證金': st.column_config.NumberColumn(format='%,.0f', width=90, disabled=True),
+                '維持保證金': st.column_config.NumberColumn(format='%,.0f', width=90, disabled=True),
             },
-            hide_index=True, width='stretch', key='futures_strategy_editor'
+            hide_index=True, width='stretch', row_height=30, key='futures_strategy_editor'
         )
+        display_key_map = {
+            f"{row['期貨代碼']}:{row['契約月份']}": str(row['契約鍵'])
+            for _, row in display_rows.iterrows()
+        }
+        current_custom_prices = {
+            str(row['契約鍵']): _safe_number(row.get('自訂價(可修)'))
+            for _, row in display_rows.iterrows()
+        }
+        price_changed = False
+        for _, edited_row in edited.iterrows():
+            key = display_key_map.get(f"{edited_row['期貨代碼']}:{edited_row['契約月份']}")
+            if not key:
+                continue
+            new_price = _safe_number(edited_row.get('自訂價(可修)'))
+            previous_price = current_custom_prices.get(key)
+            if new_price != previous_price:
+                price_changed = True
+                if new_price is None:
+                    st.session_state.futures_strategy_custom_prices.pop(key, None)
+                else:
+                    st.session_state.futures_strategy_custom_prices[key] = new_price
         hidden_rows = edited[edited['忽略'] == True]
         if not hidden_rows.empty:
-            display_key_map = {
-                f"{row['期貨代碼']}:{row['契約月份']}": str(row['契約鍵'])
-                for _, row in display_rows.iterrows()
-            }
             for _, hidden in hidden_rows.iterrows():
                 key = display_key_map.get(f"{hidden['期貨代碼']}:{hidden['契約月份']}")
                 if key:
                     st.session_state.futures_strategy_ignored.add(key)
+            price_changed = True
+        if price_changed:
             st.rerun()
 
     st.markdown("#### 🔍 快速新增期貨")
@@ -5211,6 +5252,11 @@ def render_futures_strategy_room():
     if st.button("🚀 執行期貨獨立分析", key='run_futures_independent') and independent_labels:
         keys = [option_map[label] for label in independent_labels]
         independent_rows = universe[universe['契約鍵'].isin(keys)].copy()
+        independent_rows['自訂價(可修)'] = independent_rows.apply(
+            lambda row: st.session_state.futures_strategy_custom_prices.get(
+                str(row['契約鍵']), _safe_number(row.get('收盤價'))
+            ), axis=1
+        )
         if st.session_state.get('sj_logged_in', False) and st.session_state.get('sj_api') is not None:
             with st.spinner("正在取得實際契約報價與 K 棒..."):
                 independent_rows, _ = update_futures_live_rows(
@@ -5224,7 +5270,7 @@ def render_futures_strategy_room():
             st.info("目前未登入 Shioaji，獨立計算先使用期交所日行情；登入後可加入即時與夜盤 K 棒。")
         independent_columns = [
             '期貨代碼', '契約月份', '名稱', '當日成交口數', '方向', '支撐壓力', '進出場點位', '觸發條件',
-            '當日漲停價', '當日跌停價', '收盤價', '漲跌幅', '所需保證金', '維持保證金', '交易時段'
+            '當日漲停價', '當日跌停價', '自訂價(可修)', '漲跌幅', '所需保證金', '維持保證金', '交易時段'
         ]
         st.dataframe(independent_rows[independent_columns], hide_index=True, width='stretch')
 
