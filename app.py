@@ -4050,7 +4050,8 @@ def update_futures_live_rows(rows, api, strategy_mode, direction_choice, include
             price = _safe_number(getattr(snapshot, 'close', None)) or _safe_number(getattr(snapshot, 'open', None))
             if price is not None and price > 0:
                 updated.at[index, '收盤價'] = price
-                updated.at[index, '自訂價(可修)'] = price
+                # 自訂價欄位供 TextColumn 編輯，必須維持字串型別以相容新版 Pandas Arrow 字串欄位。
+                updated.at[index, '自訂價(可修)'] = fmt_price(price)
                 change = _safe_number(getattr(snapshot, 'change_price', getattr(snapshot, 'change', None)), 0) or 0
                 reference = price - change
                 updated.at[index, '漲跌幅'] = (change / reference * 100) if reference > 0 else 0
