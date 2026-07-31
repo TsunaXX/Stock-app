@@ -3468,8 +3468,6 @@ with st.sidebar:
                     st.error(f"❌ 登入失敗: {e}")
     st.markdown("---")
 
-    st.caption("股票策略設定與資料管理已移至「股票戰略室」。")
-
 def render_stock_strategy_controls():
     """將原當沖戰略室的側欄設定與資料管理移至股票戰略室。"""
     with st.expander("⚙️ 股票戰略室設定與資料管理", expanded=False):
@@ -3675,16 +3673,36 @@ def _safe_number(value, default=None):
 @st.cache_data(ttl=300, max_entries=1, show_spinner=False)
 def fetch_futures_strategy_universe():
     """整併期交所成交量、近月契約名稱與保證金，供期貨戰略室排序。"""
-    headers = {'accept': 'application/json', 'If-Modified-Since': 'Mon, 26 Jul 1997 05:00:00 GMT'}
+    headers = {
+        'Accept': 'application/json, text/plain, */*',
+        'User-Agent': 'Mozilla/5.0 (compatible; StockApp/1.0; +https://openapi.taifex.com.tw/)',
+        'Referer': 'https://openapi.taifex.com.tw/',
+        'Cache-Control': 'no-cache',
+    }
 
     def fetch_endpoint(endpoint):
-        response = requests.get(
-            f'https://openapi.taifex.com.tw/v1/{endpoint}', headers=headers,
-            timeout=12, verify=False
-        )
-        response.raise_for_status()
-        response.encoding = 'utf-8'
-        return response.json()
+        url = f'https://openapi.taifex.com.tw/v1/{endpoint}'
+        last_error = None
+        for attempt in range(3):
+            try:
+                response = requests.get(
+                    url,
+                    headers=headers,
+                    params={'_': int(time.time())} if attempt else None,
+                    timeout=(8, 25),
+                    verify=False,
+                )
+                response.raise_for_status()
+                response.encoding = 'utf-8-sig'
+                payload = response.json()
+                if not isinstance(payload, list) or not payload:
+                    raise ValueError("期交所回傳空白或非預期格式")
+                return payload
+            except (requests.RequestException, ValueError, json.JSONDecodeError) as exc:
+                last_error = exc
+                if attempt < 2:
+                    time.sleep(0.6 * (attempt + 1))
+        raise RuntimeError(f'{endpoint} 連線失敗（已重試 3 次）：{last_error}')
 
     product_meta = {}
     errors = []
@@ -3767,8 +3785,15 @@ def fetch_futures_strategy_universe():
     for item in market_rows:
         root = str(item.get('Contract', '')).strip().upper()
         month = str(item.get('ContractMonth(Week)', '')).strip()
-        if root not in product_meta or not re.fullmatch(r'\d{6}', month):
+        if not root or not re.fullmatch(r'\d{6}', month):
             continue
+        if root not in product_meta:
+            product_meta[root] = {
+                '名稱': f'{root} 期貨', '標的代號': root,
+                'ETF期貨': False, '小型期貨': root in {'MTX', 'TMF'},
+                '乘數': 1, '原始保證金率': 0, '維持保證金率': 0,
+                '原始保證金固定': None, '維持保證金固定': None,
+            }
         key = (root, month)
         grouped.setdefault(key, []).append(item)
 
@@ -4978,6 +5003,8 @@ def render_futures_strategy_room():
         st.session_state.futures_strategy_live_cache = {}
     if 'futures_strategy_live_time' not in st.session_state:
         st.session_state.futures_strategy_live_time = None
+    if int(st.session_state.get('futures_minimum_volume', 1) or 1) < 1:
+        st.session_state.futures_minimum_volume = 1
 
     st.markdown("### ⚡ 期貨流動性戰略")
     st.caption("以期交所當日成交口數排序；預設只顯示近月。即時報價與 K 棒分析需登入 Shioaji，所有點位均為條件式觀察值，不會自動下單。")
@@ -4988,10 +5015,10 @@ def render_futures_strategy_room():
         direction_choice = st.radio("分析方向", ["自動", "偏多", "偏空"], horizontal=True, key="futures_direction_choice")
     with control2:
         limit_rows = st.number_input("顯示筆數", min_value=1, max_value=50, value=5, step=1, key="futures_strategy_limit")
-        minimum_volume = st.number_input("最低成交口數", min_value=0, value=0, step=100, key="futures_minimum_volume")
+        minimum_volume = st.number_input("最低成交口數", min_value=1, value=1, step=1, key="futures_minimum_volume")
     with control3:
-        hide_etf = st.checkbox("隱藏 ETF 期貨", value=True, key="futures_hide_etf")
-        hide_small = st.checkbox("隱藏小型期貨", value=True, key="futures_hide_small")
+        hide_etf = st.checkbox("隱藏 ETF 期貨", value=False, key="futures_hide_etf")
+        hide_small = st.checkbox("隱藏小型期貨", value=False, key="futures_hide_small")
         hide_next = st.checkbox("隱藏次月期貨", value=True, key="futures_hide_next")
     with control4:
         refresh_official = st.button("🔄 更新成交量／保證金", use_container_width=True, key="refresh_futures_official")
@@ -5007,6 +5034,7 @@ def render_futures_strategy_room():
         st.error("目前無法取得期交所期貨排行資料，請稍後重試。")
         if universe_meta.get('errors'):
             st.caption("｜".join(universe_meta['errors']))
+        st.markdown("資料來源：[臺灣期貨交易所 OpenAPI](https://openapi.taifex.com.tw/)")
         return
 
     official_date = str(universe_meta.get('updated') or '')
