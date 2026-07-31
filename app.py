@@ -5115,6 +5115,8 @@ def render_futures_strategy_room():
     display_rows['自訂價(可修)'] = display_rows.apply(
         lambda row: custom_prices.get(str(row['契約鍵'])), axis=1
     )
+    # NumberColumn 對 NaN 會顯示為真正的空白，避免空值被渲染成文字 None。
+    display_rows['自訂價(可修)'] = pd.to_numeric(display_rows['自訂價(可修)'], errors='coerce')
 
     for index, row in display_rows.iterrows():
         contract_key = str(row['契約鍵'])
@@ -5334,6 +5336,7 @@ def render_futures_strategy_room():
         independent_rows['自訂價(可修)'] = independent_rows.apply(
             lambda row: st.session_state.futures_strategy_custom_prices.get(str(row['契約鍵'])), axis=1
         )
+        independent_rows['自訂價(可修)'] = pd.to_numeric(independent_rows['自訂價(可修)'], errors='coerce')
         if st.session_state.get('sj_logged_in', False) and st.session_state.get('sj_api') is not None:
             with st.spinner("正在取得實際契約報價與 K 棒..."):
                 independent_rows, _ = update_futures_live_rows(
@@ -5861,9 +5864,15 @@ with stock_strategy_container:
                 name_c = 'color: #ff4b4b;' if "多" in note else ('color: #00e676;' if "空" in note else '')
             
             price_c = ''
+            custom_price_c = ''
             try:
                 c_val = float(str(row.get('漲跌幅', '0')).replace('%', '').replace('+', ''))
                 price_c = 'color: #ff4b4b;' if c_val > 0 else ('color: #00e676;' if c_val < 0 else '')
+                custom_price = _safe_number(row.get('自訂價(可修)'))
+                close_price = _safe_number(row.get('收盤價'))
+                reference_price = close_price / (1 + c_val / 100) if close_price is not None and abs(100 + c_val) > 1e-9 else None
+                if custom_price is not None and reference_price is not None:
+                    custom_price_c = 'color: #ff4b4b;' if custom_price > reference_price else ('color: #00e676;' if custom_price < reference_price else '')
             except: pass
             
             st_val = str(row.get('狀態', ''))
@@ -5872,6 +5881,7 @@ with stock_strategy_container:
             for idx, col in enumerate(row.index):
                 if col == "名稱": styles[idx] = name_c
                 elif col in ["收盤價", "漲跌幅"]: styles[idx] = price_c
+                elif col == "自訂價(可修)": styles[idx] = custom_price_c
                 elif col == "狀態": styles[idx] = status_c
                 elif col in ["自訂價價差", "5日線價差"]:
                     val = row[col]
