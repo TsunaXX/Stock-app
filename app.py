@@ -3468,102 +3468,136 @@ with st.sidebar:
                     st.error(f"❌ 登入失敗: {e}")
     st.markdown("---")
 
-    st.header("⚙️ 設定")
-    current_font_size = st.slider("字體大小 (表格)", min_value=12, max_value=72, value=st.session_state.font_size, key='font_size_slider')
-    st.session_state.font_size = current_font_size
-    hide_non_stock = st.checkbox("隱藏非個股 (ETF/權證/債券)", value=True)
-    st.checkbox("查詢權證 (含圖表快速標籤)", value=False, key="allow_warrant_search") # 新增權證過濾開關
-    show_3d_hilo = st.checkbox("近3日高低點 (戰略備註)", value=False, help="勾選後，將於戰略備註中加入前天、昨天、今天的最高與最低價 (僅顯示數值)")
-    st.markdown("---")
-    current_limit_rows = st.number_input("顯示筆數 (檔案/雲端)", min_value=1, value=st.session_state.limit_rows, key='limit_rows_input')
-    st.session_state.limit_rows = current_limit_rows
-    
-    if st.button("💾 儲存設定"):
-        if save_config(current_font_size, current_limit_rows, st.session_state.auto_update_last_row, st.session_state.update_delay_sec, st.session_state.sj_key, st.session_state.sj_secret, st.session_state.remember_sj):
-            st.toast("設定已儲存！", icon="✅")
-            
-    st.markdown("### 資料管理")
-    if st.session_state.ignored_stocks:
-        st.write(f"🚫 忽略名單 (取消勾選以復原):")
-        ignored_list = sorted(list(st.session_state.ignored_stocks))
-        options_map = {f"{c} {get_stock_name_online(c)}": c for c in ignored_list}
-        options_display = list(options_map.keys())
-        selected_ignored_display = st.multiselect("管理忽略股票", options=options_display, default=options_display, label_visibility="collapsed")
-        current_selected_codes = set(options_map[opt] for opt in selected_ignored_display)
-        if len(current_selected_codes) != len(st.session_state.ignored_stocks):
-            unignored_codes = st.session_state.ignored_stocks - current_selected_codes
-            st.session_state.ignored_stocks = current_selected_codes
-            # --- 新增：將待加回的股票存入 pending 狀態 ---
-            if unignored_codes:
-                st.session_state.pending_unignore = unignored_codes
-            # ---------------------------------------------
-            save_data_cache(st.session_state.stock_data, st.session_state.ignored_stocks, st.session_state.all_candidates, st.session_state.saved_notes)
-            st.toast("已更新忽略名單。", icon="🔄")
-            st.rerun()
-    else:
-        st.write("🚫 目前無忽略股票")
-    
-    col_restore, col_clear = st.columns([1, 1], gap="small")
-    with col_restore:
-        if st.button("♻️ 全部復原", width='stretch'):
-            st.session_state.ignored_stocks.clear()
-            save_data_cache(st.session_state.stock_data, st.session_state.ignored_stocks, st.session_state.all_candidates, st.session_state.saved_notes)
-            st.toast("已重置忽略名單。", icon="🔄")
-            st.rerun()
-    with col_clear:
-        if st.button("🗑️ 全部清空", type="primary", width='stretch'):
-            st.session_state.stock_data = pd.DataFrame()
-            st.session_state.ignored_stocks = set()
-            st.session_state.all_candidates = []
-            st.session_state.search_multiselect = []
-            st.session_state.saved_notes = {} 
-            save_search_cache([])
-            if os.path.exists(DATA_CACHE_FILE): os.remove(DATA_CACHE_FILE)
-            st.toast("資料已全部清空", icon="🗑️")
-            st.rerun()
-    
-    st.caption("功能說明")
-    st.info("🗑️ **如何刪除股票？**\n\n在表格左側勾選「刪除」框，資料將會立即移除並**自動遞補下一檔**。")
-    st.markdown("---")
-    st.markdown("### 🔗 外部資源")
-    
-    def perform_goodinfo_fetch():
-        with st.spinner("正在抓取最新資料，請稍候約 15 秒..."):
-            df_goodinfo = fetch_goodinfo_data()
-            if df_goodinfo is not None and not df_goodinfo.empty:
-                # 🟢 變更：同時將 DataFrame 存入 session_state 供戰略室直接讀取
-                st.session_state['goodinfo_df'] = df_goodinfo.astype(str)
-                st.session_state['goodinfo_fetch_failed'] = False
-                st.success("💡 抓取成功並已載入暫存！\n\n若要分析此數據，請確保主畫面「未上傳檔案」且「未輸入雲端連結」，直接點擊主畫面的『🚀 執行分析』即可。")
-            else:
-                st.session_state['goodinfo_fetch_failed'] = True
-                st.error("抓取失敗或查無資料，請稍後再試。")
+    st.caption("股票策略設定與資料管理已移至「股票戰略室」。")
 
-    # 觸發爬蟲的按鈕
-    if st.button("📥 抓取 Goodinfo 週轉率排行", help="需等待網頁載入約15秒", width='stretch'):
-        perform_goodinfo_fetch()
-        
-    if st.session_state.get('goodinfo_fetch_failed', False):
-        col_retry, col_link = st.columns(2)
-        with col_retry:
-            if st.button("🔄 重新抓取", key="retry_goodinfo_btn"):
+def render_stock_strategy_controls():
+    """將原當沖戰略室的側欄設定與資料管理移至股票戰略室。"""
+    with st.expander("⚙️ 股票戰略室設定與資料管理", expanded=False):
+        settings_col, data_col, resource_col = st.columns(3)
+
+        with settings_col:
+            st.markdown("#### 顯示設定")
+            current_font_size = st.slider(
+                "字體大小（表格）", min_value=12, max_value=72,
+                value=st.session_state.font_size, key='font_size_slider'
+            )
+            st.session_state.font_size = current_font_size
+            hide_non_stock = st.checkbox(
+                "隱藏非個股（ETF／權證／債券）", value=True,
+                key='stock_hide_non_stock'
+            )
+            st.checkbox(
+                "查詢權證（含圖表快速標籤）", value=False,
+                key="allow_warrant_search"
+            )
+            show_3d_hilo = st.checkbox(
+                "近 3 日高低點（戰略備註）", value=False,
+                key='stock_show_3d_hilo',
+                help="在戰略備註加入前天、昨天、今天的高低點。"
+            )
+            current_limit_rows = st.number_input(
+                "顯示筆數（檔案／雲端）", min_value=1,
+                value=st.session_state.limit_rows, key='limit_rows_input'
+            )
+            st.session_state.limit_rows = current_limit_rows
+            if st.button("💾 儲存股票設定", use_container_width=True, key='save_stock_room_settings'):
+                if save_config(
+                    current_font_size, current_limit_rows,
+                    st.session_state.auto_update_last_row, st.session_state.update_delay_sec,
+                    st.session_state.sj_key, st.session_state.sj_secret,
+                    st.session_state.remember_sj
+                ):
+                    st.toast("股票設定已儲存", icon="✅")
+
+        with data_col:
+            st.markdown("#### 資料管理")
+            if st.session_state.ignored_stocks:
+                ignored_list = sorted(st.session_state.ignored_stocks)
+                option_map = {f"{code} {get_stock_name_online(code)}": code for code in ignored_list}
+                selected = st.multiselect(
+                    "忽略名單（取消勾選以復原）", list(option_map),
+                    default=list(option_map),
+                    key=f"stock_ignored_manager_{abs(hash(tuple(ignored_list)))}"
+                )
+                selected_codes = {option_map[label] for label in selected}
+                if selected_codes != st.session_state.ignored_stocks:
+                    restored = st.session_state.ignored_stocks - selected_codes
+                    st.session_state.ignored_stocks = selected_codes
+                    if restored:
+                        st.session_state.pending_unignore = restored
+                    save_data_cache(
+                        st.session_state.stock_data, st.session_state.ignored_stocks,
+                        st.session_state.all_candidates, st.session_state.saved_notes
+                    )
+                    st.rerun()
+            else:
+                st.caption("目前無忽略股票")
+
+            restore_col, clear_col = st.columns(2)
+            with restore_col:
+                if st.button("♻️ 全部復原", use_container_width=True, key='restore_all_stocks'):
+                    st.session_state.pending_unignore = set(st.session_state.ignored_stocks)
+                    st.session_state.ignored_stocks.clear()
+                    save_data_cache(
+                        st.session_state.stock_data, st.session_state.ignored_stocks,
+                        st.session_state.all_candidates, st.session_state.saved_notes
+                    )
+                    st.rerun()
+            with clear_col:
+                if st.button("🗑️ 全部清空", type="primary", use_container_width=True, key='clear_all_stock_data'):
+                    st.session_state.stock_data = pd.DataFrame()
+                    st.session_state.ignored_stocks = set()
+                    st.session_state.all_candidates = []
+                    st.session_state.search_multiselect = []
+                    st.session_state.saved_notes = {}
+                    save_search_cache([])
+                    if os.path.exists(DATA_CACHE_FILE):
+                        os.remove(DATA_CACHE_FILE)
+                    st.rerun()
+            st.info("在股票表格左側勾選「刪除」，會立即隱藏並自動遞補下一檔。")
+
+        with resource_col:
+            st.markdown("#### 外部資源")
+
+            def perform_goodinfo_fetch():
+                with st.spinner("正在抓取最新資料，約需 15 秒..."):
+                    result = fetch_goodinfo_data()
+                    if result is not None and not result.empty:
+                        st.session_state['goodinfo_df'] = result.astype(str)
+                        st.session_state['goodinfo_fetch_failed'] = False
+                        st.success("抓取成功，已載入暫存；回到股票分析按執行即可。")
+                    else:
+                        st.session_state['goodinfo_fetch_failed'] = True
+                        st.error("抓取失敗或查無資料，請稍後再試。")
+
+            if st.button(
+                "📥 抓取 Goodinfo 週轉率排行", help="需等待動態表格載入",
+                use_container_width=True, key='fetch_goodinfo_in_stock_room'
+            ):
                 perform_goodinfo_fetch()
-                st.rerun()
-        with col_link:
-            goodinfo_url = "https://goodinfo.tw/tw/StockList.asp?RPT_TIME=&MARKET_CAT=%E7%86%B1%E9%96%80%E6%8E%92%E8%A1%8C&INDUSTRY_CAT=%E7%B4%AF%E8%A8%88%E6%88%90%E4%BA%A4%E9%87%8F%E9%80%B1%E8%BD%89%E7%8E%87%28%E7%95%B6%E6%97%A5%29%40%40%E7%B4%AF%E8%A8%88%E6%88%90%E4%BA%A4%E9%87%8F%E9%80%B1%E8%BD%89%E7%8E%87%40%40%E7%95%B6%E6%97%A5"
-            st.link_button("🌐 直接連結", goodinfo_url)
-                    
-    # 保留原有的下載按鈕
-    if 'goodinfo_df' in st.session_state:
-        st.download_button(
-            label="💾 下載 Report.csv",
-            data=st.session_state['goodinfo_df'].to_csv(index=False).encode('utf-8-sig'),
-            file_name="Report.csv",
-            mime="text/csv",
-            width='stretch'
-        )
-    st.link_button("🚨 上市處置有價證券公告", "https://www.twse.com.tw/zh/announcement/punish.html", width='stretch')
-    st.link_button("🚨 上櫃處置有價證券公告", "https://www.tpex.org.tw/zh-tw/announce/market/disposal.html", width='stretch')
+            if st.session_state.get('goodinfo_fetch_failed', False):
+                if st.button("🔄 重新抓取", use_container_width=True, key='retry_goodinfo_btn'):
+                    perform_goodinfo_fetch()
+            if 'goodinfo_df' in st.session_state:
+                st.download_button(
+                    "💾 下載 Report.csv",
+                    data=st.session_state['goodinfo_df'].to_csv(index=False).encode('utf-8-sig'),
+                    file_name="Report.csv", mime="text/csv", use_container_width=True
+                )
+            st.link_button(
+                "🌐 Goodinfo 週轉率排行",
+                "https://goodinfo.tw/tw/StockList.asp?RPT_TIME=&MARKET_CAT=%E7%86%B1%E9%96%80%E6%8E%92%E8%A1%8C&INDUSTRY_CAT=%E7%B4%AF%E8%A8%88%E6%88%90%E4%BA%A4%E9%87%8F%E9%80%B1%E8%BD%89%E7%8E%87%28%E7%95%B6%E6%97%A5%29%40%40%E7%B4%AF%E8%A8%88%E6%88%90%E4%BA%A4%E9%87%8F%E9%80%B1%E8%BD%89%E7%8E%87%40%40%E7%95%B6%E6%97%A5",
+                use_container_width=True
+            )
+            st.link_button(
+                "🚨 上市處置公告", "https://www.twse.com.tw/zh/announcement/punish.html",
+                use_container_width=True
+            )
+            st.link_button(
+                "🚨 上櫃處置公告", "https://www.tpex.org.tw/zh-tw/announce/market/disposal.html",
+                use_container_width=True
+            )
+    return current_font_size, hide_non_stock, show_3d_hilo
 
 @st.cache_data(ttl=86400)
 def fetch_futures_list():
@@ -3616,6 +3650,375 @@ def fetch_futures_list():
             return futures_dict
     except: pass
     return {}
+
+def _decode_taifex_legacy_text(value):
+    """部分期交所 ETF 端點仍回傳 Big5 字串，必要時轉回繁體中文。"""
+    text = str(value or '').strip()
+    if not text:
+        return ''
+    try:
+        decoded = text.encode('latin1').decode('big5')
+        return decoded if decoded else text
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return text
+
+def _safe_number(value, default=None):
+    try:
+        text = str(value).replace(',', '').replace('%', '').strip()
+        if text in ('', '-', 'NULL', 'nan', 'None'):
+            return default
+        number = float(text)
+        return default if not math.isfinite(number) else number
+    except (TypeError, ValueError):
+        return default
+
+@st.cache_data(ttl=300, max_entries=1, show_spinner=False)
+def fetch_futures_strategy_universe():
+    """整併期交所成交量、近月契約名稱與保證金，供期貨戰略室排序。"""
+    headers = {'accept': 'application/json', 'If-Modified-Since': 'Mon, 26 Jul 1997 05:00:00 GMT'}
+
+    def fetch_endpoint(endpoint):
+        response = requests.get(
+            f'https://openapi.taifex.com.tw/v1/{endpoint}', headers=headers,
+            timeout=12, verify=False
+        )
+        response.raise_for_status()
+        response.encoding = 'utf-8'
+        return response.json()
+
+    product_meta = {}
+    errors = []
+    sync_dates = []
+
+    try:
+        for item in fetch_endpoint('SingleStockFuturesMargining'):
+            root = str(item.get('Contract', '')).strip().upper()
+            if not root:
+                continue
+            name = str(item.get('ContractName', root)).strip()
+            underlying_code = str(item.get('UnderlyingSecurityCode', '')).strip()
+            is_small = '小型' in name
+            product_meta[root] = {
+                '名稱': name, '標的代號': underlying_code, 'ETF期貨': False,
+                '小型期貨': is_small, '乘數': 100 if is_small else 2000,
+                '原始保證金率': _safe_number(item.get('InitialMarginRate'), 0) or 0,
+                '維持保證金率': _safe_number(item.get('MaintenanceMarginRate'), 0) or 0,
+                '原始保證金固定': None, '維持保證金固定': None,
+            }
+            if item.get('Date'):
+                sync_dates.append(str(item['Date']))
+    except Exception as exc:
+        errors.append(f'個股期貨保證金：{exc}')
+
+    try:
+        for item in fetch_endpoint('SingleStockFuturesETFMargining'):
+            root = str(item.get('Contract', '')).strip().upper()
+            if not root:
+                continue
+            name = _decode_taifex_legacy_text(item.get('ContractName', root))
+            underlying_code = str(item.get('UnderlyingSecurityCode', '')).strip()
+            is_small = '小型' in name
+            product_meta[root] = {
+                '名稱': name or f'{underlying_code} ETF期貨', '標的代號': underlying_code,
+                'ETF期貨': True, '小型期貨': is_small,
+                '乘數': 100 if is_small else 1000,
+                '原始保證金率': 0, '維持保證金率': 0,
+                '原始保證金固定': _safe_number(item.get('InitialMargin')),
+                '維持保證金固定': _safe_number(item.get('MaintenanceMargin')),
+            }
+            if item.get('Date'):
+                sync_dates.append(str(item['Date']))
+    except Exception as exc:
+        errors.append(f'ETF期貨保證金：{exc}')
+
+    index_root_map = {
+        '臺股期貨': ('TX', False), '台股期貨': ('TX', False),
+        '小型臺指': ('MTX', True), '小型台指': ('MTX', True),
+        '微型臺指': ('TMF', True), '微型台指': ('TMF', True),
+        '電子期貨': ('TE', False), '金融期貨': ('TF', False),
+    }
+    try:
+        for item in fetch_endpoint('IndexFuturesAndOptionsMargining'):
+            raw_name = str(item.get('Contract', '')).strip()
+            if '客製化' in raw_name:
+                continue
+            match = next((value for key, value in index_root_map.items() if key in raw_name), None)
+            if not match:
+                continue
+            root, is_small = match
+            product_meta[root] = {
+                '名稱': raw_name, '標的代號': root, 'ETF期貨': False,
+                '小型期貨': is_small, '乘數': 1,
+                '原始保證金率': 0, '維持保證金率': 0,
+                '原始保證金固定': _safe_number(item.get('InitialMargin')),
+                '維持保證金固定': _safe_number(item.get('MaintenanceMargin')),
+            }
+            if item.get('Date'):
+                sync_dates.append(str(item['Date']))
+    except Exception as exc:
+        errors.append(f'指數期貨保證金：{exc}')
+
+    try:
+        market_rows = fetch_endpoint('DailyMarketReportFut')
+    except Exception as exc:
+        return pd.DataFrame(), {'updated': None, 'margin_date': max(sync_dates) if sync_dates else None, 'errors': errors + [f'每日行情：{exc}']}
+
+    grouped = {}
+    for item in market_rows:
+        root = str(item.get('Contract', '')).strip().upper()
+        month = str(item.get('ContractMonth(Week)', '')).strip()
+        if root not in product_meta or not re.fullmatch(r'\d{6}', month):
+            continue
+        key = (root, month)
+        grouped.setdefault(key, []).append(item)
+
+    month_map = {}
+    for root, month in grouped:
+        month_map.setdefault(root, []).append(month)
+    month_rank = {
+        (root, month): rank
+        for root, months in month_map.items()
+        for rank, month in enumerate(sorted(set(months)))
+    }
+
+    result_rows = []
+    for (root, month), rows in grouped.items():
+        meta = product_meta[root]
+        general_rows = [row for row in rows if str(row.get('TradingSession', '')).strip() == '一般']
+        quote_row = general_rows[0] if general_rows else rows[0]
+        valid_highs = [_safe_number(row.get('High')) for row in rows]
+        valid_lows = [_safe_number(row.get('Low')) for row in rows]
+        high = max((value for value in valid_highs if value is not None), default=None)
+        low = min((value for value in valid_lows if value is not None), default=None)
+        close = _safe_number(quote_row.get('Last')) or _safe_number(quote_row.get('SettlementPrice'))
+        open_price = _safe_number(quote_row.get('Open'))
+        change = _safe_number(quote_row.get('Change'), 0) or 0
+        change_pct = _safe_number(quote_row.get('%'), 0) or 0
+        volume = int(sum(_safe_number(row.get('Volume'), 0) or 0 for row in rows))
+        open_interest = int(_safe_number(quote_row.get('OpenInterest'), 0) or 0)
+        reference = close - change if close is not None else None
+        if reference and reference > 0:
+            if root in {'TX', 'MTX', 'TMF', 'TE', 'TF'}:
+                limit_up, limit_down = round(reference * 1.10), round(reference * 0.90)
+            else:
+                limit_up, limit_down = round_to_tick(reference * 1.10), round_to_tick(reference * 0.90)
+        else:
+            limit_up = limit_down = None
+        if meta['原始保證金固定'] is not None:
+            initial_margin = meta['原始保證金固定']
+            maintenance_margin = meta['維持保證金固定']
+        elif close is not None:
+            initial_margin = round(close * meta['乘數'] * meta['原始保證金率'] / 100)
+            maintenance_margin = round(close * meta['乘數'] * meta['維持保證金率'] / 100)
+        else:
+            initial_margin = maintenance_margin = None
+
+        result_rows.append({
+            '契約鍵': f'{root}:{month}', '期貨代碼': root, '契約月份': month,
+            '名稱': meta['名稱'], '標的代號': meta['標的代號'],
+            '當日成交口數': volume, '未平倉量': open_interest,
+            '開盤價': open_price, '當日高': high, '當日低': low,
+            '收盤價': close, '漲跌幅': change_pct,
+            '當日漲停價': limit_up, '當日跌停價': limit_down,
+            '所需保證金': initial_margin, '維持保證金': maintenance_margin,
+            '原始保證金率': meta['原始保證金率'], '維持保證金率': meta['維持保證金率'],
+            '乘數': meta['乘數'], 'ETF期貨': meta['ETF期貨'], '小型期貨': meta['小型期貨'],
+            '次月期貨': month_rank[(root, month)] > 0,
+            '月份順位': month_rank[(root, month)],
+            '交易時段': '日＋夜' if any(str(row.get('TradingSession', '')).strip() == '盤後' and (_safe_number(row.get('Volume'), 0) or 0) > 0 for row in rows) else '日盤',
+            '資料日期': str(quote_row.get('Date', '')),
+        })
+
+    result = pd.DataFrame(result_rows)
+    if not result.empty:
+        result = result.sort_values(['當日成交口數', '月份順位'], ascending=[False, True]).reset_index(drop=True)
+    return result, {
+        'updated': max((str(row.get('Date', '')) for row in market_rows), default=None),
+        'margin_date': max(sync_dates) if sync_dates else None,
+        'errors': errors,
+    }
+
+def resolve_shioaji_futures_contract(api, root, contract_month):
+    """依商品代碼與年月尋找 Shioaji 實際契約，支援日盤與夜盤快照。"""
+    if api is None:
+        return None
+    candidates = []
+    try:
+        for category in api.Contracts.Futures:
+            try:
+                contracts = list(category)
+            except TypeError:
+                continue
+            for contract in contracts:
+                code = str(getattr(contract, 'code', '')).upper()
+                delivery = str(getattr(contract, 'delivery_month', getattr(contract, 'delivery_date', ''))).replace('-', '').replace('/', '')
+                if code.startswith(str(root).upper()) and str(contract_month) in delivery[:6] and code[-2:] not in ('R1', 'R2'):
+                    candidates.append(contract)
+        if candidates:
+            return min(candidates, key=lambda item: str(getattr(item, 'delivery_date', getattr(item, 'delivery_month', '999999'))))
+    except Exception:
+        pass
+    return None
+
+def calculate_futures_strategy_levels(row, strategy_mode='當沖', direction_choice='自動', kbars=None):
+    """計算期貨支撐壓力與條件式進出場點位；無即時 K 棒時採官方日行情備援。"""
+    root = str(row.get('期貨代碼', ''))
+    close = _safe_number(row.get('收盤價'))
+    open_price = _safe_number(row.get('開盤價'))
+    high = _safe_number(row.get('當日高'))
+    low = _safe_number(row.get('當日低'))
+    atr = None
+    vwap = None
+
+    if isinstance(kbars, pd.DataFrame) and not kbars.empty:
+        data = kbars.copy().sort_index().dropna(subset=['High', 'Low', 'Close'])
+        if not data.empty:
+            close = float(data['Close'].iloc[-1])
+            previous_close = data['Close'].shift(1)
+            true_range = pd.concat([
+                data['High'] - data['Low'],
+                (data['High'] - previous_close).abs(),
+                (data['Low'] - previous_close).abs(),
+            ], axis=1).max(axis=1)
+            if strategy_mode == '當沖':
+                recent = data.tail(min(36, len(data)))
+                support = float(recent['Low'].min())
+                resistance = float(recent['High'].max())
+                atr = float(true_range.tail(min(14, len(true_range))).mean())
+                if 'Volume' in recent.columns and float(recent['Volume'].sum()) > 0:
+                    typical = (recent['High'] + recent['Low'] + recent['Close']) / 3
+                    vwap = float((typical * recent['Volume']).sum() / recent['Volume'].sum())
+            else:
+                trade_date = pd.Series(data.index.normalize(), index=data.index)
+                after_hours = data.index.time >= dt_time(15, 0)
+                trade_date.loc[after_hours] = trade_date.loc[after_hours] + pd.Timedelta(days=1)
+                daily = data.assign(_trade_date=trade_date.values).groupby('_trade_date').agg({
+                    'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last',
+                    **({'Volume': 'sum'} if 'Volume' in data.columns else {})
+                }).dropna()
+                recent_daily = daily.tail(min(20, len(daily)))
+                if not recent_daily.empty:
+                    support = float(recent_daily['Low'].min())
+                    resistance = float(recent_daily['High'].max())
+                    daily_prev = daily['Close'].shift(1)
+                    daily_tr = pd.concat([
+                        daily['High'] - daily['Low'],
+                        (daily['High'] - daily_prev).abs(),
+                        (daily['Low'] - daily_prev).abs(),
+                    ], axis=1).max(axis=1)
+                    atr = float(daily_tr.tail(min(14, len(daily_tr))).mean())
+                else:
+                    support, resistance = low, high
+        else:
+            support, resistance = low, high
+    else:
+        support, resistance = low, high
+
+    if close is None or support is None or resistance is None:
+        return {'支撐壓力': '資料不足', '進出場點位': '資料不足', '方向': '—', '風報比': None}
+
+    direction = direction_choice
+    if direction == '自動':
+        comparison = open_price if open_price is not None else (vwap if vwap is not None else close)
+        direction = '偏多' if close >= comparison else '偏空'
+    tick = 1.0 if root in {'TX', 'MTX', 'TMF', 'TE', 'TF'} else get_tick_size(close)
+    round_future = (lambda value: float(round(value))) if root in {'TX', 'MTX', 'TMF', 'TE', 'TF'} else round_to_tick
+    observed_range = max(float(resistance) - float(support), tick * 2)
+    risk_distance = max((atr or observed_range) * (0.55 if strategy_mode == '當沖' else 1.0), tick * 2)
+    if direction == '偏多':
+        entry = round_future(float(resistance) + tick)
+        stop = round_future(entry - risk_distance)
+        target = round_future(entry + (entry - stop) * 1.5)
+        trigger = '突破壓力後回測不破'
+    else:
+        entry = round_future(float(support) - tick)
+        stop = round_future(entry + risk_distance)
+        target = round_future(entry - (stop - entry) * 1.5)
+        trigger = '跌破支撐後反抽不過'
+    return {
+        '支撐壓力': f'支 {fmt_price(support)}｜壓 {fmt_price(resistance)}',
+        '進出場點位': f'進 {fmt_price(entry)}｜停 {fmt_price(stop)}｜目 {fmt_price(target)}',
+        '方向': direction, '風報比': 1.5, '觸發條件': trigger,
+        'VWAP': vwap, 'ATR': atr,
+    }
+
+def fetch_futures_contract_kbars(api, contract, lookback_days=20):
+    """取得指定期貨契約 K 棒；保留夜盤資料供當沖與波段分析。"""
+    if api is None or contract is None:
+        return pd.DataFrame()
+    try:
+        now = datetime.now(pytz.timezone('Asia/Taipei'))
+        raw = api.kbars(
+            contract=contract,
+            start=(now - timedelta(days=lookback_days)).strftime('%Y-%m-%d'),
+            end=now.strftime('%Y-%m-%d')
+        )
+        if not raw or not hasattr(raw, 'ts') or len(raw.ts) == 0:
+            return pd.DataFrame()
+        data = pd.DataFrame({**raw})
+        data['ts'] = pd.to_datetime(data['ts'])
+        if data['ts'].dt.tz is not None:
+            data['ts'] = data['ts'].dt.tz_convert('Asia/Taipei').dt.tz_localize(None)
+        return data.set_index('ts').sort_index()
+    except Exception:
+        return pd.DataFrame()
+
+def update_futures_live_rows(rows, api, strategy_mode, direction_choice, include_analysis=True):
+    """批次更新顯示中的實際契約快照，並選擇性重算支撐壓力。"""
+    if rows.empty or api is None:
+        return rows, 0
+    updated = rows.copy()
+    resolved = []
+    for index, row in updated.iterrows():
+        contract = resolve_shioaji_futures_contract(api, row['期貨代碼'], row['契約月份'])
+        if contract is not None:
+            resolved.append((index, contract))
+    if not resolved:
+        return updated, 0
+
+    snapshots = {}
+    try:
+        for start in range(0, len(resolved), 30):
+            batch = resolved[start:start + 30]
+            batch_snapshots = api.snapshots([contract for _, contract in batch]) or []
+            for (index, _), snapshot in zip(batch, batch_snapshots):
+                snapshots[index] = snapshot
+    except Exception:
+        snapshots = {}
+
+    update_count = 0
+    for index, contract in resolved:
+        snapshot = snapshots.get(index)
+        if snapshot is not None:
+            price = _safe_number(getattr(snapshot, 'close', None)) or _safe_number(getattr(snapshot, 'open', None))
+            if price is not None and price > 0:
+                updated.at[index, '收盤價'] = price
+                change = _safe_number(getattr(snapshot, 'change_price', getattr(snapshot, 'change', None)), 0) or 0
+                reference = price - change
+                updated.at[index, '漲跌幅'] = (change / reference * 100) if reference > 0 else 0
+                updated.at[index, '當日高'] = _safe_number(getattr(snapshot, 'high', None), updated.at[index, '當日高'])
+                updated.at[index, '當日低'] = _safe_number(getattr(snapshot, 'low', None), updated.at[index, '當日低'])
+                updated.at[index, '當日成交口數'] = int(_safe_number(getattr(snapshot, 'total_volume', None), updated.at[index, '當日成交口數']) or 0)
+                if reference > 0:
+                    if str(updated.at[index, '期貨代碼']) in {'TX', 'MTX', 'TMF', 'TE', 'TF'}:
+                        updated.at[index, '當日漲停價'] = round(reference * 1.10)
+                        updated.at[index, '當日跌停價'] = round(reference * 0.90)
+                    else:
+                        updated.at[index, '當日漲停價'] = round_to_tick(reference * 1.10)
+                        updated.at[index, '當日跌停價'] = round_to_tick(reference * 0.90)
+                initial_rate = _safe_number(updated.at[index, '原始保證金率'], 0) or 0
+                maintenance_rate = _safe_number(updated.at[index, '維持保證金率'], 0) or 0
+                multiplier = _safe_number(updated.at[index, '乘數'], 0) or 0
+                if initial_rate > 0 and multiplier > 0:
+                    updated.at[index, '所需保證金'] = round(price * multiplier * initial_rate / 100)
+                    updated.at[index, '維持保證金'] = round(price * multiplier * maintenance_rate / 100)
+                update_count += 1
+        kbars = fetch_futures_contract_kbars(api, contract, 20 if strategy_mode == '當沖' else 60) if include_analysis else None
+        analysis = calculate_futures_strategy_levels(updated.loc[index], strategy_mode, direction_choice, kbars)
+        for column, value in analysis.items():
+            updated.at[index, column] = value
+        updated.at[index, '實際契約'] = str(getattr(contract, 'code', updated.at[index, '期貨代碼']))
+    return updated, update_count
 
 @st.cache_data(ttl=900, max_entries=1, show_spinner=False)
 def fetch_market_risk_lists():
@@ -4564,12 +4967,253 @@ if 'pending_unignore' in st.session_state and st.session_state.pending_unignore:
 
 # 強制釋放不再使用的記憶體與執行緒資源
 gc.collect()
+
+def render_futures_strategy_room():
+    """期貨成交量排行、即時分析、忽略遞補與獨立計算介面。"""
+    if 'futures_strategy_ignored' not in st.session_state:
+        st.session_state.futures_strategy_ignored = set()
+    if 'futures_strategy_manual' not in st.session_state:
+        st.session_state.futures_strategy_manual = []
+    if 'futures_strategy_live_cache' not in st.session_state:
+        st.session_state.futures_strategy_live_cache = {}
+    if 'futures_strategy_live_time' not in st.session_state:
+        st.session_state.futures_strategy_live_time = None
+
+    st.markdown("### ⚡ 期貨流動性戰略")
+    st.caption("以期交所當日成交口數排序；預設只顯示近月。即時報價與 K 棒分析需登入 Shioaji，所有點位均為條件式觀察值，不會自動下單。")
+
+    control1, control2, control3, control4 = st.columns(4)
+    with control1:
+        strategy_mode = st.radio("策略週期", ["當沖", "波段"], horizontal=True, key="futures_strategy_mode")
+        direction_choice = st.radio("分析方向", ["自動", "偏多", "偏空"], horizontal=True, key="futures_direction_choice")
+    with control2:
+        limit_rows = st.number_input("顯示筆數", min_value=1, max_value=50, value=5, step=1, key="futures_strategy_limit")
+        minimum_volume = st.number_input("最低成交口數", min_value=0, value=0, step=100, key="futures_minimum_volume")
+    with control3:
+        hide_etf = st.checkbox("隱藏 ETF 期貨", value=True, key="futures_hide_etf")
+        hide_small = st.checkbox("隱藏小型期貨", value=True, key="futures_hide_small")
+        hide_next = st.checkbox("隱藏次月期貨", value=True, key="futures_hide_next")
+    with control4:
+        refresh_official = st.button("🔄 更新成交量／保證金", use_container_width=True, key="refresh_futures_official")
+        refresh_live = st.button("⏱️ 即時更新報價與分析", use_container_width=True, type="primary", key="refresh_futures_live")
+
+    if refresh_official:
+        fetch_futures_strategy_universe.clear()
+        st.session_state.futures_strategy_live_cache = {}
+
+    with st.spinner("正在讀取期交所成交量與保證金..."):
+        universe, universe_meta = fetch_futures_strategy_universe()
+    if universe.empty:
+        st.error("目前無法取得期交所期貨排行資料，請稍後重試。")
+        if universe_meta.get('errors'):
+            st.caption("｜".join(universe_meta['errors']))
+        return
+
+    official_date = str(universe_meta.get('updated') or '')
+    margin_date = str(universe_meta.get('margin_date') or '')
+    live_time = st.session_state.futures_strategy_live_time
+    status_text = f"行情資料：{official_date or '—'}｜保證金：{margin_date or '—'}"
+    if live_time:
+        status_text += f"｜即時更新：{live_time}"
+    st.caption(status_text)
+    if universe_meta.get('errors'):
+        st.warning("部分官方資料未完整取得：" + "｜".join(universe_meta['errors']))
+
+    filtered = universe.copy()
+    if hide_etf:
+        filtered = filtered[~filtered['ETF期貨']]
+    if hide_small:
+        filtered = filtered[~filtered['小型期貨']]
+    if hide_next:
+        filtered = filtered[~filtered['次月期貨']]
+    filtered = filtered[filtered['當日成交口數'] >= int(minimum_volume)]
+    filtered = filtered[~filtered['契約鍵'].isin(st.session_state.futures_strategy_ignored)]
+    base_rows = filtered.head(int(limit_rows)).copy()
+
+    manual_keys = [
+        key for key in st.session_state.futures_strategy_manual
+        if key not in st.session_state.futures_strategy_ignored and key not in set(base_rows['契約鍵'])
+    ]
+    manual_rows = universe[universe['契約鍵'].isin(manual_keys)].copy()
+    if not manual_rows.empty:
+        order_map = {key: order for order, key in enumerate(manual_keys)}
+        manual_rows['_manual_order'] = manual_rows['契約鍵'].map(order_map)
+        manual_rows = manual_rows.sort_values('_manual_order').drop(columns=['_manual_order'])
+    display_rows = pd.concat([base_rows, manual_rows], ignore_index=True)
+
+    cache = st.session_state.futures_strategy_live_cache
+    for index, row in display_rows.iterrows():
+        cached = cache.get(str(row['契約鍵']))
+        if cached:
+            for column, value in cached.items():
+                if column in display_rows.columns or column in ('支撐壓力', '進出場點位', '方向', '風報比', '觸發條件', '實際契約'):
+                    display_rows.at[index, column] = value
+        if not cached or cached.get('_策略週期') != strategy_mode or cached.get('_分析方向') != direction_choice:
+            analysis = calculate_futures_strategy_levels(display_rows.loc[index], strategy_mode, direction_choice)
+            for column, value in analysis.items():
+                display_rows.at[index, column] = value
+
+    if refresh_live:
+        if not st.session_state.get('sj_logged_in', False) or st.session_state.get('sj_api') is None:
+            st.warning("請先登入永豐 Shioaji，才能更新近月／次月實際契約的即時報價與夜盤 K 棒。")
+        elif display_rows.empty:
+            st.info("目前沒有可更新的期貨。")
+        else:
+            with st.spinner("正在更新期貨快照、夜盤資料與支撐壓力..."):
+                updated_rows, updated_count = update_futures_live_rows(
+                    display_rows, st.session_state.sj_api, strategy_mode, direction_choice, include_analysis=True
+                )
+            for _, updated_row in updated_rows.iterrows():
+                cached_row = updated_row.to_dict()
+                cached_row['_策略週期'] = strategy_mode
+                cached_row['_分析方向'] = direction_choice
+                st.session_state.futures_strategy_live_cache[str(updated_row['契約鍵'])] = cached_row
+            st.session_state.futures_strategy_live_time = datetime.now(pytz.timezone('Asia/Taipei')).strftime('%Y/%m/%d %H:%M:%S')
+            if updated_count:
+                st.toast(f"已更新 {updated_count} 檔期貨報價與分析", icon="✅")
+                st.rerun()
+            else:
+                st.warning("未取得實際契約快照；請確認 Shioaji 連線與契約是否仍有效。")
+
+    if display_rows.empty:
+        st.info("目前沒有符合篩選條件的期貨；可取消隱藏條件或降低最低成交口數。")
+    else:
+        display_rows['忽略'] = False
+        display_columns = [
+            '忽略', '期貨代碼', '契約月份', '名稱', '交易時段', '當日成交口數', '未平倉量',
+            '方向', '支撐壓力', '進出場點位', '觸發條件', '當日漲停價', '當日跌停價',
+            '收盤價', '漲跌幅', '所需保證金', '維持保證金', '風報比'
+        ]
+        for column in display_columns:
+            if column not in display_rows.columns:
+                display_rows[column] = None
+
+        def style_futures_row(row):
+            styles = [''] * len(row)
+            change = _safe_number(row.get('漲跌幅'), 0) or 0
+            direction = str(row.get('方向', ''))
+            for position, column in enumerate(row.index):
+                if column in ('收盤價', '漲跌幅'):
+                    styles[position] = 'color:#ff4b4b;font-weight:bold;' if change > 0 else ('color:#00c853;font-weight:bold;' if change < 0 else '')
+                elif column == '方向':
+                    styles[position] = 'color:#ff4b4b;font-weight:bold;' if direction == '偏多' else ('color:#00c853;font-weight:bold;' if direction == '偏空' else '')
+                elif column == '當日成交口數':
+                    styles[position] = 'color:#ff9800;font-weight:bold;'
+            return styles
+
+        edited = st.data_editor(
+            display_rows[display_columns].style.apply(style_futures_row, axis=1),
+            column_config={
+                '忽略': st.column_config.CheckboxColumn('隱藏', width=45),
+                '期貨代碼': st.column_config.TextColumn(width=65, disabled=True),
+                '契約月份': st.column_config.TextColumn(width=80, disabled=True),
+                '名稱': st.column_config.TextColumn(width=145, disabled=True),
+                '交易時段': st.column_config.TextColumn(width=75, disabled=True),
+                '當日成交口數': st.column_config.NumberColumn(format='%d', width=105, disabled=True),
+                '未平倉量': st.column_config.NumberColumn(format='%d', width=90, disabled=True),
+                '方向': st.column_config.TextColumn(width=65, disabled=True),
+                '支撐壓力': st.column_config.TextColumn(width=165, disabled=True),
+                '進出場點位': st.column_config.TextColumn(width=220, disabled=True, help='進＝條件成立後觀察價；停＝失效點；目＝第一目標。'),
+                '觸發條件': st.column_config.TextColumn(width=150, disabled=True, help='條件成立後才評估進場；未成立時不以預判價直接下單。'),
+                '當日漲停價': st.column_config.NumberColumn(format='%.2f', width=100, disabled=True, help='依期交所漲跌資料反推參考價後估算；實際限制以期交所與券商下單畫面為準。'),
+                '當日跌停價': st.column_config.NumberColumn(format='%.2f', width=100, disabled=True, help='依期交所漲跌資料反推參考價後估算；實際限制以期交所與券商下單畫面為準。'),
+                '收盤價': st.column_config.NumberColumn(format='%.2f', width=85, disabled=True),
+                '漲跌幅': st.column_config.NumberColumn(format='%+.2f%%', width=85, disabled=True),
+                '所需保證金': st.column_config.NumberColumn(format='%,.0f', width=105, disabled=True),
+                '維持保證金': st.column_config.NumberColumn(format='%,.0f', width=105, disabled=True),
+                '風報比': st.column_config.NumberColumn(format='1 : %.1f', width=75, disabled=True),
+            },
+            hide_index=True, width='stretch', key='futures_strategy_editor'
+        )
+        hidden_rows = edited[edited['忽略'] == True]
+        if not hidden_rows.empty:
+            display_key_map = {
+                f"{row['期貨代碼']}:{row['契約月份']}": str(row['契約鍵'])
+                for _, row in display_rows.iterrows()
+            }
+            for _, hidden in hidden_rows.iterrows():
+                key = display_key_map.get(f"{hidden['期貨代碼']}:{hidden['契約月份']}")
+                if key:
+                    st.session_state.futures_strategy_ignored.add(key)
+            st.rerun()
+
+    st.markdown("#### 🔍 快速新增期貨")
+    option_map = {
+        f"{row['期貨代碼']} {row['契約月份']}｜{row['名稱']}｜成交 {int(row['當日成交口數']):,} 口": str(row['契約鍵'])
+        for _, row in universe.iterrows()
+    }
+    add_col, add_button_col = st.columns([5, 1])
+    with add_col:
+        selected_to_add = st.multiselect(
+            "輸入中文名稱或期貨代碼", list(option_map), key='futures_quick_add',
+            placeholder='例如：CDF、台積電期貨'
+        )
+    with add_button_col:
+        st.markdown("<div style='margin-top:28px'></div>", unsafe_allow_html=True)
+        if st.button("➕ 加到表格", use_container_width=True, key='add_futures_to_table'):
+            for label in selected_to_add:
+                key = option_map[label]
+                if key not in st.session_state.futures_strategy_manual:
+                    st.session_state.futures_strategy_manual.append(key)
+                st.session_state.futures_strategy_ignored.discard(key)
+            st.rerun()
+
+    if st.session_state.futures_strategy_ignored:
+        with st.expander("🚫 管理已隱藏期貨", expanded=False):
+            ignored_options = {
+                f"{row['期貨代碼']} {row['契約月份']}｜{row['名稱']}": str(row['契約鍵'])
+                for _, row in universe[universe['契約鍵'].isin(st.session_state.futures_strategy_ignored)].iterrows()
+            }
+            selected_ignored = st.multiselect(
+                "取消勾選即可恢復原成交量排序位置", list(ignored_options),
+                default=list(ignored_options),
+                key=f"manage_futures_ignored_{abs(hash(tuple(sorted(st.session_state.futures_strategy_ignored))))}"
+            )
+            current_ignored = {ignored_options[label] for label in selected_ignored}
+            if current_ignored != st.session_state.futures_strategy_ignored:
+                st.session_state.futures_strategy_ignored = current_ignored
+                st.rerun()
+
+    st.markdown("---")
+    st.markdown("### ⚡ 獨立計算")
+    independent_labels = st.multiselect(
+        "快速查詢（中文名稱／期貨代碼）", list(option_map),
+        key='futures_independent_search', placeholder='選擇一檔或多檔期貨'
+    )
+    if st.button("🚀 執行期貨獨立分析", key='run_futures_independent') and independent_labels:
+        keys = [option_map[label] for label in independent_labels]
+        independent_rows = universe[universe['契約鍵'].isin(keys)].copy()
+        if st.session_state.get('sj_logged_in', False) and st.session_state.get('sj_api') is not None:
+            with st.spinner("正在取得實際契約報價與 K 棒..."):
+                independent_rows, _ = update_futures_live_rows(
+                    independent_rows, st.session_state.sj_api, strategy_mode, direction_choice, include_analysis=True
+                )
+        else:
+            for index, row in independent_rows.iterrows():
+                analysis = calculate_futures_strategy_levels(row, strategy_mode, direction_choice)
+                for column, value in analysis.items():
+                    independent_rows.at[index, column] = value
+            st.info("目前未登入 Shioaji，獨立計算先使用期交所日行情；登入後可加入即時與夜盤 K 棒。")
+        independent_columns = [
+            '期貨代碼', '契約月份', '名稱', '當日成交口數', '方向', '支撐壓力', '進出場點位', '觸發條件',
+            '當日漲停價', '當日跌停價', '收盤價', '漲跌幅', '所需保證金', '維持保證金', '交易時段'
+        ]
+        st.dataframe(independent_rows[independent_columns], hide_index=True, width='stretch')
+
 # ==========================================
 # 主介面 (Tabs)
 # ==========================================
-tab1, tab2, tab_fibo, tab_db, tab3 = st.tabs(["⚡ 當沖戰略室 ⚡", "💰 交易損益室 💰", "📈 技術分析", "📚 戰略資料庫", "📅 股市行事曆與公司事件"])
+tab1, tab2, tab_fibo, tab_db, tab3 = st.tabs(["⚡ 股期戰略室 ⚡", "💰 交易損益室 💰", "📈 技術分析", "📚 戰略資料庫", "📅 股市行事曆與公司事件"])
 
 with tab1:
+    stock_strategy_tab, futures_strategy_tab = st.tabs(["📈 股票戰略室", "🧭 期貨戰略室"])
+    with stock_strategy_tab:
+        stock_strategy_container = st.container()
+    with futures_strategy_tab:
+        render_futures_strategy_room()
+
+with stock_strategy_container:
+    current_font_size, hide_non_stock, show_3d_hilo = render_stock_strategy_controls()
     col_search, col_file = st.columns([2, 1])
     with col_search:
         code_map, name_map = load_local_stock_names()
