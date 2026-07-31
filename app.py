@@ -1485,6 +1485,17 @@ def evaluate_trade_entry_state(plan, live_price, live_change, intraday_state, te
     return finalize(state)
 
 
+def get_trade_risk_level(risk_points, atr):
+    """Classify a stop distance against the current daily ATR."""
+    atr = max(float(atr or 0), 1.0)
+    ratio = float(risk_points or 0) / atr
+    if ratio <= 0.5:
+        return '低', '#00c853', ratio
+    if ratio <= 0.9:
+        return '中', '#ffc107', ratio
+    return '高', '#ff4b4b', ratio
+
+
 def get_near_futures_contract(api, product='TMF'):
     """Resolve the live near-month futures contract used by the trade plan."""
     if api is None:
@@ -6787,10 +6798,33 @@ with tab_fibo:
                     and index_item[3] and '即時快照' in index_item[3]
                 )
                 basis_reference = "加權盤中快照" if is_cash_snapshot else "最近加權日收盤"
+                index_change = float(index_result.get('change', 0) or 0)
+                index_change_pct = float(index_result.get('change_pct', 0) or 0)
+                index_color = '#ff4b4b' if index_change > 0 else ('#00c853' if index_change < 0 else '#dfe6e9')
+                index_arrow = '▲' if index_change > 0 else ('▼' if index_change < 0 else '◆')
+                futures_result = (futures_item[4] or {}) if futures_item else {}
+                futures_change = float(live_snapshot['change']) if live_snapshot else float(futures_result.get('change', 0) or 0)
+                futures_change_pct = float(live_snapshot['change_pct']) if live_snapshot else float(futures_result.get('change_pct', 0) or 0)
+                futures_color = '#ff4b4b' if futures_change > 0 else ('#00c853' if futures_change < 0 else '#dfe6e9')
+                futures_arrow = '▲' if futures_change > 0 else ('▼' if futures_change < 0 else '◆')
                 st.markdown("##### ⚖️ 期現價差判讀")
                 b1, b2, b3 = st.columns(3)
-                b1.metric(basis_reference, f"{index_price:,.0f}")
-                b2.metric("期貨指數", f"{live_price:,.0f}")
+                b1.markdown(
+                    f"""<div style='line-height:1.25'>
+                    <div style='font-size:14px;font-weight:600;color:#dfe6e9'>{basis_reference}</div>
+                    <div style='font-size:24px;font-weight:700;color:{index_color}'>{index_price:,.0f}</div>
+                    <div style='font-size:14px;font-weight:700;color:{index_color}'>{index_arrow} {abs(index_change):,.0f} ({index_change_pct:+.2f}%)</div>
+                    </div>""",
+                    unsafe_allow_html=True,
+                )
+                b2.markdown(
+                    f"""<div style='line-height:1.25'>
+                    <div style='font-size:14px;font-weight:600;color:#dfe6e9'>期貨指數</div>
+                    <div style='font-size:24px;font-weight:700;color:{futures_color}'>{live_price:,.0f}</div>
+                    <div style='font-size:14px;font-weight:700;color:{futures_color}'>{futures_arrow} {abs(futures_change):,.0f} ({futures_change_pct:+.2f}%)</div>
+                    </div>""",
+                    unsafe_allow_html=True,
+                )
                 b3.markdown(
                     f"""<div style='line-height:1.25'>
                     <div style='font-size:14px;font-weight:600;color:#dfe6e9'>期貨－加權價差</div>
@@ -6814,13 +6848,45 @@ with tab_fibo:
                 options=[1, 2, 3, 4, 5],
                 format_func=lambda count: f"{count} 口微型臺指",
                 key="trade_plan_position_count",
-                help="此設定會連動更新下方的微台停損金額、所需原始保證金與短波當沖風險。",
+                help="此設定會連動更新進出依據與短波當沖的停損金額及預估收益。",
             )
             c_entry, c_stop, c_target, c_rr = st.columns(4)
             c_entry.metric("觀察進場區", f"{trade_state['entry_level']:,.0f}")
             c_stop.metric("失效／停損", f"{trade_state['invalidation']:,.0f}")
             c_target.metric("第一目標", f"{trade_state['target']:,.0f}")
             c_rr.metric("預估風報比", f"1 : {trade_state['rr_ratio']:.2f}" if trade_state['rr_ratio'] is not None else "—")
+            entry_risk_level, entry_risk_color, entry_risk_ratio = get_trade_risk_level(
+                trade_state['risk_points'], plan['atr'],
+            )
+            entry_risk_amount = trade_state['risk_points'] * 10 * position_count
+            entry_reward_amount = trade_state['reward_points'] * 10 * position_count
+            er1, er2, er3, er4 = st.columns(4)
+            er1.markdown(
+                f"""<div style='line-height:1.2'>
+                <div style='font-size:12px;color:#b7c0cc'>計畫風險點數</div>
+                <div style='font-size:19px;font-weight:700;color:{entry_risk_color}'>{trade_state['risk_points']:,.0f} 點</div>
+                <div style='font-size:12px;font-weight:700;color:{entry_risk_color}'>風險等級：{entry_risk_level}</div>
+                </div>""", unsafe_allow_html=True,
+            )
+            er2.markdown(
+                f"""<div style='line-height:1.2'>
+                <div style='font-size:12px;color:#b7c0cc'>預估盈利點數</div>
+                <div style='font-size:19px;font-weight:700;color:#ff4b4b'>{trade_state['reward_points']:,.0f} 點</div>
+                </div>""", unsafe_allow_html=True,
+            )
+            er3.markdown(
+                f"""<div style='line-height:1.2'>
+                <div style='font-size:12px;color:#b7c0cc'>{position_count} 口最大風險</div>
+                <div style='font-size:19px;font-weight:700;color:{entry_risk_color}'>${entry_risk_amount:,.0f}</div>
+                </div>""", unsafe_allow_html=True,
+            )
+            er4.markdown(
+                f"""<div style='line-height:1.2'>
+                <div style='font-size:12px;color:#b7c0cc'>{position_count} 口預估收益</div>
+                <div style='font-size:19px;font-weight:700;color:#ff4b4b'>${entry_reward_amount:,.0f}</div>
+                </div>""", unsafe_allow_html=True,
+            )
+            st.caption(f"風險等級以停損距離相對日 ATR 判定：{entry_risk_ratio:.2f} ATR；微台每點 10 元。")
             if trade_state['can_enter']:
                 st.info(f"15 分 K：{confirmation_text} 目前符合「{trade_state['permission']}」條件，仍須依設定停損控制部位。")
             elif plan['direction'] in ('偏多', '偏空'):
@@ -6850,36 +6916,45 @@ with tab_fibo:
                 sw3.metric("短波目標", f"{short_wave['target']:,.0f}")
                 sw4.metric("短波風報比", f"1 : {short_wave['rr']:.2f}" if short_wave['rr'] is not None else "—")
                 st.info(f"**快速進場條件：** {short_wave['trigger']}")
+                short_risk_level, short_risk_color, short_risk_ratio = get_trade_risk_level(
+                    short_wave['risk'], plan['atr'],
+                )
+                short_risk_amount = short_wave['risk'] * 10 * position_count
+                short_reward_amount = short_wave['reward'] * 10 * position_count
+                sr1, sr2, sr3, sr4 = st.columns(4)
+                sr1.markdown(
+                    f"""<div style='line-height:1.2'>
+                    <div style='font-size:12px;color:#b7c0cc'>短波風險點數</div>
+                    <div style='font-size:18px;font-weight:700;color:{short_risk_color}'>{short_wave['risk']:,.0f} 點</div>
+                    <div style='font-size:12px;font-weight:700;color:{short_risk_color}'>風險等級：{short_risk_level}</div>
+                    </div>""", unsafe_allow_html=True,
+                )
+                sr2.markdown(
+                    f"""<div style='line-height:1.2'>
+                    <div style='font-size:12px;color:#b7c0cc'>短波盈利點數</div>
+                    <div style='font-size:18px;font-weight:700;color:#ff4b4b'>{short_wave['reward']:,.0f} 點</div>
+                    </div>""", unsafe_allow_html=True,
+                )
+                sr3.markdown(
+                    f"""<div style='line-height:1.2'>
+                    <div style='font-size:12px;color:#b7c0cc'>{position_count} 口最大風險</div>
+                    <div style='font-size:18px;font-weight:700;color:{short_risk_color}'>${short_risk_amount:,.0f}</div>
+                    </div>""", unsafe_allow_html=True,
+                )
+                sr4.markdown(
+                    f"""<div style='line-height:1.2'>
+                    <div style='font-size:12px;color:#b7c0cc'>{position_count} 口預估收益</div>
+                    <div style='font-size:18px;font-weight:700;color:#ff4b4b'>${short_reward_amount:,.0f}</div>
+                    </div>""", unsafe_allow_html=True,
+                )
                 st.caption(
-                    f"以最新 12 根 5 分 K 區間計算；依目前選擇的 {position_count} 口，"
-                    f"預估停損 ${short_wave['risk'] * 10 * position_count:,.0f}。日線方向轉為區間盤整時，短波訊號不採用。"
+                    f"以最新 12 根 5 分 K 區間計算；短波停損為日 ATR 的 {short_risk_ratio:.2f} 倍。"
+                    "日線方向轉為區間盤整時，僅在區間邊緣確認後才採用短波訊號。"
                 )
             elif trade_state['can_enter']:
                 st.info("即時條件已通過，但尚未取得足夠的 5 分 K，暫不提供短波點位。")
             else:
                 st.info(f"目前為「{trade_state['permission']}」；短波當沖不啟用，避免在反轉、過熱或區間中段追價。")
-
-            st.divider()
-            st.markdown("#### 🛡️ 微型臺指風險換算")
-            st.caption("以觀察進場區到失效點計算；微台每點 10 元。保證金為交易所公告原始保證金，實際可用額度仍以期貨商為準。")
-            margin_map = fetch_taifex_index_margin_map()
-            micro_margin = margin_map.get('TMF')
-            position_risk = trade_state['risk_points'] * 10 * position_count
-            position_margin = micro_margin * position_count if micro_margin else None
-            margin_risk_pct = (position_risk / position_margin * 100) if position_margin else None
-            margin_risk_label = "—" if margin_risk_pct is None else ("低" if margin_risk_pct < 10 else ("中" if margin_risk_pct < 20 else "高"))
-            r1, r2, r3, r4 = st.columns(4)
-            r1.metric("停損距離", f"{trade_state['risk_points']:,.0f} 點")
-            r2.metric(f"{position_count} 口最大風險", f"${position_risk:,.0f}")
-            r3.metric(f"{position_count} 口原始保證金", f"${position_margin:,.0f}" if position_margin else "查詢中")
-            r4.metric("1 口原始保證金", f"${micro_margin:,.0f}" if micro_margin else "查詢中")
-            if micro_margin:
-                st.caption(
-                    f"依 {position_count} 口估算，原始保證金約 ${position_margin:,.0f}；"
-                    f"本計畫停損約為保證金 {margin_risk_pct:.1f}%（風險：{margin_risk_label}）。"
-                )
-            else:
-                st.warning("暫時無法取得交易所保證金資料；下單前請在期貨商系統確認微台原始保證金。")
 
             st.divider()
             st.markdown("#### 📅 到期選擇權操作")
