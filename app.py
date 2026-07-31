@@ -6542,8 +6542,6 @@ with tab_fibo:
         thermometer_data.append((label, code, temp_df, source, result))
 
     with tab_trade_plan:
-        st.subheader("指數操作計畫")
-        st.caption("日線費波決定主方向，5 分 K 提供短波當沖點位；即時報價僅供觀察，不會自動下單或構成投資建議。")
         index_item = next((item for item in thermometer_data if item[1] == '^TWII'), None)
         futures_item = next((item for item in thermometer_data if item[1] == 'TWF=F'), None)
         plan = calculate_index_trade_plan(
@@ -6551,8 +6549,22 @@ with tab_fibo:
             futures_item[2] if futures_item else pd.DataFrame(), futures_item[4] if futures_item else None,
         )
         if plan is None:
+            st.subheader("指數操作計畫")
+            st.caption("日線費波決定主方向，5 分 K 提供短波當沖點位；即時報價僅供觀察，不會自動下單或構成投資建議。")
             st.warning("目前缺少足夠的加權或期貨日 K，暫時無法建立操作計畫。")
         else:
+            direction_label, direction_color = {
+                '偏多': ('做多', '#ff4b4b'),
+                '偏空': ('做空', '#00c853'),
+            }.get(plan['direction'], ('等待進場', '#ffc107'))
+            st.markdown(
+                f"""<div style='display:flex;align-items:baseline;gap:14px;margin-bottom:2px'>
+                <span style='font-size:1.55rem;font-weight:700;color:#fafafa'>指數操作計畫</span>
+                <span style='font-size:1.05rem;font-weight:700;color:{direction_color}'>{direction_label}</span>
+                </div>""",
+                unsafe_allow_html=True,
+            )
+            st.caption("日線費波決定主方向，5 分 K 提供短波當沖點位；即時報價僅供觀察，不會自動下單或構成投資建議。")
             live_col, refresh_col = st.columns([6, 1])
             with live_col:
                 live_snapshot = get_live_futures_snapshot(st.session_state.get('sj_api'), 'TMF')
@@ -6566,7 +6578,7 @@ with tab_fibo:
             st.markdown(
                 f"""<div style='border-left:5px solid {plan['action_color']};background:#151a22;padding:14px 18px;border-radius:7px;margin-bottom:12px'>
                 <div style='font-size:14px;color:#b7c0cc'>{plan['market_label']}</div>
-                <div style='font-size:26px;font-weight:800;color:{plan['action_color']}'>{plan['action']}</div>
+                <div style='font-size:21px;font-weight:800;color:{plan['action_color']}'>{plan['action']}</div>
                 <div style='font-size:14px;color:#dfe6e9;margin-top:4px'>{plan['alignment_note']}</div>
                 </div>""", unsafe_allow_html=True
             )
@@ -6575,8 +6587,8 @@ with tab_fibo:
                 p1.markdown(
                     f"""<div style='line-height:1.25'>
                     <div style='font-size:14px;font-weight:600;color:#dfe6e9'>最新微台（{live_snapshot['contract_code']}）</div>
-                    <div style='font-size:31px;font-weight:700;color:{live_snapshot['color']}'>{live_snapshot['price']:,.0f}</div>
-                    <div style='font-size:15px;font-weight:700;color:{live_snapshot['color']}'>{live_snapshot['arrow']} {abs(live_snapshot['change']):,.0f} ({live_snapshot['change_pct']:+.2f}%)</div>
+                    <div style='font-size:25px;font-weight:700;color:{live_snapshot['color']}'>{live_snapshot['price']:,.0f}</div>
+                    <div style='font-size:14px;font-weight:700;color:{live_snapshot['color']}'>{live_snapshot['arrow']} {abs(live_snapshot['change']):,.0f} ({live_snapshot['change_pct']:+.2f}%)</div>
                     </div>""",
                     unsafe_allow_html=True,
                 )
@@ -6639,7 +6651,7 @@ with tab_fibo:
             else:
                 st.warning("暫時無法取得交易所保證金資料；下單前請在期貨商系統確認微台原始保證金。")
 
-            st.markdown("#### 到期週選擇權操作")
+            st.markdown("#### 到期選擇權操作")
             if plan['short_strike'] is None:
                 st.info("方向尚未一致，不建立選擇權操作。避免在區間中段或訊號分歧時進場。")
             else:
@@ -6654,9 +6666,13 @@ with tab_fibo:
                         f"永豐商品根：`{target_specs[0]['root']}`｜目標契約：`{expected_contract}`｜預定到期日：{target_specs[0]['expiry'].strftime('%Y/%m/%d')}"
                         f"｜剩餘 {(target_specs[0]['expiry'] - datetime.now(pytz.timezone('Asia/Taipei')).date()).days} 天"
                     )
+                option_mode_choices = ["價差單（限定風險，偏結算）", "單買 BC／BP（低成本高波動，短線）"]
+                # Explicitly retain the selection across the immediate-refresh rerun.
+                if st.session_state.get('trade_plan_option_mode') not in option_mode_choices:
+                    st.session_state['trade_plan_option_mode'] = option_mode_choices[0]
                 option_mode = st.radio(
                     "操作方式",
-                    ["價差單（限定風險，偏結算）", "單買 BC／BP（低成本高波動，短線）"],
+                    option_mode_choices,
                     horizontal=True,
                     key="trade_plan_option_mode",
                 )
