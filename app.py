@@ -3296,6 +3296,9 @@ if 'stock_data' not in st.session_state:
     st.session_state.fibo_tags = cached_fibo_tags if cached_fibo_tags else list(DEFAULT_FIBO_TAGS)
     st.session_state.cached_notes = cached_note_dict
 
+if 'stock_strategy_editor_revision' not in st.session_state:
+    st.session_state.stock_strategy_editor_revision = 0
+
 if 'ignored_stocks' not in st.session_state: st.session_state.ignored_stocks = set()
 if 'all_candidates' not in st.session_state: st.session_state.all_candidates = []
 if 'calc_base_price' not in st.session_state: st.session_state.calc_base_price = 100.0
@@ -5041,6 +5044,8 @@ def render_futures_strategy_room():
         st.session_state.futures_strategy_custom_prices = load_futures_custom_prices()
     if 'futures_strategy_editor_revision' not in st.session_state:
         st.session_state.futures_strategy_editor_revision = 0
+    if 'futures_auto_update_last_row' not in st.session_state:
+        st.session_state.futures_auto_update_last_row = True
     if int(st.session_state.get('futures_minimum_volume', 1) or 1) < 1:
         st.session_state.futures_minimum_volume = 1
 
@@ -5222,6 +5227,8 @@ def render_futures_strategy_room():
         return config
 
     edited = pd.DataFrame()
+    futures_editor_key = None
+    display_key_map = {}
     if display_rows.empty:
         st.info("目前沒有符合篩選條件的期貨；可取消隱藏條件或降低最低成交口數。")
     else:
@@ -5231,11 +5238,14 @@ def render_futures_strategy_room():
                 display_rows[column] = None
 
         table_signature = abs(hash(tuple(display_rows['契約鍵'].astype(str))))
+        futures_editor_key = (
+            f"futures_strategy_editor_{st.session_state.futures_strategy_editor_revision}_{table_signature}"
+        )
         edited = st.data_editor(
             display_rows[futures_display_columns].style.apply(style_futures_row, axis=1),
             column_config=futures_column_config(),
             hide_index=True, width='stretch', row_height=30,
-            key=f"futures_strategy_editor_{st.session_state.futures_strategy_editor_revision}_{table_signature}"
+            key=futures_editor_key
         )
         display_key_map = {
             f"{row['期貨代碼']}:{row['契約月份']}": str(row['契約鍵'])
@@ -5250,11 +5260,43 @@ def render_futures_strategy_room():
             st.session_state.futures_strategy_editor_revision += 1
             st.rerun()
 
-    price_save_col, price_clear_col, _ = st.columns([2, 2, 5])
+    if (
+        futures_editor_key
+        and not edited.empty
+        and st.session_state.futures_auto_update_last_row
+    ):
+        editor_state = st.session_state.get(futures_editor_key, {})
+        edited_rows = editor_state.get('edited_rows', {})
+        last_visible_idx = len(edited) - 1
+        if str(last_visible_idx) in {str(index) for index in edited_rows}:
+            updated_prices = dict(st.session_state.futures_strategy_custom_prices)
+            for _, edited_row in edited.iterrows():
+                key = display_key_map.get(f"{edited_row['期貨代碼']}:{edited_row['契約月份']}")
+                if not key:
+                    continue
+                new_price = _safe_number(edited_row.get('自訂價(可修)'))
+                if new_price is None:
+                    updated_prices.pop(key, None)
+                else:
+                    updated_prices[key] = new_price
+            st.session_state.futures_strategy_custom_prices = updated_prices
+            if save_futures_custom_prices(updated_prices):
+                st.session_state.futures_strategy_editor_revision += 1
+                st.rerun()
+            else:
+                st.error("自訂價儲存失敗，請確認設定檔是否可寫入。")
+
+    price_save_col, price_clear_col, price_auto_col = st.columns([2, 2, 3])
     with price_save_col:
         save_custom_prices = st.button("⚡ 執行更新＆儲存自訂價", use_container_width=True, key='save_futures_custom_prices')
     with price_clear_col:
         clear_custom_prices = st.button("🗑️ 清除自訂價", use_container_width=True, key='clear_futures_custom_prices')
+    with price_auto_col:
+        st.checkbox(
+            "☑️ 啟用最後一列自動更新",
+            key='futures_auto_update_last_row',
+            help="編輯目前表格最後一列的自訂價後，會自動儲存並重新計算分析。"
+        )
     st.caption(f"目前有 {len(st.session_state.futures_strategy_custom_prices)} 檔自訂價；按儲存後，下次開啟仍會保留。清除後分析會回退使用官方行情價。")
     if save_custom_prices:
         updated_prices = dict(st.session_state.futures_strategy_custom_prices)
@@ -5926,6 +5968,7 @@ with stock_strategy_container:
                     "進出場預判": st.column_config.TextColumn(width=195, disabled=True, help="通過風險條件後，以次日開盤突破昨高／昨低與 ATR 推估的進場、停損與第一目標；僅供觀察與回測。"),
                 })
 
+        stock_editor_key = f"main_editor_{st.session_state.stock_strategy_editor_revision}"
         edited_df = st.data_editor(
             styled_df,
             column_config={
@@ -5944,7 +5987,7 @@ with stock_strategy_container:
                 "狀態": None, # 設定為 None 即可在資料編輯器中隱藏該欄位
                 "戰略備註": st.column_config.TextColumn("戰略備註 ✏️", width=note_width_px, disabled=False),
             },
-            hide_index=True, width='stretch' if risk_preview_enabled else 'content', num_rows="fixed", key="main_editor"
+            hide_index=True, width='stretch' if risk_preview_enabled else 'content', num_rows="fixed", key=stock_editor_key
         )
 
         if risk_preview_enabled and risk_details:
@@ -5989,7 +6032,7 @@ with stock_strategy_container:
                     st.rerun()
 
             if not trigger_rerun and st.session_state.auto_update_last_row:
-                editor_state = st.session_state.get('main_editor', {})
+                editor_state = st.session_state.get(stock_editor_key, {})
                 edited_rows = editor_state.get('edited_rows', {})
                 last_visible_idx = len(edited_df) - 1
                 
@@ -6091,6 +6134,7 @@ with stock_strategy_container:
                 st.session_state.stock_data.at[idx, '自訂價(可修)'] = ""
                 st.session_state.stock_data.at[idx, '狀態'] = recalculate_row(st.session_state.stock_data.iloc[idx], points_map)
             save_data_cache(st.session_state.stock_data, st.session_state.ignored_stocks, st.session_state.all_candidates, st.session_state.saved_notes)
+            st.session_state.stock_strategy_editor_revision += 1
             st.toast("自訂價已清除", icon="🗑️")
             st.rerun()
 
@@ -6126,6 +6170,7 @@ with stock_strategy_container:
                     tz_tw = pytz.timezone('Asia/Taipei')
                     st.session_state.last_rt_update_time = datetime.now(tz_tw).strftime("%Y/%m/%d %H:%M:%S")
                     save_data_cache(st.session_state.stock_data, st.session_state.ignored_stocks, st.session_state.all_candidates, st.session_state.saved_notes)
+                    st.session_state.stock_strategy_editor_revision += 1
                     st.rerun()
             else:
                 st.warning("⚠️ 請先登入永豐 API 才能使用即時更新報價功能。")
