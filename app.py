@@ -5363,7 +5363,7 @@ def render_futures_strategy_room():
 # ==========================================
 # 主介面 (Tabs)
 # ==========================================
-tab1, tab2, tab_fibo, tab_db, tab3 = st.tabs(["⚡ 股期戰略室 ⚡", "💰 交易損益室 💰", "📈 技術分析", "📚 戰略資料庫", "📅 股市行事曆與公司事件"])
+tab1, tab_fibo, tab2, tab_db, tab3 = st.tabs(["⚡ 股期戰略室 ⚡", "📈 技術分析", "💰 交易損益室 💰", "📚 戰略資料庫", "📅 股市行事曆與公司事件"])
 
 with tab1:
     stock_strategy_tab, futures_strategy_tab = st.tabs(["📈 股票戰略室", "🧭 期貨戰略室"])
