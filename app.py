@@ -5068,6 +5068,10 @@ def render_futures_strategy_room():
     if refresh_official:
         fetch_futures_strategy_universe.clear()
         st.session_state.futures_strategy_live_cache = {}
+        st.session_state.futures_strategy_live_time = None
+        st.session_state.futures_strategy_manual = []
+        st.session_state.futures_quick_add = []
+        st.session_state.futures_strategy_editor_revision += 1
 
     with st.spinner("正在讀取期交所成交量與保證金..."):
         universe, universe_meta = fetch_futures_strategy_universe()
@@ -5152,9 +5156,12 @@ def render_futures_strategy_room():
                 cached_row['_策略週期'] = strategy_mode
                 cached_row['_分析方向'] = direction_choice
                 st.session_state.futures_strategy_live_cache[str(updated_row['契約鍵'])] = cached_row
-                st.session_state.futures_strategy_custom_prices[str(updated_row['契約鍵'])] = _safe_number(updated_row.get('自訂價(可修)'))
+                updated_price = _safe_number(updated_row.get('自訂價(可修)'))
+                if updated_price is not None:
+                    st.session_state.futures_strategy_custom_prices[str(updated_row['契約鍵'])] = updated_price
             st.session_state.futures_strategy_live_time = datetime.now(pytz.timezone('Asia/Taipei')).strftime('%Y/%m/%d %H:%M:%S')
             if updated_count:
+                st.session_state.futures_strategy_editor_revision += 1
                 st.toast(f"已更新 {updated_count} 檔期貨報價與分析", icon="✅")
                 st.rerun()
             else:
@@ -5214,6 +5221,7 @@ def render_futures_strategy_room():
             config.pop('忽略')
         return config
 
+    edited = pd.DataFrame()
     if display_rows.empty:
         st.info("目前沒有符合篩選條件的期貨；可取消隱藏條件或降低最低成交口數。")
     else:
@@ -5222,52 +5230,49 @@ def render_futures_strategy_room():
             if column not in display_rows.columns:
                 display_rows[column] = None
 
+        table_signature = abs(hash(tuple(display_rows['契約鍵'].astype(str))))
         edited = st.data_editor(
             display_rows[futures_display_columns].style.apply(style_futures_row, axis=1),
             column_config=futures_column_config(),
             hide_index=True, width='stretch', row_height=30,
-            key=f"futures_strategy_editor_{st.session_state.futures_strategy_editor_revision}"
+            key=f"futures_strategy_editor_{st.session_state.futures_strategy_editor_revision}_{table_signature}"
         )
         display_key_map = {
             f"{row['期貨代碼']}:{row['契約月份']}": str(row['契約鍵'])
             for _, row in display_rows.iterrows()
         }
-        current_custom_prices = {
-            str(row['契約鍵']): _safe_number(row.get('自訂價(可修)'))
-            for _, row in display_rows.iterrows()
-        }
-        price_changed = False
-        for _, edited_row in edited.iterrows():
-            key = display_key_map.get(f"{edited_row['期貨代碼']}:{edited_row['契約月份']}")
-            if not key:
-                continue
-            new_price = _safe_number(edited_row.get('自訂價(可修)'))
-            previous_price = current_custom_prices.get(key)
-            if new_price != previous_price:
-                price_changed = True
-                if new_price is None:
-                    st.session_state.futures_strategy_custom_prices.pop(key, None)
-                else:
-                    st.session_state.futures_strategy_custom_prices[key] = new_price
         hidden_rows = edited[edited['忽略'] == True]
         if not hidden_rows.empty:
             for _, hidden in hidden_rows.iterrows():
                 key = display_key_map.get(f"{hidden['期貨代碼']}:{hidden['契約月份']}")
                 if key:
                     st.session_state.futures_strategy_ignored.add(key)
-            price_changed = True
-        if price_changed:
+            st.session_state.futures_strategy_editor_revision += 1
             st.rerun()
 
     price_save_col, price_clear_col, _ = st.columns([2, 2, 5])
     with price_save_col:
-        save_custom_prices = st.button("💾 儲存手動自訂價", use_container_width=True, key='save_futures_custom_prices')
+        save_custom_prices = st.button("⚡ 執行更新＆儲存自訂價", use_container_width=True, key='save_futures_custom_prices')
     with price_clear_col:
         clear_custom_prices = st.button("🗑️ 清除自訂價", use_container_width=True, key='clear_futures_custom_prices')
     st.caption(f"目前有 {len(st.session_state.futures_strategy_custom_prices)} 檔自訂價；按儲存後，下次開啟仍會保留。清除後分析會回退使用官方行情價。")
     if save_custom_prices:
-        if save_futures_custom_prices(st.session_state.futures_strategy_custom_prices):
-            st.toast("期貨手動自訂價已儲存", icon="💾")
+        updated_prices = dict(st.session_state.futures_strategy_custom_prices)
+        if not edited.empty:
+            for _, edited_row in edited.iterrows():
+                key = display_key_map.get(f"{edited_row['期貨代碼']}:{edited_row['契約月份']}")
+                if not key:
+                    continue
+                new_price = _safe_number(edited_row.get('自訂價(可修)'))
+                if new_price is None:
+                    updated_prices.pop(key, None)
+                else:
+                    updated_prices[key] = new_price
+        st.session_state.futures_strategy_custom_prices = updated_prices
+        if save_futures_custom_prices(updated_prices):
+            st.session_state.futures_strategy_editor_revision += 1
+            st.toast("期貨自訂價已更新並儲存", icon="💾")
+            st.rerun()
         else:
             st.error("自訂價儲存失敗，請確認設定檔是否可寫入。")
     if clear_custom_prices:
@@ -5300,6 +5305,7 @@ def render_futures_strategy_room():
                 if key not in st.session_state.futures_strategy_manual:
                     st.session_state.futures_strategy_manual.append(key)
                 st.session_state.futures_strategy_ignored.discard(key)
+            st.session_state.futures_strategy_editor_revision += 1
             st.rerun()
 
     if st.session_state.futures_strategy_ignored:
@@ -5316,6 +5322,7 @@ def render_futures_strategy_room():
             current_ignored = {ignored_options[label] for label in selected_ignored}
             if current_ignored != st.session_state.futures_strategy_ignored:
                 st.session_state.futures_strategy_ignored = current_ignored
+                st.session_state.futures_strategy_editor_revision += 1
                 st.rerun()
 
     st.markdown("---")
