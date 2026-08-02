@@ -3409,7 +3409,16 @@ def notify_signal_state_changes(scope, current_states, enabled):
 
 def render_strategy_validation_room():
     """顯示已記錄訊號的追蹤結果；不主動抓取行情。"""
-    st.caption("只有按下各戰略室的「記錄目前訊號」才會新增；後續按即時更新時，沿用該次報價更新結果、MFE 與 MAE。")
+    st.caption("只有按下各戰略室的「記錄目前表格的已觸發訊號」才會新增；後續按即時更新時，沿用該次報價更新結果、MFE 與 MAE。")
+    with st.expander("📖 策略驗證怎麼記錄與判讀", expanded=True):
+        st.markdown("""
+        - **記錄目前表格的已觸發訊號**不是只記錄你正在查看的單一商品；它會一次記錄該表格內所有符合條件的標的。股票表會記錄已觸發或回測確認、且高於你設定最低進場信心的個股；期貨表則記錄已觸發且流動性未亮紅燈的契約。
+        - 同一交易日的同一商品、策略、方向與進場價只會保留一筆，重複按鈕不會重複新增。
+        - 記錄當下會保存進場、失效離場與目標價；之後你按「即時更新報價」時，才用該次取得的最新價更新驗證結果，**不會為策略驗證額外發出行情請求**。
+        - **1R** 是「進場價到策略失效離場點」的距離，不是金額。例如多方進場 100、失效點 95，則 1R = 5 元；價格上到 108 為 +1.6R，下到 97 為 -0.6R。
+        - **MFE（最大有利變動）**：訊號建立後，價格曾經朝正確方向走過最遠多少 R。**MAE（最大不利變動）**：訊號建立後，價格曾經往不利方向走過最遠多少 R。兩者用來檢查點位是否太晚、失效點是否太近；不等於實際已實現損益。
+        - **15／30／60 分(R)** 與 **收盤(R)** 是在對應時間點的策略表現快照；結果顯示「達標」代表碰到第一目標，「停損」代表碰到策略失效離場點。
+        """)
     records = load_strategy_signal_log()
     if not records:
         st.info("目前尚無策略訊號紀錄。請先在股票或期貨戰略室啟用附加分析層，再記錄符合條件的訊號。")
@@ -3465,7 +3474,16 @@ def render_strategy_validation_room():
     st.markdown('#### 訊號明細')
     st.dataframe(
         filtered[display_columns].sort_values('建立時間', ascending=False),
-        column_config={'評分': st.column_config.NumberColumn('進場信心', format='%d')},
+        column_config={
+            '評分': st.column_config.NumberColumn('進場信心', format='%d'),
+            '15分(R)': st.column_config.NumberColumn(help='建立訊號滿 15 分鐘時的表現；1R 為進場到失效點距離。'),
+            '30分(R)': st.column_config.NumberColumn(help='建立訊號滿 30 分鐘時的表現。'),
+            '60分(R)': st.column_config.NumberColumn(help='建立訊號滿 60 分鐘時的表現。'),
+            '收盤(R)': st.column_config.NumberColumn(help='股票訊號在收盤後的表現快照。'),
+            'MFE(R)': st.column_config.NumberColumn('MFE', help='Maximum Favorable Excursion：訊號後最大有利變動，單位為 R。'),
+            'MAE(R)': st.column_config.NumberColumn('MAE', help='Maximum Adverse Excursion：訊號後最大不利變動，單位為 R。'),
+            '結果(R)': st.column_config.NumberColumn(help='達標或策略失效時的結果；以 R 表示。'),
+        },
         hide_index=True, width='stretch'
     )
     with export_col:
@@ -5842,7 +5860,8 @@ def render_futures_strategy_room():
         with record_col:
             st.markdown("<div style='margin-top:28px'></div>", unsafe_allow_html=True)
             record_futures_signals = st.button(
-                '📝 記錄目前已觸發訊號', use_container_width=True, key='record_futures_strategy_signals'
+                '📝 記錄目前表格的已觸發期貨訊號', use_container_width=True, key='record_futures_strategy_signals',
+                help='一次記錄目前期貨表格中所有已觸發、且流動性未亮紅燈的契約；不是只記錄正在查看的單一契約。'
             )
         if record_futures_signals:
             records = []
@@ -6720,7 +6739,10 @@ with stock_strategy_container:
                         f"{selected_row.get('資料狀態', '—')}｜買賣價差 {selected_row.get('買賣價差', '—')}。"
                     )
 
-            if st.button('📝 記錄目前已觸發股票訊號', key='record_stock_strategy_signals'):
+            if st.button(
+                '📝 記錄目前表格的已觸發股票訊號', key='record_stock_strategy_signals',
+                help='一次記錄目前股票表格中所有已觸發或回測確認、且達最低進場信心的個股；不是只記錄單一個股。'
+            ):
                 records = []
                 recordable_rows = df_display[df_display.get('_附加可記錄', False) == True]
                 for _, row in recordable_rows.iterrows():
