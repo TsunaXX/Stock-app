@@ -3102,6 +3102,7 @@ CONFIG_FILE = "config.json"
 DATA_CACHE_FILE = "data_cache.json"
 URL_CACHE_FILE = "url_cache.json"
 SEARCH_CACHE_FILE = "search_cache.json"
+STRATEGY_SIGNAL_LOG_FILE = "strategy_signal_log.json"
 DEFAULT_FIBO_TAGS = ["台積電(2330)", "鴻海(2317)", "聯發科(2454)", "和椿(6215)", "晶彩科(3535)"]
 ANALYSIS_MAX_WORKERS = 2
 API_REQUEST_GAP_SECONDS = 0.1
@@ -3153,6 +3154,275 @@ def save_futures_custom_prices(custom_prices):
     except Exception:
         return False
 
+def load_strategy_signal_log():
+    """讀取策略訊號紀錄；格式錯誤時回傳空清單，不影響主程式。"""
+    if not os.path.exists(STRATEGY_SIGNAL_LOG_FILE):
+        return []
+    try:
+        with open(STRATEGY_SIGNAL_LOG_FILE, "r", encoding="utf-8") as file:
+            records = json.load(file)
+        return records if isinstance(records, list) else []
+    except (OSError, ValueError, TypeError):
+        return []
+
+def save_strategy_signal_log(records):
+    """最多保留最近 2,000 筆策略訊號，避免長期使用造成檔案膨脹。"""
+    try:
+        with open(STRATEGY_SIGNAL_LOG_FILE, "w", encoding="utf-8") as file:
+            json.dump(list(records)[-2000:], file, ensure_ascii=False, indent=2)
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+def parse_trade_plan_numbers(plan_text):
+    """從「進／停／目」摘要解析三個價位。"""
+    text = str(plan_text or '')
+    values = {}
+    for label, key in [('進', 'entry'), ('停', 'stop'), ('目', 'target')]:
+        match = re.search(rf'{label}\s*([0-9][0-9,]*(?:\.[0-9]+)?)', text)
+        values[key] = float(match.group(1).replace(',', '')) if match else None
+    return values
+
+def classify_signal_state(rule, eligible, score=None, minimum_score=0):
+    """把文字條件轉成簡短狀態，原始規則文字仍保留在明細。"""
+    text = str(rule or '')
+    if '資料不足' in text:
+        return '⚪ 資料不足'
+    if any(keyword in text for keyword in ('不交易', '排除', '處置', '禁止')):
+        return '⛔ 暫停'
+    if not eligible or (score is not None and float(score or 0) < float(minimum_score or 0)):
+        return '🟡 等待'
+    if any(keyword in text for keyword in ('回測確認', '站穩確認')):
+        return '🔵 回測確認'
+    if text.startswith('觸發：') or any(keyword in text for keyword in ('突破昨高後站穩', '跌破昨低後確認')):
+        return '✅ 已觸發'
+    return '🟡 接近觸發'
+
+def parse_strategy_data_time(value):
+    """將不同來源的日期時間轉成臺北時間的 naive Timestamp。"""
+    if value in (None, '', '—'):
+        return None
+    try:
+        timestamp = pd.Timestamp(value)
+        if pd.isna(timestamp):
+            return None
+        if timestamp.tzinfo is not None:
+            timestamp = timestamp.tz_convert('Asia/Taipei').tz_localize(None)
+        return timestamp
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+def build_data_health(data_time=None, required_ready=True, live_expected=False):
+    """建立不誤導的資料健康狀態；沒有即時時間時明確標示官方日行情。"""
+    if not required_ready:
+        return '⚪ 資料不足'
+    timestamp = parse_strategy_data_time(data_time)
+    if timestamp is None:
+        return '🔵 官方日行情' if not live_expected else '⚪ 尚未即時更新'
+    age_seconds = max(0, (datetime.now() - timestamp.to_pydatetime()).total_seconds())
+    if age_seconds <= 90:
+        return '🟢 即時'
+    if age_seconds <= 600:
+        return f'🟡 {int(age_seconds // 60)}分前'
+    return '🔴 報價過期'
+
+def calculate_market_alignment(direction, market_bias):
+    """比較策略方向與臺指期環境，只作附加標示，不改動原選股排序。"""
+    normalized_direction = '偏多' if direction in ('多頭', '偏多') else '偏空'
+    if market_bias not in ('偏多', '偏空'):
+        return '⚪ 盤整／未確認'
+    return '🟢 同向' if normalized_direction == market_bias else '🟡 逆勢'
+
+def futures_expiry_date(contract_month):
+    """以月契約第三個星期三估算到期日；休市時往前調整至交易日。"""
+    match = re.fullmatch(r'(\d{4})(\d{2})', str(contract_month or ''))
+    if not match:
+        return None
+    year, month = int(match.group(1)), int(match.group(2))
+    month_calendar = calendar.monthcalendar(year, month)
+    wednesdays = [week[calendar.WEDNESDAY] for week in month_calendar if week[calendar.WEDNESDAY]]
+    if len(wednesdays) < 3:
+        return None
+    expiry = date(year, month, wednesdays[2])
+    while is_market_closed_func(expiry):
+        expiry -= timedelta(days=1)
+    return expiry
+
+def futures_point_value(row):
+    """回傳期貨每點契約價值；個股／ETF 期貨沿用期交所契約乘數。"""
+    root = str(row.get('期貨代碼', '')).upper()
+    fixed_values = {'TX': 200, 'MTX': 50, 'TMF': 10, 'TE': 4000, 'TF': 1000}
+    if root in fixed_values:
+        return fixed_values[root]
+    return _safe_number(row.get('乘數'), 0) or 0
+
+def calculate_position_sizing(plan_text, direction, risk_budget, point_value, margin=None):
+    """依進場與停損距離計算風險部位，不代表下單建議。"""
+    prices = parse_trade_plan_numbers(plan_text)
+    entry, stop = prices['entry'], prices['stop']
+    if entry is None or stop is None or point_value <= 0:
+        return {'unit_loss': None, 'quantity': 0, 'margin_total': None}
+    unit_loss = abs(entry - stop) * point_value
+    quantity = int(max(0, float(risk_budget or 0)) // unit_loss) if unit_loss > 0 else 0
+    margin_value = _safe_number(margin)
+    return {
+        'unit_loss': round(unit_loss),
+        'quantity': quantity,
+        'margin_total': round(margin_value * quantity) if margin_value is not None else None,
+    }
+
+def register_strategy_signals(records):
+    """新增未重複的訊號；同商品同交易日、策略與進場價只留一筆。"""
+    existing = load_strategy_signal_log()
+    existing_keys = {str(record.get('dedupe_key', '')) for record in existing}
+    added = 0
+    now_text = datetime.now(pytz.timezone('Asia/Taipei')).strftime('%Y/%m/%d %H:%M:%S')
+    trade_day = datetime.now(pytz.timezone('Asia/Taipei')).strftime('%Y%m%d')
+    for raw_record in records:
+        record = dict(raw_record)
+        dedupe_key = '|'.join([
+            trade_day, str(record.get('市場', '')), str(record.get('商品鍵', '')),
+            str(record.get('策略', '')), str(record.get('方向', '')), str(record.get('進場價', '')),
+        ])
+        if dedupe_key in existing_keys:
+            continue
+        record.update({
+            'dedupe_key': dedupe_key, '建立時間': now_text, '最後更新': now_text,
+            '結果': '追蹤中', 'MFE(R)': 0.0, 'MAE(R)': 0.0, '結果(R)': None,
+            '15分(R)': None, '30分(R)': None, '60分(R)': None, '收盤(R)': None,
+        })
+        existing.append(record)
+        existing_keys.add(dedupe_key)
+        added += 1
+    return added, save_strategy_signal_log(existing)
+
+def update_strategy_signal_outcomes(price_map):
+    """以每次手動更新取得的最新價更新追蹤中訊號，不額外發出行情請求。"""
+    records = load_strategy_signal_log()
+    if not records:
+        return 0
+    updated_count = 0
+    now_tw = datetime.now(pytz.timezone('Asia/Taipei'))
+    now_text = now_tw.strftime('%Y/%m/%d %H:%M:%S')
+    for record in records:
+        key = str(record.get('商品鍵', ''))
+        current_price = _safe_number(price_map.get(key))
+        entry = _safe_number(record.get('進場價'))
+        stop = _safe_number(record.get('停損價'))
+        target = _safe_number(record.get('目標價'))
+        if current_price is None or None in (entry, stop, target):
+            continue
+        risk_distance = abs(entry - stop)
+        if risk_distance <= 0:
+            continue
+        is_long = str(record.get('方向')) in ('多頭', '偏多')
+        favorable = (current_price - entry) if is_long else (entry - current_price)
+        adverse = (entry - current_price) if is_long else (current_price - entry)
+        current_r = favorable / risk_distance
+        record['MFE(R)'] = round(max(_safe_number(record.get('MFE(R)'), 0) or 0, favorable / risk_distance), 2)
+        record['MAE(R)'] = round(max(_safe_number(record.get('MAE(R)'), 0) or 0, adverse / risk_distance), 2)
+        record['最新價'] = current_price
+        record['最後更新'] = now_text
+        created_at = parse_strategy_data_time(record.get('建立時間'))
+        if created_at is not None:
+            elapsed_minutes = (now_tw.replace(tzinfo=None) - created_at.to_pydatetime()).total_seconds() / 60
+            for minutes, column in ((15, '15分(R)'), (30, '30分(R)'), (60, '60分(R)')):
+                if elapsed_minutes >= minutes and _safe_number(record.get(column)) is None:
+                    record[column] = round(current_r, 2)
+        if str(record.get('市場')) == '股票' and now_tw.time() >= dt_time(13, 30) and _safe_number(record.get('收盤(R)')) is None:
+            record['收盤(R)'] = round(current_r, 2)
+        if str(record.get('結果')) == '追蹤中':
+            stopped = current_price <= stop if is_long else current_price >= stop
+            targeted = current_price >= target if is_long else current_price <= target
+            if stopped:
+                record['結果'], record['結果(R)'] = '停損', -1.0
+            elif targeted:
+                reward_r = abs(target - entry) / risk_distance
+                record['結果'], record['結果(R)'] = '達標', round(reward_r, 2)
+        updated_count += 1
+    save_strategy_signal_log(records)
+    return updated_count
+
+def notify_signal_state_changes(scope, current_states, enabled):
+    """只在手動刷新或條件重算後，提醒新進入觸發狀態的商品。"""
+    state_key = f'_strategy_signal_states_{scope}'
+    previous_states = st.session_state.get(state_key, {})
+    if enabled and previous_states:
+        changed = [
+            key for key, state in current_states.items()
+            if state in ('✅ 已觸發', '🔵 回測確認') and previous_states.get(key) != state
+        ]
+        if changed:
+            shown = '、'.join(changed[:5])
+            suffix = f' 等 {len(changed)} 檔' if len(changed) > 5 else ''
+            st.toast(f'訊號狀態更新：{shown}{suffix}', icon='🔔')
+    st.session_state[state_key] = dict(current_states)
+
+def render_strategy_validation_room():
+    """顯示已記錄訊號的追蹤結果；不主動抓取行情。"""
+    st.caption("只有按下各戰略室的「記錄目前訊號」才會新增；後續按即時更新時，沿用該次報價更新結果、MFE 與 MAE。")
+    records = load_strategy_signal_log()
+    if not records:
+        st.info("目前尚無策略訊號紀錄。請先在股票或期貨戰略室啟用附加分析層，再記錄符合條件的訊號。")
+        return
+
+    data = pd.DataFrame(records)
+    market_options = ['全部'] + sorted(str(value) for value in data.get('市場', pd.Series(dtype=str)).dropna().unique())
+    strategy_options = ['全部'] + sorted(str(value) for value in data.get('策略', pd.Series(dtype=str)).dropna().unique())
+    filter_col1, filter_col2, export_col = st.columns([2, 2, 2])
+    with filter_col1:
+        market_filter = st.selectbox('市場', market_options, key='signal_log_market_filter')
+    with filter_col2:
+        strategy_filter = st.selectbox('策略', strategy_options, key='signal_log_strategy_filter')
+    filtered = data.copy()
+    if market_filter != '全部':
+        filtered = filtered[filtered['市場'].astype(str) == market_filter]
+    if strategy_filter != '全部':
+        filtered = filtered[filtered['策略'].astype(str) == strategy_filter]
+
+    completed = filtered[filtered.get('結果', pd.Series(index=filtered.index, dtype=str)).isin(['達標', '停損'])]
+    wins = int((completed.get('結果', pd.Series(dtype=str)) == '達標').sum()) if not completed.empty else 0
+    hit_rate = wins / len(completed) * 100 if len(completed) else 0.0
+    result_r = pd.to_numeric(completed.get('結果(R)', pd.Series(dtype=float)), errors='coerce')
+    average_r = float(result_r.mean()) if not result_r.empty and result_r.notna().any() else 0.0
+    metric1, metric2, metric3, metric4 = st.columns(4)
+    metric1.metric('訊號數', len(filtered))
+    metric2.metric('追蹤中', int((filtered.get('結果', pd.Series(dtype=str)) == '追蹤中').sum()))
+    metric3.metric('已完成勝率', f'{hit_rate:.1f}%', help='只計算已有達標或停損結果的訊號。')
+    metric4.metric('平均結果', f'{average_r:+.2f} R', help='R 為進場至停損的風險距離。')
+
+    if not completed.empty:
+        group_columns = [column for column in ['市場', '策略', '方向'] if column in completed.columns]
+        if group_columns:
+            summary = completed.groupby(group_columns, dropna=False).agg(
+                已完成=('結果', 'size'),
+                達標數=('結果', lambda series: int((series == '達標').sum())),
+                平均R=('結果(R)', 'mean'),
+            ).reset_index()
+            summary['勝率'] = summary['達標數'] / summary['已完成'] * 100
+            summary['平均R'] = pd.to_numeric(summary['平均R'], errors='coerce').round(2)
+            summary['勝率'] = summary['勝率'].round(1)
+            st.markdown('#### 條件分組結果')
+            st.dataframe(summary, hide_index=True, width='stretch')
+
+    display_columns = [
+        '建立時間', '市場', '代碼', '名稱', '策略', '方向', '訊號狀態', '評分',
+        '進場價', '停損價', '目標價', '最新價', '15分(R)', '30分(R)', '60分(R)', '收盤(R)',
+        '結果', 'MFE(R)', 'MAE(R)', '結果(R)', '資料狀態'
+    ]
+    for column in display_columns:
+        if column not in filtered.columns:
+            filtered[column] = None
+    st.markdown('#### 訊號明細')
+    st.dataframe(filtered[display_columns].sort_values('建立時間', ascending=False), hide_index=True, width='stretch')
+    with export_col:
+        csv_data = filtered[display_columns].to_csv(index=False).encode('utf-8-sig')
+        st.download_button(
+            '⬇️ 匯出目前紀錄', csv_data,
+            file_name=f"strategy-signals-{datetime.now().strftime('%Y%m%d')}.csv",
+            mime='text/csv', use_container_width=True,
+        )
+
 def save_fibo_config():
     config = load_config()
     fibo_tags = [
@@ -3198,13 +3468,18 @@ def save_data_cache(df, ignored_set, candidates=None, saved_notes=None, fibo_tag
         df_save.drop(columns=['_auto_note'], errors='ignore', inplace=True)
         
         # 本地存檔維持在主執行緒 (若不想寫入本地也可將此段一併移入背景)
-        data_to_save_local = {"stock_data": df_save.to_dict(orient='records'), "ignored_stocks": ignored_list, "all_candidates": candidates, "saved_notes": saved_notes, "fibo_tags": fibo_tags, "cached_notes": cached_notes}
+        signal_records = load_strategy_signal_log()
+        data_to_save_local = {
+            "stock_data": df_save.to_dict(orient='records'), "ignored_stocks": ignored_list,
+            "all_candidates": candidates, "saved_notes": saved_notes, "fibo_tags": fibo_tags,
+            "cached_notes": cached_notes, "strategy_signal_log": signal_records,
+        }
         with open(DATA_CACHE_FILE, "w", encoding='utf-8') as f: 
             json.dump(data_to_save_local, f, ensure_ascii=False, indent=4)
         
         # 記憶體與速度終極優化：將「轉換 Dict」與「轉 JSON 字串」等高耗 RAM 動作全部移入背景執行緒
         if "gsheet_api_url" in st.secrets:
-            def bg_save(bg_df, bg_ignored, bg_cands, bg_notes, bg_tags, bg_cn):
+            def bg_save(bg_df, bg_ignored, bg_cands, bg_notes, bg_tags, bg_cn, bg_signals):
                 try:
                     data_to_save = {
                         "stock_data": bg_df.to_dict(orient='records'), 
@@ -3212,7 +3487,8 @@ def save_data_cache(df, ignored_set, candidates=None, saved_notes=None, fibo_tag
                         "all_candidates": bg_cands, 
                         "saved_notes": bg_notes, 
                         "fibo_tags": bg_tags,
-                        "cached_notes": bg_cn
+                        "cached_notes": bg_cn,
+                        "strategy_signal_log": bg_signals,
                     }
                     json_str = json.dumps(data_to_save, ensure_ascii=False)
                     requests.post(st.secrets["gsheet_api_url"], json={"action": "save", "data": json_str}, timeout=5)
@@ -3222,7 +3498,11 @@ def save_data_cache(df, ignored_set, candidates=None, saved_notes=None, fibo_tag
                     gc.collect()
 
             import threading
-            threading.Thread(target=bg_save, args=(df_save, ignored_list, candidates, saved_notes, fibo_tags, cached_notes), daemon=True).start()
+            threading.Thread(
+                target=bg_save,
+                args=(df_save, ignored_list, candidates, saved_notes, fibo_tags, cached_notes, signal_records),
+                daemon=True,
+            ).start()
     except Exception: pass
 
 def load_data_cache():
@@ -3236,6 +3516,8 @@ def load_data_cache():
                 candidates = data.get('all_candidates', [])
                 saved_notes = data.get('saved_notes', {}) 
                 fibo_tags = data.get('fibo_tags', [])
+                if isinstance(data.get('strategy_signal_log'), list):
+                    save_strategy_signal_log(data['strategy_signal_log'])
                 return df, ignored, candidates, saved_notes, fibo_tags, data.get('cached_notes', {})
         except Exception: pass
 
@@ -3247,6 +3529,8 @@ def load_data_cache():
             candidates = data.get('all_candidates', [])
             saved_notes = data.get('saved_notes', {}) 
             fibo_tags = data.get('fibo_tags', [])
+            if isinstance(data.get('strategy_signal_log'), list):
+                save_strategy_signal_log(data['strategy_signal_log'])
             return df, ignored, candidates, saved_notes, fibo_tags, data.get('cached_notes', {})
         except Exception: return pd.DataFrame(), set(), [], {}, [], {}
     return pd.DataFrame(), set(), [], {}, [], {}
@@ -3942,8 +4226,9 @@ def calculate_futures_strategy_levels(row, strategy_mode='當沖', direction_cho
             ], axis=1).max(axis=1)
             if strategy_mode == '當沖':
                 recent = data.tail(min(36, len(data)))
-                support = float(recent['Low'].min())
-                resistance = float(recent['High'].max())
+                reference_bars = recent.iloc[:-1] if len(recent) >= 4 else recent
+                support = float(reference_bars['Low'].min())
+                resistance = float(reference_bars['High'].max())
                 atr = float(true_range.tail(min(14, len(true_range))).mean())
                 if 'Volume' in recent.columns and float(recent['Volume'].sum()) > 0:
                     typical = (recent['High'] + recent['Low'] + recent['Close']) / 3
@@ -3958,8 +4243,9 @@ def calculate_futures_strategy_levels(row, strategy_mode='當沖', direction_cho
                 }).dropna()
                 recent_daily = daily.tail(min(20, len(daily)))
                 if not recent_daily.empty:
-                    support = float(recent_daily['Low'].min())
-                    resistance = float(recent_daily['High'].max())
+                    reference_daily = recent_daily.iloc[:-1] if len(recent_daily) >= 4 else recent_daily
+                    support = float(reference_daily['Low'].min())
+                    resistance = float(reference_daily['High'].max())
                     daily_prev = daily['Close'].shift(1)
                     daily_tr = pd.concat([
                         daily['High'] - daily['Low'],
@@ -3979,7 +4265,7 @@ def calculate_futures_strategy_levels(row, strategy_mode='當沖', direction_cho
 
     direction = direction_choice
     if direction == '自動':
-        comparison = open_price if open_price is not None else (vwap if vwap is not None else close)
+        comparison = vwap if strategy_mode == '當沖' and vwap is not None else (open_price if open_price is not None else close)
         direction = '偏多' if close >= comparison else '偏空'
     tick = 1.0 if root in {'TX', 'MTX', 'TMF', 'TE', 'TF'} else get_tick_size(close)
     round_future = (lambda value: float(round(value))) if root in {'TX', 'MTX', 'TMF', 'TE', 'TF'} else round_to_tick
@@ -4001,6 +4287,99 @@ def calculate_futures_strategy_levels(row, strategy_mode='當沖', direction_cho
         '方向': direction, '觸發條件': trigger,
         'VWAP': vwap, 'ATR': atr,
     }
+
+def enrich_futures_strategy_rows(rows, strategy_mode, risk_budget, market_bias='盤整'):
+    """加入可關閉的執行、流動性、到期與部位資訊，不改動原成交量排序。"""
+    if rows.empty:
+        return rows
+    enriched = rows.copy()
+    trading_date = get_futures_trading_date(datetime.now(pytz.timezone('Asia/Taipei'))).date()
+    for index, row in enriched.iterrows():
+        volume = int(_safe_number(row.get('當日成交口數'), 0) or 0)
+        open_interest = int(_safe_number(row.get('未平倉量'), 0) or 0)
+        volume_oi_ratio = volume / open_interest if open_interest > 0 else None
+        bid = _safe_number(row.get('買價'))
+        ask = _safe_number(row.get('賣價'))
+        price = _safe_number(row.get('自訂價(可修)')) or _safe_number(row.get('收盤價'))
+        tick = get_tick_size(price) if price is not None else 1.0
+        spread_ticks = (ask - bid) / tick if bid is not None and ask is not None and ask >= bid and tick > 0 else None
+        quote_time = row.get('報價時間')
+        if quote_time:
+            data_health = build_data_health(quote_time, required_ready=price is not None, live_expected=True)
+        elif _safe_number(row.get('自訂價(可修)')) is not None:
+            data_health = '🟡 手動／暫存價'
+        else:
+            data_health = '⚪ 尚未即時更新'
+
+        if data_health.startswith('🔴'):
+            liquidity = '⛔ 報價過期'
+        elif spread_ticks is not None and spread_ticks > 2:
+            liquidity = f'🟡 價差 {spread_ticks:.0f} 跳'
+        elif spread_ticks is not None and spread_ticks <= 1 and volume >= 1000 and open_interest >= 100:
+            liquidity = '🟢 良好'
+        elif volume >= 100 and open_interest > 0:
+            liquidity = '🟡 普通'
+        else:
+            liquidity = '🔴 偏低'
+
+        expiry = futures_expiry_date(row.get('契約月份'))
+        days_to_expiry = (expiry - trading_date).days if expiry else None
+        if days_to_expiry is None:
+            rollover = '—'
+        elif days_to_expiry < 0:
+            rollover = '⛔ 已到期'
+        elif days_to_expiry <= 3:
+            rollover = f'🔴 {days_to_expiry}日'
+        elif days_to_expiry <= 7:
+            rollover = f'🟡 {days_to_expiry}日'
+        else:
+            rollover = f'{days_to_expiry}日'
+
+        plan_text = row.get('進出場點位')
+        plan = parse_trade_plan_numbers(plan_text)
+        direction = str(row.get('方向', ''))
+        state = '⚪ 資料不足'
+        if price is not None and plan['entry'] is not None and plan['stop'] is not None and plan['target'] is not None:
+            is_long = direction == '偏多'
+            if data_health.startswith('🔴') or rollover.startswith('⛔'):
+                state = '⛔ 暫停'
+            elif (is_long and price <= plan['stop']) or (not is_long and price >= plan['stop']):
+                state = '⛔ 條件失效'
+            elif (is_long and price >= plan['target']) or (not is_long and price <= plan['target']):
+                state = '⛔ 已過目標'
+            elif (is_long and price >= plan['entry']) or (not is_long and price <= plan['entry']):
+                state = '✅ 已觸發'
+            else:
+                risk_distance = abs(plan['entry'] - plan['stop'])
+                entry_distance = abs(plan['entry'] - price)
+                state = '🟡 接近觸發' if risk_distance > 0 and entry_distance <= risk_distance * 0.5 else '⚪ 等待'
+            if not quote_time and data_health.startswith('⚪'):
+                state = '⚪ 待即時報價'
+
+        sizing = calculate_position_sizing(
+            plan_text, direction, risk_budget, futures_point_value(row), row.get('所需保證金')
+        )
+        execution_score = 0
+        execution_score += 25 if volume >= 1000 else (15 if volume >= 100 else 5)
+        execution_score += 15 if open_interest >= 100 else (8 if open_interest > 0 else 0)
+        execution_score += 20 if spread_ticks is not None and spread_ticks <= 1 else (10 if spread_ticks is None or spread_ticks <= 2 else 0)
+        execution_score += 15 if data_health.startswith('🟢') else (8 if not data_health.startswith(('🔴', '⚪')) else 0)
+        alignment = calculate_market_alignment(direction, market_bias)
+        execution_score += 10 if alignment.startswith('🟢') else (5 if alignment.startswith('⚪') else 0)
+        execution_score += 15 if state == '✅ 已觸發' else (8 if state.startswith('🟡') else 0)
+        enriched.at[index, '量倉比'] = round(volume_oi_ratio, 2) if volume_oi_ratio is not None else None
+        enriched.at[index, '買賣價差'] = f'{spread_ticks:.0f}跳' if spread_ticks is not None else '—'
+        enriched.at[index, '可交易性'] = liquidity
+        enriched.at[index, '資料狀態'] = data_health
+        enriched.at[index, '到期提醒'] = rollover
+        enriched.at[index, '訊號狀態'] = state
+        enriched.at[index, '市場一致'] = alignment
+        enriched.at[index, '執行分'] = execution_score
+        enriched.at[index, '每口停損'] = sizing['unit_loss']
+        enriched.at[index, '建議口數'] = sizing['quantity']
+        enriched.at[index, '預估保證金'] = sizing['margin_total']
+        enriched.at[index, '_附加可記錄'] = state == '✅ 已觸發' and not liquidity.startswith(('⛔', '🔴'))
+    return enriched
 
 def fetch_futures_contract_kbars(api, contract, lookback_days=20):
     """取得指定期貨契約 K 棒；保留夜盤資料供當沖與波段分析。"""
@@ -4061,6 +4440,9 @@ def update_futures_live_rows(rows, api, strategy_mode, direction_choice, include
                 updated.at[index, '當日高'] = _safe_number(getattr(snapshot, 'high', None), updated.at[index, '當日高'])
                 updated.at[index, '當日低'] = _safe_number(getattr(snapshot, 'low', None), updated.at[index, '當日低'])
                 updated.at[index, '當日成交口數'] = int(_safe_number(getattr(snapshot, 'total_volume', None), updated.at[index, '當日成交口數']) or 0)
+                updated.at[index, '買價'] = _safe_number(getattr(snapshot, 'buy_price', None))
+                updated.at[index, '賣價'] = _safe_number(getattr(snapshot, 'sell_price', None))
+                updated.at[index, '報價時間'] = datetime.now(pytz.timezone('Asia/Taipei')).strftime('%Y/%m/%d %H:%M:%S')
                 if reference > 0:
                     if str(updated.at[index, '期貨代碼']) in {'TX', 'MTX', 'TMF', 'TE', 'TF'}:
                         updated.at[index, '當日漲停價'] = round(reference * 1.10)
@@ -5046,8 +5428,39 @@ def render_futures_strategy_room():
         st.session_state.futures_strategy_editor_revision = 0
     if 'futures_auto_update_last_row' not in st.session_state:
         st.session_state.futures_auto_update_last_row = True
+    if 'futures_enhanced_layer_enabled' not in st.session_state:
+        st.session_state.futures_enhanced_layer_enabled = True
     if int(st.session_state.get('futures_minimum_volume', 1) or 1) < 1:
         st.session_state.futures_minimum_volume = 1
+
+    enhanced_col1, enhanced_col2, enhanced_col3, enhanced_col4, enhanced_col5 = st.columns(5)
+    with enhanced_col1:
+        enhanced_layer = st.checkbox(
+            "🧭 啟用附加分析層（可關閉回原表）",
+            key='futures_enhanced_layer_enabled',
+            help='加入訊號狀態、資料品質、流動性、到期提醒與部位試算；不改變成交量排序。'
+        )
+    with enhanced_col2:
+        compact_futures_table = st.checkbox(
+            "精簡主表", value=True, key='futures_compact_table', disabled=not enhanced_layer,
+            help='保留主要決策欄位，其餘資料放在個別明細；關閉可查看完整表格。'
+        )
+    with enhanced_col3:
+        futures_risk_budget = st.number_input(
+            "每筆最大風險（元）", min_value=0, value=5000, step=500,
+            key='futures_strategy_risk_budget', disabled=not enhanced_layer,
+            help='依進場與停損距離估算口數；0 表示不提供口數。'
+        )
+    with enhanced_col4:
+        futures_daily_risk_limit = st.number_input(
+            "每日風險上限（元）", min_value=0, value=15000, step=1000,
+            key='futures_strategy_daily_risk_limit', disabled=not enhanced_layer,
+            help='比較目前已觸發候選的合計預估停損；不會限制或自動下單。'
+        )
+    with enhanced_col5:
+        futures_notify = st.checkbox(
+            "🔔 訊號變化提醒", value=True, key='futures_strategy_notify', disabled=not enhanced_layer
+        )
 
     control1, control2, control3, control4 = st.columns(4)
     with control1:
@@ -5096,6 +5509,23 @@ def render_futures_strategy_room():
     st.caption(status_text)
     if universe_meta.get('errors'):
         st.warning("部分官方資料未完整取得：" + "｜".join(universe_meta['errors']))
+
+    front_index_rows = universe[
+        universe['期貨代碼'].isin(['TX', 'MTX', 'TMF']) & (universe['月份順位'] == 0)
+    ].copy()
+    if not front_index_rows.empty:
+        front_index_rows['_環境優先'] = front_index_rows['期貨代碼'].map({'TX': 0, 'MTX': 1, 'TMF': 2})
+        market_row = front_index_rows.sort_values(['_環境優先', '當日成交口數'], ascending=[True, False]).iloc[0]
+        market_change = _safe_number(market_row.get('漲跌幅'), 0) or 0
+        market_bias = '偏多' if market_change >= 0.3 else ('偏空' if market_change <= -0.3 else '盤整')
+        st.session_state.strategy_market_environment = {
+            'bias': market_bias,
+            'source': f"{market_row['期貨代碼']} {market_row['契約月份']}",
+            'change': market_change,
+            'updated': official_date,
+        }
+    else:
+        market_bias = str(st.session_state.get('strategy_market_environment', {}).get('bias', '盤整'))
 
     filtered = universe.copy()
     if hide_index:
@@ -5166,22 +5596,51 @@ def render_futures_strategy_room():
                     st.session_state.futures_strategy_custom_prices[str(updated_row['契約鍵'])] = updated_price
             st.session_state.futures_strategy_live_time = datetime.now(pytz.timezone('Asia/Taipei')).strftime('%Y/%m/%d %H:%M:%S')
             if updated_count:
+                update_strategy_signal_outcomes({
+                    str(row['契約鍵']): _safe_number(row.get('自訂價(可修)')) or _safe_number(row.get('收盤價'))
+                    for _, row in updated_rows.iterrows()
+                })
+                save_data_cache(
+                    st.session_state.stock_data, st.session_state.ignored_stocks,
+                    st.session_state.all_candidates, st.session_state.saved_notes
+                )
                 st.session_state.futures_strategy_editor_revision += 1
                 st.toast(f"已更新 {updated_count} 檔期貨報價與分析", icon="✅")
                 st.rerun()
             else:
                 st.warning("未取得實際契約快照；請確認 Shioaji 連線與契約是否仍有效。")
 
-    futures_display_columns = [
-        '忽略', '期貨代碼', '契約月份', '名稱', '方向', '支撐壓力', '進出場點位', '觸發條件',
-        '當日漲停價', '當日跌停價', '自訂價(可修)', '漲跌幅',
-        '交易時段', '當日成交口數', '未平倉量', '所需保證金', '維持保證金'
-    ]
+    if enhanced_layer:
+        display_rows = enrich_futures_strategy_rows(
+            display_rows, strategy_mode, futures_risk_budget, market_bias
+        )
+        if compact_futures_table:
+            futures_display_columns = [
+                '忽略', '期貨代碼', '契約月份', '名稱', '方向', '自訂價(可修)', '漲跌幅',
+                '訊號狀態', '執行分', '可交易性', '資料狀態', '市場一致', '進出場點位',
+                '當日成交口數', '未平倉量', '量倉比', '到期提醒', '每口停損', '建議口數', '所需保證金'
+            ]
+        else:
+            futures_display_columns = [
+                '忽略', '期貨代碼', '契約月份', '名稱', '方向', '支撐壓力', '進出場點位', '觸發條件',
+                '當日漲停價', '當日跌停價', '自訂價(可修)', '漲跌幅', '訊號狀態', '執行分', '可交易性',
+                '資料狀態', '市場一致', '買賣價差', '量倉比', '到期提醒', '每口停損', '建議口數',
+                '預估保證金', '交易時段', '當日成交口數', '未平倉量', '所需保證金', '維持保證金'
+            ]
+    else:
+        futures_display_columns = [
+            '忽略', '期貨代碼', '契約月份', '名稱', '方向', '支撐壓力', '進出場點位', '觸發條件',
+            '當日漲停價', '當日跌停價', '自訂價(可修)', '漲跌幅',
+            '交易時段', '當日成交口數', '未平倉量', '所需保證金', '維持保證金'
+        ]
 
     def style_futures_row(row):
         styles = [''] * len(row)
         change = _safe_number(row.get('漲跌幅'), 0) or 0
         direction = str(row.get('方向', ''))
+        signal_state = str(row.get('訊號狀態', ''))
+        liquidity = str(row.get('可交易性', ''))
+        data_health = str(row.get('資料狀態', ''))
         price = _safe_number(row.get('自訂價(可修)'))
         limit_up = _safe_number(row.get('當日漲停價'))
         limit_down = _safe_number(row.get('當日跌停價'))
@@ -5200,6 +5659,21 @@ def render_futures_strategy_room():
                 styles[position] = 'color:#ff4b4b;font-weight:bold;' if direction == '偏多' else ('color:#00c853;font-weight:bold;' if direction == '偏空' else '')
             elif column == '當日成交口數':
                 styles[position] = 'color:#ff9800;font-weight:bold;'
+            elif column == '訊號狀態':
+                if signal_state.startswith('✅'):
+                    styles[position] = 'color:#ff4b4b;font-weight:bold;'
+                elif signal_state.startswith('⛔'):
+                    styles[position] = 'color:#ff9800;font-weight:bold;'
+                elif signal_state.startswith('🟡'):
+                    styles[position] = 'color:#ffeb3b;'
+            elif column in ('可交易性', '資料狀態'):
+                value = liquidity if column == '可交易性' else data_health
+                if value.startswith('🟢'):
+                    styles[position] = 'color:#00e676;'
+                elif value.startswith(('🔴', '⛔')):
+                    styles[position] = 'color:#ff4b4b;font-weight:bold;'
+                elif value.startswith('🟡'):
+                    styles[position] = 'color:#ffeb3b;'
         return styles
 
     def futures_column_config(include_ignore=True):
@@ -5221,6 +5695,17 @@ def render_futures_strategy_room():
             '漲跌幅': st.column_config.NumberColumn(format='%+.2f%%', width=70, disabled=True),
             '所需保證金': st.column_config.NumberColumn(format='%,.0f', width=90, disabled=True),
             '維持保證金': st.column_config.NumberColumn(format='%,.0f', width=90, disabled=True),
+            '訊號狀態': st.column_config.TextColumn(width=105, disabled=True, help='等待、接近、觸發或失效；不會自動下單。'),
+            '執行分': st.column_config.ProgressColumn('執行品質', min_value=0, max_value=100, format='%d', width=90, help='成交量、未平倉、價差、報價狀態、市場一致與觸發狀態的透明加總；不是勝率。'),
+            '可交易性': st.column_config.TextColumn(width=105, disabled=True, help='綜合成交量、未平倉量、買賣價差與報價新鮮度。'),
+            '資料狀態': st.column_config.TextColumn(width=115, disabled=True, help='顯示即時、手動價、尚未更新或報價過期。'),
+            '市場一致': st.column_config.TextColumn(width=110, disabled=True, help='策略方向是否與近月臺指期環境一致；不改變原排序。'),
+            '買賣價差': st.column_config.TextColumn(width=75, disabled=True),
+            '量倉比': st.column_config.NumberColumn(format='%.2f', width=70, disabled=True, help='當日成交口數 ÷ 未平倉量。'),
+            '到期提醒': st.column_config.TextColumn(width=75, disabled=True),
+            '每口停損': st.column_config.NumberColumn(format='%,.0f', width=85, disabled=True, help='依進場與停損距離、契約每點價值估算。'),
+            '建議口數': st.column_config.NumberColumn(format='%d', width=75, disabled=True, help='每筆最大風險 ÷ 每口停損；0 表示風險預算不足或資料不足。'),
+            '預估保證金': st.column_config.NumberColumn(format='%,.0f', width=95, disabled=True),
         }
         if not include_ignore:
             config.pop('忽略')
@@ -5259,6 +5744,64 @@ def render_futures_strategy_room():
                     st.session_state.futures_strategy_ignored.add(key)
             st.session_state.futures_strategy_editor_revision += 1
             st.rerun()
+
+    if enhanced_layer and not display_rows.empty:
+        signal_states = {
+            f"{row['期貨代碼']} {row['契約月份']}": str(row.get('訊號狀態', ''))
+            for _, row in display_rows.iterrows()
+        }
+        notify_signal_state_changes('futures', signal_states, futures_notify)
+        active_risk_rows = display_rows[display_rows['_附加可記錄'] == True]
+        active_risk_total = sum(
+            (_safe_number(row.get('每口停損'), 0) or 0) * int(_safe_number(row.get('建議口數'), 0) or 0)
+            for _, row in active_risk_rows.iterrows()
+        )
+        if futures_daily_risk_limit > 0 and active_risk_total > futures_daily_risk_limit:
+            st.warning(f"目前已觸發候選的合計預估停損為 {active_risk_total:,.0f} 元，超過每日風險上限 {futures_daily_risk_limit:,.0f} 元。")
+        else:
+            st.caption(f"目前已觸發候選合計預估停損：{active_risk_total:,.0f}／{futures_daily_risk_limit:,.0f} 元。")
+        detail_map = {
+            f"{row['期貨代碼']} {row['契約月份']}｜{row['名稱']}": index
+            for index, row in display_rows.iterrows()
+        }
+        detail_col, record_col = st.columns([5, 2])
+        with detail_col:
+            selected_detail = st.selectbox(
+                '查看期貨執行明細', list(detail_map), key='futures_strategy_detail'
+            )
+            detail_row = display_rows.loc[detail_map[selected_detail]]
+            st.caption(
+                f"原分析：{detail_row.get('支撐壓力', '—')}｜{detail_row.get('觸發條件', '—')}｜"
+                f"價差 {detail_row.get('買賣價差', '—')}｜量倉比 {detail_row.get('量倉比', '—')}｜"
+                f"到期 {detail_row.get('到期提醒', '—')}｜每口停損 {fmt_price(detail_row.get('每口停損')) or '—'} 元｜"
+                f"預估保證金 {fmt_price(detail_row.get('預估保證金')) or '—'} 元。"
+            )
+        with record_col:
+            st.markdown("<div style='margin-top:28px'></div>", unsafe_allow_html=True)
+            record_futures_signals = st.button(
+                '📝 記錄目前已觸發訊號', use_container_width=True, key='record_futures_strategy_signals'
+            )
+        if record_futures_signals:
+            records = []
+            for _, row in display_rows[display_rows['_附加可記錄'] == True].iterrows():
+                plan = parse_trade_plan_numbers(row.get('進出場點位'))
+                records.append({
+                    '市場': '期貨', '商品鍵': str(row['契約鍵']), '代碼': str(row['期貨代碼']),
+                    '名稱': str(row['名稱']), '策略': strategy_mode, '方向': str(row.get('方向', '')),
+                    '訊號狀態': str(row.get('訊號狀態', '')), '評分': _safe_number(row.get('執行分')),
+                    '進場價': plan['entry'], '停損價': plan['stop'], '目標價': plan['target'],
+                    '最新價': _safe_number(row.get('自訂價(可修)')) or _safe_number(row.get('收盤價')),
+                    '風險': str(row.get('可交易性', '')), '資料狀態': str(row.get('資料狀態', '')),
+                })
+            added, saved = register_strategy_signals(records)
+            if saved:
+                save_data_cache(
+                    st.session_state.stock_data, st.session_state.ignored_stocks,
+                    st.session_state.all_candidates, st.session_state.saved_notes
+                )
+                st.toast(f'已新增 {added} 筆期貨訊號；重複訊號不另建。', icon='📝')
+            else:
+                st.error('訊號紀錄儲存失敗，請確認檔案是否可寫入。')
 
     if (
         futures_editor_key
@@ -5390,6 +5933,10 @@ def render_futures_strategy_room():
                 for column, value in analysis.items():
                     independent_rows.at[index, column] = value
             st.info("目前未登入 Shioaji，獨立計算先使用期交所日行情；登入後可加入即時與夜盤 K 棒。")
+        if enhanced_layer:
+            independent_rows = enrich_futures_strategy_rows(
+                independent_rows, strategy_mode, futures_risk_budget, market_bias
+            )
         independent_columns = [column for column in futures_display_columns if column != '忽略']
         for column in independent_columns:
             if column not in independent_rows.columns:
@@ -5408,11 +5955,15 @@ def render_futures_strategy_room():
 tab1, tab_fibo, tab2, tab_db, tab3 = st.tabs(["⚡ 股期戰略室 ⚡", "📈 技術分析", "💰 交易損益室 💰", "📚 戰略資料庫", "📅 股市行事曆與公司事件"])
 
 with tab1:
-    stock_strategy_tab, futures_strategy_tab = st.tabs(["📈 股票戰略室", "🧭 期貨戰略室"])
+    stock_strategy_tab, futures_strategy_tab, validation_strategy_tab = st.tabs([
+        "📈 股票戰略室", "🧭 期貨戰略室", "📊 策略驗證"
+    ])
     with stock_strategy_tab:
         stock_strategy_container = st.container()
     with futures_strategy_tab:
         render_futures_strategy_room()
+    with validation_strategy_tab:
+        render_strategy_validation_room()
 
 with stock_strategy_container:
     current_font_size, hide_non_stock, show_3d_hilo = render_stock_strategy_controls()
@@ -5695,15 +6246,20 @@ with stock_strategy_container:
                     try: df_display.at[i, '5日線價差'] = round(float(close_p) - float(ma5_val), 2)
                     except: pass
 
-        # 預設關閉，關閉後維持既有選股表格與資料流程，不會篩掉任何候選。
+        # 附加層只讀取原選股結果；關閉後維持既有表格、排序與戰略備註。
         risk_preview_enabled = st.checkbox(
-            "🛡️ 啟用風險篩選預覽（可隨時關閉回到原表）",
-            value=False,
+            "🛡️ 啟用附加分析層（可隨時關閉回到原表）",
+            value=True,
             key="risk_filter_preview_enabled",
-            help="僅提供選股風險評分與預覽，不會自動下單或改寫原始選股資料。"
+            help="加入風險、訊號、資料品質、市場方向、部位與成效紀錄；不改動週轉率排序或原始戰略備註。"
         )
+        st.caption("戰略備註維持原本的價位數字與簡短多／空標記；新增說明只顯示在獨立欄位與個股明細。")
         risk_details = {}
         risk_show_only_eligible = False
+        stock_compact_table = False
+        stock_risk_budget = 5000
+        stock_daily_risk_limit = 15000
+        stock_notify = False
 
         if risk_preview_enabled:
             if 'risk_filter_market_data' not in st.session_state:
@@ -5722,11 +6278,24 @@ with stock_strategy_container:
                 with risk_col1:
                     risk_direction = st.radio("判斷方向", ["多頭", "空頭"], horizontal=True, key="risk_filter_direction")
                     risk_min_score = st.slider("最低當沖評分" if is_daytrade_mode else "最低評分", min_value=60, max_value=90, value=75, key="risk_filter_min_score")
+                    stock_risk_budget = st.number_input(
+                        "每筆最大風險（元）", min_value=0, value=5000, step=500,
+                        key='stock_strategy_risk_budget', help='以一張 1,000 股及進場到停損距離估算張數。'
+                    )
+                    stock_daily_risk_limit = st.number_input(
+                        "每日風險上限（元）", min_value=0, value=15000, step=1000,
+                        key='stock_strategy_daily_risk_limit', help='比較目前已觸發候選的合計預估停損。'
+                    )
                 with risk_col2:
                     risk_max_extension = st.slider("最大乖離（ATR）", min_value=1.0, max_value=3.0, value=2.0, step=0.1, key="risk_filter_max_extension")
                     risk_block_attention = st.checkbox("封鎖注意累計 ≥ 2", value=True, key="risk_filter_block_attention")
+                    stock_compact_table = st.checkbox(
+                        "精簡主表", value=True, key='stock_strategy_compact_table',
+                        help='戰略備註維持原樣；其餘細節移到個股明細。'
+                    )
                 with risk_col3:
                     risk_show_only_eligible = st.checkbox("只顯示可操作候選", value=False, key="risk_filter_show_eligible")
+                    stock_notify = st.checkbox("🔔 訊號變化提醒", value=True, key='stock_strategy_notify')
                     if st.button("📊 重抓日 K 並計算風險", key="refresh_risk_filter_metrics"):
                         code_name_map, _ = load_local_stock_names()
                         with st.spinner("正在重抓日 K 並回填風險指標..."):
@@ -5815,6 +6384,12 @@ with stock_strategy_container:
             attention_counts = market_risk_data.get('attention', {})
             disposition_codes = market_risk_data.get('disposition', [])
             market_lists_updated = bool(market_risk_data.get('updated')) and not market_risk_data.get('errors')
+            market_environment = st.session_state.get('strategy_market_environment', {})
+            market_bias = str(market_environment.get('bias', '盤整'))
+            market_source = str(market_environment.get('source', '臺指期資料不足'))
+            market_change = _safe_number(market_environment.get('change'))
+            market_change_text = f" {market_change:+.2f}%" if market_change is not None else ''
+            st.caption(f"市場環境：{market_bias}｜依據 {market_source}{market_change_text}；只提供順逆勢標示，不改動原選股順位。")
 
             for i, row in df_display.iterrows():
                 result = calculate_daytrade_filter_result(
@@ -5851,17 +6426,57 @@ with stock_strategy_container:
                 result['trade_plan'] = trade_plan
                 risk_details[code] = result
                 df_display.at[i, '進出場預判'] = trade_plan['summary']
-                df_display.at[i, '_risk_eligible'] = result['eligible'] and result['score'] >= risk_min_score
+                eligible_with_score = result['eligible'] and result['score'] >= risk_min_score
+                signal_state = classify_signal_state(result['rule'], result['eligible'], result['score'], risk_min_score)
+                quote_time = row.get('_quote_time') or (row.get('_daytrade_data_time') if is_daytrade_mode else None)
+                required_ready = bool(result.get('data_time')) if is_daytrade_mode else result.get('extension') is not None
+                if row.get('_quote_time'):
+                    data_health = build_data_health(row.get('_quote_time'), required_ready, live_expected=True)
+                elif _safe_number(row.get('自訂價(可修)')) is not None:
+                    data_health = '🟡 手動／暫存價'
+                else:
+                    data_health = build_data_health(quote_time, required_ready, live_expected=is_daytrade_mode)
+                bid = _safe_number(row.get('_quote_bid'))
+                ask = _safe_number(row.get('_quote_ask'))
+                reference_price = _safe_number(row.get('自訂價(可修)')) or _safe_number(row.get('收盤價'))
+                tick = get_tick_size(reference_price) if reference_price is not None else 0.01
+                spread_ticks = (ask - bid) / tick if bid is not None and ask is not None and ask >= bid and tick > 0 else None
+                sizing = calculate_position_sizing(
+                    trade_plan['summary'], risk_direction, stock_risk_budget,
+                    1000 if re.fullmatch(r'\d{4,6}', code) else 0
+                )
+                market_alignment = calculate_market_alignment(risk_direction, market_bias)
+                df_display.at[i, '訊號狀態'] = signal_state
+                df_display.at[i, '市場一致'] = market_alignment
+                df_display.at[i, '資料狀態'] = data_health
+                df_display.at[i, '買賣價差'] = f'{spread_ticks:.0f}跳' if spread_ticks is not None else '—'
+                df_display.at[i, '每張停損'] = sizing['unit_loss']
+                df_display.at[i, '建議張數'] = sizing['quantity']
+                df_display.at[i, '_risk_eligible'] = eligible_with_score
+                df_display.at[i, '_附加可記錄'] = eligible_with_score and signal_state in ('✅ 已觸發', '🔵 回測確認')
+
+            notify_signal_state_changes(
+                'stocks',
+                {str(row['代號']): str(row.get('訊號狀態', '')) for _, row in df_display.iterrows()},
+                stock_notify,
+            )
 
             if risk_show_only_eligible:
                 df_display = df_display[df_display['_risk_eligible']].reset_index(drop=True)
                 if df_display.empty:
                     st.warning("目前沒有符合門檻的候選；可降低最低評分、放寬最大乖離，或切換回原表。")
 
-            if is_daytrade_mode:
-                input_cols = ["移除", "代號", "名稱", "戰略備註", "自訂價(可修)", "狀態", "自訂價價差", "5日線價差", "當日漲停價", "當日跌停價", "收盤價", "漲跌幅", "期貨", "風險", "VWAP 狀態", "開盤區間", "量能", "當沖評分", "盤中觸發", "進出場預判"]
+            if stock_compact_table:
+                score_column = "當沖評分" if is_daytrade_mode else "評分"
+                input_cols = [
+                    "移除", "代號", "名稱", "戰略備註", "自訂價(可修)", "漲跌幅", "期貨",
+                    "訊號狀態", score_column, "風險", "市場一致", "資料狀態", "5日線價差",
+                    "進出場預判", "每張停損", "建議張數"
+                ]
+            elif is_daytrade_mode:
+                input_cols = ["移除", "代號", "名稱", "戰略備註", "自訂價(可修)", "狀態", "自訂價價差", "5日線價差", "當日漲停價", "當日跌停價", "收盤價", "漲跌幅", "期貨", "風險", "VWAP 狀態", "開盤區間", "量能", "當沖評分", "盤中觸發", "進出場預判", "訊號狀態", "市場一致", "資料狀態", "買賣價差", "每張停損", "建議張數"]
             else:
-                input_cols = ["移除", "代號", "名稱", "戰略備註", "自訂價(可修)", "狀態", "自訂價價差", "5日線價差", "當日漲停價", "當日跌停價", "收盤價", "漲跌幅", "期貨", "風險", "評分", "乖離", "隔日規則", "進出場預判"]
+                input_cols = ["移除", "代號", "名稱", "戰略備註", "自訂價(可修)", "狀態", "自訂價價差", "5日線價差", "當日漲停價", "當日跌停價", "收盤價", "漲跌幅", "期貨", "風險", "評分", "乖離", "隔日規則", "進出場預判", "訊號狀態", "市場一致", "資料狀態", "買賣價差", "每張停損", "建議張數"]
         else:
             input_cols = ["移除", "代號", "名稱", "戰略備註", "自訂價(可修)", "狀態", "自訂價價差", "5日線價差", "當日漲停價", "當日跌停價", "收盤價", "漲跌幅", "期貨"]
         for col in input_cols:
@@ -5888,7 +6503,7 @@ with stock_strategy_container:
 
         df_display = df_display.reset_index(drop=True)
         for col in input_cols:
-             if col not in ["移除", "評分", "當沖評分"]: df_display[col] = df_display[col].astype(str)
+             if col not in ["移除", "評分", "當沖評分", "每張停損", "建議張數"]: df_display[col] = df_display[col].astype(str)
 
         # 定義上色邏輯
         def style_tab1_df(row):
@@ -5897,6 +6512,9 @@ with stock_strategy_container:
             st_val = str(row.get('狀態', ''))
             risk_val = str(row.get('風險', ''))
             vwap_val = str(row.get('VWAP 狀態', ''))
+            signal_state = str(row.get('訊號狀態', ''))
+            data_health = str(row.get('資料狀態', ''))
+            market_alignment = str(row.get('市場一致', ''))
             
             if st_val == "漲停":
                 name_c = 'background-color: #ff4b4b; color: #ffffff; font-weight: bold;'
@@ -5942,6 +6560,23 @@ with stock_strategy_container:
                         styles[idx] = 'color: #00e676; font-weight: bold;'
                     elif vwap_val.startswith('中性'):
                         styles[idx] = 'color: #ffeb3b;'
+                elif col == "訊號狀態":
+                    if signal_state.startswith('✅'):
+                        styles[idx] = 'color:#ff4b4b;font-weight:bold;'
+                    elif signal_state.startswith('🔵'):
+                        styles[idx] = 'color:#29b6f6;font-weight:bold;'
+                    elif signal_state.startswith('⛔'):
+                        styles[idx] = 'color:#ff9800;font-weight:bold;'
+                    elif signal_state.startswith('🟡'):
+                        styles[idx] = 'color:#ffeb3b;'
+                elif col in ["資料狀態", "市場一致"]:
+                    value = data_health if col == "資料狀態" else market_alignment
+                    if value.startswith('🟢'):
+                        styles[idx] = 'color:#00e676;'
+                    elif value.startswith(('🔴', '⛔')):
+                        styles[idx] = 'color:#ff4b4b;font-weight:bold;'
+                    elif value.startswith('🟡'):
+                        styles[idx] = 'color:#ffeb3b;'
             return styles
             
         styled_df = df_display[input_cols].style.apply(style_tab1_df, axis=1)
@@ -5950,6 +6585,12 @@ with stock_strategy_container:
         if risk_preview_enabled:
             risk_column_config = {
                 "風險": st.column_config.TextColumn("處置／注意", width=125, disabled=True, help="官方注意與處置查核結果；不預測漲跌方向。"),
+                "訊號狀態": st.column_config.TextColumn(width=105, disabled=True, help="將原條件濃縮為等待、接近、觸發或暫停；原規則仍在明細。"),
+                "市場一致": st.column_config.TextColumn(width=110, disabled=True, help="目前方向是否與近月臺指期環境一致；不改變原排序。"),
+                "資料狀態": st.column_config.TextColumn(width=115, disabled=True, help="顯示即時、手動／暫存、官方日行情或資料過期。"),
+                "買賣價差": st.column_config.TextColumn(width=75, disabled=True),
+                "每張停損": st.column_config.NumberColumn(format='%,.0f', width=85, disabled=True, help='以一張 1,000 股及進場到停損距離估算。'),
+                "建議張數": st.column_config.NumberColumn(format='%d', width=75, disabled=True, help='每筆最大風險 ÷ 每張停損；0 表示預算不足或資料不足。'),
             }
             if is_daytrade_mode:
                 risk_column_config.update({
@@ -5991,6 +6632,15 @@ with stock_strategy_container:
         )
 
         if risk_preview_enabled and risk_details:
+            active_risk_rows = df_display[df_display.get('_附加可記錄', False) == True]
+            active_risk_total = sum(
+                (_safe_number(row.get('每張停損'), 0) or 0) * int(_safe_number(row.get('建議張數'), 0) or 0)
+                for _, row in active_risk_rows.iterrows()
+            )
+            if stock_daily_risk_limit > 0 and active_risk_total > stock_daily_risk_limit:
+                st.warning(f"目前已觸發候選的合計預估停損為 {active_risk_total:,.0f} 元，超過每日風險上限 {stock_daily_risk_limit:,.0f} 元。")
+            else:
+                st.caption(f"目前已觸發候選合計預估停損：{active_risk_total:,.0f}／{stock_daily_risk_limit:,.0f} 元。")
             detail_options = {
                 f"{row['代號']} {row['名稱']}": str(row['代號'])
                 for _, row in df_display.iterrows()
@@ -6002,6 +6652,39 @@ with stock_strategy_container:
                 data_time_text = f"｜5 分 K 更新：{selected_risk['data_time']}" if is_daytrade_mode and selected_risk.get('data_time') else ""
                 plan_text = selected_risk.get('trade_plan', {}).get('detail', '尚未預判點位。')
                 st.caption(f"{selected_risk['detail']}｜{rule_label}：{selected_risk['rule']}｜進出場預判：{plan_text}{data_time_text}。僅供策略篩選與回測，不構成買賣建議。")
+                selected_code = detail_options[selected_risk_label]
+                selected_rows = df_display[df_display['代號'].astype(str) == selected_code]
+                if not selected_rows.empty:
+                    selected_row = selected_rows.iloc[0]
+                    st.caption(
+                        f"附加狀態：{selected_row.get('訊號狀態', '—')}｜{selected_row.get('市場一致', '—')}｜"
+                        f"{selected_row.get('資料狀態', '—')}｜買賣價差 {selected_row.get('買賣價差', '—')}｜"
+                        f"每張停損 {fmt_price(selected_row.get('每張停損')) or '—'} 元｜建議 {int(_safe_number(selected_row.get('建議張數'), 0) or 0)} 張。"
+                    )
+
+            if st.button('📝 記錄目前已觸發股票訊號', key='record_stock_strategy_signals'):
+                records = []
+                recordable_rows = df_display[df_display.get('_附加可記錄', False) == True]
+                for _, row in recordable_rows.iterrows():
+                    plan = parse_trade_plan_numbers(row.get('進出場預判'))
+                    score = row.get('當沖評分') if is_daytrade_mode else row.get('評分')
+                    records.append({
+                        '市場': '股票', '商品鍵': str(row['代號']), '代碼': str(row['代號']),
+                        '名稱': str(row['名稱']), '策略': strategy_mode, '方向': risk_direction,
+                        '訊號狀態': str(row.get('訊號狀態', '')), '評分': _safe_number(score),
+                        '進場價': plan['entry'], '停損價': plan['stop'], '目標價': plan['target'],
+                        '最新價': _safe_number(row.get('自訂價(可修)')) or _safe_number(row.get('收盤價')),
+                        '風險': str(row.get('風險', '')), '資料狀態': str(row.get('資料狀態', '')),
+                    })
+                added, saved = register_strategy_signals(records)
+                if saved:
+                    save_data_cache(
+                        st.session_state.stock_data, st.session_state.ignored_stocks,
+                        st.session_state.all_candidates, st.session_state.saved_notes
+                    )
+                    st.toast(f'已新增 {added} 筆股票訊號；重複訊號不另建。', icon='📝')
+                else:
+                    st.error('訊號紀錄儲存失敗，請確認檔案是否可寫入。')
         
         if not edited_df.empty:
             trigger_rerun = False
@@ -6159,9 +6842,13 @@ with stock_strategy_container:
                             if contract:
                                 snap = sj_api.snapshots([contract])
                                 if snap and len(snap) > 0:
-                                    rt_price = snap[0].close
+                                    snapshot = snap[0]
+                                    rt_price = snapshot.close
                                     if rt_price > 0:
                                         st.session_state.stock_data.at[i, '自訂價(可修)'] = fmt_price(rt_price)
+                                        st.session_state.stock_data.at[i, '_quote_bid'] = _safe_number(getattr(snapshot, 'buy_price', None))
+                                        st.session_state.stock_data.at[i, '_quote_ask'] = _safe_number(getattr(snapshot, 'sell_price', None))
+                                        st.session_state.stock_data.at[i, '_quote_time'] = datetime.now(pytz.timezone('Asia/Taipei')).strftime('%Y/%m/%d %H:%M:%S')
                                         st.session_state.stock_data.at[i, '狀態'] = recalculate_row(st.session_state.stock_data.iloc[i], points_map)
                                         updated = True
                         except Exception:
@@ -6169,6 +6856,10 @@ with stock_strategy_container:
                 if updated:
                     tz_tw = pytz.timezone('Asia/Taipei')
                     st.session_state.last_rt_update_time = datetime.now(tz_tw).strftime("%Y/%m/%d %H:%M:%S")
+                    update_strategy_signal_outcomes({
+                        str(row['代號']): _safe_number(row.get('自訂價(可修)')) or _safe_number(row.get('收盤價'))
+                        for _, row in st.session_state.stock_data.iterrows()
+                    })
                     save_data_cache(st.session_state.stock_data, st.session_state.ignored_stocks, st.session_state.all_candidates, st.session_state.saved_notes)
                     st.session_state.stock_strategy_editor_revision += 1
                     st.rerun()

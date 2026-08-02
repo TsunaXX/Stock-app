@@ -8,6 +8,7 @@ data_cache.json
 url_cache.json
 search_cache.json
 cal_preferences.json
+strategy_signal_log.json
 
 # Local Streamlit secrets
 .streamlit/secrets.toml
