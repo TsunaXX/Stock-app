@@ -3248,28 +3248,77 @@ def futures_expiry_date(contract_month):
         expiry -= timedelta(days=1)
     return expiry
 
-def futures_point_value(row):
-    """回傳期貨每點契約價值；個股／ETF 期貨沿用期交所契約乘數。"""
-    root = str(row.get('期貨代碼', '')).upper()
-    fixed_values = {'TX': 200, 'MTX': 50, 'TMF': 10, 'TE': 4000, 'TF': 1000}
-    if root in fixed_values:
-        return fixed_values[root]
-    return _safe_number(row.get('乘數'), 0) or 0
+def calculate_entry_confidence(
+    base_score, state, current_price, plan_text, direction,
+    data_health='', market_alignment='', base_detail=''
+):
+    """把條件一致度轉成進場信心；分數是觀察品質，不是歷史勝率。"""
+    score = max(0, min(100, int(round(float(base_score or 0)))))
+    reasons = [base_detail] if base_detail else []
+    state_text = str(state or '')
+    data_text = str(data_health or '')
+    alignment_text = str(market_alignment or '')
+    plan = parse_trade_plan_numbers(plan_text)
+    price = _safe_number(current_price)
+    direction_text = str(direction or '')
+    is_long = direction_text in ('多頭', '偏多')
+    maximum_score = 100
 
-def calculate_position_sizing(plan_text, direction, risk_budget, point_value, margin=None):
-    """依進場與停損距離計算風險部位，不代表下單建議。"""
-    prices = parse_trade_plan_numbers(plan_text)
-    entry, stop = prices['entry'], prices['stop']
-    if entry is None or stop is None or point_value <= 0:
-        return {'unit_loss': None, 'quantity': 0, 'margin_total': None}
-    unit_loss = abs(entry - stop) * point_value
-    quantity = int(max(0, float(risk_budget or 0)) // unit_loss) if unit_loss > 0 else 0
-    margin_value = _safe_number(margin)
-    return {
-        'unit_loss': round(unit_loss),
-        'quantity': quantity,
-        'margin_total': round(margin_value * quantity) if margin_value is not None else None,
-    }
+    if state_text.startswith(('⛔', '⚪ 資料不足')):
+        maximum_score = min(maximum_score, 20)
+        reasons.append('條件失效或資料不足')
+    elif state_text == '✅ 已觸發':
+        score = min(100, score + 5)
+        reasons.append('進場條件已成立')
+    elif state_text.startswith(('🟡', '⚪')):
+        score = max(0, score - 8)
+        reasons.append('尚待觸發確認')
+
+    entry, stop, target = plan['entry'], plan['stop'], plan['target']
+    if price is not None and None not in (entry, stop, target):
+        invalidated = price <= stop if is_long else price >= stop
+        target_reached = price >= target if is_long else price <= target
+        trigger_distance = abs(entry - stop)
+        progress = ((price - entry) if is_long else (entry - price)) / trigger_distance if trigger_distance > 0 else None
+        if invalidated:
+            maximum_score = min(maximum_score, 10)
+            reasons.append('已越過失效點')
+        elif target_reached:
+            maximum_score = min(maximum_score, 25)
+            reasons.append('已到第一目標，不宜追價')
+        elif progress is not None and progress > 1:
+            maximum_score = min(maximum_score, 45)
+            reasons.append('已離進場點超過一個進場－失效距離')
+        elif progress is not None and progress > 0.5:
+            score = max(0, score - 15)
+            reasons.append('已離進場點偏遠')
+        elif progress is not None and progress >= 0:
+            reasons.append('仍在觸發初段')
+
+    if data_text.startswith(('🔴', '⚪')):
+        maximum_score = min(maximum_score, 45)
+        reasons.append('即時資料待確認')
+    elif data_text.startswith('🟡'):
+        maximum_score = min(maximum_score, 70)
+        reasons.append('使用手動或較舊報價')
+    if alignment_text.startswith('🟢'):
+        score = min(100, score + 5)
+        reasons.append('與市場方向一致')
+    elif alignment_text.startswith('🟡'):
+        score = max(0, score - 10)
+        reasons.append('與市場方向相反')
+    score = min(score, maximum_score)
+
+    if score >= 80:
+        label = '🟢 高'
+    elif score >= 65:
+        label = '🟡 中高'
+    elif score >= 50:
+        label = '🟠 中'
+    else:
+        label = '🔴 低'
+    unique_reasons = list(dict.fromkeys(reason for reason in reasons if reason))
+    return {'score': score, 'label': label, 'detail': '｜'.join(unique_reasons)}
 
 def register_strategy_signals(records):
     """新增未重複的訊號；同商品同交易日、策略與進場價只留一筆。"""
@@ -3392,7 +3441,7 @@ def render_strategy_validation_room():
     metric4.metric('平均結果', f'{average_r:+.2f} R', help='R 為進場至停損的風險距離。')
 
     if not completed.empty:
-        group_columns = [column for column in ['市場', '策略', '方向'] if column in completed.columns]
+        group_columns = [column for column in ['市場', '策略', '方向', '信心判讀'] if column in completed.columns]
         if group_columns:
             summary = completed.groupby(group_columns, dropna=False).agg(
                 已完成=('結果', 'size'),
@@ -3406,7 +3455,7 @@ def render_strategy_validation_room():
             st.dataframe(summary, hide_index=True, width='stretch')
 
     display_columns = [
-        '建立時間', '市場', '代碼', '名稱', '策略', '方向', '訊號狀態', '評分',
+        '建立時間', '市場', '代碼', '名稱', '策略', '方向', '訊號狀態', '評分', '信心判讀',
         '進場價', '停損價', '目標價', '最新價', '15分(R)', '30分(R)', '60分(R)', '收盤(R)',
         '結果', 'MFE(R)', 'MAE(R)', '結果(R)', '資料狀態'
     ]
@@ -3414,7 +3463,11 @@ def render_strategy_validation_room():
         if column not in filtered.columns:
             filtered[column] = None
     st.markdown('#### 訊號明細')
-    st.dataframe(filtered[display_columns].sort_values('建立時間', ascending=False), hide_index=True, width='stretch')
+    st.dataframe(
+        filtered[display_columns].sort_values('建立時間', ascending=False),
+        column_config={'評分': st.column_config.NumberColumn('進場信心', format='%d')},
+        hide_index=True, width='stretch'
+    )
     with export_col:
         csv_data = filtered[display_columns].to_csv(index=False).encode('utf-8-sig')
         st.download_button(
@@ -4288,8 +4341,8 @@ def calculate_futures_strategy_levels(row, strategy_mode='當沖', direction_cho
         'VWAP': vwap, 'ATR': atr,
     }
 
-def enrich_futures_strategy_rows(rows, strategy_mode, risk_budget, market_bias='盤整'):
-    """加入可關閉的執行、流動性、到期與部位資訊，不改動原成交量排序。"""
+def enrich_futures_strategy_rows(rows, strategy_mode, market_bias='盤整'):
+    """加入可關閉的進場信心、流動性與到期資訊，不改動原成交量排序。"""
     if rows.empty:
         return rows
     enriched = rows.copy()
@@ -4356,17 +4409,18 @@ def enrich_futures_strategy_rows(rows, strategy_mode, risk_budget, market_bias='
             if not quote_time and data_health.startswith('⚪'):
                 state = '⚪ 待即時報價'
 
-        sizing = calculate_position_sizing(
-            plan_text, direction, risk_budget, futures_point_value(row), row.get('所需保證金')
-        )
-        execution_score = 0
-        execution_score += 25 if volume >= 1000 else (15 if volume >= 100 else 5)
-        execution_score += 15 if open_interest >= 100 else (8 if open_interest > 0 else 0)
-        execution_score += 20 if spread_ticks is not None and spread_ticks <= 1 else (10 if spread_ticks is None or spread_ticks <= 2 else 0)
-        execution_score += 15 if data_health.startswith('🟢') else (8 if not data_health.startswith(('🔴', '⚪')) else 0)
+        confidence_base = 0
+        confidence_base += 20 if volume >= 1000 else (12 if volume >= 100 else 4)
+        confidence_base += 10 if open_interest >= 100 else (5 if open_interest > 0 else 0)
+        confidence_base += 15 if spread_ticks is not None and spread_ticks <= 1 else (8 if spread_ticks is None or spread_ticks <= 2 else 0)
+        confidence_base += 15 if data_health.startswith('🟢') else (8 if not data_health.startswith(('🔴', '⚪')) else 0)
         alignment = calculate_market_alignment(direction, market_bias)
-        execution_score += 10 if alignment.startswith('🟢') else (5 if alignment.startswith('⚪') else 0)
-        execution_score += 15 if state == '✅ 已觸發' else (8 if state.startswith('🟡') else 0)
+        confidence_base += 15 if alignment.startswith('🟢') else (8 if alignment.startswith('⚪') else 0)
+        confidence_base += 25 if state == '✅ 已觸發' else (15 if state.startswith('🟡') else (8 if state == '⚪ 等待' else 0))
+        confidence = calculate_entry_confidence(
+            confidence_base, state, price, plan_text, direction, data_health, alignment,
+            '量能／未平倉、價差、報價、方向與觸發位置綜合判讀'
+        )
         enriched.at[index, '量倉比'] = round(volume_oi_ratio, 2) if volume_oi_ratio is not None else None
         enriched.at[index, '買賣價差'] = f'{spread_ticks:.0f}跳' if spread_ticks is not None else '—'
         enriched.at[index, '可交易性'] = liquidity
@@ -4374,10 +4428,9 @@ def enrich_futures_strategy_rows(rows, strategy_mode, risk_budget, market_bias='
         enriched.at[index, '到期提醒'] = rollover
         enriched.at[index, '訊號狀態'] = state
         enriched.at[index, '市場一致'] = alignment
-        enriched.at[index, '執行分'] = execution_score
-        enriched.at[index, '每口停損'] = sizing['unit_loss']
-        enriched.at[index, '建議口數'] = sizing['quantity']
-        enriched.at[index, '預估保證金'] = sizing['margin_total']
+        enriched.at[index, '信心分'] = confidence['score']
+        enriched.at[index, '信心判讀'] = confidence['label']
+        enriched.at[index, '_信心明細'] = confidence['detail']
         enriched.at[index, '_附加可記錄'] = state == '✅ 已觸發' and not liquidity.startswith(('⛔', '🔴'))
     return enriched
 
@@ -4773,7 +4826,7 @@ def build_trade_plan(row, direction, is_daytrade_mode, filter_result):
         summary = f"進 {fmt_price(entry)}｜停 {fmt_price(stop)}｜目 {fmt_price(target)}"
         return {
             'summary': summary,
-            'detail': f"{trigger_text}；預判進場 {fmt_price(entry)}、停損 {fmt_price(stop)}、第一目標 {fmt_price(target)}（約 1:1.5 風報比）"
+            'detail': f"{trigger_text}；預判進場 {fmt_price(entry)}、策略失效離場 {fmt_price(stop)}、第一目標 {fmt_price(target)}（目標距離約為進場至失效點的 1.5 倍）"
         }
 
     if is_daytrade_mode:
@@ -4820,6 +4873,33 @@ def build_trade_plan(row, direction, is_daytrade_mode, filter_result):
     stop = _round(entry + atr14)
     target = _round(entry - (stop - entry) * 1.5)
     return _format_plan(entry, stop, target, '次日開盤跌破昨低後再觀察進場')
+
+def build_stock_support_resistance(row, is_daytrade_mode=False):
+    """沿用已取得的原策略價位，整理出目前價格最近的支撐與壓力。"""
+    if is_daytrade_mode:
+        opening_low = _safe_number(row.get('_daytrade_or_low'))
+        opening_high = _safe_number(row.get('_daytrade_or_high'))
+        vwap = _safe_number(row.get('_daytrade_vwap'))
+        if opening_low is not None and opening_high is not None:
+            suffix = f'｜VWAP {fmt_price(vwap)}' if vwap is not None else ''
+            return f'支 {fmt_price(opening_low)}｜壓 {fmt_price(opening_high)}{suffix}'
+
+    current_price = _safe_number(row.get('自訂價(可修)')) or _safe_number(row.get('收盤價'))
+    values = []
+    for point in row.get('_points', []) if isinstance(row.get('_points', []), list) else []:
+        value = _safe_number(point.get('val')) if isinstance(point, dict) else None
+        if value is not None and value > 0:
+            values.append(value)
+    previous_low = _safe_number(row.get('_risk_prev_low'))
+    previous_high = _safe_number(row.get('_risk_prev_high'))
+    values.extend(value for value in (previous_low, previous_high) if value is not None)
+    if current_price is None or not values:
+        return '資料不足'
+    supports = [value for value in values if value <= current_price]
+    resistances = [value for value in values if value >= current_price]
+    support = max(supports) if supports else min(values)
+    resistance = min(resistances) if resistances else max(values)
+    return f'支 {fmt_price(support)}｜壓 {fmt_price(resistance)}'
 
 def get_tick_size(price):
     try: price = float(price)
@@ -5433,12 +5513,12 @@ def render_futures_strategy_room():
     if int(st.session_state.get('futures_minimum_volume', 1) or 1) < 1:
         st.session_state.futures_minimum_volume = 1
 
-    enhanced_col1, enhanced_col2, enhanced_col3, enhanced_col4, enhanced_col5 = st.columns(5)
+    enhanced_col1, enhanced_col2, enhanced_col3 = st.columns([3, 2, 2])
     with enhanced_col1:
         enhanced_layer = st.checkbox(
             "🧭 啟用附加分析層（可關閉回原表）",
             key='futures_enhanced_layer_enabled',
-            help='加入訊號狀態、資料品質、流動性、到期提醒與部位試算；不改變成交量排序。'
+            help='加入支撐壓力、訊號狀態、進場信心、資料品質與流動性；不改變成交量排序。'
         )
     with enhanced_col2:
         compact_futures_table = st.checkbox(
@@ -5446,18 +5526,6 @@ def render_futures_strategy_room():
             help='保留主要決策欄位，其餘資料放在個別明細；關閉可查看完整表格。'
         )
     with enhanced_col3:
-        futures_risk_budget = st.number_input(
-            "每筆最大風險（元）", min_value=0, value=5000, step=500,
-            key='futures_strategy_risk_budget', disabled=not enhanced_layer,
-            help='依進場與停損距離估算口數；0 表示不提供口數。'
-        )
-    with enhanced_col4:
-        futures_daily_risk_limit = st.number_input(
-            "每日風險上限（元）", min_value=0, value=15000, step=1000,
-            key='futures_strategy_daily_risk_limit', disabled=not enhanced_layer,
-            help='比較目前已觸發候選的合計預估停損；不會限制或自動下單。'
-        )
-    with enhanced_col5:
         futures_notify = st.checkbox(
             "🔔 訊號變化提醒", value=True, key='futures_strategy_notify', disabled=not enhanced_layer
         )
@@ -5611,21 +5679,19 @@ def render_futures_strategy_room():
                 st.warning("未取得實際契約快照；請確認 Shioaji 連線與契約是否仍有效。")
 
     if enhanced_layer:
-        display_rows = enrich_futures_strategy_rows(
-            display_rows, strategy_mode, futures_risk_budget, market_bias
-        )
+        display_rows = enrich_futures_strategy_rows(display_rows, strategy_mode, market_bias)
         if compact_futures_table:
             futures_display_columns = [
                 '忽略', '期貨代碼', '契約月份', '名稱', '方向', '自訂價(可修)', '漲跌幅',
-                '訊號狀態', '執行分', '可交易性', '資料狀態', '市場一致', '進出場點位',
-                '當日成交口數', '未平倉量', '量倉比', '到期提醒', '每口停損', '建議口數', '所需保證金'
+                '訊號狀態', '信心分', '信心判讀', '支撐壓力', '進出場點位', '市場一致',
+                '資料狀態', '可交易性', '當日成交口數', '未平倉量', '量倉比', '到期提醒', '所需保證金'
             ]
         else:
             futures_display_columns = [
                 '忽略', '期貨代碼', '契約月份', '名稱', '方向', '支撐壓力', '進出場點位', '觸發條件',
-                '當日漲停價', '當日跌停價', '自訂價(可修)', '漲跌幅', '訊號狀態', '執行分', '可交易性',
-                '資料狀態', '市場一致', '買賣價差', '量倉比', '到期提醒', '每口停損', '建議口數',
-                '預估保證金', '交易時段', '當日成交口數', '未平倉量', '所需保證金', '維持保證金'
+                '當日漲停價', '當日跌停價', '自訂價(可修)', '漲跌幅', '訊號狀態', '信心分', '信心判讀',
+                '可交易性', '資料狀態', '市場一致', '買賣價差', '量倉比', '到期提醒',
+                '交易時段', '當日成交口數', '未平倉量', '所需保證金', '維持保證金'
             ]
     else:
         futures_display_columns = [
@@ -5674,6 +5740,14 @@ def render_futures_strategy_room():
                     styles[position] = 'color:#ff4b4b;font-weight:bold;'
                 elif value.startswith('🟡'):
                     styles[position] = 'color:#ffeb3b;'
+            elif column == '信心判讀':
+                confidence = str(row.get('信心判讀', ''))
+                if confidence.startswith('🟢'):
+                    styles[position] = 'color:#00e676;font-weight:bold;'
+                elif confidence.startswith(('🟡', '🟠')):
+                    styles[position] = 'color:#ffb300;font-weight:bold;'
+                elif confidence.startswith('🔴'):
+                    styles[position] = 'color:#ff4b4b;font-weight:bold;'
         return styles
 
     def futures_column_config(include_ignore=True):
@@ -5696,16 +5770,14 @@ def render_futures_strategy_room():
             '所需保證金': st.column_config.NumberColumn(format='%,.0f', width=90, disabled=True),
             '維持保證金': st.column_config.NumberColumn(format='%,.0f', width=90, disabled=True),
             '訊號狀態': st.column_config.TextColumn(width=105, disabled=True, help='等待、接近、觸發或失效；不會自動下單。'),
-            '執行分': st.column_config.ProgressColumn('執行品質', min_value=0, max_value=100, format='%d', width=90, help='成交量、未平倉、價差、報價狀態、市場一致與觸發狀態的透明加總；不是勝率。'),
+            '信心分': st.column_config.ProgressColumn('進場信心', min_value=0, max_value=100, format='%d', width=90, help='綜合觸發位置、成交量、未平倉、價差、報價與市場方向；代表條件一致度，不是勝率。'),
+            '信心判讀': st.column_config.TextColumn(width=80, disabled=True, help='高／中高／中／低；若追離進場點、條件失效或資料過期會自動降級。'),
             '可交易性': st.column_config.TextColumn(width=105, disabled=True, help='綜合成交量、未平倉量、買賣價差與報價新鮮度。'),
             '資料狀態': st.column_config.TextColumn(width=115, disabled=True, help='顯示即時、手動價、尚未更新或報價過期。'),
             '市場一致': st.column_config.TextColumn(width=110, disabled=True, help='策略方向是否與近月臺指期環境一致；不改變原排序。'),
             '買賣價差': st.column_config.TextColumn(width=75, disabled=True),
             '量倉比': st.column_config.NumberColumn(format='%.2f', width=70, disabled=True, help='當日成交口數 ÷ 未平倉量。'),
             '到期提醒': st.column_config.TextColumn(width=75, disabled=True),
-            '每口停損': st.column_config.NumberColumn(format='%,.0f', width=85, disabled=True, help='依進場與停損距離、契約每點價值估算。'),
-            '建議口數': st.column_config.NumberColumn(format='%d', width=75, disabled=True, help='每筆最大風險 ÷ 每口停損；0 表示風險預算不足或資料不足。'),
-            '預估保證金': st.column_config.NumberColumn(format='%,.0f', width=95, disabled=True),
         }
         if not include_ignore:
             config.pop('忽略')
@@ -5751,15 +5823,6 @@ def render_futures_strategy_room():
             for _, row in display_rows.iterrows()
         }
         notify_signal_state_changes('futures', signal_states, futures_notify)
-        active_risk_rows = display_rows[display_rows['_附加可記錄'] == True]
-        active_risk_total = sum(
-            (_safe_number(row.get('每口停損'), 0) or 0) * int(_safe_number(row.get('建議口數'), 0) or 0)
-            for _, row in active_risk_rows.iterrows()
-        )
-        if futures_daily_risk_limit > 0 and active_risk_total > futures_daily_risk_limit:
-            st.warning(f"目前已觸發候選的合計預估停損為 {active_risk_total:,.0f} 元，超過每日風險上限 {futures_daily_risk_limit:,.0f} 元。")
-        else:
-            st.caption(f"目前已觸發候選合計預估停損：{active_risk_total:,.0f}／{futures_daily_risk_limit:,.0f} 元。")
         detail_map = {
             f"{row['期貨代碼']} {row['契約月份']}｜{row['名稱']}": index
             for index, row in display_rows.iterrows()
@@ -5767,14 +5830,14 @@ def render_futures_strategy_room():
         detail_col, record_col = st.columns([5, 2])
         with detail_col:
             selected_detail = st.selectbox(
-                '查看期貨執行明細', list(detail_map), key='futures_strategy_detail'
+                '查看期貨策略信心明細', list(detail_map), key='futures_strategy_detail'
             )
             detail_row = display_rows.loc[detail_map[selected_detail]]
             st.caption(
                 f"原分析：{detail_row.get('支撐壓力', '—')}｜{detail_row.get('觸發條件', '—')}｜"
+                f"進場信心 {detail_row.get('信心分', '—')} 分（{detail_row.get('信心判讀', '—')}）｜"
                 f"價差 {detail_row.get('買賣價差', '—')}｜量倉比 {detail_row.get('量倉比', '—')}｜"
-                f"到期 {detail_row.get('到期提醒', '—')}｜每口停損 {fmt_price(detail_row.get('每口停損')) or '—'} 元｜"
-                f"預估保證金 {fmt_price(detail_row.get('預估保證金')) or '—'} 元。"
+                f"到期 {detail_row.get('到期提醒', '—')}。{detail_row.get('_信心明細', '')}。"
             )
         with record_col:
             st.markdown("<div style='margin-top:28px'></div>", unsafe_allow_html=True)
@@ -5788,7 +5851,8 @@ def render_futures_strategy_room():
                 records.append({
                     '市場': '期貨', '商品鍵': str(row['契約鍵']), '代碼': str(row['期貨代碼']),
                     '名稱': str(row['名稱']), '策略': strategy_mode, '方向': str(row.get('方向', '')),
-                    '訊號狀態': str(row.get('訊號狀態', '')), '評分': _safe_number(row.get('執行分')),
+                    '訊號狀態': str(row.get('訊號狀態', '')), '評分': _safe_number(row.get('信心分')),
+                    '信心判讀': str(row.get('信心判讀', '')),
                     '進場價': plan['entry'], '停損價': plan['stop'], '目標價': plan['target'],
                     '最新價': _safe_number(row.get('自訂價(可修)')) or _safe_number(row.get('收盤價')),
                     '風險': str(row.get('可交易性', '')), '資料狀態': str(row.get('資料狀態', '')),
@@ -5934,9 +5998,7 @@ def render_futures_strategy_room():
                     independent_rows.at[index, column] = value
             st.info("目前未登入 Shioaji，獨立計算先使用期交所日行情；登入後可加入即時與夜盤 K 棒。")
         if enhanced_layer:
-            independent_rows = enrich_futures_strategy_rows(
-                independent_rows, strategy_mode, futures_risk_budget, market_bias
-            )
+            independent_rows = enrich_futures_strategy_rows(independent_rows, strategy_mode, market_bias)
         independent_columns = [column for column in futures_display_columns if column != '忽略']
         for column in independent_columns:
             if column not in independent_rows.columns:
@@ -6251,14 +6313,12 @@ with stock_strategy_container:
             "🛡️ 啟用附加分析層（可隨時關閉回到原表）",
             value=True,
             key="risk_filter_preview_enabled",
-            help="加入風險、訊號、資料品質、市場方向、部位與成效紀錄；不改動週轉率排序或原始戰略備註。"
+            help="加入支撐壓力、進出場點位、訊號、信心、資料品質與成效紀錄；不改動週轉率排序或原始戰略備註。"
         )
         st.caption("戰略備註維持原本的價位數字與簡短多／空標記；新增說明只顯示在獨立欄位與個股明細。")
         risk_details = {}
         risk_show_only_eligible = False
         stock_compact_table = False
-        stock_risk_budget = 5000
-        stock_daily_risk_limit = 15000
         stock_notify = False
 
         if risk_preview_enabled:
@@ -6267,7 +6327,7 @@ with stock_strategy_container:
                     'attention': {}, 'disposition': [], 'updated': None, 'errors': []
                 }
 
-            with st.expander("🛡️ 選股風險篩選設定", expanded=True):
+            with st.expander("🧭 選股條件與進場信心設定", expanded=True):
                 strategy_mode = st.radio(
                     "策略模式", ["當沖預覽", "隔日／波段"], horizontal=True,
                     key="risk_filter_strategy_mode",
@@ -6277,15 +6337,7 @@ with stock_strategy_container:
                 risk_col1, risk_col2, risk_col3 = st.columns(3)
                 with risk_col1:
                     risk_direction = st.radio("判斷方向", ["多頭", "空頭"], horizontal=True, key="risk_filter_direction")
-                    risk_min_score = st.slider("最低當沖評分" if is_daytrade_mode else "最低評分", min_value=60, max_value=90, value=75, key="risk_filter_min_score")
-                    stock_risk_budget = st.number_input(
-                        "每筆最大風險（元）", min_value=0, value=5000, step=500,
-                        key='stock_strategy_risk_budget', help='以一張 1,000 股及進場到停損距離估算張數。'
-                    )
-                    stock_daily_risk_limit = st.number_input(
-                        "每日風險上限（元）", min_value=0, value=15000, step=1000,
-                        key='stock_strategy_daily_risk_limit', help='比較目前已觸發候選的合計預估停損。'
-                    )
+                    risk_min_score = st.slider("最低進場信心", min_value=60, max_value=90, value=75, key="risk_filter_min_score")
                 with risk_col2:
                     risk_max_extension = st.slider("最大乖離（ATR）", min_value=1.0, max_value=3.0, value=2.0, step=0.1, key="risk_filter_max_extension")
                     risk_block_attention = st.checkbox("封鎖注意累計 ≥ 2", value=True, key="risk_filter_block_attention")
@@ -6296,9 +6348,9 @@ with stock_strategy_container:
                 with risk_col3:
                     risk_show_only_eligible = st.checkbox("只顯示可操作候選", value=False, key="risk_filter_show_eligible")
                     stock_notify = st.checkbox("🔔 訊號變化提醒", value=True, key='stock_strategy_notify')
-                    if st.button("📊 重抓日 K 並計算風險", key="refresh_risk_filter_metrics"):
+                    if st.button("📊 重抓日 K 並計算策略指標", key="refresh_risk_filter_metrics"):
                         code_name_map, _ = load_local_stock_names()
-                        with st.spinner("正在重抓日 K 並回填風險指標..."):
+                        with st.spinner("正在重抓日 K 並回填策略指標..."):
                             refreshed_data, updated_count = refresh_risk_metrics_for_codes(
                                 st.session_state.stock_data,
                                 st.session_state.get('futures_list', {}),
@@ -6363,20 +6415,20 @@ with stock_strategy_container:
 
                 risk_ready_mask = df_display.reindex(columns=RISK_METRIC_COLUMNS).notna().all(axis=1)
                 risk_ready_count = int(risk_ready_mask.sum())
-                st.caption(f"日 K 風險指標：{risk_ready_count} / {len(df_display)} 檔可計算；資料不足時，先按「重抓日 K 並計算風險」。")
+                st.caption(f"日 K 策略指標：{risk_ready_count} / {len(df_display)} 檔可計算；資料不足時，先按「重抓日 K 並計算策略指標」。")
                 if is_daytrade_mode:
                     daytrade_ready_mask = df_display.reindex(columns=DAYTRADE_METRIC_COLUMNS).notna().all(axis=1)
                     daytrade_ready_count = int(daytrade_ready_mask.sum())
                     st.caption(f"當沖 5 分 K 指標：{daytrade_ready_count} / {len(df_display)} 檔可計算；僅在你手動按「重抓 5 分 K」時更新，不影響原本載入速度。")
                 st.markdown("""
-##### 📖 ATR、VWAP、處置風險與評分怎麼看
+##### 📖 ATR、VWAP、處置查核與進場信心怎麼看
 
 - **ATR（14 日平均真實波幅）**衡量的是日 K 的正常波動幅度，不判斷多空。`乖離`在多頭為「收盤價高於 20 日線幾個 ATR」；空頭則為「收盤價低於 20 日線幾個 ATR」。乖離越大，代表越可能追在延伸段；預設超過 2 ATR 不列為可操作候選。
 - **VWAP（成交量加權平均價）**是把盤中每一段成交價依成交量加權後的平均成本。當沖預覽中，價格在 VWAP 上方偏多、下方偏空；它是盤中強弱與成本位置的參考，不是保證會反轉或續漲／續跌的支撐壓力線。
 - **開盤區間**預設採 09:00–09:15 的高低點。多方會觀察站上 VWAP 後突破區間高點；空方則觀察跌破 VWAP 後跌破區間低點。量能以最近交易日「相同盤中截止時間」的累積量比較，避免直接拿全天量判斷。
-- **進出場預判**只會在風險與方向條件通過時顯示：當沖以開盤區間突破／跌破與 VWAP 推估；隔日／波段以次日開盤突破昨高／昨低與 1 ATR 停損推估。`進`、`停`、`目`分別是觀察進場、停損與第一目標價，預設約 1:1.5 風報比，不是自動下單或保證成交價。
+- **進出場預判**只會在處置查核、乖離與方向條件通過時顯示：當沖以開盤區間突破／跌破與 VWAP 推估；隔日／波段以次日開盤突破昨高／昨低與 1 ATR 推估。`進`、`停`、`目`分別是觀察進場、策略失效離場與第一目標價，不是自動下單或保證成交價。
 - **風險**只代表官方的注意／處置查核結果：`🚫` 已處置、`🔴` 注意累計異常、`🟡` 單次注意、`🟢` 已更新名單且未列示、`⚪` 尚未完整查核。它不是股價會漲或跌的預測。
-- **評分越高**只表示該檔股票與你目前選擇的多頭或空頭方向較一致：趨勢、乖離、K 棒收盤位置、官方風險與昨高／昨低確認條件較佳；不代表保證獲利。切換「多頭／空頭」後，同一檔股票的分數會重新計算。
+- **進場信心越高**只表示該檔股票與目前方向、觸發位置、市場環境及資料狀態較一致；若已追離預判進場點、條件失效或資料過期會自動降級。它不是勝率，也不代表保證獲利。
 - **當沖操作順序**：先重抓日 K → 更新注意／處置名單 → 重抓 5 分 K → 設定方向與門檻 → 只將高分、非紅燈標的列為候選，再等「盤中觸發」成立。VWAP 與開盤區間應每個交易日重新計算，請以模擬／歷史紀錄驗證門檻，不以分數單獨下單。
 """)
 
@@ -6426,7 +6478,6 @@ with stock_strategy_container:
                 result['trade_plan'] = trade_plan
                 risk_details[code] = result
                 df_display.at[i, '進出場預判'] = trade_plan['summary']
-                eligible_with_score = result['eligible'] and result['score'] >= risk_min_score
                 signal_state = classify_signal_state(result['rule'], result['eligible'], result['score'], risk_min_score)
                 quote_time = row.get('_quote_time') or (row.get('_daytrade_data_time') if is_daytrade_mode else None)
                 required_ready = bool(result.get('data_time')) if is_daytrade_mode else result.get('extension') is not None
@@ -6441,17 +6492,23 @@ with stock_strategy_container:
                 reference_price = _safe_number(row.get('自訂價(可修)')) or _safe_number(row.get('收盤價'))
                 tick = get_tick_size(reference_price) if reference_price is not None else 0.01
                 spread_ticks = (ask - bid) / tick if bid is not None and ask is not None and ask >= bid and tick > 0 else None
-                sizing = calculate_position_sizing(
-                    trade_plan['summary'], risk_direction, stock_risk_budget,
-                    1000 if re.fullmatch(r'\d{4,6}', code) else 0
-                )
                 market_alignment = calculate_market_alignment(risk_direction, market_bias)
+                current_price = (
+                    _safe_number(row.get('_daytrade_close')) if is_daytrade_mode else None
+                ) or reference_price
+                confidence = calculate_entry_confidence(
+                    result['score'], signal_state, current_price, trade_plan['summary'], risk_direction,
+                    data_health, market_alignment, result.get('detail', '')
+                )
+                result['confidence'] = confidence
+                eligible_with_score = result['eligible'] and confidence['score'] >= risk_min_score
                 df_display.at[i, '訊號狀態'] = signal_state
+                df_display.at[i, '信心分'] = confidence['score']
+                df_display.at[i, '信心判讀'] = confidence['label']
+                df_display.at[i, '支撐壓力'] = build_stock_support_resistance(row, is_daytrade_mode)
                 df_display.at[i, '市場一致'] = market_alignment
                 df_display.at[i, '資料狀態'] = data_health
                 df_display.at[i, '買賣價差'] = f'{spread_ticks:.0f}跳' if spread_ticks is not None else '—'
-                df_display.at[i, '每張停損'] = sizing['unit_loss']
-                df_display.at[i, '建議張數'] = sizing['quantity']
                 df_display.at[i, '_risk_eligible'] = eligible_with_score
                 df_display.at[i, '_附加可記錄'] = eligible_with_score and signal_state in ('✅ 已觸發', '🔵 回測確認')
 
@@ -6467,16 +6524,15 @@ with stock_strategy_container:
                     st.warning("目前沒有符合門檻的候選；可降低最低評分、放寬最大乖離，或切換回原表。")
 
             if stock_compact_table:
-                score_column = "當沖評分" if is_daytrade_mode else "評分"
                 input_cols = [
                     "移除", "代號", "名稱", "戰略備註", "自訂價(可修)", "漲跌幅", "期貨",
-                    "訊號狀態", score_column, "風險", "市場一致", "資料狀態", "5日線價差",
-                    "進出場預判", "每張停損", "建議張數"
+                    "訊號狀態", "信心分", "信心判讀", "風險", "市場一致", "資料狀態",
+                    "5日線價差", "支撐壓力", "進出場預判"
                 ]
             elif is_daytrade_mode:
-                input_cols = ["移除", "代號", "名稱", "戰略備註", "自訂價(可修)", "狀態", "自訂價價差", "5日線價差", "當日漲停價", "當日跌停價", "收盤價", "漲跌幅", "期貨", "風險", "VWAP 狀態", "開盤區間", "量能", "當沖評分", "盤中觸發", "進出場預判", "訊號狀態", "市場一致", "資料狀態", "買賣價差", "每張停損", "建議張數"]
+                input_cols = ["移除", "代號", "名稱", "戰略備註", "自訂價(可修)", "狀態", "自訂價價差", "5日線價差", "當日漲停價", "當日跌停價", "收盤價", "漲跌幅", "期貨", "風險", "VWAP 狀態", "開盤區間", "量能", "信心分", "信心判讀", "支撐壓力", "盤中觸發", "進出場預判", "訊號狀態", "市場一致", "資料狀態", "買賣價差"]
             else:
-                input_cols = ["移除", "代號", "名稱", "戰略備註", "自訂價(可修)", "狀態", "自訂價價差", "5日線價差", "當日漲停價", "當日跌停價", "收盤價", "漲跌幅", "期貨", "風險", "評分", "乖離", "隔日規則", "進出場預判", "訊號狀態", "市場一致", "資料狀態", "買賣價差", "每張停損", "建議張數"]
+                input_cols = ["移除", "代號", "名稱", "戰略備註", "自訂價(可修)", "狀態", "自訂價價差", "5日線價差", "當日漲停價", "當日跌停價", "收盤價", "漲跌幅", "期貨", "風險", "信心分", "信心判讀", "乖離", "支撐壓力", "隔日規則", "進出場預判", "訊號狀態", "市場一致", "資料狀態", "買賣價差"]
         else:
             input_cols = ["移除", "代號", "名稱", "戰略備註", "自訂價(可修)", "狀態", "自訂價價差", "5日線價差", "當日漲停價", "當日跌停價", "收盤價", "漲跌幅", "期貨"]
         for col in input_cols:
@@ -6503,7 +6559,7 @@ with stock_strategy_container:
 
         df_display = df_display.reset_index(drop=True)
         for col in input_cols:
-             if col not in ["移除", "評分", "當沖評分", "每張停損", "建議張數"]: df_display[col] = df_display[col].astype(str)
+             if col not in ["移除", "信心分"]: df_display[col] = df_display[col].astype(str)
 
         # 定義上色邏輯
         def style_tab1_df(row):
@@ -6577,6 +6633,14 @@ with stock_strategy_container:
                         styles[idx] = 'color:#ff4b4b;font-weight:bold;'
                     elif value.startswith('🟡'):
                         styles[idx] = 'color:#ffeb3b;'
+                elif col == "信心判讀":
+                    confidence = str(row.get('信心判讀', ''))
+                    if confidence.startswith('🟢'):
+                        styles[idx] = 'color:#00e676;font-weight:bold;'
+                    elif confidence.startswith(('🟡', '🟠')):
+                        styles[idx] = 'color:#ffb300;font-weight:bold;'
+                    elif confidence.startswith('🔴'):
+                        styles[idx] = 'color:#ff4b4b;font-weight:bold;'
             return styles
             
         styled_df = df_display[input_cols].style.apply(style_tab1_df, axis=1)
@@ -6589,24 +6653,23 @@ with stock_strategy_container:
                 "市場一致": st.column_config.TextColumn(width=110, disabled=True, help="目前方向是否與近月臺指期環境一致；不改變原排序。"),
                 "資料狀態": st.column_config.TextColumn(width=115, disabled=True, help="顯示即時、手動／暫存、官方日行情或資料過期。"),
                 "買賣價差": st.column_config.TextColumn(width=75, disabled=True),
-                "每張停損": st.column_config.NumberColumn(format='%,.0f', width=85, disabled=True, help='以一張 1,000 股及進場到停損距離估算。'),
-                "建議張數": st.column_config.NumberColumn(format='%d', width=75, disabled=True, help='每筆最大風險 ÷ 每張停損；0 表示預算不足或資料不足。'),
+                "信心分": st.column_config.ProgressColumn("進場信心", min_value=0, max_value=100, format="%d", width=100, help="綜合方向條件、觸發位置、市場一致與資料狀態；代表條件一致度，不是勝率。"),
+                "信心判讀": st.column_config.TextColumn(width=80, disabled=True, help="高／中高／中／低；追離進場點、條件失效或資料過期時會降級。"),
+                "支撐壓力": st.column_config.TextColumn(width=160, disabled=True, help="當沖採開盤區間與 VWAP；隔日／波段沿用原戰略價位，顯示最接近目前價格的支撐與壓力。"),
             }
             if is_daytrade_mode:
                 risk_column_config.update({
                     "VWAP 狀態": st.column_config.TextColumn(width=125, disabled=True, help="價格相對成交量加權平均價的位置；上方偏多、下方偏空。"),
                     "開盤區間": st.column_config.TextColumn(width=105, disabled=True, help="09:00–09:15 的低點－高點。"),
                     "量能": st.column_config.TextColumn(width=80, disabled=True, help="目前累積量相對最近交易日同時段平均量。"),
-                    "當沖評分": st.column_config.ProgressColumn("當沖適配分", min_value=0, max_value=100, format="%d", width=105, help="日 K 趨勢、VWAP、量能、開盤區間與官方風險的一致性；不代表保證獲利。"),
                     "盤中觸發": st.column_config.TextColumn(width=190, disabled=True, help="僅在盤中條件同時成立時提供觀察提示，不是自動買賣指令。"),
-                    "進出場預判": st.column_config.TextColumn(width=195, disabled=True, help="通過風險條件後，以開盤區間與 VWAP 推估的進場、停損與第一目標；僅供觀察與回測。"),
+                    "進出場預判": st.column_config.TextColumn(width=195, disabled=True, help="通過條件後，以開盤區間與 VWAP 推估進場、策略失效離場與第一目標；僅供觀察與回測。"),
                 })
             else:
                 risk_column_config.update({
-                    "評分": st.column_config.ProgressColumn("方向適配分", min_value=0, max_value=100, format="%d", width=100, help="分數越高，代表越符合目前選擇的多頭或空頭條件；不代表保證獲利。"),
                     "乖離": st.column_config.TextColumn(width=90, disabled=True, help="收盤價相對 20 日線的 ATR 距離；數值越大越不宜追價或追空。"),
                     "隔日規則": st.column_config.TextColumn(width=160, disabled=True, help="僅在隔日條件成真時才列入評估，不是自動買賣指令。"),
-                    "進出場預判": st.column_config.TextColumn(width=195, disabled=True, help="通過風險條件後，以次日開盤突破昨高／昨低與 ATR 推估的進場、停損與第一目標；僅供觀察與回測。"),
+                    "進出場預判": st.column_config.TextColumn(width=195, disabled=True, help="通過條件後，以昨高／昨低與 ATR 推估進場、策略失效離場與第一目標；僅供觀察與回測。"),
                 })
 
         stock_editor_key = f"main_editor_{st.session_state.stock_strategy_editor_revision}"
@@ -6632,34 +6695,29 @@ with stock_strategy_container:
         )
 
         if risk_preview_enabled and risk_details:
-            active_risk_rows = df_display[df_display.get('_附加可記錄', False) == True]
-            active_risk_total = sum(
-                (_safe_number(row.get('每張停損'), 0) or 0) * int(_safe_number(row.get('建議張數'), 0) or 0)
-                for _, row in active_risk_rows.iterrows()
-            )
-            if stock_daily_risk_limit > 0 and active_risk_total > stock_daily_risk_limit:
-                st.warning(f"目前已觸發候選的合計預估停損為 {active_risk_total:,.0f} 元，超過每日風險上限 {stock_daily_risk_limit:,.0f} 元。")
-            else:
-                st.caption(f"目前已觸發候選合計預估停損：{active_risk_total:,.0f}／{stock_daily_risk_limit:,.0f} 元。")
             detail_options = {
                 f"{row['代號']} {row['名稱']}": str(row['代號'])
                 for _, row in df_display.iterrows()
             }
             if detail_options:
-                selected_risk_label = st.selectbox("查看風險評分明細", list(detail_options), key="risk_filter_detail_code")
+                selected_risk_label = st.selectbox("查看策略信心明細", list(detail_options), key="risk_filter_detail_code")
                 selected_risk = risk_details[detail_options[selected_risk_label]]
                 rule_label = "盤中觸發" if is_daytrade_mode else "隔日規則"
                 data_time_text = f"｜5 分 K 更新：{selected_risk['data_time']}" if is_daytrade_mode and selected_risk.get('data_time') else ""
                 plan_text = selected_risk.get('trade_plan', {}).get('detail', '尚未預判點位。')
-                st.caption(f"{selected_risk['detail']}｜{rule_label}：{selected_risk['rule']}｜進出場預判：{plan_text}{data_time_text}。僅供策略篩選與回測，不構成買賣建議。")
+                confidence_detail = selected_risk.get('confidence', {})
+                st.caption(
+                    f"進場信心 {confidence_detail.get('score', '—')} 分（{confidence_detail.get('label', '—')}）｜"
+                    f"{selected_risk['detail']}｜{rule_label}：{selected_risk['rule']}｜進出場預判：{plan_text}{data_time_text}。"
+                    "信心分代表條件一致度，不是勝率；僅供策略觀察與回測。"
+                )
                 selected_code = detail_options[selected_risk_label]
                 selected_rows = df_display[df_display['代號'].astype(str) == selected_code]
                 if not selected_rows.empty:
                     selected_row = selected_rows.iloc[0]
                     st.caption(
                         f"附加狀態：{selected_row.get('訊號狀態', '—')}｜{selected_row.get('市場一致', '—')}｜"
-                        f"{selected_row.get('資料狀態', '—')}｜買賣價差 {selected_row.get('買賣價差', '—')}｜"
-                        f"每張停損 {fmt_price(selected_row.get('每張停損')) or '—'} 元｜建議 {int(_safe_number(selected_row.get('建議張數'), 0) or 0)} 張。"
+                        f"{selected_row.get('資料狀態', '—')}｜買賣價差 {selected_row.get('買賣價差', '—')}。"
                     )
 
             if st.button('📝 記錄目前已觸發股票訊號', key='record_stock_strategy_signals'):
@@ -6667,11 +6725,12 @@ with stock_strategy_container:
                 recordable_rows = df_display[df_display.get('_附加可記錄', False) == True]
                 for _, row in recordable_rows.iterrows():
                     plan = parse_trade_plan_numbers(row.get('進出場預判'))
-                    score = row.get('當沖評分') if is_daytrade_mode else row.get('評分')
+                    score = row.get('信心分')
                     records.append({
                         '市場': '股票', '商品鍵': str(row['代號']), '代碼': str(row['代號']),
                         '名稱': str(row['名稱']), '策略': strategy_mode, '方向': risk_direction,
                         '訊號狀態': str(row.get('訊號狀態', '')), '評分': _safe_number(score),
+                        '信心判讀': str(row.get('信心判讀', '')),
                         '進場價': plan['entry'], '停損價': plan['stop'], '目標價': plan['target'],
                         '最新價': _safe_number(row.get('自訂價(可修)')) or _safe_number(row.get('收盤價')),
                         '風險': str(row.get('風險', '')), '資料狀態': str(row.get('資料狀態', '')),
@@ -6923,7 +6982,7 @@ with stock_strategy_container:
                 )
                 indep_direction = st.radio("判斷方向", ["多頭", "空頭"], horizontal=True, key="indep_risk_direction")
             with indep_ctrl2:
-                indep_min_score = st.slider("最低當沖評分" if indep_strategy_mode == "當沖預覽" else "最低評分", 60, 90, 75, key="indep_risk_min_score")
+                indep_min_score = st.slider("最低進場信心", 60, 90, 75, key="indep_risk_min_score")
                 indep_max_extension = st.slider("最大乖離（ATR）", 1.0, 3.0, 2.0, 0.1, key="indep_risk_max_extension")
             with indep_ctrl3:
                 indep_block_attention = st.checkbox("封鎖注意累計 ≥ 2", value=True, key="indep_risk_block_attention")
@@ -7045,18 +7104,39 @@ with stock_strategy_container:
                             df_indep.at[i, '開盤區間'] = result['opening_range']
                             volume_ratio = _as_float(row.get('_daytrade_volume_ratio'))
                             df_indep.at[i, '量能'] = f"{volume_ratio:.2f}x" if volume_ratio is not None else "資料不足"
-                            df_indep.at[i, '當沖評分'] = result['score']
                             df_indep.at[i, '盤中觸發'] = result['rule']
                         else:
                             df_indep.at[i, '風險'] = result['risk']
-                            df_indep.at[i, '評分'] = result['score']
                             df_indep.at[i, '乖離'] = f"{result['extension']:+.1f} ATR" if result['extension'] is not None else "—"
                             df_indep.at[i, '隔日規則'] = result['rule']
                         trade_plan = build_trade_plan(row, indep_direction, indep_is_daytrade, result)
                         result['trade_plan'] = trade_plan
+                        signal_state = classify_signal_state(
+                            result['rule'], result['eligible'], result['score'], indep_min_score
+                        )
+                        data_time = row.get('_daytrade_data_time') if indep_is_daytrade else None
+                        required_ready = bool(data_time) if indep_is_daytrade else result.get('extension') is not None
+                        data_health = build_data_health(
+                            data_time, required_ready, live_expected=indep_is_daytrade
+                        )
+                        market_alignment = calculate_market_alignment(indep_direction, market_bias)
+                        current_price = (
+                            _safe_number(row.get('_daytrade_close')) if indep_is_daytrade else None
+                        ) or _safe_number(row.get('收盤價'))
+                        confidence = calculate_entry_confidence(
+                            result['score'], signal_state, current_price, trade_plan['summary'], indep_direction,
+                            data_health, market_alignment, result.get('detail', '')
+                        )
+                        result['confidence'] = confidence
                         indep_risk_details[code] = result
                         df_indep.at[i, '進出場預判'] = trade_plan['summary']
-                        df_indep.at[i, '_indep_eligible'] = result['eligible'] and result['score'] >= indep_min_score
+                        df_indep.at[i, '支撐壓力'] = build_stock_support_resistance(row, indep_is_daytrade)
+                        df_indep.at[i, '訊號狀態'] = signal_state
+                        df_indep.at[i, '信心分'] = confidence['score']
+                        df_indep.at[i, '信心判讀'] = confidence['label']
+                        df_indep.at[i, '市場一致'] = market_alignment
+                        df_indep.at[i, '資料狀態'] = data_health
+                        df_indep.at[i, '_indep_eligible'] = result['eligible'] and confidence['score'] >= indep_min_score
 
                     if indep_show_only_eligible:
                         df_indep = df_indep[df_indep['_indep_eligible']].reset_index(drop=True)
@@ -7064,9 +7144,9 @@ with stock_strategy_container:
                             st.warning("目前沒有符合門檻的候選；可降低最低評分、放寬最大乖離，或改看完整結果。")
 
                     if indep_is_daytrade:
-                        input_cols = ["代號", "名稱", "戰略備註", "5日線價差", "當日漲停價", "當日跌停價", "收盤價", "漲跌幅", "期貨", "風險", "VWAP 狀態", "開盤區間", "量能", "當沖評分", "盤中觸發", "進出場預判"]
+                        input_cols = ["代號", "名稱", "戰略備註", "5日線價差", "當日漲停價", "當日跌停價", "收盤價", "漲跌幅", "期貨", "風險", "VWAP 狀態", "開盤區間", "量能", "訊號狀態", "信心分", "信心判讀", "支撐壓力", "盤中觸發", "進出場預判", "市場一致", "資料狀態"]
                     else:
-                        input_cols = ["代號", "名稱", "戰略備註", "5日線價差", "當日漲停價", "當日跌停價", "收盤價", "漲跌幅", "期貨", "風險", "評分", "乖離", "隔日規則", "進出場預判"]
+                        input_cols = ["代號", "名稱", "戰略備註", "5日線價差", "當日漲停價", "當日跌停價", "收盤價", "漲跌幅", "期貨", "風險", "訊號狀態", "信心分", "信心判讀", "乖離", "支撐壓力", "隔日規則", "進出場預判", "市場一致", "資料狀態"]
                 else:
                     input_cols = ["代號", "名稱", "戰略備註", "5日線價差", "當日漲停價", "當日跌停價", "收盤價", "漲跌幅", "期貨"]
                 for col in input_cols:
@@ -7093,29 +7173,35 @@ with stock_strategy_container:
                             except: pass
 
                 for col in input_cols:
-                    if col not in ["評分", "當沖評分"]:
+                    if col != "信心分":
                         df_indep[col] = df_indep[col].astype(str)
 
                 # 套用與主表格完全一致的顏色邏輯
                 styled_indep = df_indep[input_cols].style.apply(style_tab1_df, axis=1)
                 indep_column_config = {}
                 if risk_preview_enabled:
-                    indep_column_config["風險"] = st.column_config.TextColumn("處置／注意", width=125, disabled=True, help="官方注意與處置查核結果；不預測漲跌方向。")
+                    indep_column_config.update({
+                        "風險": st.column_config.TextColumn("處置／注意", width=125, disabled=True, help="官方注意與處置查核結果；不預測漲跌方向。"),
+                        "訊號狀態": st.column_config.TextColumn(width=105, disabled=True),
+                        "信心分": st.column_config.ProgressColumn("進場信心", min_value=0, max_value=100, format="%d", width=100, help="條件一致度，不是勝率。"),
+                        "信心判讀": st.column_config.TextColumn(width=80, disabled=True),
+                        "支撐壓力": st.column_config.TextColumn(width=160, disabled=True),
+                        "市場一致": st.column_config.TextColumn(width=110, disabled=True),
+                        "資料狀態": st.column_config.TextColumn(width=115, disabled=True),
+                    })
                     if indep_is_daytrade:
                         indep_column_config.update({
                             "VWAP 狀態": st.column_config.TextColumn(width=125, disabled=True, help="偏多：站上 VWAP；偏空：跌破 VWAP。"),
                             "開盤區間": st.column_config.TextColumn(width=105, disabled=True, help="09:00–09:15 的低點－高點。"),
                             "量能": st.column_config.TextColumn(width=80, disabled=True, help="目前累積量相對最近交易日同時段平均量。"),
-                            "當沖評分": st.column_config.ProgressColumn("當沖適配分", min_value=0, max_value=100, format="%d", width=105, help="日 K 趨勢、VWAP、量能、開盤區間與官方風險的一致性。"),
                             "盤中觸發": st.column_config.TextColumn(width=190, disabled=True, help="僅為盤中觀察提示，不是自動買賣指令。"),
-                            "進出場預判": st.column_config.TextColumn(width=195, disabled=True, help="通過風險條件後，以開盤區間與 VWAP 推估的進場、停損與第一目標；僅供觀察與回測。"),
+                            "進出場預判": st.column_config.TextColumn(width=195, disabled=True, help="以開盤區間與 VWAP 推估進場、策略失效離場與第一目標。"),
                         })
                     else:
                         indep_column_config.update({
-                            "評分": st.column_config.ProgressColumn("方向適配分", min_value=0, max_value=100, format="%d", width=100),
                             "乖離": st.column_config.TextColumn(width=90, disabled=True),
                             "隔日規則": st.column_config.TextColumn(width=160, disabled=True),
-                            "進出場預判": st.column_config.TextColumn(width=195, disabled=True, help="通過風險條件後，以次日開盤突破昨高／昨低與 ATR 推估的進場、停損與第一目標；僅供觀察與回測。"),
+                            "進出場預判": st.column_config.TextColumn(width=195, disabled=True, help="以昨高／昨低與 ATR 推估進場、策略失效離場與第一目標。"),
                         })
 
                 st.dataframe(
@@ -7143,12 +7229,17 @@ with stock_strategy_container:
                         f"{row['代號']} {row['名稱']}": str(row['代號'])
                         for _, row in df_indep.iterrows()
                     }
-                    selected_label = st.selectbox("查看獨立計算評分明細", list(detail_options), key="indep_risk_detail_code")
+                    selected_label = st.selectbox("查看獨立計算信心明細", list(detail_options), key="indep_risk_detail_code")
                     selected_result = indep_risk_details[detail_options[selected_label]]
                     rule_label = "盤中觸發" if indep_is_daytrade else "隔日規則"
                     data_time_text = f"｜5 分 K 更新：{selected_result['data_time']}" if indep_is_daytrade and selected_result.get('data_time') else ""
                     plan_text = selected_result.get('trade_plan', {}).get('detail', '尚未預判點位。')
-                    st.caption(f"{selected_result['detail']}｜{rule_label}：{selected_result['rule']}｜進出場預判：{plan_text}{data_time_text}。僅供策略篩選與回測，不構成買賣建議。")
+                    confidence_detail = selected_result.get('confidence', {})
+                    st.caption(
+                        f"進場信心 {confidence_detail.get('score', '—')} 分（{confidence_detail.get('label', '—')}）｜"
+                        f"{selected_result['detail']}｜{rule_label}：{selected_result['rule']}｜"
+                        f"進出場預判：{plan_text}{data_time_text}。信心分代表條件一致度，不是勝率。"
+                    )
 
 with tab2:
     tab2_1, tab2_2, tab2_3 = st.tabs(["當沖損益室", "波段信用室", "期權交易室"])
