@@ -9493,32 +9493,54 @@ with tab3:
         "美國高影響總經": ["FOMC 利率決議", "美國 CPI", "美國大非農", "美國小非農 ADP"],
         "個股財報與營收": ["指定股票財報", "台股月營收", "美股季度／年度營收"],
     }
+    US_EVENT_DENSITY_OPTIONS = ["核心（FOMC／CPI／大小非農）", "完整（含每週初領失業金）"]
 
-    def load_calendar_preferences():
+    def normalize_calendar_preferences(saved=None):
+        """將檔案或既有 Streamlit session 的舊版事件設定升級為目前格式。"""
         default_preferences = {
             "groups": CALENDAR_GROUP_OPTIONS.copy(),
-            "us_event_density": "完整（含每週初領失業金）",
+            "us_event_density": US_EVENT_DENSITY_OPTIONS[1],
             "tickers": "2330.TW",
         }
-        if not os.path.exists(CAL_PREFERENCES_FILE):
+        if not isinstance(saved, dict):
             return default_preferences
+
+        raw_groups = saved.get("groups", [])
+        if isinstance(raw_groups, str):
+            raw_groups = [raw_groups]
+        groups = [
+            item for item in raw_groups
+            if isinstance(item, str) and item in CALENDAR_GROUP_OPTIONS
+        ] if isinstance(raw_groups, (list, tuple, set)) else []
+        if not groups:
+            legacy_events = saved.get("events", [])
+            if isinstance(legacy_events, str):
+                legacy_events = [legacy_events]
+            legacy_events = {
+                item for item in legacy_events if isinstance(item, str)
+            } if isinstance(legacy_events, (list, tuple, set)) else set()
+            groups = [
+                group for group, events in CALENDAR_GROUP_EVENTS.items()
+                if legacy_events.intersection(events)
+            ] or CALENDAR_GROUP_OPTIONS.copy()
+
+        density = saved.get("us_event_density", default_preferences["us_event_density"])
+        if density not in US_EVENT_DENSITY_OPTIONS:
+            density = default_preferences["us_event_density"]
+        tickers = saved.get("tickers", default_preferences["tickers"])
+        if tickers is None:
+            tickers = default_preferences["tickers"]
+        return {"groups": groups, "us_event_density": density, "tickers": str(tickers)}
+
+    def load_calendar_preferences():
+        if not os.path.exists(CAL_PREFERENCES_FILE):
+            return normalize_calendar_preferences()
         try:
             with open(CAL_PREFERENCES_FILE, "r", encoding="utf-8") as file:
                 saved = json.load(file)
-            groups = [item for item in saved.get("groups", []) if item in CALENDAR_GROUP_OPTIONS]
-            if not groups:
-                legacy_events = set(saved.get("events", []))
-                groups = [
-                    group for group, events in CALENDAR_GROUP_EVENTS.items()
-                    if legacy_events.intersection(events)
-                ] or CALENDAR_GROUP_OPTIONS.copy()
-            return {
-                "groups": groups,
-                "us_event_density": saved.get("us_event_density", default_preferences["us_event_density"]),
-                "tickers": str(saved.get("tickers", default_preferences["tickers"])),
-            }
+            return normalize_calendar_preferences(saved)
         except (OSError, ValueError, TypeError):
-            return default_preferences
+            return normalize_calendar_preferences()
 
     def save_calendar_preferences(groups, us_event_density, tickers, events):
         try:
@@ -9560,6 +9582,11 @@ with tab3:
         st.session_state.cal_overrides = load_cal_overrides()
     if 'calendar_preferences' not in st.session_state:
         st.session_state.calendar_preferences = load_calendar_preferences()
+    else:
+        # Streamlit Cloud 部署新版程式時會沿用既有 session，需在讀取欄位前即時遷移。
+        st.session_state.calendar_preferences = normalize_calendar_preferences(
+            st.session_state.calendar_preferences
+        )
 
     with st.expander("🛠️ 自訂與校正行事曆事件"):
         st.info("若發現系統預設日期或時間有誤，可在此手動新增或覆寫事件（例如：提前休市、自訂總經數據時間）。")
@@ -9597,7 +9624,7 @@ with tab3:
                 key="calendar_event_groups",
             )
         with density_col:
-            density_options = ["核心（FOMC／CPI／大小非農）", "完整（含每週初領失業金）"]
+            density_options = US_EVENT_DENSITY_OPTIONS
             saved_density = st.session_state.calendar_preferences.get("us_event_density", density_options[1])
             us_event_density = st.selectbox(
                 "美國事件密度",
