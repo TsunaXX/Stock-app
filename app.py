@@ -267,6 +267,8 @@ TWSE_HOLIDAY_URL = "https://www.twse.com.tw/holidaySchedule/holidaySchedule?resp
 TWSE_NEWS_URL = "https://www.twse.com.tw/news/newsList?response=json"
 FOMC_CALENDAR_URL = "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm"
 BLS_CPI_URL = "https://www.bls.gov/schedule/news_release/cpi.htm"
+BLS_EMPLOYMENT_URL = "https://www.bls.gov/schedule/news_release/empsit.htm"
+ADP_EMPLOYMENT_DATA_URL = "https://adpemploymentreport.com/ner_production.json"
 
 
 def _calendar_get(url):
@@ -470,6 +472,137 @@ def fetch_bls_cpi_events(year):
             "temporary": False,
             "source": "U.S. Bureau of Labor Statistics",
         })
+    return events
+
+
+def _parse_official_release_schedule(response, year, event_title, source):
+    """解析美國官方發布排程的日期與美東時間，統一換算成台灣時間。"""
+    if not response or "Access Denied" in response.text:
+        return []
+    text_value = BeautifulSoup(response.text, "html.parser").get_text(" ", strip=True)
+    month_lookup = {name: index for index, name in enumerate(
+        ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"], 1
+    )}
+    pattern = re.compile(
+        r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.\s*(\d{1,2}),\s*(\d{4})\s*(\d{1,2}):(\d{2})\s*(AM|PM)",
+        re.I,
+    )
+    events, seen = [], set()
+    for match in pattern.finditer(text_value):
+        month_name, day, event_year, hour, minute, meridiem = match.groups()
+        if int(event_year) != year:
+            continue
+        hour = int(hour) % 12 + (12 if meridiem.upper() == "PM" else 0)
+        taiwan_dt = _taiwan_time_from_eastern(year, month_lookup[month_name.title()], int(day), hour, int(minute))
+        if taiwan_dt.date() in seen:
+            continue
+        seen.add(taiwan_dt.date())
+        events.append({
+            "date": taiwan_dt.date().isoformat(),
+            "title": f"{event_title}（{taiwan_dt:%H:%M}）",
+            "detail": f"{source} 官方排程；以台灣時間顯示。",
+            "closed": False,
+            "temporary": False,
+            "source": source,
+            "impact": "high",
+        })
+    return events
+
+
+@st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
+def fetch_bls_employment_events(year):
+    """BLS Employment Situation：市場俗稱大非農，同時公布失業率。"""
+    return _parse_official_release_schedule(
+        _calendar_get(BLS_EMPLOYMENT_URL),
+        year,
+        "美國大非農／失業率",
+        "U.S. Bureau of Labor Statistics",
+    )
+
+
+@st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
+def fetch_adp_employment_events(year):
+    """由 ADP 官方資料端點取得每月小非農日期，固定 08:15 ET 發布。"""
+    response = _calendar_get(ADP_EMPLOYMENT_DATA_URL)
+    if not response:
+        return []
+    try:
+        report_days = response.json().get("futureReports", [])
+    except (TypeError, ValueError, AttributeError):
+        return []
+    month_lookup = {name: index for index, name in enumerate(
+        ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"], 1
+    )}
+    pattern = re.compile(
+        r"(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2}),\s*(\d{4})",
+        re.I,
+    )
+    events, seen = [], set()
+    for report_day in report_days:
+        report_date = str(report_day.get("reportDate", "")).strip()
+        if report_date.lower().startswith("upcoming reports (weekly"):
+            break
+        match = pattern.fullmatch(report_date)
+        if not match:
+            continue
+        month_name, day, event_year = match.groups()
+        if int(event_year) != year:
+            continue
+        taiwan_dt = _taiwan_time_from_eastern(year, month_lookup[month_name.title()], int(day), 8, 15)
+        if taiwan_dt.date() in seen:
+            continue
+        seen.add(taiwan_dt.date())
+        events.append({
+            "date": taiwan_dt.date().isoformat(),
+            "title": f"美國小非農 ADP（{taiwan_dt:%H:%M}）",
+            "detail": "ADP National Employment Report 官方日曆；以台灣時間顯示。",
+            "closed": False,
+            "temporary": False,
+            "source": "ADP Research Institute",
+            "impact": "high",
+        })
+    return events
+
+
+def _us_weekly_claims_release_date(year, month, day):
+    """週四遇主要聯邦假日時，依慣例提前至週三；最終仍以 DOL 公告為準。"""
+    release_date = date(year, month, day)
+    thanksgiving = date(year, 11, 1)
+    thanksgiving += timedelta(days=(calendar.THURSDAY - thanksgiving.weekday()) % 7 + 21)
+    thursday_holidays = {
+        date(year, 1, 1),
+        date(year, 6, 19),
+        date(year, 7, 4),
+        thanksgiving,
+        date(year, 12, 25),
+    }
+    return release_date - timedelta(days=1) if release_date in thursday_holidays else release_date
+
+
+@st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
+def build_us_initial_claims_events(year):
+    """建立美國勞工部每週四 08:30 ET 的初領失業金預定發布時間。"""
+    events = []
+    for month in range(1, 13):
+        for week in calendar.monthcalendar(year, month):
+            day = week[calendar.THURSDAY]
+            if not day:
+                continue
+            release_date = _us_weekly_claims_release_date(year, month, day)
+            taiwan_dt = _taiwan_time_from_eastern(
+                release_date.year, release_date.month, release_date.day, 8, 30
+            )
+            scheduled_date = date(year, month, day)
+            holiday_note = "；遇聯邦假日，預定提前至週三" if release_date != scheduled_date else ""
+            events.append({
+                "date": taiwan_dt.date().isoformat(),
+                "title": f"美國初領失業金人數（{taiwan_dt:%H:%M}）",
+                "detail": f"U.S. Department of Labor 例行週度發布時間{holiday_note}；最終以官方公告為準。",
+                "closed": False,
+                "temporary": False,
+                "source": "U.S. Department of Labor",
+                "impact": "routine",
+            })
     return events
 
 
@@ -9347,34 +9480,56 @@ with tab3:
         "台股突發休市公告",
         "FOMC 利率決議",
         "美國 CPI",
+        "美國大非農",
+        "美國小非農 ADP",
+        "美國初領失業金",
         "指定股票財報",
         "台股月營收",
         "美股季度／年度營收",
     ]
+    CALENDAR_GROUP_OPTIONS = ["台股市場與休市", "美國高影響總經", "個股財報與營收"]
+    CALENDAR_GROUP_EVENTS = {
+        "台股市場與休市": ["台股開休市", "台股突發休市公告"],
+        "美國高影響總經": ["FOMC 利率決議", "美國 CPI", "美國大非農", "美國小非農 ADP"],
+        "個股財報與營收": ["指定股票財報", "台股月營收", "美股季度／年度營收"],
+    }
 
     def load_calendar_preferences():
-        default_preferences = {"events": CALENDAR_EVENT_OPTIONS[:4] + ["台股月營收", "美股季度／年度營收"], "tickers": "2330.TW"}
+        default_preferences = {
+            "groups": CALENDAR_GROUP_OPTIONS.copy(),
+            "us_event_density": "完整（含每週初領失業金）",
+            "tickers": "2330.TW",
+        }
         if not os.path.exists(CAL_PREFERENCES_FILE):
             return default_preferences
         try:
             with open(CAL_PREFERENCES_FILE, "r", encoding="utf-8") as file:
                 saved = json.load(file)
-            events = [item for item in saved.get("events", default_preferences["events"]) if item in CALENDAR_EVENT_OPTIONS]
-            if int(saved.get("calendar_events_version", 0)) < 2:
-                for new_event in ("台股月營收", "美股季度／年度營收"):
-                    if new_event not in events:
-                        events.append(new_event)
+            groups = [item for item in saved.get("groups", []) if item in CALENDAR_GROUP_OPTIONS]
+            if not groups:
+                legacy_events = set(saved.get("events", []))
+                groups = [
+                    group for group, events in CALENDAR_GROUP_EVENTS.items()
+                    if legacy_events.intersection(events)
+                ] or CALENDAR_GROUP_OPTIONS.copy()
             return {
-                "events": events,
+                "groups": groups,
+                "us_event_density": saved.get("us_event_density", default_preferences["us_event_density"]),
                 "tickers": str(saved.get("tickers", default_preferences["tickers"])),
             }
         except (OSError, ValueError, TypeError):
             return default_preferences
 
-    def save_calendar_preferences(events, tickers):
+    def save_calendar_preferences(groups, us_event_density, tickers, events):
         try:
             with open(CAL_PREFERENCES_FILE, "w", encoding="utf-8") as file:
-                json.dump({"events": events, "tickers": tickers, "calendar_events_version": 2}, file, ensure_ascii=False, indent=2)
+                json.dump({
+                    "groups": groups,
+                    "us_event_density": us_event_density,
+                    "events": events,
+                    "tickers": tickers,
+                    "calendar_events_version": 3,
+                }, file, ensure_ascii=False, indent=2)
         except OSError:
             pass
     
@@ -9432,20 +9587,43 @@ with tab3:
     st.markdown("---")
 
     with st.expander("🌐 網路同步與追蹤事件", expanded=False):
-        st.caption("台股開休市與突發休市以臺灣證券交易所（TWSE）官方資料為準；FOMC、CPI 取自 Fed／BLS 官方排程。")
-        selected_event_types = st.multiselect(
-            "要顯示的自動同步事件",
-            options=CALENDAR_EVENT_OPTIONS,
-            default=st.session_state.calendar_preferences["events"],
-            key="calendar_event_types",
+        st.caption("先選追蹤類別，再決定美國事件密度；細項由系統自動整理，不必逐項勾選。")
+        filter_col, density_col = st.columns([1.35, 1])
+        with filter_col:
+            selected_event_groups = st.multiselect(
+                "追蹤類別",
+                options=CALENDAR_GROUP_OPTIONS,
+                default=st.session_state.calendar_preferences["groups"],
+                key="calendar_event_groups",
+            )
+        with density_col:
+            density_options = ["核心（FOMC／CPI／大小非農）", "完整（含每週初領失業金）"]
+            saved_density = st.session_state.calendar_preferences.get("us_event_density", density_options[1])
+            us_event_density = st.selectbox(
+                "美國事件密度",
+                options=density_options,
+                index=density_options.index(saved_density) if saved_density in density_options else 1,
+                disabled="美國高影響總經" not in selected_event_groups,
+                key="calendar_us_event_density",
+            )
+
+        selected_event_types = []
+        for group in selected_event_groups:
+            selected_event_types.extend(CALENDAR_GROUP_EVENTS[group])
+        if "美國高影響總經" in selected_event_groups and us_event_density.startswith("完整"):
+            selected_event_types.append("美國初領失業金")
+        st.caption(
+            "目前顯示：" + (
+                "｜".join(selected_event_groups) if selected_event_groups else "未選擇自動事件"
+            ) + ("｜含每週初領失業金" if "美國初領失業金" in selected_event_types else "")
         )
         ticker_input = st.text_input(
             "財報／台股月營收追蹤公司或代碼（用逗號分隔，例如 台積電, META, Google, Tesla）",
             value=st.session_state.calendar_preferences["tickers"],
             key="calendar_earnings_tickers",
-            disabled=not {"指定股票財報", "台股月營收", "美股季度／年度營收"}.intersection(selected_event_types),
+            disabled="個股財報與營收" not in selected_event_groups,
         )
-        if {"指定股票財報", "台股月營收", "美股季度／年度營收"}.intersection(selected_event_types) and ticker_input.strip():
+        if "個股財報與營收" in selected_event_groups and ticker_input.strip():
             ticker_preview = [item.strip() for item in ticker_input.split(",") if item.strip()]
             resolved_preview = [resolve_earnings_ticker(item) for item in ticker_preview]
             st.caption("辨識結果：" + "； ".join(
@@ -9459,6 +9637,9 @@ with tab3:
                 fetch_twse_temporary_closure_events.clear()
                 fetch_fomc_events.clear()
                 fetch_bls_cpi_events.clear()
+                fetch_bls_employment_events.clear()
+                fetch_adp_employment_events.clear()
+                build_us_initial_claims_events.clear()
                 fetch_earnings_events.clear()
                 fetch_twse_monthly_revenue_rows.clear()
                 fetch_taiwan_monthly_revenue_events.clear()
@@ -9467,11 +9648,15 @@ with tab3:
                 st.rerun()
         with save_col:
             if st.button("💾 儲存追蹤設定", key="save_calendar_preferences"):
-                st.session_state.calendar_preferences = {"events": selected_event_types, "tickers": ticker_input}
-                save_calendar_preferences(selected_event_types, ticker_input)
+                st.session_state.calendar_preferences = {
+                    "groups": selected_event_groups,
+                    "us_event_density": us_event_density,
+                    "tickers": ticker_input,
+                }
+                save_calendar_preferences(selected_event_groups, us_event_density, ticker_input, selected_event_types)
                 st.toast("追蹤設定已儲存。", icon="✅")
 
-    st.caption("資料來源：TWSE 市場開休市日期與最新公告、MOPS 月營收彙總表、Federal Reserve、U.S. BLS、Yahoo Finance（財報預估日）。網路來源暫時無法連線時，會保留既有預設與手動校正資料。")
+    st.caption("資料來源：TWSE／MOPS、Federal Reserve、U.S. BLS、U.S. Department of Labor、ADP、Yahoo Finance。網路來源暫時無法連線時，會保留既有預設與手動校正資料。")
 
     def change_month(delta):
         st.session_state.cal_month += delta
@@ -9532,6 +9717,12 @@ with tab3:
         network_events.extend(fetch_fomc_events(sel_year))
     if "美國 CPI" in selected_event_types:
         network_events.extend(fetch_bls_cpi_events(sel_year))
+    if "美國大非農" in selected_event_types:
+        network_events.extend(fetch_bls_employment_events(sel_year))
+    if "美國小非農 ADP" in selected_event_types:
+        network_events.extend(fetch_adp_employment_events(sel_year))
+    if "美國初領失業金" in selected_event_types:
+        network_events.extend(build_us_initial_claims_events(sel_year))
     if "指定股票財報" in selected_event_types:
         if ticker_symbols:
             earnings_result = fetch_earnings_events(ticker_symbols)
@@ -9768,6 +9959,14 @@ with tab3:
                         content_html.append(f"<div style='color:#FFCDD2; font-size:0.72em; margin-top:2px;'>{detail}</div>")
                 else:
                     color = "#FF7043" if event.get("source") == "Federal Reserve" else "#00E5FF"
+                    if "大非農" in event.get("title", ""):
+                        color = "#FF5252"
+                    elif "小非農" in event.get("title", ""):
+                        color = "#FFB74D"
+                    elif event.get("impact") == "routine":
+                        color = "#B0BEC5"
+                    elif "CPI" in event.get("title", ""):
+                        color = "#00FA9A"
                     if "財報" in event.get("title", ""):
                         color = "#FFD700"
                     if event.get("source") == "TWSE OpenAPI（MOPS 每月營收）":
