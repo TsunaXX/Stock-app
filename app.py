@@ -6290,7 +6290,7 @@ def render_futures_strategy_room():
 # ==========================================
 # 主介面 (Tabs)
 # ==========================================
-tab1, tab_fibo, tab2, tab_db, tab3 = st.tabs(["⚡ 股期戰略室 ⚡", "📈 技術分析", "💰 交易損益室 💰", "📚 戰略資料庫", "📅 股市行事曆與公司事件"])
+tab1, tab_fibo, tab2, tab_db, tab3 = st.tabs(["⚡ 股期戰略室 ⚡", "📈 指數操盤室", "💰 交易損益室 💰", "📚 戰略資料庫", "📅 股市行事曆與公司事件"])
 
 with tab1:
     stock_strategy_tab, futures_strategy_tab, validation_strategy_tab = st.tabs([
@@ -8649,6 +8649,15 @@ with tab_fibo:
                 plan, live_price, live_change, intraday_state, temperature_delta,
             )
             confirmation_text = intraday_state['confirmation_text']
+            if trade_state['can_enter'] and trade_state['execution_direction'] == '偏多':
+                position_recommendation = '建議做多｜可快進快出'
+                position_color = '#ff4b4b'
+            elif trade_state['can_enter'] and trade_state['execution_direction'] == '偏空':
+                position_recommendation = '建議做空｜可快進快出'
+                position_color = '#00c853'
+            else:
+                position_recommendation = f"保守不進場｜{trade_state['permission']}"
+                position_color = '#ffc107'
             st.markdown(
                 f"""<div style='border-left:5px solid {plan['action_color']};background:#151a22;padding:14px 18px;border-radius:7px;margin-bottom:12px'>
                 <div style='font-size:14px;color:#b7c0cc'>{plan['market_label']}</div>
@@ -8746,7 +8755,10 @@ with tab_fibo:
                 st.info(f"**操作建議：** {basis_advice}")
 
             st.divider()
-            st.markdown("#### 🎯 進出依據")
+            st.markdown(
+                f"#### 🎯 進出依據 <span style='font-size:15px;color:{position_color};font-weight:700'>　{position_recommendation}</span>",
+                unsafe_allow_html=True,
+            )
             st.caption("以日線費波支撐／壓力與 15 分 K 確認，作為順勢進場、停損與目標依據。")
             st.info(f"**進場確認：** {plan['trigger']}")
             position_count = st.selectbox(
@@ -8811,7 +8823,10 @@ with tab_fibo:
             st.caption("｜".join(signal_details))
 
             st.divider()
-            st.markdown("#### ⚡ 短波當沖（5 分 K）")
+            st.markdown(
+                f"#### ⚡ 短波當沖（5 分 K） <span style='font-size:15px;color:{position_color};font-weight:700'>　{position_recommendation}</span>",
+                unsafe_allow_html=True,
+            )
             st.caption("僅在即時進場許可通過時啟用；使用最新 5 分 K 區間規劃短線進出。")
             short_wave_direction = trade_state['execution_direction'] if trade_state['can_enter'] else None
             short_wave = calculate_short_wave_plan(st.session_state.get('sj_api'), short_wave_direction)
@@ -8863,7 +8878,10 @@ with tab_fibo:
                 st.info(f"目前為「{trade_state['permission']}」；短波當沖不啟用，避免在反轉、過熱或區間中段追價。")
 
             st.divider()
-            st.markdown("#### 📅 到期選擇權操作")
+            st.markdown(
+                f"#### 📅 到期選擇權操作 <span style='font-size:15px;color:{position_color};font-weight:700'>　{position_recommendation}</span>",
+                unsafe_allow_html=True,
+            )
             st.caption("僅在即時進場許可通過時，才依選擇權契約報價提供價差單或短線單買參考。")
             if not trade_state['can_enter']:
                 st.info(
