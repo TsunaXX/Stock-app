@@ -3313,14 +3313,14 @@ def load_config():
         except Exception: return {}
     return {}
 
-def save_config(font_size, limit_rows, auto_update, delay_sec, sj_key="", sj_secret="", remember_sj=False):
+def save_config(font_size, limit_rows, sj_key="", sj_secret="", remember_sj=False):
     try:
         config = load_config()
+        config.pop('auto_update', None)
+        config.pop('delay_sec', None)
         config.update({
             "font_size": font_size, 
             "limit_rows": limit_rows, 
-            "auto_update": auto_update, 
-            "delay_sec": delay_sec,
             "sj_key": sj_key if remember_sj else "",
             "sj_secret": sj_secret if remember_sj else "",
             "remember_sj": remember_sj
@@ -3329,28 +3329,56 @@ def save_config(font_size, limit_rows, auto_update, delay_sec, sj_key="", sj_sec
         return True
     except Exception: return False
 
-def load_futures_custom_prices():
-    """讀取已儲存的期貨手動自訂價；無效資料不影響主程式。"""
-    raw_prices = load_config().get('futures_strategy_custom_prices', {})
-    if not isinstance(raw_prices, dict):
-        return {}
-    return {
-        str(key): price for key, value in raw_prices.items()
-        if (price := _safe_number(value)) is not None and price > 0
-    }
+def _json_safe(value):
+    """將期貨快取轉為可寫入設定檔的基本型別。"""
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        return float(value) if math.isfinite(float(value)) else None
+    if isinstance(value, (pd.Timestamp, datetime, date)):
+        return value.strftime('%Y/%m/%d %H:%M:%S')
+    try:
+        return None if pd.isna(value) else value
+    except (TypeError, ValueError):
+        return str(value)
 
-def save_futures_custom_prices(custom_prices):
-    """將期貨手動自訂價寫入既有設定檔，供下次開啟時還原。"""
+
+def load_futures_strategy_state():
+    """讀取期貨戰略室上次成功取得的表格與使用者清單。"""
+    state = load_config().get('futures_strategy_state', {})
+    return state if isinstance(state, dict) else {}
+
+
+def save_futures_strategy_state(
+    universe=None, metadata=None, rank_cache=None, live_cache=None,
+    manual=None, ignored=None, rank_time=None, live_time=None,
+):
+    """持久化期貨表格快照，重整後仍能還原最後成功資料。"""
     try:
         config = load_config()
-        config['futures_strategy_custom_prices'] = {
-            str(key): price for key, value in custom_prices.items()
-            if (price := _safe_number(value)) is not None and price > 0
-        }
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(config, f, ensure_ascii=False)
+        config.pop('futures_strategy_custom_prices', None)
+        existing = config.get('futures_strategy_state', {})
+        records = existing.get('universe', []) if isinstance(existing, dict) else []
+        if isinstance(universe, pd.DataFrame) and not universe.empty:
+            records = json.loads(universe.to_json(orient='records', force_ascii=False))
+        config['futures_strategy_state'] = _json_safe({
+            'universe': records,
+            'metadata': metadata or (existing.get('metadata', {}) if isinstance(existing, dict) else {}),
+            'rank_cache': rank_cache if rank_cache is not None else (existing.get('rank_cache', {}) if isinstance(existing, dict) else {}),
+            'live_cache': live_cache if live_cache is not None else (existing.get('live_cache', {}) if isinstance(existing, dict) else {}),
+            'manual': list(manual if manual is not None else (existing.get('manual', []) if isinstance(existing, dict) else [])),
+            'ignored': list(ignored if ignored is not None else (existing.get('ignored', []) if isinstance(existing, dict) else [])),
+            'rank_time': rank_time if rank_time is not None else (existing.get('rank_time') if isinstance(existing, dict) else None),
+            'live_time': live_time if live_time is not None else (existing.get('live_time') if isinstance(existing, dict) else None),
+        })
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as file:
+            json.dump(config, file, ensure_ascii=False)
         return True
-    except Exception:
+    except (OSError, TypeError, ValueError):
         return False
 
 def load_strategy_signal_log():
@@ -4072,8 +4100,6 @@ def init_shioaji_connection(api_key, secret_key):
 
 if 'font_size' not in st.session_state: st.session_state.font_size = saved_config.get('font_size', 15)
 if 'limit_rows' not in st.session_state: st.session_state.limit_rows = saved_config.get('limit_rows', 5)
-if 'auto_update_last_row' not in st.session_state: st.session_state.auto_update_last_row = saved_config.get('auto_update', True)
-if 'update_delay_sec' not in st.session_state: st.session_state.update_delay_sec = saved_config.get('delay_sec', 1.0) 
 
 # 永豐API帳密：
 if 'sj_key' not in st.session_state: 
@@ -4157,8 +4183,6 @@ with st.sidebar:
                     save_config(
                         st.session_state.font_size, 
                         st.session_state.limit_rows, 
-                        st.session_state.auto_update_last_row, 
-                        st.session_state.update_delay_sec, 
                         st.session_state.sj_key, 
                         st.session_state.sj_secret, 
                         st.session_state.remember_sj
@@ -4201,8 +4225,6 @@ with st.sidebar:
                     save_config(
                         st.session_state.font_size, 
                         st.session_state.limit_rows, 
-                        st.session_state.auto_update_last_row, 
-                        st.session_state.update_delay_sec, 
                         sj_api_key, 
                         sj_secret, 
                         remember_sj
@@ -4246,7 +4268,6 @@ def render_stock_strategy_controls():
             if st.button("💾 儲存股票設定", use_container_width=True, key='save_stock_room_settings'):
                 if save_config(
                     current_font_size, current_limit_rows,
-                    st.session_state.auto_update_last_row, st.session_state.update_delay_sec,
                     st.session_state.sj_key, st.session_state.sj_secret,
                     st.session_state.remember_sj
                 ):
@@ -4363,7 +4384,7 @@ def render_futures_strategy_explanation():
     with st.expander("📖 期貨戰略室說明", expanded=False):
         st.markdown("""
 - **怎麼操作**：主表先依成交口數排序。需要盤中／夜盤資訊時登入 Shioaji，按「即時更新成交量排行」或「即時更新報價與分析」；篩選、週期與方向可在上方設定區調整。
-- **怎麼看資料**：先看「自訂價、漲跌幅、方向、訊號狀態、進場信心、支撐壓力、進出場點位」；完整表可查看保證金、未平倉量、交易時段與資料狀態。
+- **怎麼看資料**：先看「成交價、漲跌幅、方向、訊號狀態、進場信心、支撐壓力、進出場點位」；完整表可查看保證金、未平倉量、交易時段與資料狀態。
 - **怎麼進場**：只在觸發條件成立後，讓最新價接近「進」且方向與市場一致時再評估；「停」是策略失效點，「目」是第一觀察目標，均為提示，不會自動下單。
 - 主排行以**當日累計成交口數**由大到小排列；期交所 OpenAPI 是盤後正式資料，登入 Shioaji 後可手動取得盤中／夜盤快照提前重排。
 - **自動方向**依目前價格強弱判定；偏多只觀察突破壓力，偏空只觀察跌破支撐。進、停、目均為條件式觀察點位，不會自動下單。
@@ -4693,9 +4714,7 @@ def resolve_shioaji_futures_contract(api, root, contract_month):
 def calculate_futures_strategy_levels(row, strategy_mode='當沖', direction_choice='自動', kbars=None):
     """計算期貨支撐壓力與條件式進出場點位；無即時 K 棒時採官方日行情備援。"""
     root = str(row.get('期貨代碼', ''))
-    close = _safe_number(row.get('自訂價(可修)'))
-    if close is None:
-        close = _safe_number(row.get('收盤價'))
+    close = _safe_number(row.get('收盤價'))
     open_price = _safe_number(row.get('開盤價'))
     high = _safe_number(row.get('當日高'))
     low = _safe_number(row.get('當日低'))
@@ -4788,16 +4807,14 @@ def enrich_futures_strategy_rows(rows, strategy_mode, market_bias='盤整'):
         volume_oi_ratio = volume / open_interest if open_interest > 0 else None
         bid = _safe_number(row.get('買價'))
         ask = _safe_number(row.get('賣價'))
-        price = _safe_number(row.get('自訂價(可修)')) or _safe_number(row.get('收盤價'))
+        price = _safe_number(row.get('收盤價'))
         tick = get_tick_size(price) if price is not None else 1.0
         spread_ticks = (ask - bid) / tick if bid is not None and ask is not None and ask >= bid and tick > 0 else None
         quote_time = row.get('報價時間')
         if quote_time:
             data_health = build_data_health(quote_time, required_ready=price is not None, live_expected=True)
-        elif _safe_number(row.get('自訂價(可修)')) is not None:
-            data_health = '🟡 手動／暫存價'
         else:
-            data_health = '⚪ 尚未即時更新'
+            data_health = build_data_health(None, required_ready=price is not None, live_expected=False)
 
         if data_health.startswith('🔴'):
             liquidity = '⛔ 報價過期'
@@ -4920,8 +4937,6 @@ def update_futures_live_rows(rows, api, strategy_mode, direction_choice, include
             price = _safe_number(getattr(snapshot, 'close', None)) or _safe_number(getattr(snapshot, 'open', None))
             if price is not None and price > 0:
                 updated.at[index, '收盤價'] = price
-                # 自訂價欄位供 TextColumn 編輯，必須維持字串型別以相容新版 Pandas Arrow 字串欄位。
-                updated.at[index, '自訂價(可修)'] = fmt_price(price)
                 change = _safe_number(getattr(snapshot, 'change_price', getattr(snapshot, 'change', None)), 0) or 0
                 reference = price - change
                 live_change_rate = snapshot_change_rate(snapshot, price)
@@ -6484,24 +6499,21 @@ gc.collect()
 
 def render_futures_strategy_room():
     """期貨成交量排行、即時分析、忽略遞補與獨立計算介面。"""
+    persisted_futures_state = load_futures_strategy_state()
     if 'futures_strategy_ignored' not in st.session_state:
-        st.session_state.futures_strategy_ignored = set()
+        st.session_state.futures_strategy_ignored = set(persisted_futures_state.get('ignored', []))
     if 'futures_strategy_manual' not in st.session_state:
-        st.session_state.futures_strategy_manual = []
+        st.session_state.futures_strategy_manual = list(persisted_futures_state.get('manual', []))
     if 'futures_strategy_live_cache' not in st.session_state:
-        st.session_state.futures_strategy_live_cache = {}
+        st.session_state.futures_strategy_live_cache = dict(persisted_futures_state.get('live_cache', {}))
     if 'futures_strategy_live_time' not in st.session_state:
-        st.session_state.futures_strategy_live_time = None
+        st.session_state.futures_strategy_live_time = persisted_futures_state.get('live_time')
     if 'futures_strategy_rank_cache' not in st.session_state:
-        st.session_state.futures_strategy_rank_cache = {}
+        st.session_state.futures_strategy_rank_cache = dict(persisted_futures_state.get('rank_cache', {}))
     if 'futures_strategy_rank_time' not in st.session_state:
-        st.session_state.futures_strategy_rank_time = None
-    if 'futures_strategy_custom_prices' not in st.session_state:
-        st.session_state.futures_strategy_custom_prices = load_futures_custom_prices()
+        st.session_state.futures_strategy_rank_time = persisted_futures_state.get('rank_time')
     if 'futures_strategy_editor_revision' not in st.session_state:
         st.session_state.futures_strategy_editor_revision = 0
-    if 'futures_auto_update_last_row' not in st.session_state:
-        st.session_state.futures_auto_update_last_row = True
     if 'futures_enhanced_layer_enabled' not in st.session_state:
         st.session_state.futures_enhanced_layer_enabled = True
     if int(st.session_state.get('futures_minimum_volume', 1) or 1) < 1:
@@ -6533,7 +6545,7 @@ def render_futures_strategy_room():
                 direction_choice = st.radio(
                     "分析方向", ["自動", "偏多", "偏空"], horizontal=True,
                     key="futures_direction_choice",
-                    help="自動：依自訂價相對開盤價（當沖則優先參考 VWAP）判定；偏多：固定以突破壓力的做多計畫計算；偏空：固定以跌破支撐的做空計畫計算。"
+                    help="自動：依成交價相對開盤價（當沖則優先參考 VWAP）判定；偏多：固定以突破壓力的做多計畫計算；偏空：固定以跌破支撐的做空計畫計算。"
                 )
             with control2:
                 limit_rows = st.number_input("顯示筆數", min_value=1, max_value=50, value=5, step=1, key="futures_strategy_limit")
@@ -6546,13 +6558,18 @@ def render_futures_strategy_room():
     with info_col:
         render_futures_strategy_explanation()
 
-    action_col1, action_col2 = st.columns(2)
+    action_col1, action_col2, action_col3 = st.columns(3)
     with action_col1:
         refresh_official = st.button("🔄 更新成交量／保證金", use_container_width=True, key="refresh_futures_official")
     with action_col2:
         refresh_rank = st.button(
             "📊 即時更新成交量排行", use_container_width=True, key="refresh_futures_rank",
             help="登入 Shioaji 後批次取得盤中／夜盤累計成交量並重新排序；不會背景輪詢。"
+        )
+    with action_col3:
+        refresh_live = st.button(
+            "⏱️ 即時更新報價與分析", use_container_width=True, type="primary", key="refresh_futures_live",
+            help='登入 Shioaji 後更新目前表格的成交價、夜盤資料與支撐壓力。'
         )
 
     if refresh_official:
@@ -6565,12 +6582,34 @@ def render_futures_strategy_room():
 
     with st.spinner("正在讀取期交所成交量與保證金..."):
         universe, universe_meta = fetch_futures_strategy_universe()
+    saved_universe_records = persisted_futures_state.get('universe', [])
+    saved_universe = pd.DataFrame(saved_universe_records) if isinstance(saved_universe_records, list) else pd.DataFrame()
     if universe.empty:
-        st.error("目前無法取得期交所期貨排行資料，請稍後重試。")
-        if universe_meta.get('errors'):
-            st.caption("｜".join(universe_meta['errors']))
-        st.markdown("資料來源：[臺灣期貨交易所 OpenAPI](https://openapi.taifex.com.tw/)")
-        return
+        if saved_universe.empty:
+            st.error("目前無法取得期交所期貨排行資料，請稍後重試。")
+            if universe_meta.get('errors'):
+                st.caption("｜".join(universe_meta['errors']))
+            st.markdown("資料來源：[臺灣期貨交易所 OpenAPI](https://openapi.taifex.com.tw/)")
+            return
+        universe = saved_universe
+        saved_meta = persisted_futures_state.get('metadata', {})
+        universe_meta = {
+            **(saved_meta if isinstance(saved_meta, dict) else {}),
+            'errors': universe_meta.get('errors', []), 'restored': True,
+        }
+        st.info("期交所資料暫時無法取得，已還原上次成功保存的期貨表格。")
+
+    def persist_futures_room_state(snapshot=None):
+        return save_futures_strategy_state(
+            universe=snapshot if isinstance(snapshot, pd.DataFrame) else universe,
+            metadata=universe_meta,
+            rank_cache=st.session_state.futures_strategy_rank_cache,
+            live_cache=st.session_state.futures_strategy_live_cache,
+            manual=st.session_state.futures_strategy_manual,
+            ignored=st.session_state.futures_strategy_ignored,
+            rank_time=st.session_state.futures_strategy_rank_time,
+            live_time=st.session_state.futures_strategy_live_time,
+        )
 
     rank_cache = st.session_state.futures_strategy_rank_cache
     if rank_cache:
@@ -6607,9 +6646,17 @@ def render_futures_strategy_room():
                 ).strftime('%Y/%m/%d %H:%M:%S')
                 universe = live_universe
                 st.session_state.futures_strategy_editor_revision += 1
+                persist_futures_room_state(live_universe)
                 st.toast(f"已用即時快照更新 {live_count} 個契約並重新排序", icon="📊")
             else:
                 st.warning("未取得可用的期貨快照；請確認 Shioaji 契約資料與連線狀態。")
+
+    saved_metadata = persisted_futures_state.get('metadata', {})
+    if (
+        refresh_official or not saved_universe_records
+        or universe_meta.get('updated') != (saved_metadata.get('updated') if isinstance(saved_metadata, dict) else None)
+    ):
+        persist_futures_room_state(universe)
 
     official_date = str(universe_meta.get('updated') or '')
     margin_date = str(universe_meta.get('margin_date') or '')
@@ -6704,27 +6751,15 @@ def render_futures_strategy_room():
         manual_rows = manual_rows.sort_values('_manual_order').drop(columns=['_manual_order'])
     display_rows = pd.concat([base_rows, manual_rows, linked_rows], ignore_index=True)
     cache = st.session_state.futures_strategy_live_cache
-    custom_prices = st.session_state.futures_strategy_custom_prices
-    display_rows['自訂價(可修)'] = display_rows.apply(
-        lambda row: custom_prices.get(str(row['契約鍵'])), axis=1
-    )
-    # TextColumn 以空字串呈現未填自訂價，避免表格渲染成文字 None。
-    display_rows['自訂價(可修)'] = display_rows['自訂價(可修)'].apply(fmt_price)
 
     for index, row in display_rows.iterrows():
         contract_key = str(row['契約鍵'])
         cached = cache.get(contract_key)
         if cached:
             for column, value in cached.items():
-                if column == '自訂價(可修)':
-                    continue
                 if column in display_rows.columns or column in ('支撐壓力', '進出場點位', '方向', '觸發條件', '實際契約'):
                     display_rows.at[index, column] = value
-        custom_price_changed = (
-            cached is not None
-            and _safe_number(display_rows.at[index, '自訂價(可修)']) != _safe_number(cached.get('自訂價(可修)'))
-        )
-        if not cached or cached.get('_策略週期') != strategy_mode or cached.get('_分析方向') != direction_choice or custom_price_changed:
+        if not cached or cached.get('_策略週期') != strategy_mode or cached.get('_分析方向') != direction_choice:
             analysis = calculate_futures_strategy_levels(display_rows.loc[index], strategy_mode, direction_choice)
             for column, value in analysis.items():
                 display_rows.at[index, column] = value
@@ -6744,15 +6779,13 @@ def render_futures_strategy_room():
                 cached_row['_策略週期'] = strategy_mode
                 cached_row['_分析方向'] = direction_choice
                 st.session_state.futures_strategy_live_cache[str(updated_row['契約鍵'])] = cached_row
-                updated_price = _safe_number(updated_row.get('自訂價(可修)'))
-                if updated_price is not None:
-                    st.session_state.futures_strategy_custom_prices[str(updated_row['契約鍵'])] = updated_price
             st.session_state.futures_strategy_live_time = datetime.now(pytz.timezone('Asia/Taipei')).strftime('%Y/%m/%d %H:%M:%S')
             if updated_count:
                 update_strategy_signal_outcomes({
-                    str(row['契約鍵']): _safe_number(row.get('自訂價(可修)')) or _safe_number(row.get('收盤價'))
+                    str(row['契約鍵']): _safe_number(row.get('收盤價'))
                     for _, row in updated_rows.iterrows()
                 })
+                persist_futures_room_state()
                 save_data_cache(
                     st.session_state.stock_data, st.session_state.ignored_stocks,
                     st.session_state.all_candidates, st.session_state.saved_notes
@@ -6767,21 +6800,21 @@ def render_futures_strategy_room():
         display_rows = enrich_futures_strategy_rows(display_rows, strategy_mode, market_bias)
         if compact_futures_table:
             futures_display_columns = [
-                '忽略', '期貨代碼', '契約月份', '名稱', '方向', '自訂價(可修)', '漲跌幅',
+                '忽略', '期貨代碼', '契約月份', '名稱', '方向', '收盤價', '漲跌幅',
                 '訊號狀態', '信心分', '信心判讀', '支撐壓力', '進出場點位', '市場一致',
                 '資料狀態', '可交易性', '當日成交口數', '未平倉量', '量倉比', '到期提醒', '所需保證金'
             ]
         else:
             futures_display_columns = [
                 '忽略', '期貨代碼', '契約月份', '名稱', '方向', '支撐壓力', '進出場點位', '觸發條件',
-                '當日漲停價', '當日跌停價', '自訂價(可修)', '漲跌幅', '訊號狀態', '信心分', '信心判讀',
+                '當日漲停價', '當日跌停價', '收盤價', '漲跌幅', '訊號狀態', '信心分', '信心判讀',
                 '可交易性', '資料狀態', '市場一致', '買賣價差', '量倉比', '到期提醒',
                 '交易時段', '當日成交口數', '未平倉量', '所需保證金', '維持保證金'
             ]
     else:
         futures_display_columns = [
             '忽略', '期貨代碼', '契約月份', '名稱', '方向', '支撐壓力', '進出場點位', '觸發條件',
-            '當日漲停價', '當日跌停價', '自訂價(可修)', '漲跌幅',
+            '當日漲停價', '當日跌停價', '收盤價', '漲跌幅',
             '交易時段', '當日成交口數', '未平倉量', '所需保證金', '維持保證金'
         ]
 
@@ -6792,7 +6825,7 @@ def render_futures_strategy_room():
         signal_state = str(row.get('訊號狀態', ''))
         liquidity = str(row.get('可交易性', ''))
         data_health = str(row.get('資料狀態', ''))
-        price = _safe_number(row.get('自訂價(可修)'))
+        price = _safe_number(row.get('收盤價'))
         limit_up = _safe_number(row.get('當日漲停價'))
         limit_down = _safe_number(row.get('當日跌停價'))
         if price is not None and limit_up is not None and price >= limit_up:
@@ -6850,7 +6883,7 @@ def render_futures_strategy_room():
             '觸發條件': st.column_config.TextColumn(width=120, disabled=True, help='條件成立後才評估進場；未成立時不以預判價直接下單。'),
             '當日漲停價': st.column_config.NumberColumn(format='%.12g', width=80, disabled=True, help='依期交所漲跌資料反推參考價後估算；實際限制以期交所與券商下單畫面為準。'),
             '當日跌停價': st.column_config.NumberColumn(format='%.12g', width=80, disabled=True, help='依期交所漲跌資料反推參考價後估算；實際限制以期交所與券商下單畫面為準。'),
-            '自訂價(可修)': st.column_config.TextColumn('自訂價 ✏️', width=85, help='可手動調整；按即時更新時會改為最新報價。'),
+            '收盤價': st.column_config.TextColumn('成交價', width=85, disabled=True),
             '漲跌幅': st.column_config.TextColumn(width=85, disabled=True),
             '所需保證金': st.column_config.NumberColumn(format='%,.0f', width=90, disabled=True),
             '維持保證金': st.column_config.NumberColumn(format='%,.0f', width=90, disabled=True),
@@ -6858,7 +6891,7 @@ def render_futures_strategy_room():
             '信心分': st.column_config.ProgressColumn('進場信心', min_value=0, max_value=100, format='%d', width=90, help='綜合觸發位置、成交量、未平倉、價差、報價與市場方向；代表條件一致度，不是勝率。'),
             '信心判讀': st.column_config.TextColumn(width=80, disabled=True, help='高／中高／中／低；若追離進場點、條件失效或資料過期會自動降級。'),
             '可交易性': st.column_config.TextColumn(width=105, disabled=True, help='綜合成交量、未平倉量、買賣價差與報價新鮮度。'),
-            '資料狀態': st.column_config.TextColumn(width=115, disabled=True, help='顯示即時、手動價、尚未更新或報價過期。'),
+            '資料狀態': st.column_config.TextColumn(width=115, disabled=True, help='顯示即時、官方日行情、尚未更新或報價過期。'),
             '市場一致': st.column_config.TextColumn(width=110, disabled=True, help='策略方向是否與近月臺指期環境一致；不改變原排序。'),
             '買賣價差': st.column_config.TextColumn(
                 width=75, disabled=True,
@@ -6890,6 +6923,7 @@ def render_futures_strategy_room():
             f"futures_strategy_editor_{st.session_state.futures_strategy_editor_revision}_{table_signature}"
         )
         editor_display = display_rows[futures_display_columns].copy()
+        editor_display['收盤價'] = editor_display['收盤價'].apply(fmt_price)
         editor_display['漲跌幅'] = editor_display['漲跌幅'].apply(_signed_percent)
         edited = st.data_editor(
             editor_display.style.apply(style_futures_row, axis=1),
@@ -6908,6 +6942,7 @@ def render_futures_strategy_room():
                 if key:
                     st.session_state.futures_strategy_ignored.add(key)
             st.session_state.futures_strategy_editor_revision += 1
+            persist_futures_room_state()
             st.rerun()
 
     if enhanced_layer and not display_rows.empty:
@@ -6948,7 +6983,7 @@ def render_futures_strategy_room():
                     '訊號狀態': str(row.get('訊號狀態', '')), '評分': _safe_number(row.get('信心分')),
                     '信心判讀': str(row.get('信心判讀', '')),
                     '進場價': plan['entry'], '停損價': plan['stop'], '目標價': plan['target'],
-                    '最新價': _safe_number(row.get('自訂價(可修)')) or _safe_number(row.get('收盤價')),
+                    '最新價': _safe_number(row.get('收盤價')),
                     '風險': str(row.get('可交易性', '')), '資料狀態': str(row.get('資料狀態', '')),
                 })
             added, saved = register_strategy_signals(records)
@@ -6961,80 +6996,8 @@ def render_futures_strategy_room():
             else:
                 st.error('訊號紀錄儲存失敗，請確認檔案是否可寫入。')
 
-    if (
-        futures_editor_key
-        and not edited.empty
-        and st.session_state.futures_auto_update_last_row
-    ):
-        editor_state = st.session_state.get(futures_editor_key, {})
-        edited_rows = editor_state.get('edited_rows', {})
-        last_visible_idx = len(edited) - 1
-        if str(last_visible_idx) in {str(index) for index in edited_rows}:
-            updated_prices = dict(st.session_state.futures_strategy_custom_prices)
-            for _, edited_row in edited.iterrows():
-                key = display_key_map.get(f"{edited_row['期貨代碼']}:{edited_row['契約月份']}")
-                if not key:
-                    continue
-                new_price = _safe_number(edited_row.get('自訂價(可修)'))
-                if new_price is None:
-                    updated_prices.pop(key, None)
-                else:
-                    updated_prices[key] = new_price
-            st.session_state.futures_strategy_custom_prices = updated_prices
-            if save_futures_custom_prices(updated_prices):
-                st.session_state.futures_strategy_editor_revision += 1
-                st.rerun()
-            else:
-                st.error("自訂價儲存失敗，請確認設定檔是否可寫入。")
-
-    price_live_col, price_save_col, price_clear_col, price_auto_col = st.columns([2, 2, 2, 3])
-    with price_live_col:
-        refresh_live = st.button(
-            "⏱️ 即時更新報價與分析", use_container_width=True, type="primary", key="refresh_futures_live",
-            help='登入 Shioaji 後更新目前表格的最新報價、夜盤資料與支撐壓力。'
-        )
-    with price_save_col:
-        save_custom_prices = st.button("⚡ 執行更新＆儲存自訂價", use_container_width=True, key='save_futures_custom_prices')
-    with price_clear_col:
-        clear_custom_prices = st.button("🗑️ 清除自訂價", use_container_width=True, key='clear_futures_custom_prices')
-    with price_auto_col:
-        st.checkbox(
-            "☑️ 啟用最後一列自動更新",
-            key='futures_auto_update_last_row',
-            help="編輯目前表格最後一列的自訂價後，會自動儲存並重新計算分析。"
-        )
-    st.caption(f"目前有 {len(st.session_state.futures_strategy_custom_prices)} 檔自訂價；按儲存後，下次開啟仍會保留。清除後分析會回退使用官方行情價。")
     if refresh_live:
         refresh_futures_live_data()
-    if save_custom_prices:
-        updated_prices = dict(st.session_state.futures_strategy_custom_prices)
-        if not edited.empty:
-            for _, edited_row in edited.iterrows():
-                key = display_key_map.get(f"{edited_row['期貨代碼']}:{edited_row['契約月份']}")
-                if not key:
-                    continue
-                new_price = _safe_number(edited_row.get('自訂價(可修)'))
-                if new_price is None:
-                    updated_prices.pop(key, None)
-                else:
-                    updated_prices[key] = new_price
-        st.session_state.futures_strategy_custom_prices = updated_prices
-        if save_futures_custom_prices(updated_prices):
-            st.session_state.futures_strategy_editor_revision += 1
-            st.toast("期貨自訂價已更新並儲存", icon="💾")
-            st.rerun()
-        else:
-            st.error("自訂價儲存失敗，請確認設定檔是否可寫入。")
-    if clear_custom_prices:
-        st.session_state.futures_strategy_custom_prices = {}
-        for cached_row in st.session_state.futures_strategy_live_cache.values():
-            cached_row.pop('自訂價(可修)', None)
-        st.session_state.futures_strategy_editor_revision += 1
-        if save_futures_custom_prices({}):
-            st.toast("期貨自訂價已清除，分析已回退官方行情價", icon="🗑️")
-        else:
-            st.warning("本次自訂價已清除，但無法寫入設定檔。")
-        st.rerun()
 
     st.markdown("#### 🔍 快速新增期貨")
     option_map = {
@@ -7056,6 +7019,7 @@ def render_futures_strategy_room():
                     st.session_state.futures_strategy_manual.append(key)
                 st.session_state.futures_strategy_ignored.discard(key)
             st.session_state.futures_strategy_editor_revision += 1
+            persist_futures_room_state()
             st.rerun()
 
     if st.session_state.futures_strategy_ignored:
@@ -7073,6 +7037,7 @@ def render_futures_strategy_room():
             if current_ignored != st.session_state.futures_strategy_ignored:
                 st.session_state.futures_strategy_ignored = current_ignored
                 st.session_state.futures_strategy_editor_revision += 1
+                persist_futures_room_state()
                 st.rerun()
 
     st.markdown("---")
@@ -7084,9 +7049,6 @@ def render_futures_strategy_room():
     if st.button("🚀 執行期貨獨立分析", key='run_futures_independent') and independent_labels:
         keys = [option_map[label] for label in independent_labels]
         independent_rows = universe[universe['契約鍵'].isin(keys)].copy()
-        independent_rows['自訂價(可修)'] = independent_rows.apply(
-            lambda row: st.session_state.futures_strategy_custom_prices.get(str(row['契約鍵'])), axis=1
-        )
         if st.session_state.get('sj_logged_in', False) and st.session_state.get('sj_api') is not None:
             with st.spinner("正在取得實際契約報價與 K 棒..."):
                 independent_rows, _ = update_futures_live_rows(
@@ -7105,7 +7067,7 @@ def render_futures_strategy_room():
             if column not in independent_rows.columns:
                 independent_rows[column] = None
         independent_display = independent_rows[independent_columns].copy()
-        independent_display['自訂價(可修)'] = independent_display['自訂價(可修)'].apply(fmt_price)
+        independent_display['收盤價'] = independent_display['收盤價'].apply(fmt_price)
         independent_display['漲跌幅'] = independent_display['漲跌幅'].apply(_signed_percent)
         st.dataframe(
             independent_display.style.apply(style_futures_row, axis=1),
@@ -7922,37 +7884,6 @@ with stock_strategy_container:
                     st.session_state.stock_strategy_editor_revision += 1
                     st.rerun()
 
-            if not trigger_rerun and st.session_state.auto_update_last_row:
-                editor_state = st.session_state.get(stock_editor_key, {})
-                edited_rows = editor_state.get('edited_rows', {})
-                last_visible_idx = len(edited_df) - 1
-                
-                # 嚴格限制：只有當最後一列有發生編輯行為時，才觸發更新，避免中斷前面的連續輸入
-                last_row_edited = (
-                    last_visible_idx in edited_rows or str(last_visible_idx) in edited_rows
-                )
-                
-                if last_row_edited:
-                    update_map = edited_df.set_index('代號')[['戰略備註']].to_dict('index')
-                    
-                    if st.session_state.update_delay_sec > 0: time.sleep(st.session_state.update_delay_sec)
-                    
-                    for j, r in st.session_state.stock_data.iterrows():
-                        c_code = r['代號']
-                        if c_code in update_map:
-                            nn = update_map[c_code]['戰略備註']
-                            if str(r['戰略備註']) != str(nn):
-                                b_auto = str(auto_notes_dict.get(c_code, "")).strip()
-                                n_note = str(nn).strip()
-                                st.session_state.stock_data.at[j, '戰略備註'] = nn
-                                st.session_state.saved_notes[c_code] = n_note[len(b_auto):] if b_auto and n_note.startswith(b_auto) else f"[M]{n_note}"
-                        
-                        st.session_state.stock_data.at[j, '狀態'] = recalculate_row(st.session_state.stock_data.loc[j], points_map)
-                        
-                    save_data_cache(st.session_state.stock_data, st.session_state.ignored_stocks, st.session_state.all_candidates, st.session_state.saved_notes)
-                    st.session_state.stock_strategy_editor_revision += 1
-                    trigger_rerun = True
-
             if trigger_rerun: st.rerun()
 
         df_curr = st.session_state.stock_data
@@ -8086,17 +8017,6 @@ with stock_strategy_container:
             st.session_state.stock_strategy_editor_revision += 1
             st.rerun()
         
-        auto_update = st.checkbox("☑️ 啟用最後一列自動更新", value=st.session_state.auto_update_last_row, key="toggle_auto_update")
-        st.session_state.auto_update_last_row = auto_update
-        if auto_update:
-            col_delay, _ = st.columns([2, 8])
-            with col_delay:
-                st.session_state.update_delay_sec = st.number_input(
-                    "⏳ 寫入前等待（秒）", min_value=0.0, max_value=5.0, step=0.1,
-                    value=st.session_state.update_delay_sec,
-                    help="只在啟用「最後一列自動更新」且最後一列被編輯時生效；等待後才寫入快取並重新整理。設為 0 會立即寫入。"
-                )
-
         if 'last_rt_update_time' in st.session_state:
             st.markdown(f"<div style='text-align: left; color: #888; font-size: 14px; margin-top: 5px; margin-bottom: 10px;'>透過永豐API即時更新報價(更新時間:{st.session_state.last_rt_update_time})</div>", unsafe_allow_html=True)
 
