@@ -3721,6 +3721,12 @@ def render_strategy_validation_room():
     st.markdown('#### 訊號明細')
     validation_display = filtered[['_紀錄ID'] + display_columns].sort_values('建立時間', ascending=False).copy()
     validation_display.insert(0, '刪除', False)
+    compact_number_columns = [
+        '進場價', '停損價', '目標價', '最新價', '15分(R)', '30分(R)', '60分(R)', '收盤(R)',
+        'MFE(R)', 'MAE(R)', '結果(R)'
+    ]
+    for column in compact_number_columns:
+        validation_display[column] = pd.to_numeric(validation_display[column], errors='coerce')
 
     def style_validation_row(row):
         styles = [''] * len(row)
@@ -3780,13 +3786,17 @@ def render_strategy_validation_room():
         column_config={
             '刪除': st.column_config.CheckboxColumn('刪除', width=50, help='勾選後可一次刪除多筆訊號紀錄。'),
             '評分': st.column_config.NumberColumn('進場信心', format='%d'),
-            '15分(R)': st.column_config.NumberColumn(help='建立訊號滿 15 分鐘時的表現；1R 為進場到失效點距離。'),
-            '30分(R)': st.column_config.NumberColumn(help='建立訊號滿 30 分鐘時的表現。'),
-            '60分(R)': st.column_config.NumberColumn(help='建立訊號滿 60 分鐘時的表現。'),
-            '收盤(R)': st.column_config.NumberColumn(help='股票訊號在收盤後的表現快照。'),
-            'MFE(R)': st.column_config.NumberColumn('MFE', help='Maximum Favorable Excursion：訊號後最大有利變動，單位為 R。'),
-            'MAE(R)': st.column_config.NumberColumn('MAE', help='Maximum Adverse Excursion：訊號後最大不利變動，單位為 R。'),
-            '結果(R)': st.column_config.NumberColumn(help='達標或策略失效時的結果；以 R 表示。'),
+            '進場價': st.column_config.NumberColumn(format='%.12g'),
+            '停損價': st.column_config.NumberColumn(format='%.12g'),
+            '目標價': st.column_config.NumberColumn(format='%.12g'),
+            '最新價': st.column_config.NumberColumn(format='%.12g'),
+            '15分(R)': st.column_config.NumberColumn(format='%.12g', help='建立訊號滿 15 分鐘時的表現；1R 為進場到失效點距離。'),
+            '30分(R)': st.column_config.NumberColumn(format='%.12g', help='建立訊號滿 30 分鐘時的表現。'),
+            '60分(R)': st.column_config.NumberColumn(format='%.12g', help='建立訊號滿 60 分鐘時的表現。'),
+            '收盤(R)': st.column_config.NumberColumn(format='%.12g', help='股票訊號在收盤後的表現快照。'),
+            'MFE(R)': st.column_config.NumberColumn('MFE', format='%.12g', help='Maximum Favorable Excursion：訊號後最大有利變動，單位為 R。'),
+            'MAE(R)': st.column_config.NumberColumn('MAE', format='%.12g', help='Maximum Adverse Excursion：訊號後最大不利變動，單位為 R。'),
+            '結果(R)': st.column_config.NumberColumn(format='%.12g', help='達標或策略失效時的結果；以 R 表示。'),
         },
         disabled=display_columns, hide_index=True, width='stretch', key=table_key,
     )
@@ -6449,9 +6459,7 @@ def render_futures_strategy_room():
     if int(st.session_state.get('futures_minimum_volume', 1) or 1) < 1:
         st.session_state.futures_minimum_volume = 1
 
-    info_col, settings_col = st.columns([2, 3])
-    with info_col:
-        render_futures_strategy_explanation()
+    settings_col, info_col = st.columns([3, 2])
     with settings_col:
         with st.expander("⚙️ 期貨篩選、策略與顯示設定", expanded=False):
             enhanced_col1, enhanced_col2, enhanced_col3 = st.columns([3, 2, 2])
@@ -6487,8 +6495,10 @@ def render_futures_strategy_room():
                 hide_etf = st.checkbox("隱藏 ETF 期貨", value=False, key="futures_hide_etf")
                 hide_small = st.checkbox("隱藏小型期貨", value=False, key="futures_hide_small")
                 hide_next = st.checkbox("隱藏次月期貨", value=True, key="futures_hide_next")
+    with info_col:
+        render_futures_strategy_explanation()
 
-    action_col1, action_col2, action_col3 = st.columns(3)
+    action_col1, action_col2 = st.columns(2)
     with action_col1:
         refresh_official = st.button("🔄 更新成交量／保證金", use_container_width=True, key="refresh_futures_official")
     with action_col2:
@@ -6496,8 +6506,6 @@ def render_futures_strategy_room():
             "📊 即時更新成交量排行", use_container_width=True, key="refresh_futures_rank",
             help="登入 Shioaji 後批次取得盤中／夜盤累計成交量並重新排序；不會背景輪詢。"
         )
-    with action_col3:
-        refresh_live = st.button("⏱️ 即時更新報價與分析", use_container_width=True, type="primary", key="refresh_futures_live")
 
     if refresh_official:
         fetch_futures_strategy_universe.clear()
@@ -6673,7 +6681,7 @@ def render_futures_strategy_room():
             for column, value in analysis.items():
                 display_rows.at[index, column] = value
 
-    if refresh_live:
+    def refresh_futures_live_data():
         if not st.session_state.get('sj_logged_in', False) or st.session_state.get('sj_api') is None:
             st.warning("請先登入永豐 Shioaji，才能更新近月／次月實際契約的即時報價與夜盤 K 棒。")
         elif display_rows.empty:
@@ -6804,9 +6812,15 @@ def render_futures_strategy_room():
             '可交易性': st.column_config.TextColumn(width=105, disabled=True, help='綜合成交量、未平倉量、買賣價差與報價新鮮度。'),
             '資料狀態': st.column_config.TextColumn(width=115, disabled=True, help='顯示即時、手動價、尚未更新或報價過期。'),
             '市場一致': st.column_config.TextColumn(width=110, disabled=True, help='策略方向是否與近月臺指期環境一致；不改變原排序。'),
-            '買賣價差': st.column_config.TextColumn(width=75, disabled=True),
+            '買賣價差': st.column_config.TextColumn(
+                width=75, disabled=True,
+                help='最佳賣價－最佳買價換算成跳動單位；跳數越少通常代表進出成本較低、報價較連續。無即時買賣價時顯示「—」。'
+            ),
             '量倉比': st.column_config.NumberColumn(format='%.2f', width=70, disabled=True, help='當日成交口數 ÷ 未平倉量。'),
-            '到期提醒': st.column_config.TextColumn(width=75, disabled=True),
+            '到期提醒': st.column_config.TextColumn(
+                width=75, disabled=True,
+                help='依目前契約距到期日的天數提示。接近到期時注意流動性、轉倉與近月／次月價格差；不是強制平倉通知。'
+            ),
         }
         if not include_ignore:
             config.pop('忽略')
@@ -6828,7 +6842,7 @@ def render_futures_strategy_room():
             f"futures_strategy_editor_{st.session_state.futures_strategy_editor_revision}_{table_signature}"
         )
         editor_display = display_rows[futures_display_columns].copy()
-        editor_display['漲跌幅'] = editor_display['漲跌幅'].apply(_signed_percent_arrow)
+        editor_display['漲跌幅'] = editor_display['漲跌幅'].apply(_signed_percent)
         edited = st.data_editor(
             editor_display.style.apply(style_futures_row, axis=1),
             column_config=futures_column_config(),
@@ -6925,7 +6939,12 @@ def render_futures_strategy_room():
             else:
                 st.error("自訂價儲存失敗，請確認設定檔是否可寫入。")
 
-    price_save_col, price_clear_col, price_auto_col = st.columns([2, 2, 3])
+    price_live_col, price_save_col, price_clear_col, price_auto_col = st.columns([2, 2, 2, 3])
+    with price_live_col:
+        refresh_live = st.button(
+            "⏱️ 即時更新報價與分析", use_container_width=True, type="primary", key="refresh_futures_live",
+            help='登入 Shioaji 後更新目前表格的最新報價、夜盤資料與支撐壓力。'
+        )
     with price_save_col:
         save_custom_prices = st.button("⚡ 執行更新＆儲存自訂價", use_container_width=True, key='save_futures_custom_prices')
     with price_clear_col:
@@ -6937,6 +6956,8 @@ def render_futures_strategy_room():
             help="編輯目前表格最後一列的自訂價後，會自動儲存並重新計算分析。"
         )
     st.caption(f"目前有 {len(st.session_state.futures_strategy_custom_prices)} 檔自訂價；按儲存後，下次開啟仍會保留。清除後分析會回退使用官方行情價。")
+    if refresh_live:
+        refresh_futures_live_data()
     if save_custom_prices:
         updated_prices = dict(st.session_state.futures_strategy_custom_prices)
         if not edited.empty:
@@ -7037,7 +7058,7 @@ def render_futures_strategy_room():
                 independent_rows[column] = None
         independent_display = independent_rows[independent_columns].copy()
         independent_display['自訂價(可修)'] = independent_display['自訂價(可修)'].apply(fmt_price)
-        independent_display['漲跌幅'] = independent_display['漲跌幅'].apply(_signed_percent_arrow)
+        independent_display['漲跌幅'] = independent_display['漲跌幅'].apply(_signed_percent)
         st.dataframe(
             independent_display.style.apply(style_futures_row, axis=1),
             column_config=futures_column_config(include_ignore=False),
@@ -7586,10 +7607,10 @@ with stock_strategy_container:
                     p = float(df_display.at[i, "收盤價"])
                     chg = float(df_display.at[i, "漲跌幅"])
                     df_display.at[i, "收盤價"] = fmt_price(p)
-                    df_display.at[i, "漲跌幅"] = _signed_percent_arrow(chg)
+                    df_display.at[i, "漲跌幅"] = _signed_percent(chg)
                 except:
                     df_display.at[i, "收盤價"] = fmt_price(df_display.at[i, "收盤價"])
-                    try: df_display.at[i, "漲跌幅"] = _signed_percent_arrow(float(df_display.at[i, '漲跌幅']))
+                    try: df_display.at[i, "漲跌幅"] = _signed_percent(float(df_display.at[i, '漲跌幅']))
                     except: pass
 
         df_display = df_display.reset_index(drop=True)
@@ -8200,10 +8221,10 @@ with stock_strategy_container:
                             p = float(df_indep.at[i, "收盤價"])
                             chg = float(df_indep.at[i, "漲跌幅"])
                             df_indep.at[i, "收盤價"] = fmt_price(p)
-                            df_indep.at[i, "漲跌幅"] = _signed_percent_arrow(chg)
+                            df_indep.at[i, "漲跌幅"] = _signed_percent(chg)
                         except:
                             df_indep.at[i, "收盤價"] = fmt_price(df_indep.at[i, "收盤價"])
-                            try: df_indep.at[i, "漲跌幅"] = _signed_percent_arrow(float(df_indep.at[i, '漲跌幅']))
+                            try: df_indep.at[i, "漲跌幅"] = _signed_percent(float(df_indep.at[i, '漲跌幅']))
                             except: pass
 
                 for col in input_cols:
