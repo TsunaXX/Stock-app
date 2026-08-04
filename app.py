@@ -782,6 +782,27 @@ def _percent_badge_html(value, font_size=14):
     )
 
 
+def _score_color(value):
+    """將 0–100 分映射為低分綠、高分紅的連續色階。"""
+    score = _to_number(value)
+    if score is None:
+        return '#9e9e9e'
+    ratio = min(100, max(0, score)) / 100
+    if ratio <= 0.5:
+        # 綠 → 黃：低分一眼辨識為偏弱。
+        progress = ratio / 0.5
+        red = round(255 * progress)
+        green = round(200 + (179 - 200) * progress)
+        blue = round(83 * (1 - progress))
+    else:
+        # 黃 → 紅：分數越高，紅色越明確。
+        progress = (ratio - 0.5) / 0.5
+        red = 255
+        green = round(179 + (75 - 179) * progress)
+        blue = round(75 * progress)
+    return f'#{red:02x}{green:02x}{blue:02x}'
+
+
 def _thousand_currency(value):
     number = _to_number(value)
     if number is None:
@@ -3566,12 +3587,11 @@ def render_strategy_validation_room():
     st.caption("只有按下各戰略室的「記錄目前表格的已觸發訊號」才會新增；後續按即時更新時，沿用該次報價更新結果、MFE 與 MAE。")
     with st.expander("📖 策略驗證怎麼記錄與判讀", expanded=False):
         st.markdown("""
-        - **記錄目前表格的已觸發訊號**不是只記錄你正在查看的單一商品；它會一次記錄該表格內所有符合條件的標的。股票表會記錄已觸發或回測確認、且高於你設定最低進場信心的個股；期貨表則記錄已觸發且流動性未亮紅燈的契約。
-        - 同一交易日的同一商品、策略、方向與進場價只會保留一筆，重複按鈕不會重複新增。
-        - 記錄當下會保存進場、失效離場與目標價；之後你按「即時更新報價」時，才用該次取得的最新價更新驗證結果，**不會為策略驗證額外發出行情請求**。
-        - **1R** 是「進場價到策略失效離場點」的距離，不是金額。例如多方進場 100、失效點 95，則 1R = 5 元；價格上到 108 為 +1.6R，下到 97 為 -0.6R。
-        - **MFE（最大有利變動）**：訊號建立後，價格曾經朝正確方向走過最遠多少 R。**MAE（最大不利變動）**：訊號建立後，價格曾經往不利方向走過最遠多少 R。兩者用來檢查點位是否太晚、失效點是否太近；不等於實際已實現損益。
-        - **15／30／60 分(R)** 與 **收盤(R)** 是在對應時間點的策略表現快照；結果顯示「達標」代表碰到第一目標，「停損」代表碰到策略失效離場點。
+        1. **先記錄**：在股票或期貨戰略室按「記錄目前表格的已觸發訊號」。它會一次保存表內符合門檻的標的，不是只保存目前查看的那一檔；同一交易日、商品、策略、方向與進場價只會保存一筆。
+        2. **再更新**：回到原戰略室按即時更新報價／分析時，該次取得的最新價會更新已記錄訊號的追蹤結果；策略驗證頁本身**不會額外抓行情**。
+        3. **怎麼看表格**：建立時間、策略、方向、進場／停損／目標是建立訊號當下的計畫；最新價與 15／30／60 分(R)、收盤(R)是後續表現。結果「達標」代表到第一目標，「停損」代表觸及策略失效點。
+        4. **R、MFE、MAE**：1R 是進場到失效點的距離，不是金額；例如多方進場 100、停損 95，1R = 5。MFE 是建立訊號後最有利曾走到多少 R，MAE 是最不利曾回撤多少 R，可用來檢查進場是否太晚、停損是否太近，不等於實際損益。
+        5. **刪除與匯出**：可在下方明細勾選多筆「刪除」，確認後只移除勾選紀錄；匯出按鈕會下載目前篩選後的 CSV。
         """)
     records = load_strategy_signal_log()
     with st.expander("🧹 策略驗證紀錄管理", expanded=False):
@@ -3615,6 +3635,7 @@ def render_strategy_validation_room():
         return
 
     data = pd.DataFrame(records)
+    data['_紀錄ID'] = data.index
     market_options = ['全部'] + sorted(str(value) for value in data.get('市場', pd.Series(dtype=str)).dropna().unique())
     strategy_options = ['全部'] + sorted(str(value) for value in data.get('策略', pd.Series(dtype=str)).dropna().unique())
     filter_col1, filter_col2, export_col = st.columns([2, 2, 2])
@@ -3627,6 +3648,19 @@ def render_strategy_validation_room():
         filtered = filtered[filtered['市場'].astype(str) == market_filter]
     if strategy_filter != '全部':
         filtered = filtered[filtered['策略'].astype(str) == strategy_filter]
+
+    with export_col:
+        export_columns = [
+            '建立時間', '市場', '代碼', '名稱', '策略', '方向', '訊號狀態', '評分', '信心判讀',
+            '進場價', '停損價', '目標價', '最新價', '15分(R)', '30分(R)', '60分(R)', '收盤(R)',
+            '結果', 'MFE(R)', 'MAE(R)', '結果(R)', '資料狀態'
+        ]
+        csv_data = filtered.reindex(columns=export_columns).to_csv(index=False).encode('utf-8-sig')
+        st.download_button(
+            '⬇️ 匯出目前紀錄', csv_data,
+            file_name=f"strategy-signals-{datetime.now().strftime('%Y%m%d')}.csv",
+            mime='text/csv', use_container_width=True,
+        )
 
     completed = filtered[filtered.get('結果', pd.Series(index=filtered.index, dtype=str)).isin(['達標', '停損'])]
     wins = int((completed.get('結果', pd.Series(dtype=str)) == '達標').sum()) if not completed.empty else 0
@@ -3651,7 +3685,30 @@ def render_strategy_validation_room():
             summary['平均R'] = pd.to_numeric(summary['平均R'], errors='coerce').round(2)
             summary['勝率'] = summary['勝率'].round(1)
             st.markdown('#### 條件分組結果')
-            st.dataframe(summary, hide_index=True, width='stretch')
+
+            def style_validation_summary(row):
+                styles = [''] * len(row)
+                for position, column in enumerate(row.index):
+                    value = row.get(column)
+                    if column == '方向':
+                        styles[position] = (
+                            'color:#ff4b4b;font-weight:bold;' if '多' in str(value)
+                            else ('color:#00c853;font-weight:bold;' if '空' in str(value) else '')
+                        )
+                    elif column in ('平均R', '勝率'):
+                        number = _safe_number(value)
+                        if number is not None:
+                            positive = number > (50 if column == '勝率' else 0)
+                            negative = number < (50 if column == '勝率' else 0)
+                            styles[position] = (
+                                'color:#ff4b4b;font-weight:bold;' if positive
+                                else ('color:#00c853;font-weight:bold;' if negative else 'color:#9e9e9e;')
+                            )
+                return styles
+
+            st.dataframe(
+                summary.style.apply(style_validation_summary, axis=1), hide_index=True, width='stretch'
+            )
 
     display_columns = [
         '建立時間', '市場', '代碼', '名稱', '策略', '方向', '訊號狀態', '評分', '信心判讀',
@@ -3662,9 +3719,66 @@ def render_strategy_validation_room():
         if column not in filtered.columns:
             filtered[column] = None
     st.markdown('#### 訊號明細')
-    st.dataframe(
-        filtered[display_columns].sort_values('建立時間', ascending=False),
+    validation_display = filtered[['_紀錄ID'] + display_columns].sort_values('建立時間', ascending=False).copy()
+    validation_display.insert(0, '刪除', False)
+
+    def style_validation_row(row):
+        styles = [''] * len(row)
+        direction = str(row.get('方向', ''))
+        signal_state = str(row.get('訊號狀態', ''))
+        confidence = str(row.get('信心判讀', ''))
+        result_text = str(row.get('結果', ''))
+        data_health = str(row.get('資料狀態', ''))
+        for position, column in enumerate(row.index):
+            if column == '方向':
+                styles[position] = (
+                    'color:#ff4b4b;font-weight:bold;' if '多' in direction
+                    else ('color:#00c853;font-weight:bold;' if '空' in direction else '')
+                )
+            elif column == '訊號狀態':
+                if signal_state.startswith(('✅', '🔵')):
+                    styles[position] = 'color:#ff4b4b;font-weight:bold;'
+                elif signal_state.startswith(('⛔', '🔴')):
+                    styles[position] = 'color:#00c853;font-weight:bold;'
+                elif signal_state.startswith('🟡'):
+                    styles[position] = 'color:#ffb300;font-weight:bold;'
+            elif column == '信心判讀':
+                if confidence.startswith('🟢'):
+                    styles[position] = 'color:#ff4b4b;font-weight:bold;'
+                elif confidence.startswith(('🟡', '🟠')):
+                    styles[position] = 'color:#ffb300;font-weight:bold;'
+                elif confidence.startswith('🔴'):
+                    styles[position] = 'color:#00c853;font-weight:bold;'
+            elif column == '結果':
+                if result_text == '達標':
+                    styles[position] = 'color:#ff4b4b;font-weight:bold;'
+                elif result_text == '停損':
+                    styles[position] = 'color:#00c853;font-weight:bold;'
+                elif result_text == '追蹤中':
+                    styles[position] = 'color:#ffb300;font-weight:bold;'
+            elif column == '評分':
+                styles[position] = f'color:{_score_color(row.get(column))};font-weight:bold;'
+            elif column in ('15分(R)', '30分(R)', '60分(R)', '收盤(R)', 'MFE(R)', 'MAE(R)', '結果(R)'):
+                value = _safe_number(row.get(column))
+                if value is not None:
+                    styles[position] = (
+                        'color:#ff4b4b;font-weight:bold;' if value > 0
+                        else ('color:#00c853;font-weight:bold;' if value < 0 else 'color:#9e9e9e;')
+                    )
+            elif column == '資料狀態':
+                if data_health.startswith('🟢'):
+                    styles[position] = 'color:#ff4b4b;'
+                elif data_health.startswith(('🔴', '⛔')):
+                    styles[position] = 'color:#00c853;font-weight:bold;'
+                elif data_health.startswith('🟡'):
+                    styles[position] = 'color:#ffb300;'
+        return styles
+
+    table_key = f"strategy_validation_editor_{abs(hash(tuple(validation_display['_紀錄ID'].tolist())))}"
+    edited_validation = st.data_editor(
+        validation_display.drop(columns=['_紀錄ID']).style.apply(style_validation_row, axis=1),
         column_config={
+            '刪除': st.column_config.CheckboxColumn('刪除', width=50, help='勾選後可一次刪除多筆訊號紀錄。'),
             '評分': st.column_config.NumberColumn('進場信心', format='%d'),
             '15分(R)': st.column_config.NumberColumn(help='建立訊號滿 15 分鐘時的表現；1R 為進場到失效點距離。'),
             '30分(R)': st.column_config.NumberColumn(help='建立訊號滿 30 分鐘時的表現。'),
@@ -3674,15 +3788,33 @@ def render_strategy_validation_room():
             'MAE(R)': st.column_config.NumberColumn('MAE', help='Maximum Adverse Excursion：訊號後最大不利變動，單位為 R。'),
             '結果(R)': st.column_config.NumberColumn(help='達標或策略失效時的結果；以 R 表示。'),
         },
-        hide_index=True, width='stretch'
+        disabled=display_columns, hide_index=True, width='stretch', key=table_key,
     )
-    with export_col:
-        csv_data = filtered[display_columns].to_csv(index=False).encode('utf-8-sig')
-        st.download_button(
-            '⬇️ 匯出目前紀錄', csv_data,
-            file_name=f"strategy-signals-{datetime.now().strftime('%Y%m%d')}.csv",
-            mime='text/csv', use_container_width=True,
+    selected_mask = edited_validation['刪除'].fillna(False).astype(bool).to_numpy()
+    selected_ids = set(validation_display.iloc[selected_mask]['_紀錄ID'].astype(int).tolist())
+    delete_col, confirm_col, hint_col = st.columns([2, 2, 4])
+    with confirm_col:
+        confirm_selected_delete = st.checkbox(
+            '確認刪除勾選訊號', key=f'{table_key}_confirm_delete', disabled=not selected_ids
         )
+    with delete_col:
+        delete_selected = st.button(
+            f'🗑️ 刪除勾選訊號（{len(selected_ids)}）', type='primary', use_container_width=True,
+            disabled=not selected_ids or not confirm_selected_delete, key=f'{table_key}_delete_selected'
+        )
+    with hint_col:
+        st.caption('刪除只影響勾選紀錄；其餘歷史訊號與目前篩選條件不受影響。')
+    if delete_selected:
+        remaining = [record for index, record in enumerate(records) if index not in selected_ids]
+        if save_strategy_signal_log(remaining):
+            save_data_cache(
+                st.session_state.stock_data, st.session_state.ignored_stocks,
+                st.session_state.all_candidates, st.session_state.saved_notes
+            )
+            st.toast(f'已刪除 {len(selected_ids)} 筆訊號紀錄', icon='🗑️')
+            st.rerun()
+        else:
+            st.error('訊號刪除失敗，請確認紀錄檔是否可寫入。')
 
 def save_fibo_config():
     config = load_config()
@@ -4173,6 +4305,9 @@ def render_stock_strategy_explanation():
     """股票戰略室的靜態說明，與操作設定分開並預設折疊。"""
     with st.expander("📖 股票戰略室說明", expanded=False):
         st.markdown("""
+- **怎麼操作**：先在「選股資料來源與快速查詢」載入週轉率資料或輸入個股，再按「執行分析」；已有結果時資料來源區會收合，直接看主表即可。
+- **怎麼看資料**：主表保留原始週轉率排序與戰略備註；開啟附加分析層後，優先看「訊號狀態、進場信心、支撐壓力、進出場預判」；需要完整欄位時可關閉精簡主表。
+- **怎麼進場**：不以預判價直接下單。先等訊號為「已觸發／回測確認」、價格靠近預判進場區、支撐壓力與原戰略備註方向一致，再自行確認量能與盤勢；條件失效則依「停」退出觀察。
 - **原選股順序不變**：維持週轉率排行及原本的戰略備註；附加分析只補充支撐壓力、進出場點位與信心判讀。
 - **ATR**衡量正常波動幅度，不判斷多空；乖離越大，越不適合追價或追空。
 - **VWAP**是盤中成交量加權平均成本。當沖時，價格在 VWAP 上方偏多、下方偏空，並搭配 09:00–09:15 開盤區間及量能確認。
@@ -4185,6 +4320,9 @@ def render_futures_strategy_explanation():
     """期貨戰略室的靜態說明，預設折疊避免占用表格空間。"""
     with st.expander("📖 期貨戰略室說明", expanded=False):
         st.markdown("""
+- **怎麼操作**：主表先依成交口數排序。需要盤中／夜盤資訊時登入 Shioaji，按「即時更新成交量排行」或「即時更新報價與分析」；篩選、週期與方向可在上方設定區調整。
+- **怎麼看資料**：先看「自訂價、漲跌幅、方向、訊號狀態、進場信心、支撐壓力、進出場點位」；完整表可查看保證金、未平倉量、交易時段與資料狀態。
+- **怎麼進場**：只在觸發條件成立後，讓最新價接近「進」且方向與市場一致時再評估；「停」是策略失效點，「目」是第一觀察目標，均為提示，不會自動下單。
 - 主排行以**當日累計成交口數**由大到小排列；期交所 OpenAPI 是盤後正式資料，登入 Shioaji 後可手動取得盤中／夜盤快照提前重排。
 - **自動方向**依目前價格強弱判定；偏多只觀察突破壓力，偏空只觀察跌破支撐。進、停、目均為條件式觀察點位，不會自動下單。
 - **進場信心**綜合觸發位置、成交量、未平倉量、買賣價差、資料新鮮度與市場方向；不是歷史勝率。
@@ -5226,15 +5364,19 @@ def render_opening_direction_prompt():
                 f"{html.escape(group)} —</span>"
             )
 
-    score_text = f"{result['score']} 分" if result['score'] is not None else '—'
+    score_text = (
+        f"<span style='color:{_score_color(result['score'])};font-weight:800;'>{result['score']} 分</span>"
+        if result['score'] is not None else '—'
+    )
     weighted_badge = _percent_badge_html(result['weighted_pct'], 14)
     st.markdown(
         f"<div style='border-left:5px solid {color};padding:7px 10px;"
         "background:rgba(128,128,128,.08);border-radius:6px;line-height:1.65;'>"
         f"<span style='font-size:18px;font-weight:800;color:{color};'>{direction}</span>　"
-        f"分數 {score_text}　加權 {weighted_badge}　覆蓋 {result['coverage']}%　"
+        f"分數 {score_text}　加權 {weighted_badge}　"
         f"{' '.join(group_badges)}<br>"
-        f"<span style='font-size:12px;color:#a0a0a0;'>{html.escape(advice)}</span></div>",
+        f"<span style='font-size:14px;color:#c8c8c8;'>{html.escape(advice)}"
+        f"　｜資料覆蓋 {result['coverage']}%</span></div>",
         unsafe_allow_html=True,
     )
 
