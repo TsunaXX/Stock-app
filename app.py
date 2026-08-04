@@ -3708,7 +3708,14 @@ def render_strategy_validation_room():
                 return styles
 
             st.dataframe(
-                summary.style.apply(style_validation_summary, axis=1), hide_index=True, width='stretch'
+                summary.style.apply(style_validation_summary, axis=1),
+                column_config={
+                    '已完成': st.column_config.NumberColumn(format='%d'),
+                    '達標數': st.column_config.NumberColumn(format='%d'),
+                    '平均R': st.column_config.NumberColumn(format='%.12g'),
+                    '勝率': st.column_config.NumberColumn(format='%.12g'),
+                },
+                hide_index=True, width='stretch',
             )
 
     display_columns = [
@@ -3728,6 +3735,10 @@ def render_strategy_validation_room():
     ]
     for column in compact_number_columns:
         validation_display[column] = pd.to_numeric(validation_display[column], errors='coerce')
+    for column in (set(display_columns) - set(compact_number_columns)):
+        validation_display[column] = validation_display[column].where(
+            validation_display[column].notna(), ''
+        ).replace('None', '')
 
     def style_validation_row(row):
         styles = [''] * len(row)
@@ -3770,13 +3781,13 @@ def render_strategy_validation_room():
                 if value is not None:
                     styles[position] = (
                         'color:#ff4b4b;font-weight:bold;' if value > 0
-                        else ('color:#00c853;font-weight:bold;' if value < 0 else 'color:#9e9e9e;')
+                        else ('color:#00c853;font-weight:bold;' if value < 0 else '')
                     )
             elif column == '資料狀態':
                 if data_health.startswith('🟢'):
-                    styles[position] = 'color:#ff4b4b;'
+                    styles[position] = 'color:#00e676;font-weight:bold;'
                 elif data_health.startswith(('🔴', '⛔')):
-                    styles[position] = 'color:#00c853;font-weight:bold;'
+                    styles[position] = 'color:#ff4b4b;font-weight:bold;'
                 elif data_health.startswith('🟡'):
                     styles[position] = 'color:#ffb300;'
         return styles
@@ -3803,15 +3814,11 @@ def render_strategy_validation_room():
     )
     selected_mask = edited_validation['刪除'].fillna(False).astype(bool).to_numpy()
     selected_ids = set(validation_display.iloc[selected_mask]['_紀錄ID'].astype(int).tolist())
-    delete_col, confirm_col, hint_col = st.columns([2, 2, 4])
-    with confirm_col:
-        confirm_selected_delete = st.checkbox(
-            '確認刪除勾選訊號', key=f'{table_key}_confirm_delete', disabled=not selected_ids
-        )
+    delete_col, hint_col = st.columns([2, 4])
     with delete_col:
         delete_selected = st.button(
             f'🗑️ 刪除勾選訊號（{len(selected_ids)}）', type='primary', use_container_width=True,
-            disabled=not selected_ids or not confirm_selected_delete, key=f'{table_key}_delete_selected'
+            disabled=not selected_ids, key=f'{table_key}_delete_selected'
         )
     with hint_col:
         st.caption('刪除只影響勾選紀錄；其餘歷史訊號與目前篩選條件不受影響。')
@@ -5267,7 +5274,7 @@ def fetch_shioaji_tx_night_signal(api, now_tw):
 
 
 def calculate_opening_direction(rows):
-    """依加權漲跌與多空廣度產生盤前觀察方向，不改動個股策略。"""
+    """依跨市場加權變動與多空廣度產生盤前觀察方向，不改動個股策略。"""
     valid = [row for row in rows if _safe_number(row.get('pct')) is not None]
     available_weight = sum(row['weight'] for row in valid)
     if not valid or available_weight < 45:
@@ -5297,7 +5304,7 @@ def render_opening_direction_prompt():
 
     title_col, refresh_col = st.columns([9, 1], vertical_alignment='center')
     with title_col:
-        st.markdown('**台股試搓方向**')
+        st.markdown('<span style="font-size:18px;font-weight:800;">🧭 台股試搓方向</span>', unsafe_allow_html=True)
     with refresh_col:
         refresh = st.button('🔄 更新', key='refresh_opening_direction', width='stretch')
     if refresh:
@@ -5376,15 +5383,14 @@ def render_opening_direction_prompt():
             )
 
     score_text = (
-        f"<span style='color:{_score_color(result['score'])};font-weight:800;'>{result['score']} 分</span>"
+        f"<span style='color:{_score_color(result['score'])};font-weight:800;'>{result['score']}</span>"
         if result['score'] is not None else '—'
     )
-    weighted_badge = _percent_badge_html(result['weighted_pct'], 14)
     st.markdown(
         f"<div style='border-left:5px solid {color};padding:7px 10px;"
         "background:rgba(128,128,128,.08);border-radius:6px;line-height:1.65;'>"
         f"<span style='font-size:18px;font-weight:800;color:{color};'>{direction}</span>　"
-        f"分數 {score_text}　加權 {weighted_badge}　"
+        f"分數 {score_text} 分　"
         f"{' '.join(group_badges)}<br>"
         f"<span style='font-size:14px;color:#c8c8c8;'>{html.escape(advice)}"
         f"　｜資料覆蓋 {result['coverage']}%</span></div>",
@@ -5401,13 +5407,12 @@ def render_opening_direction_prompt():
                 'label': '市場', 'group': '群組', 'price': '價格', 'pct': '漲跌幅',
                 'time': '資料時間', 'weight': '權重', 'source': '來源',
             })
-            details['漲跌幅'] = details['漲跌幅'].apply(_signed_percent_arrow)
+            details['漲跌幅'] = details['漲跌幅'].apply(_signed_percent)
 
             def style_opening_detail(row):
                 styles = [''] * len(row)
                 value = _to_number(
-                    str(row.get('漲跌幅', '')).replace('%', '').replace('↑', '')
-                    .replace('↓', '').replace('→', '')
+                    str(row.get('漲跌幅', '')).replace('%', '').replace('+', '')
                 )
                 if '漲跌幅' in row.index and value is not None:
                     position = row.index.get_loc('漲跌幅')
@@ -5420,7 +5425,11 @@ def render_opening_direction_prompt():
             st.dataframe(
                 details[['群組', '市場', '價格', '漲跌幅', '資料時間', '權重', '來源']]
                 .style.apply(style_opening_detail, axis=1),
-                column_config={'漲跌幅': st.column_config.TextColumn(width=90)},
+                column_config={
+                    '價格': st.column_config.NumberColumn(format='%.12g', width=100),
+                    '漲跌幅': st.column_config.TextColumn(width=90),
+                    '權重': st.column_config.NumberColumn(format='%d', width=60),
+                },
                 hide_index=True, width='stretch',
             )
         st.caption(
