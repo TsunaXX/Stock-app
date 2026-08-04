@@ -4809,6 +4809,332 @@ def update_futures_universe_live(rows, api):
         ).reset_index(drop=True)
     return updated, update_count
 
+
+OPENING_SIGNAL_WEIGHTS = {
+    'TX_NIGHT': 30,
+    'DJI': 5, 'NASDAQ': 7, 'SP500': 6, 'SOX': 12,
+    'NQ_FUT': 12, 'YM_FUT': 8,
+    'NIKKEI': 10, 'KOSPI': 10,
+}
+
+
+def _extract_yfinance_close(downloaded, ticker):
+    """從 yfinance 單／多商品結果安全取出 Close，統一轉成臺北時間。"""
+    if downloaded is None or downloaded.empty:
+        return pd.Series(dtype=float)
+    try:
+        if isinstance(downloaded.columns, pd.MultiIndex):
+            level0 = downloaded.columns.get_level_values(0)
+            if ticker in level0:
+                series = downloaded[ticker]['Close']
+            elif 'Close' in level0:
+                series = downloaded['Close'][ticker]
+            else:
+                return pd.Series(dtype=float)
+        else:
+            series = downloaded['Close']
+        series = pd.to_numeric(series, errors='coerce').dropna()
+        if series.empty:
+            return series
+        index = pd.to_datetime(series.index)
+        if getattr(index, 'tz', None) is None:
+            index = index.tz_localize('UTC')
+        series.index = index.tz_convert('Asia/Taipei')
+        return series[~series.index.duplicated(keep='last')].sort_index()
+    except Exception:
+        return pd.Series(dtype=float)
+
+
+def _opening_window_change(series, start_at, cutoff_at):
+    """以指定開盤時間前最後成交為基準，計算至 08:30 截止的漲跌幅。"""
+    if series.empty:
+        return None
+    before = series[series.index < start_at]
+    current = series[(series.index >= start_at) & (series.index <= cutoff_at)]
+    if before.empty or current.empty:
+        return None
+    reference = _safe_number(before.iloc[-1])
+    latest = _safe_number(current.iloc[-1])
+    if reference is None or latest is None or reference <= 0:
+        return None
+    return {
+        'price': latest,
+        'pct': (latest / reference - 1) * 100,
+        'time': current.index[-1].strftime('%m/%d %H:%M'),
+    }
+
+
+def _opening_night_change(series, cutoff_at):
+    """Yahoo 備援：找最近一段 15:00–05:00 台指期夜盤並對比夜盤前收盤。"""
+    if series.empty:
+        return None
+    eligible = series[
+        (series.index <= cutoff_at)
+        & ((series.index.time >= dt_time(15, 0)) | (series.index.time <= dt_time(5, 0)))
+    ]
+    if eligible.empty:
+        return None
+    last_time = eligible.index[-1]
+    start_date = (last_time - timedelta(days=1)).date() if last_time.time() <= dt_time(5, 0) else last_time.date()
+    start_at = pytz.timezone('Asia/Taipei').localize(datetime.combine(start_date, dt_time(15, 0)))
+    night = series[(series.index >= start_at) & (series.index <= cutoff_at)]
+    before = series[series.index < start_at]
+    if night.empty or before.empty:
+        return None
+    reference = _safe_number(before.iloc[-1])
+    latest = _safe_number(night.iloc[-1])
+    if reference is None or latest is None or reference <= 0:
+        return None
+    return {
+        'price': latest,
+        'pct': (latest / reference - 1) * 100,
+        'time': night.index[-1].strftime('%m/%d %H:%M'),
+    }
+
+
+@st.cache_data(ttl=300, max_entries=6, show_spinner=False)
+def fetch_opening_overseas_signals(trading_date_text, cutoff_text):
+    """批次取得美股收盤、美期與日韓盤；固定以 08:30 前資料計算。"""
+    tz_tw = pytz.timezone('Asia/Taipei')
+    trading_day = datetime.strptime(trading_date_text, '%Y-%m-%d').date()
+    cutoff_at = tz_tw.localize(datetime.strptime(cutoff_text, '%Y-%m-%d %H:%M'))
+    rows = []
+    errors = []
+    daily_symbols = {
+        'DJI': ('道瓊', '^DJI', '美股收盤'),
+        'NASDAQ': ('那斯達克', '^IXIC', '美股收盤'),
+        'SP500': ('標普500', '^GSPC', '美股收盤'),
+        'SOX': ('費半', '^SOX', '美股收盤'),
+    }
+    intraday_symbols = {
+        'NQ_FUT': ('小那期', 'NQ=F', '06:00 美期', dt_time(6, 0)),
+        'YM_FUT': ('小道期', 'YM=F', '06:00 美期', dt_time(6, 0)),
+        'NIKKEI': ('日經', '^N225', '08:00 日韓', dt_time(8, 0)),
+        'KOSPI': ('韓股綜合', '^KS11', '08:00 日韓', dt_time(8, 0)),
+    }
+
+    try:
+        downloaded = yf.download(
+            [item[1] for item in daily_symbols.values()], period='10d', interval='1d',
+            group_by='ticker', auto_adjust=False, progress=False, threads=True,
+        )
+        for key, (label, ticker, group) in daily_symbols.items():
+            series = _extract_yfinance_close(downloaded, ticker)
+            if len(series) < 2:
+                continue
+            previous = _safe_number(series.iloc[-2])
+            latest = _safe_number(series.iloc[-1])
+            if previous is None or latest is None or previous <= 0:
+                continue
+            rows.append({
+                'key': key, 'label': label, 'group': group, 'price': latest,
+                'pct': (latest / previous - 1) * 100,
+                'time': series.index[-1].strftime('%m/%d 收盤'),
+                'weight': OPENING_SIGNAL_WEIGHTS[key], 'source': 'Yahoo Finance 日線',
+            })
+    except Exception as exc:
+        errors.append(f'美股指數：{exc}')
+
+    try:
+        downloaded = yf.download(
+            [item[1] for item in intraday_symbols.values()] + ['TWF=F'],
+            period='5d', interval='5m', group_by='ticker', auto_adjust=False,
+            prepost=True, progress=False, threads=True,
+        )
+        for key, (label, ticker, group, start_time) in intraday_symbols.items():
+            start_at = tz_tw.localize(datetime.combine(trading_day, start_time))
+            measured = _opening_window_change(_extract_yfinance_close(downloaded, ticker), start_at, cutoff_at)
+            if measured:
+                rows.append({
+                    'key': key, 'label': label, 'group': group, **measured,
+                    'weight': OPENING_SIGNAL_WEIGHTS[key], 'source': 'Yahoo Finance 5分線',
+                })
+        tx_measured = _opening_night_change(_extract_yfinance_close(downloaded, 'TWF=F'), cutoff_at)
+        if tx_measured:
+            rows.append({
+                'key': 'TX_NIGHT', 'label': '台指期夜盤', 'group': '台指夜盤', **tx_measured,
+                'weight': OPENING_SIGNAL_WEIGHTS['TX_NIGHT'], 'source': 'Yahoo Finance 5分線備援',
+            })
+    except Exception as exc:
+        errors.append(f'盤前即時市場：{exc}')
+    if not rows and not errors:
+        errors.append('Yahoo Finance 暫未回傳可用行情')
+    return rows, errors
+
+
+def fetch_shioaji_tx_night_signal(api, now_tw):
+    """取得歸屬今日交易日的臺指期夜盤，避免 08:45 後混入日盤價格。"""
+    if api is None:
+        return None
+    try:
+        contracts = [
+            contract for contract in api.Contracts.Futures.TXF
+            if str(getattr(contract, 'code', ''))[-2:] not in ('R1', 'R2')
+            and '/' not in str(getattr(contract, 'code', ''))
+        ]
+        contract = min(contracts, key=lambda item: getattr(item, 'delivery_date', '999999'))
+    except Exception:
+        try:
+            contract = api.Contracts.Futures.TXF.TXFR1
+        except Exception:
+            return None
+
+    kbars = fetch_futures_contract_kbars(api, contract, 4)
+    if kbars.empty or 'Close' not in kbars.columns:
+        return None
+    target_date = get_futures_trading_date(now_tw).date()
+    session_dates = []
+    for stamp in kbars.index:
+        stamp_dt = stamp.to_pydatetime() if hasattr(stamp, 'to_pydatetime') else stamp
+        aware = pytz.timezone('Asia/Taipei').localize(stamp_dt) if stamp_dt.tzinfo is None else stamp_dt
+        session_dates.append(get_futures_trading_date(aware).date())
+    session_dates = pd.Series(session_dates, index=kbars.index)
+    time_mask = (kbars.index.time >= dt_time(15, 0)) | (kbars.index.time <= dt_time(5, 0))
+    night = kbars[(session_dates == target_date).to_numpy() & time_mask]
+    if night.empty:
+        return None
+    before = kbars[kbars.index < night.index[0]]
+    day_mask = (before.index.time >= dt_time(8, 45)) & (before.index.time <= dt_time(13, 45))
+    prior_day = before[day_mask]
+    if prior_day.empty:
+        return None
+    reference = _safe_number(prior_day['Close'].iloc[-1])
+    latest = _safe_number(night['Close'].iloc[-1])
+    if reference is None or latest is None or reference <= 0:
+        return None
+    return {
+        'key': 'TX_NIGHT', 'label': '台指期夜盤', 'group': '台指夜盤',
+        'price': latest, 'pct': (latest / reference - 1) * 100,
+        'time': night.index[-1].strftime('%m/%d %H:%M'),
+        'weight': OPENING_SIGNAL_WEIGHTS['TX_NIGHT'], 'source': 'Shioaji 臺指期分K',
+    }
+
+
+def calculate_opening_direction(rows):
+    """依加權漲跌與多空廣度產生盤前觀察方向，不改動個股策略。"""
+    valid = [row for row in rows if _safe_number(row.get('pct')) is not None]
+    available_weight = sum(row['weight'] for row in valid)
+    if not valid or available_weight < 45:
+        return {'direction': '資料不足', 'score': None, 'coverage': available_weight, 'weighted_pct': None}
+    weighted_pct = sum(row['pct'] * row['weight'] for row in valid) / available_weight
+    positive_weight = sum(row['weight'] for row in valid if row['pct'] > 0.10)
+    negative_weight = sum(row['weight'] for row in valid if row['pct'] < -0.10)
+    breadth = (positive_weight - negative_weight) / available_weight
+    score = max(0, min(100, round(50 + weighted_pct * 10 + breadth * 8)))
+    direction = '偏多' if score >= 54 else ('偏空' if score <= 46 else '中性')
+    return {
+        'direction': direction, 'score': score, 'coverage': available_weight,
+        'weighted_pct': weighted_pct,
+    }
+
+
+@st.fragment(run_every=60)
+def render_opening_direction_prompt():
+    """在股期戰略室頂端顯示 08:30 試搓用的跨市場方向提示。"""
+    tz_tw = pytz.timezone('Asia/Taipei')
+    now_tw = datetime.now(tz_tw)
+    active_window = dt_time(8, 20) <= now_tw.time() <= dt_time(9, 0)
+    auto_refresh_window = dt_time(8, 0) <= now_tw.time() <= dt_time(8, 40)
+    cutoff_time = min(now_tw.time(), dt_time(8, 30))
+    cutoff_minute = (cutoff_time.minute // 5) * 5
+    cutoff_at = datetime.combine(now_tw.date(), dt_time(cutoff_time.hour, cutoff_minute))
+
+    title_col, refresh_col = st.columns([8, 1])
+    with title_col:
+        st.markdown('#### 🌏 08:30 台股試搓方向提示')
+    with refresh_col:
+        refresh = st.button('🔄 更新', key='refresh_opening_direction', width='stretch')
+    if refresh:
+        fetch_opening_overseas_signals.clear()
+        st.session_state.pop('opening_overseas_signal', None)
+        st.session_state.pop('opening_tx_night_signal', None)
+
+    trading_date_text = now_tw.strftime('%Y-%m-%d')
+    overseas_cache = st.session_state.get('opening_overseas_signal')
+    if refresh or auto_refresh_window or not overseas_cache or overseas_cache.get('date') != trading_date_text:
+        rows, errors = fetch_opening_overseas_signals(
+            trading_date_text, cutoff_at.strftime('%Y-%m-%d %H:%M')
+        )
+        st.session_state.opening_overseas_signal = {
+            'date': trading_date_text, 'rows': rows, 'errors': errors,
+        }
+    else:
+        rows = list(overseas_cache.get('rows', []))
+        errors = list(overseas_cache.get('errors', []))
+    if st.session_state.get('sj_logged_in', False) and st.session_state.get('sj_api') is not None:
+        cache = st.session_state.get('opening_tx_night_signal')
+        cache_stale = not cache or cache.get('date') != now_tw.strftime('%Y-%m-%d')
+        if refresh or cache_stale:
+            tx_signal = fetch_shioaji_tx_night_signal(st.session_state.sj_api, now_tw)
+            st.session_state.opening_tx_night_signal = {
+                'date': now_tw.strftime('%Y-%m-%d'), 'row': tx_signal,
+            }
+        tx_signal = st.session_state.get('opening_tx_night_signal', {}).get('row')
+        if tx_signal:
+            rows = [row for row in rows if row['key'] != 'TX_NIGHT'] + [tx_signal]
+
+    market_closed = is_market_closed_func(now_tw.date())
+    result = calculate_opening_direction(rows)
+    if market_closed:
+        result = {
+            'direction': '休市', 'score': None, 'coverage': result['coverage'],
+            'weighted_pct': result['weighted_pct'],
+        }
+    direction = result['direction']
+    palette = {
+        '偏多': ('#ff4b4b', '優先等待多方條件：試搓守穩、突破壓力且量能確認後再評估。'),
+        '偏空': ('#00c853', '優先等待空方條件：試搓轉弱、跌破支撐且反彈不過後再評估。'),
+        '中性': ('#ffb300', '多空訊號分歧：先等開盤區間、VWAP 與量能確認，不預設方向。'),
+        '資料不足': ('#9e9e9e', '可用市場權重不足，暫不提供方向；可更新資料或登入 Shioaji 補齊台指期夜盤。'),
+        '休市': ('#9e9e9e', '今日臺股休市，不產生試搓操作方向；行情僅保留作為下一交易日背景。'),
+    }
+    color, advice = palette[direction]
+    score_text = f"{result['score']} 分" if result['score'] is not None else '—'
+    weighted_text = f"{result['weighted_pct']:+.2f}%" if result['weighted_pct'] is not None else '—'
+    st.markdown(
+        f"<div style='border-left:6px solid {color};padding:10px 14px;background:rgba(128,128,128,.10);border-radius:6px;'>"
+        f"<span style='font-size:20px;font-weight:800;color:{color};'>{direction}</span>　"
+        f"綜合分數 {score_text}｜加權行情 {weighted_text}｜資料覆蓋 {result['coverage']}%<br>"
+        f"<span style='font-size:14px;'>{advice}</span></div>",
+        unsafe_allow_html=True,
+    )
+
+    groups = ['台指夜盤', '美股收盤', '06:00 美期', '08:00 日韓']
+    group_columns = st.columns(4)
+    for column, group in zip(group_columns, groups):
+        group_rows = [row for row in rows if row['group'] == group]
+        if group_rows:
+            group_weight = sum(row['weight'] for row in group_rows)
+            group_pct = sum(row['pct'] * row['weight'] for row in group_rows) / group_weight
+            details = '｜'.join(f"{row['label']} {row['pct']:+.2f}%" for row in group_rows)
+            column.metric(group, f'{group_pct:+.2f}%')
+            column.caption(details)
+        else:
+            column.metric(group, '待資料')
+
+    phase = '08:30 試搓提示期間' if active_window else (
+        '08:30 前逐步納入已開盤市場' if now_tw.time() < dt_time(8, 30)
+        else '已固定美期／日韓資料至 08:30'
+    )
+    with st.expander('查看參考市場、資料時間與判讀方式', expanded=False):
+        if rows:
+            details = pd.DataFrame(rows).rename(columns={
+                'label': '市場', 'group': '群組', 'price': '價格', 'pct': '漲跌幅',
+                'time': '資料時間', 'weight': '權重', 'source': '來源',
+            })
+            st.dataframe(
+                details[['群組', '市場', '價格', '漲跌幅', '資料時間', '權重', '來源']],
+                column_config={'漲跌幅': st.column_config.NumberColumn(format='%+.2f%%')},
+                hide_index=True, width='stretch',
+            )
+        st.caption(
+            f'{phase}。美股採最近完整收盤；美期採 06:00 後、日韓採 08:00 後，盤後查看仍以 08:30 為截止。'
+            '分數代表跨市場方向一致度，不是勝率；個股仍需依原戰略備註、支撐壓力與進場條件確認。'
+        )
+        if errors:
+            st.warning('部分行情來源暫時無法取得：' + '；'.join(errors))
+
+
 @st.cache_data(ttl=900, max_entries=1, show_spinner=False)
 def fetch_market_risk_lists():
     """取得上市、上櫃注意／處置名單；僅在使用者手動更新時呼叫。"""
@@ -6427,6 +6753,7 @@ def render_futures_strategy_room():
 tab1, tab_fibo, tab2, tab_db, tab3 = st.tabs(["⚡ 股期戰略室 ⚡", "📈 指數操盤室", "💰 交易損益室 💰", "📚 戰略資料庫", "📅 股市行事曆與公司事件"])
 
 with tab1:
+    render_opening_direction_prompt()
     stock_strategy_tab, futures_strategy_tab, validation_strategy_tab = st.tabs([
         "📈 股票戰略室", "🧭 期貨戰略室", "📊 策略驗證"
     ])
