@@ -761,6 +761,27 @@ def _signed_percent(value):
     return "--" if number is None else f"{number:+.2f}%"
 
 
+def _signed_percent_arrow(value):
+    """以臺股慣例顯示漲紅跌綠所搭配的方向箭頭。"""
+    number = _to_number(str(value).replace('%', ''))
+    if number is None:
+        return '—'
+    arrow = '↑' if number > 0 else ('↓' if number < 0 else '→')
+    return f'{arrow} {number:+.2f}%'
+
+
+def _percent_badge_html(value, font_size=14):
+    """產生可放入精簡市場卡的紅漲綠跌百分比。"""
+    number = _to_number(str(value).replace('%', ''))
+    if number is None:
+        return "<span style='color:#9e9e9e;'>—</span>"
+    color = '#ff4b4b' if number > 0 else ('#00c853' if number < 0 else '#9e9e9e')
+    return (
+        f"<span style='color:{color};font-size:{font_size}px;font-weight:800;'>"
+        f"{_signed_percent_arrow(number)}</span>"
+    )
+
+
 def _thousand_currency(value):
     number = _to_number(value)
     if number is None:
@@ -4236,7 +4257,10 @@ def _decode_taifex_legacy_text(value):
 
 def _safe_number(value, default=None):
     try:
-        text = str(value).replace(',', '').replace('%', '').strip()
+        text = (
+            str(value).replace(',', '').replace('%', '')
+            .replace('↑', '').replace('↓', '').replace('→', '').strip()
+        )
         if text in ('', '-', 'NULL', 'nan', 'None'):
             return default
         number = float(text)
@@ -4816,6 +4840,113 @@ OPENING_SIGNAL_WEIGHTS = {
     'NQ_FUT': 12, 'YM_FUT': 8,
     'NIKKEI': 10, 'KOSPI': 10,
 }
+OPENING_SIGNAL_CACHE_VERSION = 2
+
+NASDAQ_MARKET_HEADERS = {
+    'User-Agent': (
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+        'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36'
+    ),
+    'Accept': 'application/json, text/plain, */*',
+    'Origin': 'https://www.nasdaq.com',
+    'Referer': 'https://www.nasdaq.com/',
+}
+
+
+def _parse_nasdaq_number(value):
+    """將 Nasdaq 回傳的逗號、美元符號價格轉成浮點數。"""
+    if value is None:
+        return None
+    cleaned = re.sub(r'[^0-9.\-]', '', str(value))
+    return _safe_number(cleaned)
+
+
+def _previous_weekday(day_value):
+    """Nasdaq 市場日端點失效時，提供只排除週末的保守備援日期。"""
+    candidate = day_value - timedelta(days=1)
+    while candidate.weekday() >= 5:
+        candidate -= timedelta(days=1)
+    return candidate
+
+
+def fetch_nasdaq_us_close_signals(trading_day):
+    """從 Nasdaq 取得最近美股收盤，並拒絕早於最近應有交易日的資料。"""
+    expected_date = None
+    errors = []
+    try:
+        response = requests.get(
+            'https://api.nasdaq.com/api/market-info',
+            headers=NASDAQ_MARKET_HEADERS, timeout=7,
+        )
+        response.raise_for_status()
+        previous_trade_date = response.json().get('data', {}).get('previousTradeDate')
+        if previous_trade_date:
+            expected_date = datetime.strptime(previous_trade_date, '%b %d, %Y').date()
+    except Exception as exc:
+        errors.append(f'Nasdaq 交易日：{exc}')
+    expected_date = expected_date or _previous_weekday(trading_day)
+
+    # Nasdaq 可直接提供 COMP／SOX；道瓊與標普以流動性高的 DIA／SPY 收盤報酬代理。
+    instruments = {
+        'DJI': ('道瓊', 'DIA', 'etf', 'Nasdaq｜DIA 指數代理'),
+        'NASDAQ': ('那斯達克', 'COMP', 'index', 'Nasdaq｜COMP 指數'),
+        'SP500': ('標普500', 'SPY', 'etf', 'Nasdaq｜SPY 指數代理'),
+        'SOX': ('費半', 'SOX', 'index', 'Nasdaq｜SOX 指數'),
+    }
+    from_date = (expected_date - timedelta(days=12)).isoformat()
+    to_date = trading_day.isoformat()
+
+    def fetch_one(item):
+        key, (label, symbol, asset_class, source) = item
+        try:
+            response = requests.get(
+                f'https://api.nasdaq.com/api/quote/{symbol}/historical',
+                params={
+                    'assetclass': asset_class, 'fromdate': from_date,
+                    'todate': to_date, 'limit': 12,
+                },
+                headers=NASDAQ_MARKET_HEADERS, timeout=8,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            records = payload.get('data', {}).get('tradesTable', {}).get('rows') or []
+            parsed = []
+            for record in records:
+                try:
+                    trade_date = datetime.strptime(str(record.get('date')), '%m/%d/%Y').date()
+                except (TypeError, ValueError):
+                    continue
+                close = _parse_nasdaq_number(record.get('close'))
+                if close is not None and close > 0:
+                    parsed.append((trade_date, close))
+            parsed.sort(key=lambda pair: pair[0], reverse=True)
+            if len(parsed) < 2:
+                return None, f'{label}：Nasdaq 收盤資料不足'
+            latest_date, latest = parsed[0]
+            _, previous = parsed[1]
+            if latest_date < expected_date:
+                return None, (
+                    f'{label}：資料停在 {latest_date:%m/%d}，'
+                    f'最近應有交易日為 {expected_date:%m/%d}，已排除評分'
+                )
+            return {
+                'key': key, 'label': label, 'group': '美股收盤', 'price': latest,
+                'pct': (latest / previous - 1) * 100,
+                'time': f'{latest_date:%m/%d} 收盤',
+                'weight': OPENING_SIGNAL_WEIGHTS[key], 'source': source,
+            }, None
+        except Exception as exc:
+            return None, f'{label}：{exc}'
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        results = list(executor.map(fetch_one, instruments.items()))
+    rows = []
+    for row, error in results:
+        if row:
+            rows.append(row)
+        if error:
+            errors.append(error)
+    return rows, errors, expected_date
 
 
 def _extract_yfinance_close(downloaded, ticker):
@@ -4900,12 +5031,6 @@ def fetch_opening_overseas_signals(trading_date_text, cutoff_text):
     cutoff_at = tz_tw.localize(datetime.strptime(cutoff_text, '%Y-%m-%d %H:%M'))
     rows = []
     errors = []
-    daily_symbols = {
-        'DJI': ('道瓊', '^DJI', '美股收盤'),
-        'NASDAQ': ('那斯達克', '^IXIC', '美股收盤'),
-        'SP500': ('標普500', '^GSPC', '美股收盤'),
-        'SOX': ('費半', '^SOX', '美股收盤'),
-    }
     intraday_symbols = {
         'NQ_FUT': ('小那期', 'NQ=F', '06:00 美期', dt_time(6, 0)),
         'YM_FUT': ('小道期', 'YM=F', '06:00 美期', dt_time(6, 0)),
@@ -4913,27 +5038,9 @@ def fetch_opening_overseas_signals(trading_date_text, cutoff_text):
         'KOSPI': ('韓股綜合', '^KS11', '08:00 日韓', dt_time(8, 0)),
     }
 
-    try:
-        downloaded = yf.download(
-            [item[1] for item in daily_symbols.values()], period='10d', interval='1d',
-            group_by='ticker', auto_adjust=False, progress=False, threads=True,
-        )
-        for key, (label, ticker, group) in daily_symbols.items():
-            series = _extract_yfinance_close(downloaded, ticker)
-            if len(series) < 2:
-                continue
-            previous = _safe_number(series.iloc[-2])
-            latest = _safe_number(series.iloc[-1])
-            if previous is None or latest is None or previous <= 0:
-                continue
-            rows.append({
-                'key': key, 'label': label, 'group': group, 'price': latest,
-                'pct': (latest / previous - 1) * 100,
-                'time': series.index[-1].strftime('%m/%d 收盤'),
-                'weight': OPENING_SIGNAL_WEIGHTS[key], 'source': 'Yahoo Finance 日線',
-            })
-    except Exception as exc:
-        errors.append(f'美股指數：{exc}')
+    us_close_rows, us_close_errors, _ = fetch_nasdaq_us_close_signals(trading_day)
+    rows.extend(us_close_rows)
+    errors.extend(us_close_errors)
 
     try:
         downloaded = yf.download(
@@ -4958,7 +5065,7 @@ def fetch_opening_overseas_signals(trading_date_text, cutoff_text):
     except Exception as exc:
         errors.append(f'盤前即時市場：{exc}')
     if not rows and not errors:
-        errors.append('Yahoo Finance 暫未回傳可用行情')
+        errors.append('Nasdaq／盤前行情來源暫未回傳可用資料')
     return rows, errors
 
 
@@ -5039,9 +5146,9 @@ def render_opening_direction_prompt():
     cutoff_minute = (cutoff_time.minute // 5) * 5
     cutoff_at = datetime.combine(now_tw.date(), dt_time(cutoff_time.hour, cutoff_minute))
 
-    title_col, refresh_col = st.columns([8, 1])
+    title_col, refresh_col = st.columns([9, 1], vertical_alignment='center')
     with title_col:
-        st.markdown('#### 🌏 08:30 台股試搓方向提示')
+        st.markdown('**🌏 08:30 台股試搓方向**　`只作盤前背景，不改動原選股規則`')
     with refresh_col:
         refresh = st.button('🔄 更新', key='refresh_opening_direction', width='stretch')
     if refresh:
@@ -5051,11 +5158,17 @@ def render_opening_direction_prompt():
 
     trading_date_text = now_tw.strftime('%Y-%m-%d')
     overseas_cache = st.session_state.get('opening_overseas_signal')
-    if refresh or auto_refresh_window or not overseas_cache or overseas_cache.get('date') != trading_date_text:
+    cache_outdated = (
+        not overseas_cache
+        or overseas_cache.get('date') != trading_date_text
+        or overseas_cache.get('version') != OPENING_SIGNAL_CACHE_VERSION
+    )
+    if refresh or auto_refresh_window or cache_outdated:
         rows, errors = fetch_opening_overseas_signals(
             trading_date_text, cutoff_at.strftime('%Y-%m-%d %H:%M')
         )
         st.session_state.opening_overseas_signal = {
+            'version': OPENING_SIGNAL_CACHE_VERSION,
             'date': trading_date_text, 'rows': rows, 'errors': errors,
         }
     else:
@@ -5089,28 +5202,41 @@ def render_opening_direction_prompt():
         '休市': ('#9e9e9e', '今日臺股休市，不產生試搓操作方向；行情僅保留作為下一交易日背景。'),
     }
     color, advice = palette[direction]
-    score_text = f"{result['score']} 分" if result['score'] is not None else '—'
-    weighted_text = f"{result['weighted_pct']:+.2f}%" if result['weighted_pct'] is not None else '—'
-    st.markdown(
-        f"<div style='border-left:6px solid {color};padding:10px 14px;background:rgba(128,128,128,.10);border-radius:6px;'>"
-        f"<span style='font-size:20px;font-weight:800;color:{color};'>{direction}</span>　"
-        f"綜合分數 {score_text}｜加權行情 {weighted_text}｜資料覆蓋 {result['coverage']}%<br>"
-        f"<span style='font-size:14px;'>{advice}</span></div>",
-        unsafe_allow_html=True,
-    )
-
     groups = ['台指夜盤', '美股收盤', '06:00 美期', '08:00 日韓']
-    group_columns = st.columns(4)
-    for column, group in zip(group_columns, groups):
+    group_badges = []
+    for group in groups:
         group_rows = [row for row in rows if row['group'] == group]
         if group_rows:
             group_weight = sum(row['weight'] for row in group_rows)
             group_pct = sum(row['pct'] * row['weight'] for row in group_rows) / group_weight
-            details = '｜'.join(f"{row['label']} {row['pct']:+.2f}%" for row in group_rows)
-            column.metric(group, f'{group_pct:+.2f}%')
-            column.caption(details)
+            detail_text = '｜'.join(
+                f"{row['label']} {_signed_percent_arrow(row['pct'])}（{row['time']}）"
+                for row in group_rows
+            )
+            group_badges.append(
+                "<span style='white-space:nowrap;padding:3px 8px;border-radius:999px;"
+                "background:rgba(128,128,128,.12);' "
+                f"title='{html.escape(detail_text, quote=True)}'>"
+                f"{html.escape(group)} {_percent_badge_html(group_pct, 13)}</span>"
+            )
         else:
-            column.metric(group, '待資料')
+            group_badges.append(
+                "<span style='white-space:nowrap;padding:3px 8px;border-radius:999px;"
+                "background:rgba(128,128,128,.12);color:#9e9e9e;'>"
+                f"{html.escape(group)} —</span>"
+            )
+
+    score_text = f"{result['score']} 分" if result['score'] is not None else '—'
+    weighted_badge = _percent_badge_html(result['weighted_pct'], 14)
+    st.markdown(
+        f"<div style='border-left:5px solid {color};padding:7px 10px;"
+        "background:rgba(128,128,128,.08);border-radius:6px;line-height:1.65;'>"
+        f"<span style='font-size:18px;font-weight:800;color:{color};'>{direction}</span>　"
+        f"分數 {score_text}　加權 {weighted_badge}　覆蓋 {result['coverage']}%　"
+        f"{' '.join(group_badges)}<br>"
+        f"<span style='font-size:12px;color:#a0a0a0;'>{html.escape(advice)}</span></div>",
+        unsafe_allow_html=True,
+    )
 
     phase = '08:30 試搓提示期間' if active_window else (
         '08:30 前逐步納入已開盤市場' if now_tw.time() < dt_time(8, 30)
@@ -5122,13 +5248,31 @@ def render_opening_direction_prompt():
                 'label': '市場', 'group': '群組', 'price': '價格', 'pct': '漲跌幅',
                 'time': '資料時間', 'weight': '權重', 'source': '來源',
             })
+            details['漲跌幅'] = details['漲跌幅'].apply(_signed_percent_arrow)
+
+            def style_opening_detail(row):
+                styles = [''] * len(row)
+                value = _to_number(
+                    str(row.get('漲跌幅', '')).replace('%', '').replace('↑', '')
+                    .replace('↓', '').replace('→', '')
+                )
+                if '漲跌幅' in row.index and value is not None:
+                    position = row.index.get_loc('漲跌幅')
+                    styles[position] = (
+                        'color:#ff4b4b;font-weight:bold;' if value > 0
+                        else ('color:#00c853;font-weight:bold;' if value < 0 else 'color:#9e9e9e;')
+                    )
+                return styles
+
             st.dataframe(
-                details[['群組', '市場', '價格', '漲跌幅', '資料時間', '權重', '來源']],
-                column_config={'漲跌幅': st.column_config.NumberColumn(format='%+.2f%%')},
+                details[['群組', '市場', '價格', '漲跌幅', '資料時間', '權重', '來源']]
+                .style.apply(style_opening_detail, axis=1),
+                column_config={'漲跌幅': st.column_config.TextColumn(width=90)},
                 hide_index=True, width='stretch',
             )
         st.caption(
             f'{phase}。美股採最近完整收盤；美期採 06:00 後、日韓採 08:00 後，盤後查看仍以 08:30 為截止。'
+            '美股收盤改採 Nasdaq；COMP／SOX 為指數，DIA／SPY 分別代理道瓊／標普，舊於最近應有交易日會排除評分。'
             '分數代表跨市場方向一致度，不是勝率；個股仍需依原戰略備註、支撐壓力與進場條件確認。'
         )
         if errors:
@@ -6140,7 +6284,6 @@ gc.collect()
 
 def render_futures_strategy_room():
     """期貨成交量排行、即時分析、忽略遞補與獨立計算介面。"""
-    render_futures_strategy_explanation()
     if 'futures_strategy_ignored' not in st.session_state:
         st.session_state.futures_strategy_ignored = set()
     if 'futures_strategy_manual' not in st.session_state:
@@ -6164,45 +6307,54 @@ def render_futures_strategy_room():
     if int(st.session_state.get('futures_minimum_volume', 1) or 1) < 1:
         st.session_state.futures_minimum_volume = 1
 
-    enhanced_col1, enhanced_col2, enhanced_col3 = st.columns([3, 2, 2])
-    with enhanced_col1:
-        enhanced_layer = st.checkbox(
-            "🧭 啟用附加分析層（可關閉回原表）",
-            key='futures_enhanced_layer_enabled',
-            help='加入支撐壓力、訊號狀態、進場信心、資料品質與流動性；不改變成交量排序。'
-        )
-    with enhanced_col2:
-        compact_futures_table = st.checkbox(
-            "精簡主表", value=True, key='futures_compact_table', disabled=not enhanced_layer,
-            help='保留主要決策欄位，其餘資料放在個別明細；關閉可查看完整表格。'
-        )
-    with enhanced_col3:
-        futures_notify = st.checkbox(
-            "🔔 訊號變化提醒", value=True, key='futures_strategy_notify', disabled=not enhanced_layer
-        )
+    info_col, settings_col = st.columns([2, 3])
+    with info_col:
+        render_futures_strategy_explanation()
+    with settings_col:
+        with st.expander("⚙️ 期貨篩選、策略與顯示設定", expanded=False):
+            enhanced_col1, enhanced_col2, enhanced_col3 = st.columns([3, 2, 2])
+            with enhanced_col1:
+                enhanced_layer = st.checkbox(
+                    "🧭 啟用附加分析層（可關閉回原表）",
+                    key='futures_enhanced_layer_enabled',
+                    help='加入支撐壓力、訊號狀態、進場信心、資料品質與流動性；不改變成交量排序。'
+                )
+            with enhanced_col2:
+                compact_futures_table = st.checkbox(
+                    "精簡主表", value=True, key='futures_compact_table', disabled=not enhanced_layer,
+                    help='保留主要決策欄位，其餘資料放在個別明細；關閉可查看完整表格。'
+                )
+            with enhanced_col3:
+                futures_notify = st.checkbox(
+                    "🔔 訊號變化提醒", value=True, key='futures_strategy_notify', disabled=not enhanced_layer
+                )
 
-    control1, control2, control3, control4 = st.columns(4)
-    with control1:
-        strategy_mode = st.radio("策略週期", ["當沖", "波段"], horizontal=True, key="futures_strategy_mode")
-        direction_choice = st.radio(
-            "分析方向", ["自動", "偏多", "偏空"], horizontal=True,
-            key="futures_direction_choice",
-            help="自動：依自訂價相對開盤價（當沖則優先參考 VWAP）判定；偏多：固定以突破壓力的做多計畫計算；偏空：固定以跌破支撐的做空計畫計算。"
-        )
-    with control2:
-        limit_rows = st.number_input("顯示筆數", min_value=1, max_value=50, value=5, step=1, key="futures_strategy_limit")
-        minimum_volume = st.number_input("最低成交口數", min_value=1, value=1, step=1, key="futures_minimum_volume")
-    with control3:
-        hide_index = st.checkbox("隱藏指數期貨", value=True, key="futures_hide_index")
-        hide_etf = st.checkbox("隱藏 ETF 期貨", value=False, key="futures_hide_etf")
-        hide_small = st.checkbox("隱藏小型期貨", value=False, key="futures_hide_small")
-        hide_next = st.checkbox("隱藏次月期貨", value=True, key="futures_hide_next")
-    with control4:
+            control1, control2, control3 = st.columns(3)
+            with control1:
+                strategy_mode = st.radio("策略週期", ["當沖", "波段"], horizontal=True, key="futures_strategy_mode")
+                direction_choice = st.radio(
+                    "分析方向", ["自動", "偏多", "偏空"], horizontal=True,
+                    key="futures_direction_choice",
+                    help="自動：依自訂價相對開盤價（當沖則優先參考 VWAP）判定；偏多：固定以突破壓力的做多計畫計算；偏空：固定以跌破支撐的做空計畫計算。"
+                )
+            with control2:
+                limit_rows = st.number_input("顯示筆數", min_value=1, max_value=50, value=5, step=1, key="futures_strategy_limit")
+                minimum_volume = st.number_input("最低成交口數", min_value=1, value=1, step=1, key="futures_minimum_volume")
+            with control3:
+                hide_index = st.checkbox("隱藏指數期貨", value=True, key="futures_hide_index")
+                hide_etf = st.checkbox("隱藏 ETF 期貨", value=False, key="futures_hide_etf")
+                hide_small = st.checkbox("隱藏小型期貨", value=False, key="futures_hide_small")
+                hide_next = st.checkbox("隱藏次月期貨", value=True, key="futures_hide_next")
+
+    action_col1, action_col2, action_col3 = st.columns(3)
+    with action_col1:
         refresh_official = st.button("🔄 更新成交量／保證金", use_container_width=True, key="refresh_futures_official")
+    with action_col2:
         refresh_rank = st.button(
             "📊 即時更新成交量排行", use_container_width=True, key="refresh_futures_rank",
             help="登入 Shioaji 後批次取得盤中／夜盤累計成交量並重新排序；不會背景輪詢。"
         )
+    with action_col3:
         refresh_live = st.button("⏱️ 即時更新報價與分析", use_container_width=True, type="primary", key="refresh_futures_live")
 
     if refresh_official:
@@ -6501,7 +6653,7 @@ def render_futures_strategy_room():
             '當日漲停價': st.column_config.NumberColumn(format='%.12g', width=80, disabled=True, help='依期交所漲跌資料反推參考價後估算；實際限制以期交所與券商下單畫面為準。'),
             '當日跌停價': st.column_config.NumberColumn(format='%.12g', width=80, disabled=True, help='依期交所漲跌資料反推參考價後估算；實際限制以期交所與券商下單畫面為準。'),
             '自訂價(可修)': st.column_config.TextColumn('自訂價 ✏️', width=85, help='可手動調整；按即時更新時會改為最新報價。'),
-            '漲跌幅': st.column_config.NumberColumn(format='%+.2f%%', width=70, disabled=True),
+            '漲跌幅': st.column_config.TextColumn(width=85, disabled=True),
             '所需保證金': st.column_config.NumberColumn(format='%,.0f', width=90, disabled=True),
             '維持保證金': st.column_config.NumberColumn(format='%,.0f', width=90, disabled=True),
             '訊號狀態': st.column_config.TextColumn(width=105, disabled=True, help='等待、接近、觸發或失效；不會自動下單。'),
@@ -6533,8 +6685,10 @@ def render_futures_strategy_room():
         futures_editor_key = (
             f"futures_strategy_editor_{st.session_state.futures_strategy_editor_revision}_{table_signature}"
         )
+        editor_display = display_rows[futures_display_columns].copy()
+        editor_display['漲跌幅'] = editor_display['漲跌幅'].apply(_signed_percent_arrow)
         edited = st.data_editor(
-            display_rows[futures_display_columns].style.apply(style_futures_row, axis=1),
+            editor_display.style.apply(style_futures_row, axis=1),
             column_config=futures_column_config(),
             hide_index=True, width='stretch', row_height=30,
             key=futures_editor_key
@@ -6741,6 +6895,7 @@ def render_futures_strategy_room():
                 independent_rows[column] = None
         independent_display = independent_rows[independent_columns].copy()
         independent_display['自訂價(可修)'] = independent_display['自訂價(可修)'].apply(fmt_price)
+        independent_display['漲跌幅'] = independent_display['漲跌幅'].apply(_signed_percent_arrow)
         st.dataframe(
             independent_display.style.apply(style_futures_row, axis=1),
             column_config=futures_column_config(include_ignore=False),
@@ -6765,9 +6920,15 @@ with tab1:
         render_strategy_validation_room()
 
 with stock_strategy_container:
-    current_font_size, hide_non_stock, show_3d_hilo = render_stock_strategy_controls()
-    render_stock_strategy_explanation()
-    col_search, col_file = st.columns([2, 1])
+    stock_settings_col, stock_help_col = st.columns([3, 2])
+    with stock_settings_col:
+        current_font_size, hide_non_stock, show_3d_hilo = render_stock_strategy_controls()
+    with stock_help_col:
+        render_stock_strategy_explanation()
+    col_search = st.expander(
+        "📥 選股資料來源與快速查詢",
+        expanded=st.session_state.stock_data.empty,
+    )
     with col_search:
         code_map, name_map = load_local_stock_names()
         stock_options = []
@@ -7072,7 +7233,7 @@ with stock_strategy_container:
                     'attention': {}, 'disposition': [], 'updated': None, 'errors': []
                 }
 
-            with st.expander("🧭 選股條件與進場信心設定", expanded=True):
+            with st.expander("🧭 選股條件與進場信心設定", expanded=False):
                 strategy_mode = st.radio(
                     "策略模式", ["當沖預覽", "隔日／波段"], horizontal=True,
                     key="risk_filter_strategy_mode",
@@ -7174,7 +7335,7 @@ with stock_strategy_container:
             market_bias = str(market_environment.get('bias', '盤整'))
             market_source = str(market_environment.get('source', '臺指期資料不足'))
             market_change = _safe_number(market_environment.get('change'))
-            market_change_text = f" {market_change:+.2f}%" if market_change is not None else ''
+            market_change_text = f" {_signed_percent_arrow(market_change)}" if market_change is not None else ''
             st.caption(f"市場環境：{market_bias}｜依據 {market_source}{market_change_text}；只提供順逆勢標示，不改動原選股順位。")
 
             for i, row in df_display.iterrows():
@@ -7283,10 +7444,10 @@ with stock_strategy_container:
                     p = float(df_display.at[i, "收盤價"])
                     chg = float(df_display.at[i, "漲跌幅"])
                     df_display.at[i, "收盤價"] = fmt_price(p)
-                    df_display.at[i, "漲跌幅"] = f"{chg:+.2f}%"
+                    df_display.at[i, "漲跌幅"] = _signed_percent_arrow(chg)
                 except:
                     df_display.at[i, "收盤價"] = fmt_price(df_display.at[i, "收盤價"])
-                    try: df_display.at[i, "漲跌幅"] = f"{float(df_display.at[i, '漲跌幅']):.2f}%"
+                    try: df_display.at[i, "漲跌幅"] = _signed_percent_arrow(float(df_display.at[i, '漲跌幅']))
                     except: pass
 
         df_display = df_display.reset_index(drop=True)
@@ -7318,7 +7479,10 @@ with stock_strategy_container:
             
             price_c = ''
             try:
-                c_val = float(str(row.get('漲跌幅', '0')).replace('%', '').replace('+', ''))
+                c_val = float(
+                    str(row.get('漲跌幅', '0')).replace('%', '').replace('+', '')
+                    .replace('↑', '').replace('↓', '').replace('→', '').strip()
+                )
                 price_c = 'color: #ff4b4b;' if c_val > 0 else ('color: #00e676;' if c_val < 0 else '')
             except: pass
             
@@ -7894,10 +8058,10 @@ with stock_strategy_container:
                             p = float(df_indep.at[i, "收盤價"])
                             chg = float(df_indep.at[i, "漲跌幅"])
                             df_indep.at[i, "收盤價"] = fmt_price(p)
-                            df_indep.at[i, "漲跌幅"] = f"{chg:+.2f}%"
+                            df_indep.at[i, "漲跌幅"] = _signed_percent_arrow(chg)
                         except:
                             df_indep.at[i, "收盤價"] = fmt_price(df_indep.at[i, "收盤價"])
-                            try: df_indep.at[i, "漲跌幅"] = f"{float(df_indep.at[i, '漲跌幅']):.2f}%"
+                            try: df_indep.at[i, "漲跌幅"] = _signed_percent_arrow(float(df_indep.at[i, '漲跌幅']))
                             except: pass
 
                 for col in input_cols:
