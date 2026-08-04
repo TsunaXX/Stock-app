@@ -3650,6 +3650,7 @@ def render_strategy_validation_room():
         filtered = filtered[filtered['策略'].astype(str) == strategy_filter]
 
     with export_col:
+        st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
         export_columns = [
             '建立時間', '市場', '代碼', '名稱', '策略', '方向', '訊號狀態', '評分', '信心判讀',
             '進場價', '停損價', '目標價', '最新價', '15分(R)', '30分(R)', '60分(R)', '收盤(R)',
@@ -5296,7 +5297,7 @@ def render_opening_direction_prompt():
 
     title_col, refresh_col = st.columns([9, 1], vertical_alignment='center')
     with title_col:
-        st.markdown('**🌏 08:30 台股試搓方向**　`只作盤前背景，不改動原選股規則`')
+        st.markdown('**台股試搓方向**')
     with refresh_col:
         refresh = st.button('🔄 更新', key='refresh_opening_direction', width='stretch')
     if refresh:
@@ -7714,7 +7715,10 @@ with stock_strategy_container:
                 "訊號狀態": st.column_config.TextColumn(width=105, disabled=True, help="將原條件濃縮為等待、接近、觸發或暫停；原規則仍在明細。"),
                 "市場一致": st.column_config.TextColumn(width=110, disabled=True, help="目前方向是否與近月臺指期環境一致；不改變原排序。"),
                 "資料狀態": st.column_config.TextColumn(width=115, disabled=True, help="顯示即時、手動／暫存、官方日行情或資料過期。"),
-                "買賣價差": st.column_config.TextColumn(width=75, disabled=True),
+                "買賣價差": st.column_config.TextColumn(
+                    width=75, disabled=True,
+                    help="即時最佳賣價與最佳買價的距離，換算為跳動單位；跳數越少通常代表報價較連續、進出成本較低。無即時買賣價時顯示「—」。"
+                ),
                 "信心分": st.column_config.ProgressColumn("進場信心", min_value=0, max_value=100, format="%d", width=100, help="綜合方向條件、觸發位置、市場一致與資料狀態；代表條件一致度，不是勝率。"),
                 "信心判讀": st.column_config.TextColumn(width=80, disabled=True, help="高／中高／中／低；追離進場點、條件失效或資料過期時會降級。"),
                 "支撐壓力": st.column_config.TextColumn(width=160, disabled=True, help="當沖採開盤區間與 VWAP；隔日／波段沿用原戰略價位，顯示最接近目前價格的支撐與壓力。"),
