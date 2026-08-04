@@ -5176,7 +5176,7 @@ def build_stock_support_resistance(row, is_daytrade_mode=False):
             suffix = f'｜VWAP {fmt_price(vwap)}' if vwap is not None else ''
             return f'支 {fmt_price(opening_low)}｜壓 {fmt_price(opening_high)}{suffix}'
 
-    current_price = _safe_number(row.get('自訂價(可修)')) or _safe_number(row.get('收盤價'))
+    current_price = _safe_number(row.get('收盤價'))
     values = []
     for point in row.get('_points', []) if isinstance(row.get('_points', []), list) else []:
         value = _safe_number(point.get('val')) if isinstance(point, dict) else None
@@ -5284,7 +5284,8 @@ def calculate_note_width(series, font_size):
     return max(50, pixel_width)
 
 def recalculate_row(row, points_map):
-    custom_price = row.get('自訂價(可修)')
+    # 股票戰略室改以成交價作為唯一計算基準，不再使用舊版自訂價。
+    custom_price = row.get('收盤價')
     code = row.get('代號')
     status = ""
     if pd.isna(custom_price) or str(custom_price).strip() == "": return status
@@ -5677,7 +5678,7 @@ def fetch_stock_data_raw(code, name_hint="", extra_data=None, futures_set=None, 
     display_change_rate = live_quote_rate if live_quote_rate is not None else live_pct_change
     return {
         "代號": code, "名稱": final_name_display, "收盤價": round(display_price, 2), "漲跌幅": display_change_rate, "期貨": has_futures,
-        "當日漲停價": limit_up_show, "當日跌停價": limit_down_show, "自訂價(可修)": None,   
+        "當日漲停價": limit_up_show, "當日跌停價": limit_down_show,
         "戰略備註": strategy_note, "_points": full_calc_points, "狀態": "", "_auto_note": auto_note, "_ma5": ma5 if 'ma5' in locals() else None,
         "_risk_atr14": risk_atr14, "_risk_ma20": risk_ma20, "_risk_ma20_slope": risk_ma20_slope,
         "_risk_close_position": risk_close_position, "_risk_prev_high": risk_prev_high, "_risk_prev_low": risk_prev_low,
@@ -6646,6 +6647,14 @@ with stock_strategy_container:
         gc.collect()
 
     if not st.session_state.stock_data.empty:
+        # 舊版股票自訂價不再參與顯示或策略計算；成交價統一採行情資料。
+        legacy_stock_columns = [
+            column for column in ('自訂價(可修)', '自訂價價差')
+            if column in st.session_state.stock_data.columns
+        ]
+        if legacy_stock_columns:
+            st.session_state.stock_data = st.session_state.stock_data.drop(columns=legacy_stock_columns)
+
         # 新增：當限制筆數減少時，自動隱藏多餘的檔案上傳資料
         df_check = st.session_state.stock_data
         if '_source' in df_check.columns:
@@ -6695,8 +6704,8 @@ with stock_strategy_container:
         points_map = df_display.set_index('代號')['_points'].to_dict() if '_points' in df_display.columns else {}
         auto_notes_dict = df_display.set_index('代號')['_auto_note'].to_dict() if '_auto_note' in df_display.columns else {}
 
-        # 進行自訂價價差與5日線價差計算
-        if "自訂價價差" not in df_display.columns: df_display["自訂價價差"] = None
+        # 成交價與 5 日線價差皆以目前成交／最後成交資料計算。
+        if "成交價價差" not in df_display.columns: df_display["成交價價差"] = None
         if "5日線價差" not in df_display.columns: df_display["5日線價差"] = None
         
         for i, row in df_display.iterrows():
@@ -6708,9 +6717,9 @@ with stock_strategy_container:
                         break
             
             if pd.notna(ma5_val):
-                c_price = row.get('自訂價(可修)')
+                c_price = row.get('收盤價')
                 if pd.notna(c_price) and str(c_price).strip() != "":
-                    try: df_display.at[i, '自訂價價差'] = round(float(c_price) - float(ma5_val), 2)
+                    try: df_display.at[i, '成交價價差'] = round(float(c_price) - float(ma5_val), 2)
                     except: pass
                     
                 close_p = row.get('收盤價')
@@ -6881,13 +6890,11 @@ with stock_strategy_container:
                 required_ready = bool(result.get('data_time')) if is_daytrade_mode else result.get('extension') is not None
                 if row.get('_quote_time'):
                     data_health = build_data_health(row.get('_quote_time'), required_ready, live_expected=True)
-                elif _safe_number(row.get('自訂價(可修)')) is not None:
-                    data_health = '🟡 手動／暫存價'
                 else:
                     data_health = build_data_health(quote_time, required_ready, live_expected=is_daytrade_mode)
                 bid = _safe_number(row.get('_quote_bid'))
                 ask = _safe_number(row.get('_quote_ask'))
-                reference_price = _safe_number(row.get('自訂價(可修)')) or _safe_number(row.get('收盤價'))
+                reference_price = _safe_number(row.get('收盤價'))
                 tick = get_tick_size(reference_price) if reference_price is not None else 0.01
                 spread_ticks = (ask - bid) / tick if bid is not None and ask is not None and ask >= bid and tick > 0 else None
                 market_alignment = calculate_market_alignment(risk_direction, market_bias)
@@ -6923,20 +6930,20 @@ with stock_strategy_container:
 
             if stock_compact_table:
                 input_cols = [
-                    "移除", "代號", "名稱", "戰略備註", "自訂價(可修)", "漲跌幅", "期貨",
-                    "訊號狀態", "信心分", "信心判讀", "風險", "市場一致", "資料狀態",
-                    "5日線價差", "支撐壓力", "進出場預判"
+                    "移除", "代號", "名稱", "戰略備註", "收盤價", "漲跌幅",
+                    "支撐壓力", "進出場預判", "5日線價差", "信心分", "信心判讀",
+                    "訊號狀態", "市場一致", "風險", "資料狀態"
                 ]
             elif is_daytrade_mode:
-                input_cols = ["移除", "代號", "名稱", "戰略備註", "自訂價(可修)", "狀態", "自訂價價差", "5日線價差", "當日漲停價", "當日跌停價", "收盤價", "漲跌幅", "期貨", "風險", "VWAP 狀態", "開盤區間", "量能", "信心分", "信心判讀", "支撐壓力", "盤中觸發", "進出場預判", "訊號狀態", "市場一致", "資料狀態", "買賣價差"]
+                input_cols = ["移除", "代號", "名稱", "戰略備註", "收盤價", "漲跌幅", "狀態", "成交價價差", "5日線價差", "風險", "VWAP 狀態", "開盤區間", "量能", "信心分", "信心判讀", "支撐壓力", "盤中觸發", "進出場預判", "訊號狀態", "市場一致", "當日漲停價", "當日跌停價", "期貨", "資料狀態", "買賣價差"]
             else:
-                input_cols = ["移除", "代號", "名稱", "戰略備註", "自訂價(可修)", "狀態", "自訂價價差", "5日線價差", "當日漲停價", "當日跌停價", "收盤價", "漲跌幅", "期貨", "風險", "信心分", "信心判讀", "乖離", "支撐壓力", "隔日規則", "進出場預判", "訊號狀態", "市場一致", "資料狀態", "買賣價差"]
+                input_cols = ["移除", "代號", "名稱", "戰略備註", "收盤價", "漲跌幅", "狀態", "成交價價差", "5日線價差", "風險", "信心分", "信心判讀", "乖離", "支撐壓力", "隔日規則", "進出場預判", "訊號狀態", "市場一致", "當日漲停價", "當日跌停價", "期貨", "資料狀態", "買賣價差"]
         else:
-            input_cols = ["移除", "代號", "名稱", "戰略備註", "自訂價(可修)", "狀態", "自訂價價差", "5日線價差", "當日漲停價", "當日跌停價", "收盤價", "漲跌幅", "期貨"]
+            input_cols = ["移除", "代號", "名稱", "戰略備註", "收盤價", "漲跌幅", "狀態", "成交價價差", "5日線價差", "當日漲停價", "當日跌停價", "期貨"]
         for col in input_cols:
             if col not in df_display.columns: df_display[col] = None
 
-        cols_to_fmt = ["當日漲停價", "當日跌停價", "自訂價(可修)", "自訂價價差", "5日線價差"]
+        cols_to_fmt = ["當日漲停價", "當日跌停價", "成交價價差", "5日線價差"]
         for c in cols_to_fmt:
             if c in df_display.columns: df_display[c] = df_display[c].apply(fmt_price)
 
@@ -6995,7 +7002,7 @@ with stock_strategy_container:
                 if col == "名稱": styles[idx] = name_c
                 elif col in ["收盤價", "漲跌幅"]: styles[idx] = price_c
                 elif col == "狀態": styles[idx] = status_c
-                elif col in ["自訂價價差", "5日線價差"]:
+                elif col in ["成交價價差", "5日線價差"]:
                     val = row[col]
                     try:
                         f_val = float(val)
@@ -7081,13 +7088,12 @@ with stock_strategy_container:
                 "移除": st.column_config.CheckboxColumn("刪除", width=40, help="勾選後刪除並自動遞補"),
                 "代號": st.column_config.TextColumn(disabled=True, width=50), 
                 "名稱": st.column_config.TextColumn(disabled=True, width="small"),
-                "收盤價": st.column_config.TextColumn(width="small", disabled=True),
+                "收盤價": st.column_config.TextColumn("成交價", width="small", disabled=True),
                 "漲跌幅": st.column_config.TextColumn(disabled=True, width="small"),
                 "期貨": st.column_config.TextColumn(width=80), 
-                "自訂價(可修)": st.column_config.TextColumn("自訂價 ✏️", width=60), 
                 "當日漲停價": st.column_config.TextColumn(width="small", disabled=True),
                 "當日跌停價": st.column_config.TextColumn(width="small", disabled=True),
-                "自訂價價差": st.column_config.TextColumn(width=70, disabled=True),
+                "成交價價差": st.column_config.TextColumn(width=70, disabled=True),
                 "5日線價差": st.column_config.TextColumn(width=70, disabled=True),
                 "狀態": None, # 設定為 None 即可在資料編輯器中隱藏該欄位
                 "戰略備註": st.column_config.TextColumn("戰略備註 ✏️", width=note_width_px, disabled=False),
@@ -7136,7 +7142,7 @@ with stock_strategy_container:
                         '訊號狀態': str(row.get('訊號狀態', '')), '評分': _safe_number(score),
                         '信心判讀': str(row.get('信心判讀', '')),
                         '進場價': plan['entry'], '停損價': plan['stop'], '目標價': plan['target'],
-                        '最新價': _safe_number(row.get('自訂價(可修)')) or _safe_number(row.get('收盤價')),
+                        '最新價': _safe_number(row.get('收盤價')),
                         '風險': str(row.get('風險', '')), '資料狀態': str(row.get('資料狀態', '')),
                     })
                 added, saved = register_strategy_signals(records)
@@ -7186,15 +7192,14 @@ with stock_strategy_container:
                 last_row_edited = str(last_visible_idx) in str(edited_rows.keys())
                 
                 if last_row_edited:
-                    update_map = edited_df.set_index('代號')[['自訂價(可修)', '戰略備註']].to_dict('index')
+                    update_map = edited_df.set_index('代號')[['戰略備註']].to_dict('index')
                     
                     if st.session_state.update_delay_sec > 0: time.sleep(st.session_state.update_delay_sec)
                     
                     for j, r in st.session_state.stock_data.iterrows():
                         c_code = r['代號']
                         if c_code in update_map:
-                            np, nn = update_map[c_code]['自訂價(可修)'], update_map[c_code]['戰略備註']
-                            st.session_state.stock_data.at[j, '自訂價(可修)'] = np
+                            nn = update_map[c_code]['戰略備註']
                             if str(r['戰略備註']) != str(nn):
                                 b_auto = str(auto_notes_dict.get(c_code, "")).strip()
                                 n_note = str(nn).strip()
@@ -7269,20 +7274,10 @@ with stock_strategy_container:
         
         st.markdown("---")
         # 重新配置欄位比例與順序
-        col_rt_update, col_btn, col_clear, col_clear_price = st.columns([2, 2.5, 2, 2])
+        col_rt_update, col_btn, col_clear = st.columns([2, 2.5, 2])
         with col_rt_update: btn_rt_update = st.button("⏱️ 即時更新報價", width='stretch', type="primary")
         with col_btn: btn_update = st.button("⚡ 執行更新&儲存手動備註", width='stretch')
         with col_clear: btn_clear_notes = st.button("🧹 清除手動備註", width='stretch', help="清除所有記憶的戰略備註內容")
-        with col_clear_price: btn_clear_price = st.button("🗑️ 清除自訂價", width='stretch', help="清除所有輸入的自訂價")
-        
-        if btn_clear_price:
-            for idx, row in st.session_state.stock_data.iterrows():
-                st.session_state.stock_data.at[idx, '自訂價(可修)'] = ""
-                st.session_state.stock_data.at[idx, '狀態'] = recalculate_row(st.session_state.stock_data.iloc[idx], points_map)
-            save_data_cache(st.session_state.stock_data, st.session_state.ignored_stocks, st.session_state.all_candidates, st.session_state.saved_notes)
-            st.session_state.stock_strategy_editor_revision += 1
-            st.toast("自訂價已清除", icon="🗑️")
-            st.rerun()
 
         if btn_rt_update:
             if st.session_state.get('sj_logged_in', False) and st.session_state.get('sj_api'):
@@ -7312,7 +7307,6 @@ with stock_strategy_container:
                                         st.session_state.stock_data.at[i, '收盤價'] = rt_price
                                         if rt_change_rate is not None:
                                             st.session_state.stock_data.at[i, '漲跌幅'] = rt_change_rate
-                                        st.session_state.stock_data.at[i, '自訂價(可修)'] = fmt_price(rt_price)
                                         st.session_state.stock_data.at[i, '_quote_bid'] = _safe_number(getattr(snapshot, 'buy_price', None))
                                         st.session_state.stock_data.at[i, '_quote_ask'] = _safe_number(getattr(snapshot, 'sell_price', None))
                                         st.session_state.stock_data.at[i, '_quote_time'] = datetime.now(pytz.timezone('Asia/Taipei')).strftime('%Y/%m/%d %H:%M:%S')
@@ -7324,7 +7318,7 @@ with stock_strategy_container:
                     tz_tw = pytz.timezone('Asia/Taipei')
                     st.session_state.last_rt_update_time = datetime.now(tz_tw).strftime("%Y/%m/%d %H:%M:%S")
                     update_strategy_signal_outcomes({
-                        str(row['代號']): _safe_number(row.get('自訂價(可修)')) or _safe_number(row.get('收盤價'))
+                        str(row['代號']): _safe_number(row.get('收盤價'))
                         for _, row in st.session_state.stock_data.iterrows()
                     })
                     save_data_cache(st.session_state.stock_data, st.session_state.ignored_stocks, st.session_state.all_candidates, st.session_state.saved_notes)
@@ -7359,12 +7353,11 @@ with stock_strategy_container:
             st.markdown(f"<div style='text-align: left; color: #888; font-size: 14px; margin-top: 5px; margin-bottom: 10px;'>透過永豐API即時更新報價(更新時間:{st.session_state.last_rt_update_time})</div>", unsafe_allow_html=True)
 
         if btn_update:
-             update_map = edited_df.set_index('代號')[['自訂價(可修)', '戰略備註']].to_dict('index')
+             update_map = edited_df.set_index('代號')[['戰略備註']].to_dict('index')
              for i, row in st.session_state.stock_data.iterrows():
                 code = row['代號']
                 if code in update_map:
                     new_note = update_map[code]['戰略備註']
-                    st.session_state.stock_data.at[i, '自訂價(可修)'] = update_map[code]['自訂價(可修)']
                     if str(row['戰略備註']) != str(new_note):
                         b_auto = str(auto_notes_dict.get(code, "")).strip()
                         n_note = str(new_note).strip()
@@ -7552,11 +7545,11 @@ with stock_strategy_container:
                             st.warning("目前沒有符合門檻的候選；可降低最低評分、放寬最大乖離，或改看完整結果。")
 
                     if indep_is_daytrade:
-                        input_cols = ["代號", "名稱", "戰略備註", "5日線價差", "當日漲停價", "當日跌停價", "收盤價", "漲跌幅", "期貨", "風險", "VWAP 狀態", "開盤區間", "量能", "訊號狀態", "信心分", "信心判讀", "支撐壓力", "盤中觸發", "進出場預判", "市場一致", "資料狀態"]
+                        input_cols = ["代號", "名稱", "戰略備註", "收盤價", "漲跌幅", "5日線價差", "風險", "VWAP 狀態", "開盤區間", "量能", "訊號狀態", "信心分", "信心判讀", "支撐壓力", "盤中觸發", "進出場預判", "市場一致", "當日漲停價", "當日跌停價", "期貨", "資料狀態"]
                     else:
-                        input_cols = ["代號", "名稱", "戰略備註", "5日線價差", "當日漲停價", "當日跌停價", "收盤價", "漲跌幅", "期貨", "風險", "訊號狀態", "信心分", "信心判讀", "乖離", "支撐壓力", "隔日規則", "進出場預判", "市場一致", "資料狀態"]
+                        input_cols = ["代號", "名稱", "戰略備註", "收盤價", "漲跌幅", "5日線價差", "風險", "訊號狀態", "信心分", "信心判讀", "乖離", "支撐壓力", "隔日規則", "進出場預判", "市場一致", "當日漲停價", "當日跌停價", "期貨", "資料狀態"]
                 else:
-                    input_cols = ["代號", "名稱", "戰略備註", "5日線價差", "當日漲停價", "當日跌停價", "收盤價", "漲跌幅", "期貨"]
+                    input_cols = ["代號", "名稱", "戰略備註", "收盤價", "漲跌幅", "5日線價差", "當日漲停價", "當日跌停價", "期貨"]
                 for col in input_cols:
                     if col not in df_indep.columns: df_indep[col] = None
                     
@@ -7618,13 +7611,11 @@ with stock_strategy_container:
                         **indep_column_config,
                         "代號": st.column_config.TextColumn(width=50), 
                         "名稱": st.column_config.TextColumn(width="small"),
-                        "收盤價": st.column_config.TextColumn(width="small"),
+                        "收盤價": st.column_config.TextColumn("成交價", width="small"),
                         "漲跌幅": st.column_config.TextColumn(width="small"),
                         "期貨": st.column_config.TextColumn(width=80), 
-                        "自訂價(可修)": st.column_config.TextColumn("自訂價", width=60), 
                         "當日漲停價": st.column_config.TextColumn(width="small"),
                         "當日跌停價": st.column_config.TextColumn(width="small"),
-                        "自訂價價差": st.column_config.TextColumn(width=70),
                         "5日線價差": st.column_config.TextColumn(width=70),
                         "狀態": None, # 設定為 None 隱藏獨立計算結果的狀態欄位
                         "戰略備註": st.column_config.TextColumn("戰略備註", width=note_width_px)
