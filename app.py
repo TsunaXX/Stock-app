@@ -1987,6 +1987,36 @@ def fetch_shioaji_data(api, code, interval='1d', lookback_days=10):
         st.session_state['sj_last_error'] = f"{type(e).__name__}: {e}"
         return pd.DataFrame()
 
+
+def get_cached_fibonacci_kbars(api, code, interval='1d', lookback_days=10):
+    """Reuse Fibonacci history while the live stream updates the newest bar.
+
+    Historical kbars are the expensive part of a chart rerun.  The cache is
+    deliberately shorter for minute bars, but daily/weekly history can be
+    reused for much longer because the current quote is overlaid separately.
+    """
+    if api is None:
+        return pd.DataFrame()
+    ttl_by_interval = {
+        '1m': 20, '5m': 45, '15m': 90, '60m': 180,
+        '1d': 1800, '1wk': 3600, '1mo': 3600,
+    }
+    ttl = ttl_by_interval.get(interval, 120)
+    cache = st.session_state.setdefault('_fibonacci_kbar_cache', {})
+    cache_key = (id(api), str(code), str(interval), int(lookback_days))
+    cached = cache.get(cache_key)
+    now_mono = time.monotonic()
+    if cached and now_mono - cached['saved_at'] <= ttl:
+        return cached['data'].copy()
+
+    data = fetch_shioaji_data(api, code, interval=interval, lookback_days=lookback_days)
+    if not data.empty:
+        cache[cache_key] = {'saved_at': now_mono, 'data': data.copy()}
+        if len(cache) > 12:
+            oldest_key = min(cache, key=lambda key: cache[key]['saved_at'])
+            cache.pop(oldest_key, None)
+    return data.copy()
+
 # ==========================================
 # 費波計算核心函數
 # ==========================================
@@ -3513,6 +3543,26 @@ def _fibo_trade_price(value, is_futures=False):
     return float(round(value)) if is_futures else round_to_tick(value)
 
 
+def _round_fibo_asset_price(value, asset_type):
+    if asset_type == 'futures':
+        return float(round(float(value)))
+    if asset_type == 'index':
+        return round(float(value), 2)
+    return round_to_tick(value)
+
+
+def _format_fibo_trade_price(value, asset_type):
+    """Format futures as whole points and stocks with their actual tick decimals."""
+    rounded = _round_fibo_asset_price(value, asset_type)
+    if asset_type == 'futures':
+        return f"{rounded:,.0f}"
+    if asset_type == 'index':
+        return f"{rounded:,.2f}"
+    tick = get_taiwan_tick_size(max(float(rounded), 0.01))
+    decimals = 2 if tick < 0.1 else (1 if tick < 1 else 0)
+    return f"{rounded:,.{decimals}f}"
+
+
 def _fibo_pivots(data, width=2):
     """Return alternating local swing points, newest point last."""
     highs = data['High'].astype(float).to_numpy()
@@ -3556,10 +3606,12 @@ def build_fibonacci_trade_suggestion(data, range_high, range_low, ticker_code, i
         (source['High'].astype(float) - previous_close).abs(),
         (source['Low'].astype(float) - previous_close).abs(),
     ], axis=1).max(axis=1)
-    atr = float(true_range.tail(14).mean()) if not true_range.empty else 0.0
-    atr = max(atr if np.isfinite(atr) else 0.0, (range_high - range_low) * 0.01, 1.0)
-    buffer = max(atr * 0.18, (range_high - range_low) * 0.006)
     is_futures = ticker_code in ('TWF=F', 'TMF=F')
+    asset_type = 'futures' if is_futures else ('index' if str(ticker_code).startswith('^') else 'stock')
+    atr = float(true_range.tail(14).mean()) if not true_range.empty else 0.0
+    atr_floor = get_taiwan_tick_size(close) if asset_type == 'stock' else 1.0
+    atr = max(atr if np.isfinite(atr) else 0.0, (range_high - range_low) * 0.01, atr_floor)
+    buffer = max(atr * 0.18, (range_high - range_low) * 0.006, atr_floor)
 
     ratios = (0.0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0)
     levels = {ratio: range_low + (range_high - range_low) * ratio for ratio in ratios}
@@ -3611,6 +3663,7 @@ def build_fibonacci_trade_suggestion(data, range_high, range_low, ticker_code, i
             invalidation = min(float(recent['Low'].min()), prior_low) - buffer
             signal_parts = ['多方 2B 假跌破確認'] + signal_parts
 
+    structural_confirmed = direction in ('long', 'short')
     if direction == 'long':
         entry = close
         stop = invalidation if invalidation is not None else lower_support - buffer
@@ -3644,15 +3697,33 @@ def build_fibonacci_trade_suggestion(data, range_high, range_low, ticker_code, i
     else:
         long_entry, long_stop, long_target = levels[0.382], levels[0.236] - buffer, levels[0.5]
         short_entry, short_stop, short_target = levels[0.618], levels[0.786] + buffer, levels[0.5]
+        long_entry, long_stop, long_target = (
+            _round_fibo_asset_price(value, asset_type)
+            for value in (long_entry, long_stop, long_target)
+        )
+        short_entry, short_stop, short_target = (
+            _round_fibo_asset_price(value, asset_type)
+            for value in (short_entry, short_stop, short_target)
+        )
         return {
             'mode': 'range', 'action': '區間盤整，等待邊緣再操作', 'color': '#ffc107',
             'signal': '、'.join(signal_parts) if signal_parts else '未形成 123／2B 確認',
             'note': '價格在 0.382–0.618 洗盤區，中央位置不追價。',
             'long': (long_entry, long_stop, long_target),
             'short': (short_entry, short_stop, short_target),
-            'is_futures': is_futures,
+            'is_futures': is_futures, 'asset_type': asset_type,
         }
 
+    entry, stop, target = (
+        _round_fibo_asset_price(value, asset_type)
+        for value in (entry, stop, target)
+    )
+    if asset_type == 'stock' and direction == 'short':
+        action = (
+            '反轉偏空，反彈不過可減碼；符合融券條件才放空'
+            if structural_confirmed else
+            '偏空，等反彈壓力減碼；符合融券條件才放空'
+        )
     risk = abs(entry - stop)
     reward = abs(target - entry)
     return {
@@ -3661,7 +3732,7 @@ def build_fibonacci_trade_suggestion(data, range_high, range_low, ticker_code, i
         'note': note, 'entry': entry, 'stop': stop, 'target': target,
         'risk': risk, 'reward': reward,
         'rr': reward / risk if risk > 0 else None,
-        'is_futures': is_futures,
+        'is_futures': is_futures, 'asset_type': asset_type,
     }
 
 
@@ -3669,7 +3740,6 @@ def render_fibonacci_trade_suggestion(suggestion):
     """Render the Fibonacci plan below the chart in a concise, actionable form."""
     if not suggestion:
         return
-    st.markdown('---')
     st.markdown(
         "<div style='font-size:18px;font-weight:700;'>🧭 費波操作建議 "
         f"<span style='color:{suggestion['color']};'>｜{suggestion['action']}</span></div>",
@@ -3678,25 +3748,27 @@ def render_fibonacci_trade_suggestion(suggestion):
     st.caption(f"結構訊號：{suggestion['signal']}。{suggestion['note']}")
 
     def price_text(value):
-        return f"{_fibo_trade_price(value, suggestion['is_futures']):,.0f}"
+        return _format_fibo_trade_price(value, suggestion['asset_type'])
+
+    def amount_note(risk, reward):
+        if suggestion['asset_type'] == 'futures':
+            return f"微台 1 口：約 -${risk * 10:,.0f}／+${reward * 10:,.0f}"
+        if suggestion['asset_type'] == 'stock':
+            return f"現股 1 張：約 -${risk * 1000:,.0f}／+${reward * 1000:,.0f}（未含費稅）"
+        return f"風險 {risk:,.2f} 點／目標 {reward:,.2f} 點"
 
     if suggestion['mode'] == 'range':
         long_entry, long_stop, long_target = suggestion['long']
         short_entry, short_stop, short_target = suggestion['short']
         long_risk, long_reward = abs(long_entry - long_stop), abs(long_target - long_entry)
         short_risk, short_reward = abs(short_entry - short_stop), abs(short_target - short_entry)
-        unit_note = (
-            f"（微台 1 口：約 -${long_risk * 10:,.0f}／+${long_reward * 10:,.0f}）"
-            if suggestion['is_futures'] else f"（風險 {long_risk:,.0f} 點／目標 {long_reward:,.0f} 點）"
-        )
-        short_unit_note = (
-            f"（微台 1 口：約 -${short_risk * 10:,.0f}／+${short_reward * 10:,.0f}）"
-            if suggestion['is_futures'] else f"（風險 {short_risk:,.0f} 點／目標 {short_reward:,.0f} 點）"
-        )
+        unit_note = f"（{amount_note(long_risk, long_reward)}）"
+        short_unit_note = f"（{amount_note(short_risk, short_reward)}）"
+        short_label = '減碼／融券條件' if suggestion['asset_type'] == 'stock' else '做空條件'
         st.markdown(
             f"- <span style='color:#ff4b4b;'>做多條件</span>：回測 **{price_text(long_entry)}** 止穩；停損 **{price_text(long_stop)}**；目標 **{price_text(long_target)}**。  \n"
             f"{unit_note}  \n"
-            f"- <span style='color:#00c853;'>做空條件</span>：反彈 **{price_text(short_entry)}** 受壓；停損 **{price_text(short_stop)}**；目標 **{price_text(short_target)}**。 {short_unit_note}",
+            f"- <span style='color:#00c853;'>{short_label}</span>：反彈 **{price_text(short_entry)}** 受壓；停損 **{price_text(short_stop)}**；目標 **{price_text(short_target)}**。 {short_unit_note}",
             unsafe_allow_html=True,
         )
         return
@@ -3707,16 +3779,26 @@ def render_fibonacci_trade_suggestion(suggestion):
     cols[0].metric('參考進場', price_text(entry))
     cols[1].metric('停損／出場', price_text(stop))
     cols[2].metric('第一目標', price_text(target))
-    cols[3].metric('預估風險', f"{risk:,.0f} 點")
-    cols[4].metric('預估獲利', f"{reward:,.0f} 點", help=f"風報比 {suggestion['rr']:.2f}" if suggestion['rr'] else None)
-    if suggestion['is_futures']:
+    metric_unit = '元/股' if suggestion['asset_type'] == 'stock' else '點'
+    metric_decimals = 2 if suggestion['asset_type'] == 'stock' else 0
+    cols[3].metric('預估風險', f"{risk:,.{metric_decimals}f} {metric_unit}")
+    cols[4].metric('預估獲利', f"{reward:,.{metric_decimals}f} {metric_unit}", help=f"風報比 {suggestion['rr']:.2f}" if suggestion['rr'] else None)
+    if suggestion['asset_type'] == 'futures':
         st.caption(
             f"以微台 1 口（每點 10 元）試算：停損約 -${risk * 10:,.0f}；"
             f"到目標約 +${reward * 10:,.0f}；風報比 {suggestion['rr']:.2f}。"
         )
+    elif suggestion['asset_type'] == 'stock':
+        st.caption(
+            f"以現股 1 張（1,000 股）試算：停損價差約 -${risk * 1000:,.0f}；"
+            f"目標價差約 +${reward * 1000:,.0f}；風報比 {suggestion['rr']:.2f}（未含手續費與證交稅）。"
+        )
 
 
-def plot_fibonacci_chart(symbol, interval, lookback=60, font_size=15, ma_flags=None, ma_width=1.5, show_vol=True):
+def plot_fibonacci_chart(
+    symbol, interval, lookback=60, font_size=15, ma_flags=None,
+    ma_width=1.5, show_vol=True, advice_container=None,
+):
     if ma_flags is None:
         ma_flags = {'5': True, '10': True, '20': True, '60': True}
 
@@ -3781,7 +3863,10 @@ def plot_fibonacci_chart(symbol, interval, lookback=60, font_size=15, ma_flags=N
             days_needed = {"1m": 3, "5m": 3, "15m": 5, "60m": 12, "1d": 150, "1wk": 730, "1mo": 1825}
             if interval in days_needed:
                 req_days = days_needed[interval]
-                sj_df = fetch_shioaji_data(st.session_state.sj_api, raw_code, interval=interval, lookback_days=req_days)
+                sj_df = get_cached_fibonacci_kbars(
+                    st.session_state.sj_api, raw_code,
+                    interval=interval, lookback_days=req_days,
+                )
                 if not sj_df.empty:
                     df = sj_df
                     sj_kbars_used = True
@@ -4319,13 +4404,17 @@ def plot_fibonacci_chart(symbol, interval, lookback=60, font_size=15, ma_flags=N
             xaxis_rangeslider_visible=False
         )
 
-    fig.update_layout(**layout_update)
-    st.plotly_chart(fig, width='stretch')
-
     trade_suggestion = build_fibonacci_trade_suggestion(
         df_subset, high_60, low_60, ticker, interval
     )
-    render_fibonacci_trade_suggestion(trade_suggestion)
+    if advice_container is None:
+        render_fibonacci_trade_suggestion(trade_suggestion)
+    else:
+        with advice_container:
+            render_fibonacci_trade_suggestion(trade_suggestion)
+
+    fig.update_layout(**layout_update)
+    st.plotly_chart(fig, width='stretch')
     
     fetch_time_str = datetime.now(pytz.timezone('Asia/Taipei')).strftime('%Y-%m-%d %H:%M:%S')
     
@@ -11784,18 +11873,25 @@ with tab_fibo:
         try: default_radio_idx = list(interval_options.keys()).index(st.session_state.fibo_interval)
         except: default_radio_idx = 0 
 
-        selected_interval_label = st.radio(
+        interval_col, advice_col = st.columns([1, 3], vertical_alignment="top")
+        selected_interval_label = interval_col.radio(
             "⏱️ 選擇時間標籤",
             options=list(interval_options.values()),
             index=default_radio_idx,
             horizontal=True
         )
+        advice_placeholder = advice_col.container()
         
         selected_interval = list(interval_options.keys())[list(interval_options.values()).index(selected_interval_label)]
         st.session_state.fibo_interval = selected_interval 
         
         if final_target.strip():
-            plot_fibonacci_chart(final_target, selected_interval, font_size=st.session_state.fibo_font_size, ma_flags=ma_flags, ma_width=st.session_state.ma_w, show_vol=s_vol)
+            plot_fibonacci_chart(
+                final_target, selected_interval,
+                font_size=st.session_state.fibo_font_size,
+                ma_flags=ma_flags, ma_width=st.session_state.ma_w,
+                show_vol=s_vol, advice_container=advice_placeholder,
+            )
         else:
             st.info("請在上方選擇或輸入股票/期貨以顯示圖表。")
 
