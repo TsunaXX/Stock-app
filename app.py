@@ -5611,7 +5611,7 @@ def render_opening_direction_prompt():
                 details[['群組', '市場', '價格', '漲跌幅', '資料時間', '權重', '來源']]
                 .style.apply(style_opening_detail, axis=1),
                 column_config={
-                    '價格': st.column_config.NumberColumn(format='%.12g', width=100),
+                    '價格': st.column_config.NumberColumn(format='%.2f', width=100),
                     '漲跌幅': st.column_config.TextColumn(width=90),
                     '權重': st.column_config.NumberColumn(format='%d', width=60),
                 },
