@@ -10749,6 +10749,8 @@ with tab_fibo:
                     )
                 st.session_state['trade_plan_moneyness_saved'] = moneyness_preference
                 with control_refresh:
+                    # Align the button with the lower selectbox control instead of its label.
+                    st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
                     refresh_option_plan = st.button("↻ 更新", key="refresh_option_plan", width='stretch')
 
                 option_entry = short_wave['entry'] if short_wave else trade_state['entry_level']
