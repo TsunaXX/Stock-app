@@ -737,6 +737,8 @@ def fetch_earnings_events(inputs):
 
 
 TWSE_MONTHLY_REVENUE_URL = "https://openapi.twse.com.tw/v1/opendata/t187ap05_L"
+MOPS_MONTHLY_REVENUE_PAGE_URL = "https://mopsov.twse.com.tw/mops/web/t05st10_ifrs"
+MOPS_MONTHLY_REVENUE_QUERY_URL = "https://mopsov.twse.com.tw/mops/web/ajax_t05st10_ifrs"
 
 
 def _to_number(value):
@@ -783,6 +785,97 @@ def _roc_compact_date(value):
 def _signed_percent(value):
     number = _to_number(value)
     return "--" if number is None else f"{number:+.2f}%"
+
+
+def _latest_completed_roc_month():
+    """回傳最近一個已結束月份的民國年月，用於 MOPS 單一公司補查。"""
+    today = datetime.now(pytz.timezone("Asia/Taipei")).date()
+    last_day = today.replace(day=1) - timedelta(days=1)
+    return last_day.year - 1911, last_day.month
+
+
+def _previous_roc_month(roc_year, month):
+    if month == 1:
+        return roc_year - 1, 12
+    return roc_year, month - 1
+
+
+def _roc_month_text(roc_year, month):
+    return f"{int(roc_year):03d}{int(month):02d}"
+
+
+@st.cache_data(ttl=60 * 60 * 4, show_spinner=False)
+def fetch_mops_company_monthly_revenue(code, roc_year, month, market_type):
+    """補查 MOPS 單一公司月營收，處理 TWSE 彙總 OpenAPI 更新落後的公告空窗。"""
+    payload = {
+        "step": "1",
+        "firstin": "1",
+        "off": "1",
+        "inpuType": "co_id",
+        "TYPEK": market_type,
+        "isnew": "false",
+        "co_id": str(code),
+        "year": str(roc_year),
+        "month": f"{int(month):02d}",
+    }
+    headers = {
+        **CALENDAR_HTTP_HEADERS,
+        "Referer": MOPS_MONTHLY_REVENUE_PAGE_URL,
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    try:
+        with requests.Session() as session:
+            session.headers.update(CALENDAR_HTTP_HEADERS)
+            session.get(MOPS_MONTHLY_REVENUE_PAGE_URL, timeout=12)
+            response = session.post(
+                MOPS_MONTHLY_REVENUE_QUERY_URL,
+                data=payload,
+                headers=headers,
+                timeout=12,
+            )
+            response.raise_for_status()
+    except requests.RequestException:
+        return None
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    page_text = soup.get_text(" ", strip=True)
+    expected_month = f"民國{roc_year}年{int(month):02d}月"
+    if expected_month not in page_text or "本資料由" not in page_text:
+        return None
+
+    values = {}
+    for table in soup.find_all("table"):
+        for row in table.find_all("tr"):
+            cells = [cell.get_text(" ", strip=True) for cell in row.find_all(["th", "td"])]
+            if len(cells) < 2:
+                continue
+            label, value = cells[0], cells[1]
+            if label in {"本月", "去年同期", "增減百分比", "本年累計", "去年累計"}:
+                values.setdefault(label, []).append(value)
+    required_labels = {"本月", "去年同期", "增減百分比", "本年累計", "去年累計"}
+    if not required_labels.issubset(values):
+        return None
+
+    company_match = re.search(r"\)(.+?)\s*公司提供", page_text)
+    note_match = re.search(
+        r"備註\s*/\s*營收變化原因說明\s*[:：]?\s*(.*?)(?=\s*1\.各項增減百分比資訊|$)",
+        page_text,
+    )
+    return {
+        "公司代號": str(code),
+        "公司名稱": company_match.group(1).strip() if company_match else str(code),
+        "資料年月": _roc_month_text(roc_year, month),
+        "營業收入-當月營收": values["本月"][0],
+        "營業收入-去年當月營收": values["去年同期"][0],
+        "營業收入-去年同月增減(%)": values["增減百分比"][0],
+        "累計營業收入-當月累計營收": values["本年累計"][0],
+        "累計營業收入-去年累計營收": values["去年累計"][0],
+        "累計營業收入-前期比較增減(%)": values["增減百分比"][1] if len(values["增減百分比"]) > 1 else None,
+        "備註": note_match.group(1).strip() if note_match else "-",
+        "_mops_direct": True,
+        # MOPS 單一公司頁不提供出表日期，採系統首次偵測到資料的台灣日期標示。
+        "_report_date": datetime.now(pytz.timezone("Asia/Taipei")).date().isoformat(),
+    }
 
 
 def _signed_percent_arrow(value):
@@ -893,7 +986,7 @@ def fetch_twse_monthly_revenue_rows():
 
 @st.cache_data(ttl=60 * 60 * 4, show_spinner=False)
 def fetch_taiwan_monthly_revenue_events(inputs):
-    """依追蹤清單產生台股最新月營收事件；數字欄位與 MOPS 公告表一致。"""
+    """依追蹤清單產生台股最新月營收事件，必要時由 MOPS 單一公司資料補齊。"""
     input_by_code = {}
     for user_input in inputs:
         item = resolve_earnings_ticker(user_input)
@@ -907,13 +1000,54 @@ def fetch_taiwan_monthly_revenue_events(inputs):
 
     revenue_rows = fetch_twse_monthly_revenue_rows()
     rows_by_code = {str(row.get("公司代號", "")).strip(): row for row in revenue_rows}
+    bulk_months = [
+        str(row.get("資料年月", "")).strip()
+        for row in revenue_rows
+        if re.fullmatch(r"\d{5}", str(row.get("資料年月", "")).strip())
+    ]
+    latest_bulk_month = max(bulk_months) if bulk_months else ""
+    target_roc_year, target_month = _latest_completed_roc_month()
+    target_month_text = _roc_month_text(target_roc_year, target_month)
+    previous_roc_year, previous_month = _previous_roc_month(target_roc_year, target_month)
+    previous_month_text = _roc_month_text(previous_roc_year, previous_month)
+    should_check_mops = not latest_bulk_month or latest_bulk_month < target_month_text
     events, missing = [], []
     for code, item in input_by_code.items():
         row = rows_by_code.get(code)
+        if should_check_mops:
+            direct_row = None
+            for market_type in ("sii", "otc"):
+                direct_row = fetch_mops_company_monthly_revenue(
+                    code, target_roc_year, target_month, market_type
+                )
+                if direct_row:
+                    break
+            if direct_row:
+                previous_row = None
+                if row and str(row.get("資料年月", "")).strip() == previous_month_text:
+                    previous_row = row
+                else:
+                    for market_type in ("sii", "otc"):
+                        previous_row = fetch_mops_company_monthly_revenue(
+                            code, previous_roc_year, previous_month, market_type
+                        )
+                        if previous_row:
+                            break
+                previous_revenue = previous_row.get("營業收入-當月營收") if previous_row else None
+                direct_row["營業收入-上月營收"] = previous_revenue
+                current_number, previous_number = _to_number(direct_row["營業收入-當月營收"]), _to_number(previous_revenue)
+                if current_number is not None and previous_number not in (None, 0):
+                    direct_row["營業收入-上月比較增減(%)"] = (current_number - previous_number) / previous_number * 100
+                row = direct_row
         if not row:
             missing.append(f"{item['display_name']}（目前官方月營收彙總表未提供）")
             continue
-        report_date = _roc_compact_date(row.get("出表日期"))
+        report_date_value = row.get("_report_date")
+        try:
+            report_date = date.fromisoformat(str(report_date_value)) if report_date_value else None
+        except ValueError:
+            report_date = None
+        report_date = report_date or _roc_compact_date(row.get("出表日期"))
         revenue_month = str(row.get("資料年月", ""))
         if not report_date or not revenue_month:
             missing.append(f"{item['display_name']}（官方資料日期格式異常）")
@@ -939,10 +1073,14 @@ def fetch_taiwan_monthly_revenue_events(inputs):
         events.append({
             "date": report_date.isoformat(),
             "title": f"{company} 月營收 MOM{mom}／YOY{yoy}",
-            "detail": f"{revenue_month} 月營收：{_thousand_currency(revenue_data['current_month'])}；點擊事件名稱查看 MOPS 格式明細。",
+            "detail": (
+                f"{revenue_month} 月營收：{_thousand_currency(revenue_data['current_month'])}；"
+                + ("MOPS 單一公司資料（公告日未提供，顯示系統偵測日）；" if row.get("_mops_direct") else "")
+                + "點擊事件名稱查看 MOPS 格式明細。"
+            ),
             "closed": False,
             "temporary": False,
-            "source": "TWSE OpenAPI（MOPS 每月營收）",
+            "source": "MOPS 單一公司月營收" if row.get("_mops_direct") else "TWSE OpenAPI（MOPS 每月營收）",
             "revenue": revenue_data,
         })
     return {"events": events, "missing": missing}
@@ -10658,6 +10796,7 @@ with tab3:
                 build_us_initial_claims_events.clear()
                 fetch_earnings_events.clear()
                 fetch_twse_monthly_revenue_rows.clear()
+                fetch_mops_company_monthly_revenue.clear()
                 fetch_taiwan_monthly_revenue_events.clear()
                 fetch_us_revenue_events.clear()
                 st.toast("已重新向資料來源查詢。", icon="🔄")
@@ -10672,7 +10811,7 @@ with tab3:
                 save_calendar_preferences(selected_event_groups, us_event_density, ticker_input, selected_event_types)
                 st.toast("追蹤設定已儲存。", icon="✅")
 
-    st.caption("資料來源：TWSE／MOPS、Federal Reserve、U.S. BLS、U.S. Department of Labor、ADP、Yahoo Finance。網路來源暫時無法連線時，會保留既有預設與手動校正資料。")
+    st.caption("資料來源：TWSE OpenAPI／MOPS 單一公司月營收、Federal Reserve、U.S. BLS、U.S. Department of Labor、ADP、Yahoo Finance。網路來源暫時無法連線時，會保留既有預設與手動校正資料。")
 
     def change_month(delta):
         st.session_state.cal_month += delta
@@ -10985,7 +11124,7 @@ with tab3:
                         color = "#00FA9A"
                     if "財報" in event.get("title", ""):
                         color = "#FFD700"
-                    if event.get("source") == "TWSE OpenAPI（MOPS 每月營收）":
+                    if "MOPS" in event.get("source", ""):
                         revenue = event.get("revenue", {})
                         mom, yoy = revenue.get("mom", "--"), revenue.get("yoy", "--")
                         content_html.append(
@@ -11044,7 +11183,7 @@ with tab3:
     if current_month_revenue_events:
         st.markdown("<div id='monthly-revenue-details'></div>", unsafe_allow_html=True)
         st.subheader("🏢 台股月營收明細")
-        st.caption("資料來源：證交所 OpenAPI（公開資訊觀測站 MOPS 每月營收彙總表）。金額單位：新臺幣千元。")
+        st.caption("資料來源：證交所 OpenAPI；若彙總表尚未更新，改由公開資訊觀測站 MOPS 單一公司月營收補查。金額單位：新臺幣千元。")
         st.markdown("""
         <style>
         .revenue-metric-card { padding: 0.15rem 0 0.55rem; min-height: 6rem; }
