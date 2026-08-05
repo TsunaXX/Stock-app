@@ -1,4 +1,5 @@
-streamlit
+streamlit==1.61.0
+starlette==0.52.1
 pandas
 yfinance
 requests
