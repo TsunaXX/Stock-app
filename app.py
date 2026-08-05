@@ -3507,6 +3507,215 @@ def build_market_temperature_gauge(label, result):
     )
     return fig
 
+def _fibo_trade_price(value, is_futures=False):
+    """Round a displayed trade level without applying stock tick rules to futures."""
+    value = float(value)
+    return float(round(value)) if is_futures else round_to_tick(value)
+
+
+def _fibo_pivots(data, width=2):
+    """Return alternating local swing points, newest point last."""
+    highs = data['High'].astype(float).to_numpy()
+    lows = data['Low'].astype(float).to_numpy()
+    candidates = []
+    for i in range(width, len(data) - width):
+        high_window = highs[i - width:i + width + 1]
+        low_window = lows[i - width:i + width + 1]
+        if highs[i] >= high_window.max() and highs[i] > max(high_window[0], high_window[-1]):
+            candidates.append((i, 'H', float(highs[i])))
+        if lows[i] <= low_window.min() and lows[i] < min(low_window[0], low_window[-1]):
+            candidates.append((i, 'L', float(lows[i])))
+
+    pivots = []
+    for point in sorted(candidates, key=lambda item: item[0]):
+        if pivots and point[1] == pivots[-1][1]:
+            is_more_extreme = (point[1] == 'H' and point[2] >= pivots[-1][2]) or (
+                point[1] == 'L' and point[2] <= pivots[-1][2]
+            )
+            if is_more_extreme:
+                pivots[-1] = point
+        else:
+            pivots.append(point)
+    return pivots
+
+
+def build_fibonacci_trade_suggestion(data, range_high, range_low, ticker_code, interval):
+    """Create a compact, rule-based Fibonacci / 123 / 2B trade reference.
+
+    The result is deliberately conditional: it presents a level to wait for,
+    instead of turning a lagging trend label into an unconditional market order.
+    """
+    source = data.dropna(subset=['Open', 'High', 'Low', 'Close']).copy()
+    if len(source) < 12 or range_high <= range_low:
+        return None
+
+    close = float(source['Close'].iloc[-1])
+    previous_close = source['Close'].astype(float).shift(1)
+    true_range = pd.concat([
+        source['High'].astype(float) - source['Low'].astype(float),
+        (source['High'].astype(float) - previous_close).abs(),
+        (source['Low'].astype(float) - previous_close).abs(),
+    ], axis=1).max(axis=1)
+    atr = float(true_range.tail(14).mean()) if not true_range.empty else 0.0
+    atr = max(atr if np.isfinite(atr) else 0.0, (range_high - range_low) * 0.01, 1.0)
+    buffer = max(atr * 0.18, (range_high - range_low) * 0.006)
+    is_futures = ticker_code in ('TWF=F', 'TMF=F')
+
+    ratios = (0.0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0)
+    levels = {ratio: range_low + (range_high - range_low) * ratio for ratio in ratios}
+    ordered_levels = [levels[ratio] for ratio in ratios]
+    below = [price for price in ordered_levels if price <= close]
+    above = [price for price in ordered_levels if price >= close]
+    support = max(below) if below else range_low
+    resistance = min(above) if above else range_high
+    lower_support = max([price for price in ordered_levels if price < support], default=range_low)
+    upper_resistance = min([price for price in ordered_levels if price > resistance], default=range_high)
+
+    pivots = _fibo_pivots(source.tail(45))
+    signal_parts = []
+    direction = None
+    trigger = None
+    invalidation = None
+
+    # 123: a lower high + breakdown confirms bearish reversal; the inverse
+    # confirms bullish reversal.  It intentionally requires the final break.
+    if len(pivots) >= 3:
+        p1, p2, p3 = pivots[-3:]
+        if (p1[1], p2[1], p3[1]) == ('H', 'L', 'H') and p3[2] < p1[2]:
+            if close < p2[2]:
+                direction, trigger, invalidation = 'short', p2[2], p3[2] + buffer
+                signal_parts.append('空方 123 確認')
+            else:
+                signal_parts.append('空方 123 觀察中')
+        elif (p1[1], p2[1], p3[1]) == ('L', 'H', 'L') and p3[2] > p1[2]:
+            if close > p2[2]:
+                direction, trigger, invalidation = 'long', p2[2], p3[2] - buffer
+                signal_parts.append('多方 123 確認')
+            else:
+                signal_parts.append('多方 123 觀察中')
+
+    # 2B: a recent false break must close back inside the preceding swing.
+    # This avoids treating only an intrabar wick as a reversal signal.
+    recent = source.tail(4)
+    prior = source.iloc[-24:-4] if len(source) >= 24 else source.iloc[:-4]
+    tolerance = max(buffer, atr * 0.15)
+    if not prior.empty and not recent.empty:
+        prior_high = float(prior['High'].max())
+        prior_low = float(prior['Low'].min())
+        if float(recent['High'].max()) > prior_high + tolerance and close < prior_high:
+            direction, trigger = 'short', prior_high
+            invalidation = max(float(recent['High'].max()), prior_high) + buffer
+            signal_parts = ['空方 2B 假突破確認'] + signal_parts
+        elif float(recent['Low'].min()) < prior_low - tolerance and close > prior_low:
+            direction, trigger = 'long', prior_low
+            invalidation = min(float(recent['Low'].min()), prior_low) - buffer
+            signal_parts = ['多方 2B 假跌破確認'] + signal_parts
+
+    if direction == 'long':
+        entry = close
+        stop = invalidation if invalidation is not None else lower_support - buffer
+        target_candidates = [price for price in ordered_levels if price > entry + buffer]
+        target = target_candidates[0] if target_candidates else entry + atr * 1.5
+        action = '反轉偏多，回踩不破可做多'
+        color = '#ff4b4b'
+        note = '已完成結構確認；不追高，跌回停損即離場。'
+    elif direction == 'short':
+        entry = close
+        stop = invalidation if invalidation is not None else upper_resistance + buffer
+        target_candidates = [price for price in reversed(ordered_levels) if price < entry - buffer]
+        target = target_candidates[0] if target_candidates else entry - atr * 1.5
+        action = '反轉偏空，反彈不過可做空'
+        color = '#00c853'
+        note = '已完成結構確認；不追殺，突破停損即離場。'
+    elif close >= levels[0.618]:
+        direction = 'long'
+        entry, stop = support, max(lower_support - buffer, range_low - buffer)
+        target = upper_resistance if upper_resistance > entry else range_high
+        action = '偏多，等回測支撐做多'
+        color = '#ff4b4b'
+        note = '尚未出現反轉訊號；只在回測支撐止穩時進場。'
+    elif close <= levels[0.382]:
+        direction = 'short'
+        entry, stop = resistance, min(upper_resistance + buffer, range_high + buffer)
+        target = lower_support if lower_support < entry else range_low
+        action = '偏空，等反彈壓力做空'
+        color = '#00c853'
+        note = '尚未出現反轉訊號；只在反彈受壓時進場。'
+    else:
+        long_entry, long_stop, long_target = levels[0.382], levels[0.236] - buffer, levels[0.5]
+        short_entry, short_stop, short_target = levels[0.618], levels[0.786] + buffer, levels[0.5]
+        return {
+            'mode': 'range', 'action': '區間盤整，等待邊緣再操作', 'color': '#ffc107',
+            'signal': '、'.join(signal_parts) if signal_parts else '未形成 123／2B 確認',
+            'note': '價格在 0.382–0.618 洗盤區，中央位置不追價。',
+            'long': (long_entry, long_stop, long_target),
+            'short': (short_entry, short_stop, short_target),
+            'is_futures': is_futures,
+        }
+
+    risk = abs(entry - stop)
+    reward = abs(target - entry)
+    return {
+        'mode': direction, 'action': action, 'color': color,
+        'signal': '、'.join(dict.fromkeys(signal_parts)) if signal_parts else '費波趨勢判讀',
+        'note': note, 'entry': entry, 'stop': stop, 'target': target,
+        'risk': risk, 'reward': reward,
+        'rr': reward / risk if risk > 0 else None,
+        'is_futures': is_futures,
+    }
+
+
+def render_fibonacci_trade_suggestion(suggestion):
+    """Render the Fibonacci plan below the chart in a concise, actionable form."""
+    if not suggestion:
+        return
+    st.markdown('---')
+    st.markdown(
+        "<div style='font-size:18px;font-weight:700;'>🧭 費波操作建議 "
+        f"<span style='color:{suggestion['color']};'>｜{suggestion['action']}</span></div>",
+        unsafe_allow_html=True,
+    )
+    st.caption(f"結構訊號：{suggestion['signal']}。{suggestion['note']}")
+
+    def price_text(value):
+        return f"{_fibo_trade_price(value, suggestion['is_futures']):,.0f}"
+
+    if suggestion['mode'] == 'range':
+        long_entry, long_stop, long_target = suggestion['long']
+        short_entry, short_stop, short_target = suggestion['short']
+        long_risk, long_reward = abs(long_entry - long_stop), abs(long_target - long_entry)
+        short_risk, short_reward = abs(short_entry - short_stop), abs(short_target - short_entry)
+        unit_note = (
+            f"（微台 1 口：約 -${long_risk * 10:,.0f}／+${long_reward * 10:,.0f}）"
+            if suggestion['is_futures'] else f"（風險 {long_risk:,.0f} 點／目標 {long_reward:,.0f} 點）"
+        )
+        short_unit_note = (
+            f"（微台 1 口：約 -${short_risk * 10:,.0f}／+${short_reward * 10:,.0f}）"
+            if suggestion['is_futures'] else f"（風險 {short_risk:,.0f} 點／目標 {short_reward:,.0f} 點）"
+        )
+        st.markdown(
+            f"- <span style='color:#ff4b4b;'>做多條件</span>：回測 **{price_text(long_entry)}** 止穩；停損 **{price_text(long_stop)}**；目標 **{price_text(long_target)}**。  \n"
+            f"{unit_note}  \n"
+            f"- <span style='color:#00c853;'>做空條件</span>：反彈 **{price_text(short_entry)}** 受壓；停損 **{price_text(short_stop)}**；目標 **{price_text(short_target)}**。 {short_unit_note}",
+            unsafe_allow_html=True,
+        )
+        return
+
+    entry, stop, target = suggestion['entry'], suggestion['stop'], suggestion['target']
+    risk, reward = suggestion['risk'], suggestion['reward']
+    cols = st.columns(5)
+    cols[0].metric('參考進場', price_text(entry))
+    cols[1].metric('停損／出場', price_text(stop))
+    cols[2].metric('第一目標', price_text(target))
+    cols[3].metric('預估風險', f"{risk:,.0f} 點")
+    cols[4].metric('預估獲利', f"{reward:,.0f} 點", help=f"風報比 {suggestion['rr']:.2f}" if suggestion['rr'] else None)
+    if suggestion['is_futures']:
+        st.caption(
+            f"以微台 1 口（每點 10 元）試算：停損約 -${risk * 10:,.0f}；"
+            f"到目標約 +${reward * 10:,.0f}；風報比 {suggestion['rr']:.2f}。"
+        )
+
+
 def plot_fibonacci_chart(symbol, interval, lookback=60, font_size=15, ma_flags=None, ma_width=1.5, show_vol=True):
     if ma_flags is None:
         ma_flags = {'5': True, '10': True, '20': True, '60': True}
@@ -4112,6 +4321,11 @@ def plot_fibonacci_chart(symbol, interval, lookback=60, font_size=15, ma_flags=N
 
     fig.update_layout(**layout_update)
     st.plotly_chart(fig, width='stretch')
+
+    trade_suggestion = build_fibonacci_trade_suggestion(
+        df_subset, high_60, low_60, ticker, interval
+    )
+    render_fibonacci_trade_suggestion(trade_suggestion)
     
     fetch_time_str = datetime.now(pytz.timezone('Asia/Taipei')).strftime('%Y-%m-%d %H:%M:%S')
     
