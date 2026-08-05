@@ -2123,7 +2123,7 @@ def fetch_taifex_index_margin_map():
 
 
 def calculate_short_wave_plan(api, direction):
-    """Calculate a compact 5-minute support/resistance plan for intraday observation."""
+    """Calculate an intentionally fast 5-minute pullback/breakout plan."""
     if api is None or direction not in ('偏多', '偏空'):
         return None
     try:
@@ -2140,21 +2140,47 @@ def calculate_short_wave_plan(api, direction):
         if not np.isfinite(atr) or atr <= 0:
             return None
         latest = float(data['Close'].iloc[-1])
-        recent = data.tail(12)
+        recent = data.tail(6)
         range_low = float(recent['Low'].min())
         range_high = float(recent['High'].max())
-        zone = max(10.0, atr * 0.20)
+        ema_fast = float(data['Close'].ewm(span=5, adjust=False).mean().iloc[-1])
+        ema_slow = float(data['Close'].ewm(span=10, adjust=False).mean().iloc[-1])
+        previous_bar = data.iloc[-2]
+        last_bar = data.iloc[-1]
+        volume = pd.to_numeric(data.get('Volume', pd.Series(0, index=data.index)), errors='coerce').fillna(0)
+        average_volume = float(volume.tail(20).mean())
+        volume_ratio = float(volume.iloc[-1] / average_volume) if average_volume > 0 else 1.0
+        zone = max(10.0, atr * 0.35)
         if direction == '偏多':
-            entry, stop, target = range_low, range_low - atr * 0.55, range_high
-            trigger = f"回測 {entry:,.0f} ± {zone:,.0f} 後，5 分 K 收紅並高過前一根收盤。"
+            entry = min(latest, max(range_low, ema_fast))
+            stop = entry - atr * 0.45
+            target = max(range_high, entry + atr * 0.85)
+            momentum_ready = (
+                latest >= ema_fast
+                and (latest > float(previous_bar['Close']) or float(last_bar['High']) > float(previous_bar['High']))
+            )
+            trigger = (
+                f"即時價守住 EMA5 約 {ema_fast:,.0f}，或突破前一根高點 {float(previous_bar['High']):,.0f} 即可小部位試多；"
+                "不必等待完整 5 分 K 收盤。"
+            )
         else:
-            entry, stop, target = range_high, range_high + atr * 0.55, range_low
-            trigger = f"反彈至 {entry:,.0f} ± {zone:,.0f} 後，5 分 K 收黑並低於前一根收盤。"
+            entry = max(latest, min(range_high, ema_fast))
+            stop = entry + atr * 0.45
+            target = min(range_low, entry - atr * 0.85)
+            momentum_ready = (
+                latest <= ema_fast
+                and (latest < float(previous_bar['Close']) or float(last_bar['Low']) < float(previous_bar['Low']))
+            )
+            trigger = (
+                f"即時價受壓於 EMA5 約 {ema_fast:,.0f}，或跌破前一根低點 {float(previous_bar['Low']):,.0f} 即可小部位試空；"
+                "不必等待完整 5 分 K 收盤。"
+            )
         return {
             'latest': latest, 'entry': entry, 'stop': stop, 'target': target,
             'zone': zone, 'risk': abs(entry - stop), 'reward': abs(target - entry),
             'rr': (abs(target - entry) / abs(entry - stop)) if entry != stop else None,
-            'trigger': trigger,
+            'trigger': trigger, 'momentum_ready': momentum_ready,
+            'ema_fast': ema_fast, 'ema_slow': ema_slow, 'volume_ratio': volume_ratio,
         }
     except Exception:
         return None
@@ -2172,6 +2198,20 @@ def get_cached_short_wave_plan(api, direction, max_age_seconds=8):
     cache.clear()
     cache[cache_key] = {'saved_at': now, 'value': dict(value) if value else None}
     return value
+
+
+def resolve_short_wave_direction(plan, trade_state, intraday_state):
+    """Let 5-minute momentum react before the slower daily entry gate."""
+    if trade_state.get('can_enter') and trade_state.get('execution_direction') in ('偏多', '偏空'):
+        return trade_state['execution_direction'], '主計畫與短波方向一致'
+    shock_ratio = float(trade_state.get('shock_ratio', 0) or 0)
+    if intraday_state.get('bullish_break') and shock_ratio < 1.25:
+        return '偏多', '15 分 K 已突破 VWAP／開盤區間，短波先採多方快進快出'
+    if intraday_state.get('bearish_break') and shock_ratio > -1.25:
+        return '偏空', '15 分 K 已跌破 VWAP／開盤區間，短波先採空方快進快出'
+    if plan.get('direction') in ('偏多', '偏空') and not str(trade_state.get('permission', '')).startswith('禁止'):
+        return plan['direction'], '沿用日線方向，但以 EMA5／前根高低點提早觸發'
+    return None, '盤中動能尚未形成，暫不建立短波方向'
 
 
 def get_txo_target_contract_specs(expiry_choice, today=None):
@@ -2423,6 +2463,10 @@ def get_txo_snapshot_quotes(api, contracts):
         spread = (ask - bid) if bid is not None and ask is not None and ask >= bid else None
         spread_pct = (spread / mid * 100) if spread is not None and mid else None
         volume = number('total_volume') or 0.0
+        bid_volume = number('buy_volume') or 0.0
+        ask_volume = number('sell_volume') or 0.0
+        book_total = bid_volume + ask_volume
+        book_balance = (bid_volume - ask_volume) / book_total if book_total > 0 else 0.0
         if ask is None:
             liquidity = '報價不足'
         elif bid is None or spread_pct is None or spread_pct > 25:
@@ -2434,45 +2478,129 @@ def get_txo_snapshot_quotes(api, contracts):
         quotes.append({
             'contract': contract, 'bid': bid, 'ask': ask, 'last': last,
             'premium': premium, 'spread': spread, 'spread_pct': spread_pct,
-            'volume': volume, 'liquidity': liquidity,
+            'volume': volume, 'bid_volume': bid_volume, 'ask_volume': ask_volume,
+            'book_balance': book_balance, 'liquidity': liquidity,
         })
     return quotes
 
 
-def rank_txo_directional_candidates(contracts, quotes, plan, is_buy_call, otm_profile):
-    """Select a strictly OTM contract by distance, target reachability and liquidity."""
+def _normal_cdf(value):
+    return 0.5 * (1.0 + math.erf(float(value) / math.sqrt(2.0)))
+
+
+def black_scholes_index_option_price(spot, strike, years, volatility, is_call, rate=0.012, dividend_yield=0.0):
+    """European index option value used only for clearly-labelled estimates."""
+    spot, strike = float(spot), float(strike)
+    years, volatility = max(float(years), 1e-8), max(float(volatility), 1e-6)
+    root_t = math.sqrt(years)
+    d1 = (math.log(spot / strike) + (rate - dividend_yield + 0.5 * volatility ** 2) * years) / (volatility * root_t)
+    d2 = d1 - volatility * root_t
+    if is_call:
+        return spot * math.exp(-dividend_yield * years) * _normal_cdf(d1) - strike * math.exp(-rate * years) * _normal_cdf(d2)
+    return strike * math.exp(-rate * years) * _normal_cdf(-d2) - spot * math.exp(-dividend_yield * years) * _normal_cdf(-d1)
+
+
+def estimate_implied_volatility(market_price, spot, strike, years, is_call):
+    """Invert Black-Scholes by bisection; return None when the quote is invalid."""
+    if market_price is None or float(market_price) <= 0 or float(spot) <= 0 or float(strike) <= 0:
+        return None
+    intrinsic = max(float(spot) - float(strike), 0.0) if is_call else max(float(strike) - float(spot), 0.0)
+    if float(market_price) + 1e-6 < intrinsic:
+        return None
+    low, high = 0.01, 5.0
+    if black_scholes_index_option_price(spot, strike, years, high, is_call) < float(market_price):
+        return None
+    for _ in range(70):
+        middle = (low + high) / 2
+        value = black_scholes_index_option_price(spot, strike, years, middle, is_call)
+        if value < float(market_price):
+            low = middle
+        else:
+            high = middle
+    return (low + high) / 2
+
+
+def option_time_to_expiry_years(expiry):
+    timezone = pytz.timezone('Asia/Taipei')
+    now_tw = datetime.now(timezone)
+    expiry_dt = timezone.localize(datetime.combine(expiry, dt_time(13, 30)))
+    remaining_seconds = max((expiry_dt - now_tw).total_seconds(), 30 * 60)
+    return remaining_seconds / (365.25 * 24 * 60 * 60)
+
+
+def option_profit_probability(spot, breakeven, years, volatility, is_call, rate=0.012):
+    """Risk-neutral terminal probability of finishing beyond the premium breakeven."""
+    if breakeven is None or volatility is None or spot <= 0 or breakeven <= 0:
+        return None
+    root_t = math.sqrt(max(years, 1e-8))
+    d2 = (math.log(float(spot) / float(breakeven)) + (rate - 0.5 * volatility ** 2) * years) / (volatility * root_t)
+    return _normal_cdf(d2) if is_call else _normal_cdf(-d2)
+
+
+def rank_txo_directional_candidates(
+    contracts, quotes, plan, is_buy_call, moneyness_preference, selected_expiry,
+):
+    """Compare ITM/ATM/OTM contracts with volatility, liquidity and scenario P/L."""
     spot = float(plan['latest'])
-    atr = max(float(plan.get('atr', 0) or 0), 1.0)
-    profile_settings = {
-        '淺價外（勝率優先）': (max(50.0, atr * 0.10), '履約價較接近現價，成本較高但較容易跟隨標的'),
-        '標準價外（成本／勝率平衡）': (max(100.0, atr * 0.25), '兼顧權利金、價差與目標可達性'),
-        '深價外（低成本高槓桿）': (max(150.0, atr * 0.45), '權利金較低，但歸零機率與時間價值衰減較高'),
-    }
-    desired_distance, profile_note = profile_settings.get(
-        otm_profile, profile_settings['標準價外（成本／勝率平衡）'],
-    )
     target = float(plan['target'])
+    stop = float(plan['invalidation'])
+    years = option_time_to_expiry_years(selected_expiry)
+    realized_vol = float(plan.get('realized_volatility', 0.25) or 0.25)
+    atm_contract = min(contracts, key=lambda item: abs(float(getattr(item, 'strike_price', 0)) - spot)) if contracts else None
+    atm_strike = float(getattr(atm_contract, 'strike_price', spot))
+    max_volume = max([float(quote.get('volume', 0) or 0) for quote in quotes] + [1.0])
     rows = []
     for contract, quote in zip(contracts, quotes):
         strike = float(getattr(contract, 'strike_price', 0) or 0)
-        strictly_otm = strike > spot if is_buy_call else strike < spot
-        if not strictly_otm:
+        if strike == atm_strike:
+            moneyness = '平價'
+        elif (strike < atm_strike and is_buy_call) or (strike > atm_strike and not is_buy_call):
+            moneyness = '價內'
+        else:
+            moneyness = '價外'
+        if moneyness_preference in ('價外', '平價', '價內') and moneyness != moneyness_preference:
             continue
-        otm_points = strike - spot if is_buy_call else spot - strike
+        premium = quote.get('premium')
+        if premium is None:
+            continue
+        implied_vol = estimate_implied_volatility(premium, spot, strike, years, is_buy_call)
+        model_vol = implied_vol or realized_vol
+        volatility_source = '即時權利金反推 IV' if implied_vol is not None else '20 日歷史波動率替代'
+        breakeven = strike + premium if is_buy_call else strike - premium
+        probability = option_profit_probability(spot, breakeven, years, model_vol, is_buy_call)
+        remaining_after_fast_exit = max(years * 0.65, 30 * 60 / (365.25 * 24 * 60 * 60))
+        target_option_price = black_scholes_index_option_price(target, strike, remaining_after_fast_exit, model_vol, is_buy_call)
+        stop_option_price = black_scholes_index_option_price(stop, strike, remaining_after_fast_exit, model_vol, is_buy_call)
+        target_pnl = (target_option_price - premium) * 50
+        stop_pnl = (stop_option_price - premium) * 50
+        target_return_pct = (target_option_price - premium) / premium * 100 if premium > 0 else None
+        expected_pnl = (
+            probability * max(target_pnl, 0.0) + (1 - probability) * min(stop_pnl, 0.0)
+            if probability is not None else None
+        )
+        distance_points = abs(strike - spot)
         target_reachable = strike <= target if is_buy_call else strike >= target
-        distance_penalty = abs(otm_points - desired_distance) / max(desired_distance, 1.0)
-        spread_penalty = min(float(quote['spread_pct'] or 40.0) / 20.0, 3.0)
-        quote_penalty = 0.0 if quote['ask'] is not None else 4.0
-        liquidity_bonus = 0.35 if quote['liquidity'] == '高' else (0.15 if quote['liquidity'] == '中' else 0.0)
-        reach_penalty = 0.0 if target_reachable else 2.5
-        score = distance_penalty + spread_penalty + quote_penalty + reach_penalty - liquidity_bonus
+        liquidity_score = {'高': 1.0, '中': 0.65, '低': 0.25, '報價不足': 0.0}.get(quote['liquidity'], 0.0)
+        volume_score = math.sqrt(max(float(quote.get('volume', 0) or 0), 0.0) / max_volume)
+        flow_score = float(np.clip((float(quote.get('book_balance', 0) or 0) + 1) / 2, 0, 1))
+        capital_efficiency = float(np.clip(max(target_pnl, 0.0) / max(premium * 50, 1.0), 0, 2)) / 2
+        probability_score = float(probability or 0.0)
+        score = 100 * (
+            0.35 * probability_score + 0.20 * capital_efficiency + 0.15 * liquidity_score
+            + 0.10 * volume_score + 0.10 * flow_score + 0.10 * float(target_reachable)
+        )
         rows.append({
-            **quote, 'contract': contract, 'strike': strike, 'otm_points': otm_points,
-            'otm_pct': otm_points / spot * 100 if spot else 0.0,
-            'target_reachable': target_reachable, 'score': score,
-            'profile_note': profile_note,
+            **quote, 'contract': contract, 'strike': strike, 'moneyness': moneyness,
+            'distance_points': distance_points, 'distance_pct': distance_points / spot * 100 if spot else 0.0,
+            'target_reachable': target_reachable, 'score': score, 'breakeven': breakeven,
+            'implied_volatility': implied_vol, 'model_volatility': model_vol,
+            'volatility_source': volatility_source, 'model_probability': probability,
+            'target_option_price': target_option_price, 'stop_option_price': stop_option_price,
+            'target_pnl': target_pnl, 'stop_pnl': stop_pnl,
+            'target_return_pct': target_return_pct, 'expected_pnl': expected_pnl,
         })
-    return min(rows, key=lambda row: row['score']) if rows else None
+    rows.sort(key=lambda row: row['score'], reverse=True)
+    return rows
 
 
 def get_txo_spread_quote(api, plan, expiry_choice):
@@ -2502,24 +2630,56 @@ def get_txo_spread_quote(api, plan, expiry_choice):
     if short_contract is None or long_contract is None:
         return None
 
-    short_price, long_price = get_txo_snapshot_prices(api, [short_contract, long_contract], ['sell', 'buy'])
+    spread_quotes = get_txo_snapshot_quotes(api, [short_contract, long_contract])
+    short_quote, long_quote = spread_quotes
+    short_price = short_quote['bid'] or short_quote['last']
+    long_price = long_quote['ask'] or long_quote['last']
     width = abs(float(short_contract.strike_price) - float(long_contract.strike_price))
-    credit = ((short_price - long_price) * 50) if short_price is not None and long_price is not None else None
+    credit_points = (short_price - long_price) if short_price is not None and long_price is not None else None
+    if credit_points is not None and credit_points <= 0:
+        credit_points = None
+    credit = credit_points * 50 if credit_points is not None else None
     max_loss = width * 50 - credit if credit is not None else width * 50
     dte = (selected_expiry - datetime.now(pytz.timezone('Asia/Taipei')).date()).days
+    years = option_time_to_expiry_years(selected_expiry)
+    short_mid = (
+        (short_quote['bid'] + short_quote['ask']) / 2
+        if short_quote['bid'] is not None and short_quote['ask'] is not None else short_quote['premium']
+    )
+    implied_vol = estimate_implied_volatility(
+        short_mid, float(spot), float(short_contract.strike_price), years, not is_bull_put,
+    )
+    model_vol = implied_vol or float(plan.get('realized_volatility', 0.25) or 0.25)
+    breakeven = None
+    model_probability = None
+    expected_pnl = None
+    if credit_points is not None:
+        breakeven = (
+            float(short_contract.strike_price) - credit_points
+            if is_bull_put else float(short_contract.strike_price) + credit_points
+        )
+        model_probability = option_profit_probability(
+            float(spot), breakeven, years, model_vol, is_call=is_bull_put,
+        )
+        if model_probability is not None:
+            expected_pnl = model_probability * credit + (1 - model_probability) * (-max_loss)
     return {
         'name': '賣權多頭價差（Bull Put Credit Spread）' if is_bull_put else '買權空頭價差（Bear Call Credit Spread）',
         'right': 'Put' if is_bull_put else 'Call', 'short_contract': short_contract,
         'long_contract': long_contract, 'short_strike': float(short_contract.strike_price),
         'long_strike': float(long_contract.strike_price), 'expiry': selected_expiry,
         'dte': dte, 'short_premium': short_price, 'long_premium': long_price,
-        'net_credit': credit, 'max_loss': max_loss, 'risk_level': '高' if dte <= 1 else ('中高' if dte <= 3 else '中'),
+        'net_credit_points': credit_points, 'net_credit': credit, 'max_profit': credit,
+        'max_loss': max_loss, 'risk_level': '高' if dte <= 1 else ('中高' if dte <= 3 else '中'),
+        'breakeven': breakeven, 'model_probability': model_probability,
+        'expected_pnl': expected_pnl, 'model_volatility': model_vol,
+        'implied_volatility': implied_vol,
         'source': source, 'delivery_month': str(getattr(short_contract, 'delivery_month', '')),
     }
 
 
-def get_txo_directional_quote(api, plan, expiry_choice, otm_profile='標準價外（成本／勝率平衡）'):
-    """Find a strictly OTM BC/BP using distance, target reachability and live liquidity."""
+def get_txo_directional_quote(api, plan, expiry_choice, moneyness_preference='自動評選'):
+    """Compare BC/BP candidates across ITM, ATM and OTM using live quotes."""
     if api is None or plan is None or plan['direction'] not in ('偏多', '偏空'):
         return None
     expiry_options, selected_expiry, source = select_txo_expiry(api, expiry_choice)
@@ -2530,39 +2690,25 @@ def get_txo_directional_quote(api, plan, expiry_choice, otm_profile='標準價�
     right = 'C' if is_buy_call else 'P'
     contracts = [contract for contract in expiry_options if txo_right_value(contract) == right]
     spot = float(plan['latest'])
-    if is_buy_call:
-        candidates = [c for c in contracts if float(getattr(c, 'strike_price', 0)) > spot]
-    else:
-        candidates = [c for c in contracts if float(getattr(c, 'strike_price', 0)) < spot]
-    if not candidates:
+    if not contracts:
         return None
 
-    atr = max(float(plan.get('atr', 0) or 0), 1.0)
-    desired_distance = {
-        '淺價外（勝率優先）': max(50.0, atr * 0.10),
-        '標準價外（成本／勝率平衡）': max(100.0, atr * 0.25),
-        '深價外（低成本高槓桿）': max(150.0, atr * 0.45),
-    }.get(otm_profile, max(100.0, atr * 0.25))
-    desired_strike = spot + desired_distance if is_buy_call else spot - desired_distance
-    nearby = sorted(candidates, key=lambda c: abs(float(c.strike_price) - desired_strike))[:8]
+    # Compare only the bounded near-price chain: four strikes on each side plus ATM.
+    nearby = sorted(contracts, key=lambda c: abs(float(c.strike_price) - spot))[:12]
     quotes = get_txo_snapshot_quotes(api, nearby)
-    selected = rank_txo_directional_candidates(nearby, quotes, plan, is_buy_call, otm_profile)
-    if selected is None:
+    ranked = rank_txo_directional_candidates(
+        nearby, quotes, plan, is_buy_call, moneyness_preference, selected_expiry,
+    )
+    if not ranked:
         return None
+    selected = ranked[0]
     contract = selected['contract']
     premium = selected['premium']
     dte = (selected_expiry - datetime.now(pytz.timezone('Asia/Taipei')).date()).days
     strike = float(contract.strike_price)
-    breakeven = (strike + premium) if is_buy_call and premium is not None else (
-        strike - premium if premium is not None else None
-    )
+    breakeven = selected['breakeven']
     target = float(plan['target'])
     target_intrinsic = max(target - strike, 0.0) if is_buy_call else max(strike - target, 0.0)
-    target_pnl = (target_intrinsic - premium) * 50 if premium is not None else None
-    target_return_pct = (
-        (target_intrinsic - premium) / premium * 100
-        if premium is not None and premium > 0 else None
-    )
     return {
         'name': '單買買權（BC / Buy Call）' if is_buy_call else '單買賣權（BP / Buy Put）',
         'right': 'Call' if is_buy_call else 'Put', 'contract': contract,
@@ -2573,11 +2719,49 @@ def get_txo_directional_quote(api, plan, expiry_choice, otm_profile='標準價�
         'premium_basis': '永豐 Shioaji 快照：最佳賣價，缺值時以最後成交價替代',
         'bid': selected['bid'], 'ask': selected['ask'], 'spread': selected['spread'],
         'spread_pct': selected['spread_pct'], 'volume': selected['volume'],
-        'liquidity': selected['liquidity'], 'otm_points': selected['otm_points'],
-        'otm_pct': selected['otm_pct'], 'target_reachable': selected['target_reachable'],
-        'profile': otm_profile, 'profile_note': selected['profile_note'],
+        'liquidity': selected['liquidity'], 'distance_points': selected['distance_points'],
+        'distance_pct': selected['distance_pct'], 'moneyness': selected['moneyness'],
+        'target_reachable': selected['target_reachable'], 'profile': moneyness_preference,
         'breakeven': breakeven, 'target_intrinsic': target_intrinsic,
-        'target_pnl': target_pnl, 'target_return_pct': target_return_pct,
+        'target_pnl': selected['target_pnl'], 'stop_pnl': selected['stop_pnl'],
+        'target_return_pct': selected['target_return_pct'], 'expected_pnl': selected['expected_pnl'],
+        'implied_volatility': selected['implied_volatility'],
+        'model_volatility': selected['model_volatility'],
+        'volatility_source': selected['volatility_source'],
+        'model_probability': selected['model_probability'], 'selection_score': selected['score'],
+        'alternatives': ranked[:6],
+    }
+
+
+def recommend_txo_strategy(directional_quote, spread_quote, plan):
+    """Choose long premium or defined-risk spread from volatility and signal conditions."""
+    realized_vol = float(plan.get('realized_volatility', 0.25) or 0.25)
+    valid_spread = spread_quote is not None and float(spread_quote.get('max_profit') or 0) > 0
+    if directional_quote is None and not valid_spread:
+        return {'choice': '等待', 'color': '#ffc107', 'reason': '契約或即時報價不足，無法建立可驗證的選擇權計畫。'}
+    if directional_quote is None:
+        return {'choice': '價差單', 'color': '#ffc107', 'reason': '單買契約報價不足；僅保留限定風險價差單參考。'}
+    implied_vol = float(directional_quote.get('model_volatility', realized_vol) or realized_vol)
+    iv_ratio = implied_vol / max(realized_vol, 1e-6)
+    dte = int(directional_quote.get('dte', 0) or 0)
+    probability = float(directional_quote.get('model_probability', 0) or 0)
+    liquidity = directional_quote.get('liquidity')
+    if valid_spread and (iv_ratio >= 1.20 or (dte <= 1 and probability < 0.45)):
+        reason = (
+            f"隱含／模型波動率約為 20 日實現波動率的 {iv_ratio:.2f} 倍，"
+            "單買權利金相對偏貴或到期時間過短；限定風險價差較能降低時間價值與波動率回落風險。"
+        )
+        return {'choice': '價差單', 'color': '#ffc107', 'reason': reason, 'iv_ratio': iv_ratio}
+    if probability >= 0.42 and liquidity in ('高', '中'):
+        reason = (
+            f"模型到期獲利機率約 {probability * 100:.1f}%，且流動性為{liquidity}；"
+            f"目前以{directional_quote['moneyness']} {directional_quote['right']} 快進快出較合適。"
+        )
+        return {'choice': f"單買 {directional_quote['right']}", 'color': '#ff4b4b' if plan['direction'] == '偏多' else '#00c853', 'reason': reason, 'iv_ratio': iv_ratio}
+    return {
+        'choice': '等待／小部位', 'color': '#ffc107',
+        'reason': '模型獲利機率或即時流動性未達快進快出條件；若仍交易，只採可承受歸零的小部位。',
+        'iv_ratio': iv_ratio,
     }
 
 
@@ -2764,6 +2948,13 @@ def calculate_index_trade_plan(index_df, index_result, futures_df, futures_resul
     ], axis=1).max(axis=1)
     atr = float(true_range.rolling(14, min_periods=10).mean().iloc[-1])
     zone_points = max(20.0, (atr * 0.15) if np.isfinite(atr) else 20.0)
+    log_returns = np.log(pd.to_numeric(data['Close'], errors='coerce')).diff().dropna()
+    realized_volatility = float(log_returns.tail(20).std() * math.sqrt(252)) if len(log_returns) >= 10 else 0.25
+    if not np.isfinite(realized_volatility) or realized_volatility <= 0:
+        realized_volatility = 0.25
+    plan_volume = pd.to_numeric(data.get('Volume', pd.Series(0, index=data.index)), errors='coerce').fillna(0)
+    average_volume = float(plan_volume.tail(20).mean())
+    latest_volume_ratio = float(plan_volume.iloc[-1] / average_volume) if average_volume > 0 else 1.0
 
     if direction == '偏多':
         entry_level = support
@@ -2804,6 +2995,7 @@ def calculate_index_trade_plan(index_df, index_result, futures_df, futures_resul
         'support': support, 'resistance': resistance, 'entry_level': entry_level,
         'invalidation': invalidation, 'target': target, 'zone_points': zone_points,
         'trigger': trigger, 'atr': atr, 'risk_points': risk_points, 'reward_points': reward_points,
+        'realized_volatility': realized_volatility, 'latest_volume_ratio': latest_volume_ratio,
         'rr_ratio': (reward_points / risk_points) if risk_points > 0 else None,
         'micro_risk_1': risk_points * 10, 'micro_risk_2': risk_points * 20,
         'option_name': option_name, 'short_strike': short_strike,
@@ -10196,9 +10388,10 @@ with tab_fibo:
                 st.session_state[key] = f"{best_match[0]}({best_match[1]})"
         save_fibo_config()
     
-    tab_trade_plan, tab_fibo_thermometer, tab_fibo_chart, tab_fibo_manual = st.tabs([
-        "🧭 指數操作計畫", "🌡️ 市場溫度計", "📊 費波圖表", "🧮 手動費波"
-    ])
+    tab_trade_plan, tab_option_plan, tab_fibo_thermometer, tab_fibo_chart, tab_fibo_manual = st.tabs(
+        ["🧭 指數操作計畫", "📅 選擇權操作計畫", "🌡️ 市場溫度計", "📊 費波圖表", "🧮 手動費波"],
+        default="🧭 指數操作計畫", key="index_workspace_active_tab", on_change="rerun",
+    )
 
     thermometer_specs = [
         ("加權股價指數", "^TWII"),
@@ -10213,9 +10406,20 @@ with tab_fibo:
     with tab_trade_plan:
         st.subheader("指數操作計畫")
         st.caption("日線費波決定主方向，5 分 K 提供短波當沖點位；即時報價僅供觀察，不會自動下單或構成投資建議。")
-        option_mode_choices = ["價差單（限定風險，偏結算）", "單買 BC／BP（低成本高波動，短線）"]
-        if st.session_state.get('trade_plan_option_mode_saved') not in option_mode_choices:
-            st.session_state['trade_plan_option_mode_saved'] = option_mode_choices[0]
+        option_mode_choices = [
+            "自動評選（單買／價差）",
+            "價差單（限定風險，偏結算）",
+            "單買 BC／BP（快進快出）",
+        ]
+        saved_option_mode = st.session_state.get('trade_plan_option_mode_saved', '')
+        if saved_option_mode not in option_mode_choices:
+            if str(saved_option_mode).startswith('價差單'):
+                saved_option_mode = option_mode_choices[1]
+            elif str(saved_option_mode).startswith('單買'):
+                saved_option_mode = option_mode_choices[2]
+            else:
+                saved_option_mode = option_mode_choices[0]
+            st.session_state['trade_plan_option_mode_saved'] = saved_option_mode
         index_item = next((item for item in thermometer_data if item[1] == '^TWII'), None)
         futures_item = next((item for item in thermometer_data if item[1] == 'TWF=F'), None)
         plan = calculate_index_trade_plan(
@@ -10434,12 +10638,20 @@ with tab_fibo:
             st.caption("｜".join(signal_details))
 
             st.divider()
+            short_wave_direction, short_direction_note = resolve_short_wave_direction(
+                plan, trade_state, intraday_state,
+            )
+            if short_wave_direction == '偏多':
+                short_recommendation, short_color = '短多｜可提早小部位進場', '#ff4b4b'
+            elif short_wave_direction == '偏空':
+                short_recommendation, short_color = '短空｜可提早小部位進場', '#00c853'
+            else:
+                short_recommendation, short_color = '等待盤中動能', '#ffc107'
             st.markdown(
-                f"#### ⚡ 短波當沖（5 分 K） <span style='font-size:15px;color:{position_color};font-weight:700'>　{position_recommendation}</span>",
+                f"#### ⚡ 短波當沖（5 分 K） <span style='font-size:15px;color:{short_color};font-weight:700'>　{short_recommendation}</span>",
                 unsafe_allow_html=True,
             )
-            st.caption("僅在即時進場許可通過時啟用；使用最新 5 分 K 區間規劃短線進出。")
-            short_wave_direction = trade_state['execution_direction'] if trade_state['can_enter'] else None
+            st.caption(f"{short_direction_note}。短波採 EMA5 或前根高低點即時觸發，不等待完整 5 分 K 收盤。")
             short_wave = get_cached_short_wave_plan(st.session_state.get('sj_api'), short_wave_direction)
             if short_wave:
                 sw1, sw2, sw3, sw4 = st.columns(4)
@@ -10448,6 +10660,13 @@ with tab_fibo:
                 sw3.metric("短波目標", f"{short_wave['target']:,.0f}")
                 sw4.metric("短波風報比", f"1 : {short_wave['rr']:.2f}" if short_wave['rr'] is not None else "—")
                 st.info(f"**快速進場條件：** {short_wave['trigger']}")
+                momentum_label = "已達快速觸發" if short_wave['momentum_ready'] else "接近觸發，等待穿越前根高低點"
+                momentum_color = '#ff4b4b' if short_wave_direction == '偏多' else '#00c853'
+                st.markdown(
+                    f"<div style='font-size:14px;font-weight:700;color:{momentum_color}'>即時狀態：{momentum_label}｜"
+                    f"EMA5 {short_wave['ema_fast']:,.0f}｜量比 {short_wave['volume_ratio']:.2f}</div>",
+                    unsafe_allow_html=True,
+                )
                 short_risk_level, short_risk_color, short_risk_ratio = get_trade_risk_level(
                     short_wave['risk'], plan['atr'],
                 )
@@ -10480,32 +10699,31 @@ with tab_fibo:
                     </div>""", unsafe_allow_html=True,
                 )
                 st.caption(
-                    f"以最新 12 根 5 分 K 區間計算；短波停損為日 ATR 的 {short_risk_ratio:.2f} 倍。"
-                    "日線方向轉為區間盤整時，僅在區間邊緣確認後才採用短波訊號。"
+                    f"以最新 6 根 5 分 K、EMA5 與前根高低點計算；短波停損為日 ATR 的 {short_risk_ratio:.2f} 倍。"
+                    "短波可先於日線進場許可觸發，但只適合小部位快進快出。"
                 )
-            elif trade_state['can_enter']:
+            elif short_wave_direction:
                 st.info("即時條件已通過，但尚未取得足夠的 5 分 K，暫不提供短波點位。")
             else:
-                st.info(f"目前為「{trade_state['permission']}」；短波當沖不啟用，避免在反轉、過熱或區間中段追價。")
+                st.info("尚未形成可辨識的盤中方向；短波暫不啟用，避免在區間中段雙向追價。")
 
-            st.divider()
-            st.markdown(
-                f"#### 📅 到期選擇權操作 <span style='font-size:15px;color:{position_color};font-weight:700'>　{position_recommendation}</span>",
-                unsafe_allow_html=True,
-            )
-            st.caption("僅在即時進場許可通過時，才依選擇權契約報價提供價差單或短線單買參考。")
-            if not trade_state['can_enter']:
+    with tab_option_plan:
+        if tab_option_plan.open:
+            st.subheader("選擇權操作計畫")
+            st.caption("獨立載入最近到期週三選、週五選或月選；比較價外／平價／價內單買與限定風險價差。")
+            if plan is None:
                 st.info(
-                    f"目前為「{trade_state['stage']}／{trade_state['permission']}」，暫停產生選擇權履約價與權利金建議。"
-                    "等待費波位置與盤中確認一致後再啟用。"
+                    "目前缺少足夠的加權或期貨日 K，暫時無法建立選擇權操作計畫。"
                 )
-            elif trade_state['execution_direction'] not in ('偏多', '偏空'):
-                st.info("方向尚未一致，不建立選擇權操作。避免在區間中段或訊號分歧時進場。")
+            elif short_wave_direction not in ('偏多', '偏空'):
+                st.info("盤中方向尚未形成，暫不建立 BC／BP 或方向價差；等待 VWAP 與 5 分 K 動能確認。")
             else:
-                expiry_choice = st.selectbox(
-                    "到期別", ["最近到期", "週三選", "週五選", "月選"], key="trade_plan_expiry_choice",
-                    help="週三／週五／月選均由永豐 Shioaji 的 TXO 契約到期日篩選；預設挑選最近可交易到期日。"
-                )
+                control_expiry, control_mode, control_money, control_refresh = st.columns([1.2, 2.2, 1.4, 0.8])
+                with control_expiry:
+                    expiry_choice = st.selectbox(
+                        "到期別", ["最近到期", "週三選", "週五選", "月選"], key="trade_plan_expiry_choice",
+                        help="最近到期會比較週三、週五與月選，優先採最早仍可交易的契約。",
+                    )
                 target_specs = get_txo_target_contract_specs(expiry_choice)
                 expected_contract = target_specs[0]['delivery_month'] if target_specs else "依永豐最近到期契約"
                 if target_specs:
@@ -10513,52 +10731,86 @@ with tab_fibo:
                         f"永豐商品根：`{target_specs[0]['root']}`｜目標契約：`{expected_contract}`｜預定到期日：{target_specs[0]['expiry'].strftime('%Y/%m/%d')}"
                         f"｜剩餘 {(target_specs[0]['expiry'] - datetime.now(pytz.timezone('Asia/Taipei')).date()).days} 天"
                     )
-                # Widget keys are removed by Streamlit while this section is hidden, so
-                # keep a separate durable value that survives no-entry reruns.
                 if st.session_state.get('trade_plan_option_mode_widget') not in option_mode_choices:
                     st.session_state['trade_plan_option_mode_widget'] = st.session_state['trade_plan_option_mode_saved']
-                option_mode = st.radio(
-                    "操作方式",
-                    option_mode_choices,
-                    horizontal=True,
-                    key="trade_plan_option_mode_widget",
-                )
+                with control_mode:
+                    option_mode = st.selectbox("操作方式", option_mode_choices, key="trade_plan_option_mode_widget")
                 st.session_state['trade_plan_option_mode_saved'] = option_mode
+                moneyness_choices = ["自動評選", "價外", "平價", "價內"]
+                saved_moneyness = st.session_state.get('trade_plan_moneyness_saved', moneyness_choices[0])
+                if saved_moneyness not in moneyness_choices:
+                    saved_moneyness = moneyness_choices[0]
+                if st.session_state.get('trade_plan_moneyness_widget') not in moneyness_choices:
+                    st.session_state['trade_plan_moneyness_widget'] = saved_moneyness
+                with control_money:
+                    moneyness_preference = st.selectbox(
+                        "履約價偏好", moneyness_choices, key="trade_plan_moneyness_widget",
+                        help="自動評選會同時比較價外、平價與價內的模型獲利機率、成本效率及流動性。",
+                    )
+                st.session_state['trade_plan_moneyness_saved'] = moneyness_preference
+                with control_refresh:
+                    refresh_option_plan = st.button("↻ 更新", key="refresh_option_plan", width='stretch')
+
+                option_entry = short_wave['entry'] if short_wave else trade_state['entry_level']
+                option_stop = short_wave['stop'] if short_wave else trade_state['invalidation']
+                option_target = short_wave['target'] if short_wave else trade_state['target']
                 quote_plan = {
                     **plan,
                     'latest': live_price,
-                    'direction': trade_state['execution_direction'],
-                    'entry_level': trade_state['entry_level'],
-                    'invalidation': trade_state['invalidation'],
-                    'target': trade_state['target'],
+                    'direction': short_wave_direction,
+                    'entry_level': option_entry,
+                    'invalidation': option_stop,
+                    'target': option_target,
                 }
-                otm_profile = None
-                if not option_mode.startswith("價差單"):
-                    otm_profile_choices = [
-                        "淺價外（勝率優先）",
-                        "標準價外（成本／勝率平衡）",
-                        "深價外（低成本高槓桿）",
-                    ]
-                    if st.session_state.get('trade_plan_otm_profile_saved') not in otm_profile_choices:
-                        st.session_state['trade_plan_otm_profile_saved'] = otm_profile_choices[1]
-                    if st.session_state.get('trade_plan_otm_profile_widget') not in otm_profile_choices:
-                        st.session_state['trade_plan_otm_profile_widget'] = st.session_state['trade_plan_otm_profile_saved']
-                    otm_profile = st.selectbox(
-                        "價外距離",
-                        otm_profile_choices,
-                        key="trade_plan_otm_profile_widget",
-                        help="淺價外較容易跟隨標的但成本較高；深價外成本低、槓桿高，但到期歸零機率也較高。",
+                quote_signature = (
+                    expiry_choice, option_mode, moneyness_preference, short_wave_direction,
+                    round(float(live_price), 0), round(float(option_target), 0), round(float(option_stop), 0),
+                    id(st.session_state.get('sj_api')),
+                )
+                option_cache = st.session_state.get('_option_plan_quote_cache')
+                if refresh_option_plan or not option_cache or option_cache.get('signature') != quote_signature:
+                    directional_quote = None
+                    spread_quote = None
+                    if option_mode.startswith("自動") or option_mode.startswith("單買"):
+                        directional_quote = get_txo_directional_quote(
+                            st.session_state.get('sj_api'), quote_plan, expiry_choice, moneyness_preference,
+                        )
+                    if option_mode.startswith("自動") or option_mode.startswith("價差單"):
+                        spread_quote = get_txo_spread_quote(
+                            st.session_state.get('sj_api'), quote_plan, expiry_choice,
+                        )
+                    option_cache = {
+                        'signature': quote_signature, 'directional': directional_quote,
+                        'spread': spread_quote, 'updated_at': datetime.now(pytz.timezone('Asia/Taipei')),
+                    }
+                    st.session_state['_option_plan_quote_cache'] = option_cache
+                directional_quote = option_cache.get('directional')
+                spread_quote = option_cache.get('spread')
+                strategy_view = recommend_txo_strategy(directional_quote, spread_quote, quote_plan)
+                st.markdown(
+                    f"<div style='border-left:5px solid {strategy_view['color']};background:#151a22;padding:12px 16px;border-radius:7px'>"
+                    f"<div style='font-size:13px;color:#b7c0cc'>綜合波動率、量價、流動性與短波方向</div>"
+                    f"<div style='font-size:20px;font-weight:800;color:{strategy_view['color']}'>建議：{strategy_view['choice']}</div>"
+                    f"<div style='font-size:14px;color:#dfe6e9'>{strategy_view['reason']}</div></div>",
+                    unsafe_allow_html=True,
+                )
+                st.caption(
+                    f"方向：{'BC／Call' if short_wave_direction == '偏多' else 'BP／Put'}｜"
+                    f"報價更新：{option_cache['updated_at'].strftime('%H:%M:%S')}｜資料只在本分頁開啟或按更新時載入。"
+                )
+                with st.expander("模型勝率與損益怎麼算"):
+                    st.markdown(
+                        "- **模型勝率**：以最佳賣價反推 Black–Scholes 隱含波動率，估算到期超越損益兩平點的市場隱含機率；無法反推時改用近 20 日實現波動率。\n"
+                        "- **目標／停損損益**：假設快進快出後仍剩目前約 65% 的存續時間、波動率不變，重新評價權利金；未含手續費與稅。\n"
+                        "- **模型期望損益**：用模型勝率加權目標與停損兩種情境，屬情境比較，不是歷史回測績效。\n"
+                        "- 夜盤現貨不交易，模型以最新期貨作為臺指選標的代理，期現價差會造成估算誤差。"
                     )
-                    st.session_state['trade_plan_otm_profile_saved'] = otm_profile
 
-                if option_mode.startswith("價差單"):
-                    option_quote = get_txo_spread_quote(st.session_state.get('sj_api'), quote_plan, expiry_choice)
-                else:
-                    option_quote = get_txo_directional_quote(
-                        st.session_state.get('sj_api'), quote_plan, expiry_choice, otm_profile,
-                    )
-
-                if option_quote and option_mode.startswith("價差單"):
+                display_spread = option_mode.startswith("價差單") or (
+                    option_mode.startswith("自動") and strategy_view['choice'] == '價差單'
+                )
+                option_quote = spread_quote if display_spread else directional_quote
+                if option_quote and display_spread:
                     option_title = f"{option_quote['name']}｜{option_quote['delivery_month']}｜{option_quote['expiry'].strftime('%Y/%m/%d')} 到期（剩 {option_quote['dte']} 天）"
                     st.markdown(f"**{option_title}**")
                     o1, o2, o3, o4 = st.columns(4)
@@ -10566,6 +10818,17 @@ with tab_fibo:
                     o2.metric("保護買方履約價", f"{option_quote['long_strike']:,.0f} {option_quote['right']}")
                     o3.metric("預估淨權利金", f"${option_quote['net_credit']:,.0f}" if option_quote['net_credit'] is not None else "報價不足")
                     o4.metric("單組最大風險", f"${option_quote['max_loss']:,.0f}")
+                    s1, s2, s3, s4 = st.columns(4)
+                    s1.metric("最大獲利", f"${option_quote['max_profit']:,.0f}" if option_quote['max_profit'] is not None else "報價不足")
+                    s2.metric("損益兩平", f"{option_quote['breakeven']:,.1f}" if option_quote['breakeven'] is not None else "報價不足")
+                    s3.metric(
+                        "模型勝率",
+                        f"{option_quote['model_probability'] * 100:.1f}%" if option_quote['model_probability'] is not None else "無法估算",
+                    )
+                    s4.metric(
+                        "模型期望損益",
+                        f"${option_quote['expected_pnl']:+,.0f}" if option_quote['expected_pnl'] is not None else "無法估算",
+                    )
                     premium_detail = "即時買賣價不足，最大風險先以履約價差 × 50 元估算。"
                     if option_quote['short_premium'] is not None and option_quote['long_premium'] is not None:
                         premium_detail = (
@@ -10586,10 +10849,22 @@ with tab_fibo:
                     o3.metric("單口權利金成本", f"${option_quote['max_loss']:,.0f}" if option_quote['max_loss'] is not None else "報價不足")
                     o4.metric("最大風險（權利金）", f"${option_quote['max_loss']:,.0f}" if option_quote['max_loss'] is not None else "權利金全額")
                     q1, q2, q3, q4 = st.columns(4)
-                    q1.metric("價外距離", f"{option_quote['otm_points']:,.0f} 點 ({option_quote['otm_pct']:.2f}%)")
+                    q1.metric("價內外", f"{option_quote['moneyness']}｜距現價 {option_quote['distance_points']:,.0f} 點")
                     q2.metric("買賣價差", f"{option_quote['spread']:.1f} 點" if option_quote['spread'] is not None else "報價不足")
                     q3.metric("損益兩平", f"{option_quote['breakeven']:,.1f}" if option_quote['breakeven'] is not None else "報價不足")
                     q4.metric("流動性", option_quote['liquidity'])
+                    m1, m2, m3, m4, m5 = st.columns(5)
+                    m1.metric(
+                        "模型勝率",
+                        f"{option_quote['model_probability'] * 100:.1f}%" if option_quote['model_probability'] is not None else "無法估算",
+                    )
+                    m2.metric(
+                        "模型期望損益",
+                        f"${option_quote['expected_pnl']:+,.0f}" if option_quote['expected_pnl'] is not None else "無法估算",
+                    )
+                    m3.metric("模型波動率", f"{option_quote['model_volatility'] * 100:.1f}%")
+                    m4.metric("目標情境損益", f"${option_quote['target_pnl']:+,.0f}")
+                    m5.metric("停損情境損益", f"${option_quote['stop_pnl']:+,.0f}")
                     st.warning(
                         f"風險指標：{option_quote['risk_level']}。此為 {option_quote['name']} 的快進快出方案；"
                         "僅在 5 分 K 確認後進場，標的觸及日線失效點或權利金回落約 40% 時優先退出。"
@@ -10599,18 +10874,36 @@ with tab_fibo:
                         "未含手續費與交易稅；買方最大風險即已付權利金。"
                     )
                     st.caption(
-                        f"篩選模式：{option_quote['profile']}；{option_quote['profile_note']}。"
-                        f"履約價為嚴格價外，且費波目標{'可涵蓋' if option_quote['target_reachable'] else '尚未涵蓋'}此履約價；"
-                        "系統會同時考慮價外距離、目標可達性與買賣價差，不以最低權利金當作唯一依據。"
+                        f"篩選模式：{option_quote['profile']}；目前選為{option_quote['moneyness']}。"
+                        f"短波目標{'可涵蓋' if option_quote['target_reachable'] else '尚未涵蓋'}此履約價；"
+                        f"波動率來源：{option_quote['volatility_source']}。"
+                        "模型勝率是到期超越損益兩平點的估算，不是歷史回測命中率。"
                         f"資料來源：{option_quote['source']}（契約與報價）。"
                     )
                     if option_quote['target_return_pct'] is not None:
                         st.caption(
-                            f"若持有至到期且標的恰好到達費波目標，到期內含價值約 {option_quote['target_intrinsic']:.1f} 點，"
-                            f"相對目前買進參考價的情境報酬為 {option_quote['target_return_pct']:+.1f}%"
-                            f"（損益約 ${option_quote['target_pnl']:,.0f}，未含手續費與稅）。這是到期情境，不是勝率或報酬保證。"
+                            f"若標的到達短波目標且剩餘時間約為目前的 65%，模型權利金情境報酬約 {option_quote['target_return_pct']:+.1f}%"
+                            f"（損益約 ${option_quote['target_pnl']:+,.0f}）；停損情境約 ${option_quote['stop_pnl']:+,.0f}。"
+                            "未計手續費、稅及波動率即時改變。"
                         )
-                elif option_mode.startswith("價差單"):
+                    if option_quote.get('alternatives'):
+                        comparison_rows = []
+                        for candidate in option_quote['alternatives']:
+                            comparison_rows.append({
+                                "價內外": candidate['moneyness'],
+                                "履約價": f"{candidate['strike']:,.0f}",
+                                "買進價": f"{candidate['premium']:.1f}",
+                                "模型勝率": f"{candidate['model_probability'] * 100:.1f}%" if candidate['model_probability'] is not None else "—",
+                                "IV／模型波動率": f"{candidate['model_volatility'] * 100:.1f}%",
+                                "期望損益": f"${candidate['expected_pnl']:+,.0f}" if candidate['expected_pnl'] is not None else "—",
+                                "目標損益": f"${candidate['target_pnl']:+,.0f}",
+                                "停損損益": f"${candidate['stop_pnl']:+,.0f}",
+                                "流動性": candidate['liquidity'],
+                                "綜合分數": f"{candidate['score']:.1f}",
+                            })
+                        st.markdown("##### 履約價比較")
+                        st.dataframe(pd.DataFrame(comparison_rows), width='stretch', hide_index=True)
+                elif display_spread:
                     st.warning(
                         f"永豐 Shioaji 尚未取得 {expiry_choice}（預期 `{expected_contract}`）的夜盤即時契約／報價，"
                         "本次不提供價差單履約價與權利金建議，避免使用日盤資料造成誤判。"
