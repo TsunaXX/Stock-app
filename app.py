@@ -5,6 +5,7 @@ import requests
 from bs4 import BeautifulSoup
 import math
 import time
+import threading
 import os
 import itertools
 import json
@@ -44,6 +45,449 @@ try:
     import shioaji as sj
 except ImportError:
     sj = None
+
+
+# ==========================================
+# Shioaji 即時行情共享串流
+# ==========================================
+@st.cache_resource(show_spinner=False)
+def get_market_stream_registry():
+    """Keep quote callbacks alive across Streamlit reruns without touching session_state."""
+    return {}, threading.RLock()
+
+
+def _stream_number(value, default=None):
+    """Convert Decimal/scalar/level-one list values to a finite float."""
+    if isinstance(value, (list, tuple, np.ndarray, pd.Series)):
+        value = value[0] if len(value) else None
+    try:
+        result = float(value)
+        return result if np.isfinite(result) else default
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def _stream_datetime(value):
+    if value is None:
+        return datetime.now(pytz.timezone('Asia/Taipei')).replace(tzinfo=None)
+    if isinstance(value, tuple):
+        try:
+            value = datetime(*value)
+        except (TypeError, ValueError):
+            value = None
+    try:
+        parsed = pd.Timestamp(value)
+        if parsed.tzinfo is not None:
+            parsed = parsed.tz_convert('Asia/Taipei').tz_localize(None)
+        return parsed.to_pydatetime()
+    except (TypeError, ValueError, AttributeError):
+        return datetime.now(pytz.timezone('Asia/Taipei')).replace(tzinfo=None)
+
+
+def _stream_contract_codes(contract):
+    codes = []
+    for field in ('code', 'target_code', 'symbol'):
+        value = str(getattr(contract, field, '') or '').strip()
+        if value and value not in codes:
+            codes.append(value)
+    return codes
+
+
+def _stream_state(api):
+    registry, registry_lock = get_market_stream_registry()
+    api_key = id(api)
+    with registry_lock:
+        state = registry.get(api_key)
+        if state is None:
+            state = {
+                'lock': threading.RLock(),
+                'quotes': {},
+                'aliases': {},
+                'subscriptions': {},
+                'snapshot_retry_after': {},
+                'callbacks_installed': False,
+                'errors': [],
+            }
+            registry[api_key] = state
+    return state
+
+
+def _remember_stream_error(state, message):
+    with state['lock']:
+        state['errors'] = (state['errors'] + [str(message)])[-8:]
+
+
+def _stream_payload(api, payload, security_type):
+    """Copy one quote payload into the shared cache; callbacks stay intentionally light."""
+    if payload is None:
+        return
+    state = _stream_state(api)
+    code = str(getattr(payload, 'code', '') or '').strip()
+    if not code:
+        return
+
+    updated_at = _stream_datetime(getattr(payload, 'datetime', None))
+    values = {
+        'code': code,
+        'security_type': security_type,
+        'updated_at': updated_at,
+        'source': 'stream',
+    }
+    scalar_fields = (
+        'open', 'high', 'low', 'close', 'avg_price', 'amount', 'total_amount',
+        'amount_sum', 'volume', 'total_volume', 'vol_sum', 'reference',
+        'underlying_price', 'price_chg', 'pct_chg', 'change_price', 'change_rate',
+        'bid_side_total_vol', 'ask_side_total_vol',
+    )
+    for field in scalar_fields:
+        number = _stream_number(getattr(payload, field, None))
+        if number is not None:
+            values[field] = number
+
+    for field in ('bid_price', 'ask_price', 'bid_volume', 'ask_volume'):
+        raw = getattr(payload, field, None)
+        if raw is not None:
+            try:
+                values[field] = list(raw)
+            except TypeError:
+                values[field] = [raw]
+
+    bid = _stream_number(values.get('bid_price'))
+    ask = _stream_number(values.get('ask_price'))
+    bid_volume = _stream_number(values.get('bid_volume'))
+    ask_volume = _stream_number(values.get('ask_volume'))
+    if bid is not None:
+        values['buy_price'] = bid
+    if ask is not None:
+        values['sell_price'] = ask
+    if bid_volume is not None:
+        values['buy_volume'] = bid_volume
+    if ask_volume is not None:
+        values['sell_volume'] = ask_volume
+
+    close = values.get('close')
+    change = values.get('price_chg', values.get('change_price'))
+    reference = values.get('reference')
+    if reference is None and close is not None and change is not None and close - change > 0:
+        reference = close - change
+        values['reference'] = reference
+    if change is None and close is not None and reference is not None:
+        change = close - reference
+    if change is not None:
+        values['change_price'] = change
+    if close is not None and reference is not None and reference > 0:
+        values['change_rate'] = (close - reference) / reference * 100
+
+    with state['lock']:
+        previous = state['quotes'].get(code, {})
+        previous.update(values)
+        state['quotes'][code] = previous
+        for requested, target in list(state['aliases'].items()):
+            if target == code:
+                state['quotes'][requested] = previous
+
+
+def _install_stream_callbacks(api):
+    state = _stream_state(api)
+    with state['lock']:
+        if state['callbacks_installed']:
+            return True
+        # Claim installation before registering so concurrent Streamlit workers do not
+        # overwrite each other's callbacks.
+        state['callbacks_installed'] = True
+
+    callback_target = api if any(
+        callable(getattr(api, name, None))
+        for name in ('set_on_quote_stk_v1_callback', 'set_on_quote_fop_v1_callback', 'set_on_quote_idx_v1_callback')
+    ) else getattr(api, 'quote', None)
+    if callback_target is None:
+        _remember_stream_error(state, '此 Shioaji 版本沒有 Quote v1 callback')
+        return False
+
+    installed = 0
+
+    def register(name, security_type):
+        nonlocal installed
+        setter = getattr(callback_target, name, None)
+        if not callable(setter):
+            return
+
+        def callback(*args):
+            _stream_payload(api, args[-1] if args else None, security_type)
+
+        try:
+            setter(callback)
+            installed += 1
+        except Exception as exc:
+            _remember_stream_error(state, f'{name}: {exc}')
+
+    register('set_on_quote_stk_v1_callback', 'STK')
+    register('set_on_quote_fop_v1_callback', 'FOP')
+    # Index streaming is available in Shioaji 1.7+; older versions simply keep
+    # using the one-time snapshot seed for IX0001.
+    register('set_on_quote_idx_v1_callback', 'IND')
+    if installed == 0:
+        _remember_stream_error(state, '無法註冊任何 Quote v1 callback')
+        return False
+    return True
+
+
+def _shioaji_quote_type():
+    quote_type = getattr(sj, 'QuoteType', None) if sj is not None else None
+    if quote_type is None and sj is not None:
+        quote_type = getattr(getattr(sj, 'constant', None), 'QuoteType', None)
+    return getattr(quote_type, 'Quote', 'quote')
+
+
+def _unsubscribe_market_stream(api, state, subscription_key, metadata):
+    contract = metadata.get('contract')
+    if contract is None:
+        return
+    target = api if callable(getattr(api, 'unsubscribe', None)) else getattr(api, 'quote', None)
+    method = getattr(target, 'unsubscribe', None)
+    if callable(method):
+        try:
+            method(contract, quote_type=_shioaji_quote_type())
+        except Exception:
+            pass
+    with state['lock']:
+        state['subscriptions'].pop(subscription_key, None)
+
+
+def ensure_market_stream_subscription(api, contract):
+    """Subscribe one visible contract once, recycling old subscriptions near the 200 limit."""
+    if api is None or contract is None:
+        return False
+    _install_stream_callbacks(api)
+    state = _stream_state(api)
+    codes = _stream_contract_codes(contract)
+    if not codes:
+        return False
+    requested = codes[0]
+    target_code = codes[1] if len(codes) > 1 else requested
+    subscription_key = requested
+    now_mono = time.monotonic()
+    with state['lock']:
+        state['aliases'][requested] = target_code
+        existing = state['subscriptions'].get(subscription_key)
+        if existing:
+            if existing.get('status') == 'active':
+                existing['last_used'] = now_mono
+                return True
+            if now_mono < existing.get('retry_after', 0):
+                return False
+            state['subscriptions'].pop(subscription_key, None)
+        state['subscriptions'][subscription_key] = {
+            'contract': contract, 'last_used': now_mono, 'status': 'pending'
+        }
+        active = [
+            (key, value) for key, value in state['subscriptions'].items()
+            if key != subscription_key and value.get('status') == 'active'
+        ]
+
+    # Shioaji allows at most 200 subscriptions. Keep headroom for broker/system
+    # subscriptions and recycle contracts that have not been displayed recently.
+    if len(active) >= 180:
+        oldest_key, oldest = min(active, key=lambda item: item[1].get('last_used', 0))
+        if now_mono - oldest.get('last_used', 0) >= 60:
+            _unsubscribe_market_stream(api, state, oldest_key, oldest)
+        else:
+            with state['lock']:
+                state['subscriptions'][subscription_key].update({
+                    'status': 'capacity', 'retry_after': now_mono + 60
+                })
+            return False
+
+    target = api if callable(getattr(api, 'subscribe', None)) else getattr(api, 'quote', None)
+    method = getattr(target, 'subscribe', None)
+    if not callable(method):
+        with state['lock']:
+            state['subscriptions'][subscription_key].update({
+                'status': 'error', 'retry_after': now_mono + 60
+            })
+        _remember_stream_error(state, '此 Shioaji 版本沒有 subscribe')
+        return False
+    try:
+        method(contract, quote_type=_shioaji_quote_type())
+        with state['lock']:
+            state['subscriptions'][subscription_key]['status'] = 'active'
+        return True
+    except Exception as exc:
+        with state['lock']:
+            state['subscriptions'][subscription_key].update({
+                'status': 'error', 'retry_after': now_mono + 60
+            })
+        _remember_stream_error(state, f'{requested}: {exc}')
+        return False
+
+
+def _stream_store_snapshot(api, contract, snapshot):
+    if snapshot is None:
+        return
+    state = _stream_state(api)
+    requested_codes = _stream_contract_codes(contract)
+    snapshot_code = str(getattr(snapshot, 'code', '') or '').strip()
+    fields = (
+        'open', 'high', 'low', 'close', 'avg_price', 'amount', 'total_amount',
+        'amount_sum', 'volume', 'total_volume', 'vol_sum', 'reference',
+        'underlying_price', 'change_price', 'change_rate', 'buy_price', 'sell_price',
+        'buy_volume', 'sell_volume',
+    )
+    values = {
+        'code': snapshot_code or (requested_codes[0] if requested_codes else ''),
+        'updated_at': datetime.now(pytz.timezone('Asia/Taipei')).replace(tzinfo=None),
+        'source': 'snapshot_seed',
+    }
+    for field in fields:
+        number = _stream_number(getattr(snapshot, field, None))
+        if number is not None:
+            values[field] = number
+    with state['lock']:
+        for code in set(requested_codes + ([snapshot_code] if snapshot_code else [])):
+            previous = state['quotes'].get(code, {})
+            previous.update(values)
+            state['quotes'][code] = previous
+
+
+def _stream_quote_for_contract(api, contract):
+    state = _stream_state(api)
+    codes = _stream_contract_codes(contract)
+    with state['lock']:
+        for code in codes:
+            quote = state['quotes'].get(code)
+            if quote:
+                return SimpleNamespace(**quote.copy())
+            target = state['aliases'].get(code)
+            quote = state['quotes'].get(target) if target else None
+            if quote:
+                return SimpleNamespace(**quote.copy())
+    return None
+
+
+def _is_contract_stream_session(contract, now_tw):
+    """Avoid polling the fallback while the relevant exchange is closed."""
+    if now_tw.weekday() >= 5:
+        return False
+    codes = _stream_contract_codes(contract)
+    code = codes[0].upper() if codes else ''
+    security_text = str(getattr(contract, 'security_type', '')).upper()
+    is_fop = (
+        'FUT' in security_text or 'OPT' in security_text
+        or hasattr(contract, 'delivery_month') or hasattr(contract, 'option_right')
+    )
+    if code.startswith('IX') or not is_fop:
+        return dt_time(9, 0) <= now_tw.time() <= dt_time(13, 35)
+    current_time = now_tw.time()
+    return (
+        dt_time(8, 45) <= current_time <= dt_time(13, 45)
+        or current_time >= dt_time(15, 0)
+        or current_time < dt_time(5, 0)
+    )
+
+
+def get_stream_quotes(api, contracts, snapshot_fallback=True):
+    """Return quotes in input order: stream first, throttled snapshot for cold start/failure."""
+    contracts = list(contracts or [])
+    if api is None or not contracts:
+        return []
+    for contract in contracts:
+        ensure_market_stream_subscription(api, contract)
+
+    results = [_stream_quote_for_contract(api, contract) for contract in contracts]
+    fallback_indices = []
+    state = _stream_state(api)
+    now_mono = time.monotonic()
+    now_tw = datetime.now(pytz.timezone('Asia/Taipei')).replace(tzinfo=None)
+    if snapshot_fallback:
+        with state['lock']:
+            for index, (contract, quote) in enumerate(zip(contracts, results)):
+                codes = _stream_contract_codes(contract)
+                key = codes[0] if codes else str(index)
+                is_missing = quote is None
+                is_stale_seed = False
+                if quote is not None and getattr(quote, 'source', '') == 'snapshot_seed':
+                    updated_at = _stream_datetime(getattr(quote, 'updated_at', None))
+                    is_stale_seed = (
+                        (now_tw - updated_at).total_seconds() >= 30
+                        and _is_contract_stream_session(contract, now_tw)
+                    )
+                if (is_missing or is_stale_seed) and now_mono >= state['snapshot_retry_after'].get(key, 0):
+                    state['snapshot_retry_after'][key] = now_mono + 30
+                    fallback_indices.append(index)
+
+    if fallback_indices:
+        missing_contracts = [contracts[index] for index in fallback_indices]
+        try:
+            snapshots = api.snapshots(missing_contracts) or []
+        except Exception:
+            snapshots = []
+        for index, contract, snapshot in zip(fallback_indices, missing_contracts, snapshots):
+            _stream_store_snapshot(api, contract, snapshot)
+            results[index] = _stream_quote_for_contract(api, contract)
+    return results
+
+
+def merge_stream_quote_into_intraday(df, quote, interval):
+    """Overlay the latest stream price on the unfinished intraday candle."""
+    if df is None or df.empty or quote is None or interval not in ('1m', '5m', '15m', '60m'):
+        return df
+    price = _stream_number(getattr(quote, 'close', None))
+    if price is None or price <= 0:
+        return df
+    updated_at = _stream_datetime(getattr(quote, 'updated_at', None))
+    now_tw = datetime.now(pytz.timezone('Asia/Taipei')).replace(tzinfo=None)
+    # A cached closing quote must never open a synthetic candle after the session.
+    if abs((now_tw - updated_at).total_seconds()) > 180:
+        return df
+
+    minutes = {'1m': 1, '5m': 5, '15m': 15, '60m': 60}[interval]
+    bucket = pd.Timestamp(updated_at).floor(f'{minutes}min')
+    result = df.copy()
+    if result.index.tz is not None:
+        result.index = result.index.tz_localize(None)
+    last_index = pd.Timestamp(result.index[-1])
+    if bucket < last_index - pd.Timedelta(minutes=minutes):
+        return result
+
+    if bucket < last_index + pd.Timedelta(minutes=minutes):
+        target = last_index
+        result.at[target, 'Close'] = price
+        result.at[target, 'High'] = max(float(result.at[target, 'High']), price)
+        result.at[target, 'Low'] = min(float(result.at[target, 'Low']), price)
+        return result
+
+    latest_volume = _stream_number(getattr(quote, 'volume', None), 0) or 0
+    new_row = pd.DataFrame([{
+        'Open': price, 'High': price, 'Low': price, 'Close': price, 'Volume': latest_volume
+    }], index=[bucket])
+    return pd.concat([result, new_row]).sort_index()
+
+
+def get_market_stream_status(api):
+    if api is None:
+        return {'subscriptions': 0, 'stream_quotes': 0, 'errors': []}
+    state = _stream_state(api)
+    with state['lock']:
+        streamed_codes = {
+            value.get('code') for value in state['quotes'].values()
+            if value.get('source') == 'stream' and value.get('code')
+        }
+        return {
+            'subscriptions': sum(
+                value.get('status') == 'active' for value in state['subscriptions'].values()
+            ),
+            'stream_quotes': len(streamed_codes),
+            'errors': list(state['errors']),
+        }
+
+
+def clear_market_stream(api):
+    """Forget one disconnected API object's quote cache."""
+    if api is None:
+        return
+    registry, registry_lock = get_market_stream_registry()
+    with registry_lock:
+        registry.pop(id(api), None)
 # ==========================================
 # 新增: 全域行事曆與權證判斷函數
 # ==========================================
@@ -1502,6 +1946,15 @@ def fetch_shioaji_data(api, code, interval='1d', lookback_days=10):
             df['Volume'] = df['Amount'].astype(float) / 100_000_000
             df.attrs['volume_unit'] = '億'
 
+        # Historical K bars remain query-based. The unfinished minute candle is
+        # overlaid from the live subscription so a rerun no longer needs another
+        # kbars/snapshot round trip just to obtain the latest price.
+        if interval in ('1m', '5m', '15m', '60m'):
+            stream_quote = get_stream_quotes(api, [contract], snapshot_fallback=False)
+            df = merge_stream_quote_into_intraday(
+                df, stream_quote[0] if stream_quote else None, interval
+            )
+
         # 保留資料實際來源，讓圖表可以驗證商品與連續契約是否正確。
         df.attrs['shioaji_contract_code'] = getattr(contract, 'code', '')
         df.attrs['shioaji_target_code'] = getattr(contract, 'target_code', '')
@@ -1559,7 +2012,7 @@ def merge_market_temperature_snapshot(df, api, code):
         else:
             return df
 
-        snapshots = api.snapshots([contract])
+        snapshots = get_stream_quotes(api, [contract])
         if not snapshots:
             return df
 
@@ -1634,7 +2087,7 @@ def fetch_market_temperature_data(code, lookback_days=180):
             twse_df = fetch_twse_taiex_daily_history(lookback_days=lookback_days)
             if not twse_df.empty:
                 df = merge_taiex_history_with_shioaji(twse_df, df)
-                source = "證交所官方歷史日K + 永豐 Shioaji 即時快照"
+                source = "證交所官方歷史日K + 永豐 Shioaji 即時串流"
         if not df.empty:
             df = merge_market_temperature_snapshot(df, api, code)
             if not source:
@@ -1672,7 +2125,7 @@ def fetch_market_temperature_data(code, lookback_days=180):
 
 
 def get_cached_market_temperature_data(code, lookback_days=180, max_age_seconds=180):
-    """Reuse slower daily history while still merging a fresh intraday snapshot."""
+    """Reuse slower daily history while still merging the current streamed quote."""
     cache = st.session_state.setdefault('_market_temperature_history_cache', {})
     logged_in = bool(st.session_state.get('sj_logged_in', False))
     api = st.session_state.get('sj_api')
@@ -1864,7 +2317,7 @@ def get_futures_intraday_state(api, direction):
 
 
 def get_cached_futures_intraday_state(api, direction, max_age_seconds=8):
-    """Throttle the slower 15-minute K request; the price snapshot remains live."""
+    """Throttle the slower 15-minute K request; the streamed price remains live."""
     cache = st.session_state.setdefault('_trade_plan_intraday_cache', {})
     cache_key = (direction, id(api) if api is not None else None)
     cached = cache.get(cache_key)
@@ -2063,7 +2516,7 @@ def get_live_futures_snapshot(api, product='TMF'):
     if contract is None:
         return None
     try:
-        snapshots = api.snapshots([contract])
+        snapshots = get_stream_quotes(api, [contract])
         if not snapshots:
             return None
         snapshot = snapshots[0]
@@ -2423,11 +2876,11 @@ def txo_right_value(contract):
 
 
 def get_txo_snapshot_prices(api, contracts, sides):
-    """Read executable-side option prices from Shioaji snapshots, falling back to close."""
+    """Read executable-side option prices from Shioaji streaming, falling back to close."""
     prices = [None] * len(contracts)
     try:
         snapshot_contracts = [getattr(contract, 'shioaji_contract', contract) for contract in contracts]
-        snapshots = api.snapshots(snapshot_contracts)
+        snapshots = get_stream_quotes(api, snapshot_contracts)
         for index, (snapshot, side) in enumerate(zip(snapshots, sides)):
             field = 'buy_price' if side == 'sell' else 'sell_price'
             price = float(getattr(snapshot, field, 0) or getattr(snapshot, 'close', 0) or 0)
@@ -2438,11 +2891,11 @@ def get_txo_snapshot_prices(api, contracts, sides):
 
 
 def get_txo_snapshot_quotes(api, contracts):
-    """Read buy-side executable quotes and liquidity fields in one snapshot batch."""
+    """Read executable option quotes and liquidity fields from the shared stream."""
     quotes = []
     try:
         snapshot_contracts = [getattr(contract, 'shioaji_contract', contract) for contract in contracts]
-        snapshots = api.snapshots(snapshot_contracts)
+        snapshots = get_stream_quotes(api, snapshot_contracts)
     except Exception:
         snapshots = []
     for index, contract in enumerate(contracts):
@@ -3180,7 +3633,7 @@ def plot_fibonacci_chart(symbol, interval, lookback=60, font_size=15, ma_flags=N
                     if not drop_indices.empty:
                         df.drop(index=drop_indices, inplace=True)
                 
-        # 透過 snapshots 即時快照更新圖表最後一筆資料
+        # 透過共享串流更新圖表最後一筆資料；首次暖機才使用 snapshot。
         if st.session_state.get('sj_logged_in', False) and not df.empty:
             try:
                 contract_snap = None
@@ -3204,7 +3657,7 @@ def plot_fibonacci_chart(symbol, interval, lookback=60, font_size=15, ma_flags=N
                         except: pass
                 
                 if contract_snap:
-                    snap = st.session_state.sj_api.snapshots([contract_snap])
+                    snap = get_stream_quotes(st.session_state.sj_api, [contract_snap])
                     if snap and len(snap) > 0:
                         s = snap[0]
                         # 指數快照有時不提供成交量，close 也可能在開盤瞬間尚未
@@ -3640,14 +4093,14 @@ def plot_fibonacci_chart(symbol, interval, lookback=60, font_size=15, ma_flags=N
     fetch_time_str = datetime.now(pytz.timezone('Asia/Taipei')).strftime('%Y-%m-%d %H:%M:%S')
     
     if twse_taiex_used:
-        data_source_text = "證交所官方歷史日K + 永豐即時快照"
+        data_source_text = "證交所官方歷史日K + 永豐即時串流"
     elif sj_kbars_used:
         contract_code = df.attrs.get('shioaji_contract_code', '')
         target_code = df.attrs.get('shioaji_target_code', '')
         resolved_contract = f" → {target_code}" if target_code else ""
         data_source_text = f"永豐 Shioaji API (K線合約：{contract_code}{resolved_contract})"
     elif sj_snap_used:
-        data_source_text = "YF歷史 + 永豐即時快照"
+        data_source_text = "YF歷史 + 永豐即時串流"
     elif twstock_used:
         data_source_text = "YF歷史 + Twstock即時"
     else:
@@ -4758,6 +5211,7 @@ if 'cal_month' not in st.session_state: st.session_state.cal_month = now_tw.mont
 def init_shioaji_connection(api_key, secret_key):
     api = sj.Shioaji(simulation=False)
     api.login(api_key, secret_key)
+    _install_stream_callbacks(api)
     return api
 
 if 'font_size' not in st.session_state: st.session_state.font_size = saved_config.get('font_size', 15)
@@ -4830,13 +5284,22 @@ with st.sidebar:
             except Exception:
                 st.caption("📊 API 今日剩餘流量: 暫時無法獲取 (連線讀取中)")
 
+            stream_status = get_market_stream_status(st.session_state.sj_api)
+            st.caption(
+                f"📡 串流已訂閱 {stream_status['subscriptions']} 項｜"
+                f"已接收 {stream_status['stream_quotes']} 項即時行情"
+            )
+            if stream_status['errors']:
+                st.caption("⚠️ 部分商品暫無串流，已自動使用暖機報價備援。")
+
             col_logout, col_relogin = st.columns(2)
             with col_logout:
                 if st.button("登出", key="btn_logout_sj", use_container_width=True):
                     st.session_state.sj_logged_in = False
                     st.session_state.manual_logout = True # 標記為手動登出，阻擋重整時自動登入
                     
-                    try: 
+                    try:
+                        clear_market_stream(st.session_state.sj_api)
                         st.session_state.sj_api.logout()
                         init_shioaji_connection.clear() 
                     except: pass
@@ -4857,6 +5320,7 @@ with st.sidebar:
             
             if relogin_clicked:
                 try:
+                    clear_market_stream(st.session_state.sj_api)
                     st.session_state.sj_api.logout()
                     init_shioaji_connection.clear() # 必須清除快取，否則只會拿到舊的連線物件
                     time.sleep(0.5)
@@ -5036,7 +5500,7 @@ def render_stock_strategy_explanation():
 - **原選股順序不變**：維持週轉率排行及原本的戰略備註；附加分析只補充支撐壓力、進出場點位與信心判讀。
 - **ATR**衡量正常波動幅度，不判斷多空；乖離越大，越不適合追價或追空。
 - **VWAP**是盤中成交量加權平均成本。當沖時，價格在 VWAP 上方偏多、下方偏空，並搭配 09:00–09:15 開盤區間及量能確認。
-- **開盤首 15 分鐘**按「更新盤中資料與當沖條件」後，會以 Shioaji 即時快照＋1 分 K 顯示形成中的高低點與動能；09:15 後自動改用 5 分 K 與完整開盤區間。
+- **開盤首 15 分鐘**按「更新盤中資料與當沖條件」後，會以 Shioaji 即時串流＋1 分 K 顯示形成中的高低點與動能；09:15 後自動改用 5 分 K 與完整開盤區間。
 - **進／停／目**分別為條件成立後的觀察進場、策略失效離場與第一目標。信心分是條件一致度，不是勝率。
 - **處置／注意**只代表官方名單查核。即時價格與漲跌幅需登入 Shioaji；盤中取最新快照，盤後保留最後成交價與漲跌幅。
 - 若股票有一般股期或小型股期，會依股票表順序自動附加到期貨戰略室排行之後。
@@ -5566,7 +6030,11 @@ def fetch_futures_contract_kbars(api, contract, lookback_days=20):
         data['ts'] = pd.to_datetime(data['ts'])
         if data['ts'].dt.tz is not None:
             data['ts'] = data['ts'].dt.tz_convert('Asia/Taipei').dt.tz_localize(None)
-        return data.set_index('ts').sort_index()
+        data = data.set_index('ts').sort_index()
+        stream_quote = get_stream_quotes(api, [contract], snapshot_fallback=False)
+        return merge_stream_quote_into_intraday(
+            data, stream_quote[0] if stream_quote else None, '1m'
+        )
     except Exception:
         return pd.DataFrame()
 
@@ -5587,7 +6055,7 @@ def update_futures_live_rows(rows, api, strategy_mode, direction_choice, include
     try:
         for start in range(0, len(resolved), 30):
             batch = resolved[start:start + 30]
-            batch_snapshots = api.snapshots([contract for _, contract in batch]) or []
+            batch_snapshots = get_stream_quotes(api, [contract for _, contract in batch])
             for (index, _), snapshot in zip(batch, batch_snapshots):
                 snapshots[index] = snapshot
     except Exception:
@@ -5632,7 +6100,7 @@ def update_futures_live_rows(rows, api, strategy_mode, direction_choice, include
     return updated, update_count
 
 def update_futures_universe_live(rows, api):
-    """以一次手動批次快照更新完整期貨清單，供盤中／夜盤提前重排成交量。"""
+    """以共享串流更新完整期貨清單，供盤中／夜盤提前重排成交量。"""
     if rows.empty or api is None:
         return rows, 0
     updated = rows.copy()
@@ -5670,7 +6138,7 @@ def update_futures_universe_live(rows, api):
     for start in range(0, len(resolved), 200):
         batch = resolved[start:start + 200]
         try:
-            batch_snapshots = api.snapshots([contract for _, contract in batch]) or []
+            batch_snapshots = get_stream_quotes(api, [contract for _, contract in batch])
         except Exception:
             continue
         for (index, _), snapshot in zip(batch, batch_snapshots):
@@ -6566,7 +7034,7 @@ def calculate_daytrade_filter_result(row, direction, attention_counts=None, disp
         return {
             'score': 0, 'rule': '資料不足：先更新盤中資料', 'eligible': False,
             'vwap_status': '—', 'opening_range': '—',
-            'detail': '尚未取得即時快照／分 K、VWAP 或開盤區間資料。', 'data_time': None
+            'detail': '尚未取得即時串流／分 K、VWAP 或開盤區間資料。', 'data_time': None
         }
 
     daily_trend_score = 0
@@ -6969,7 +7437,7 @@ def fetch_stock_data_raw(code, name_hint="", extra_data=None, futures_set=None, 
         if re.fullmatch(r'\d{4,6}', code):
             try:
                 stock_contract = sj_api.Contracts.Stocks[code]
-                stock_snapshots = sj_api.snapshots([stock_contract]) or []
+                stock_snapshots = get_stream_quotes(sj_api, [stock_contract])
                 if stock_snapshots:
                     stock_snapshot = stock_snapshots[0]
                     live_quote_price = _safe_number(getattr(stock_snapshot, 'close', None))
@@ -7028,7 +7496,7 @@ def fetch_stock_data_raw(code, name_hint="", extra_data=None, futures_set=None, 
             pass
 
     # 僅當未使用永豐 API，且需獲取即時資訊時，才透過 twstock.realtime 補足今日最新
-    if source_used != "shioaji":
+    if source_used != "shioaji" and live_quote_price is None:
         try:
             rt_data = twstock.realtime.get(code)
             if rt_data['success'] and rt_data['realtime']['latest_trade_price'] not in ['-', None, '']:
@@ -7091,7 +7559,7 @@ def fetch_stock_data_raw(code, name_hint="", extra_data=None, futures_set=None, 
             else:
                 contract = sj_api.Contracts.Futures.TMF.TMFR1
             if contract:
-                snap = sj_api.snapshots([contract])
+                snap = get_stream_quotes(sj_api, [contract])
                 if snap and len(snap) > 0:
                     s = snap[0]
                     rt_p = s.close if s.close > 0 else s.open
@@ -7309,7 +7777,7 @@ def fetch_stock_snapshot_map(api, codes):
     if not contracts:
         return {}
     try:
-        snapshots = api.snapshots(contracts) or []
+        snapshots = get_stream_quotes(api, contracts)
         return {
             str(getattr(snapshot, 'code', '')): snapshot for snapshot in snapshots
             if getattr(snapshot, 'code', None)
@@ -7581,7 +8049,7 @@ def render_futures_strategy_room():
                 universe = live_universe
                 st.session_state.futures_strategy_editor_revision += 1
                 persist_futures_room_state(live_universe)
-                st.toast(f"已用即時快照更新 {live_count} 個契約並重新排序", icon="📊")
+                st.toast(f"已用即時串流更新 {live_count} 個契約並重新排序", icon="📊")
             else:
                 st.warning("未取得可用的期貨快照；請確認 Shioaji 契約資料與連線狀態。")
 
@@ -8363,7 +8831,7 @@ with stock_strategy_container:
                 strategy_mode = st.radio(
                     "策略模式", ["當沖預覽", "隔日／波段"], horizontal=True,
                     key="risk_filter_strategy_mode",
-                    help="隔日／波段維持原有規則；09:00–09:15 採即時快照＋1 分 K，之後採 5 分 K、VWAP 與完整開盤區間，不會自動下單。"
+                    help="隔日／波段維持原有規則；09:00–09:15 採即時串流＋1 分 K，之後採 5 分 K、VWAP 與完整開盤區間，不會自動下單。"
                 )
                 is_daytrade_mode = strategy_mode == "當沖預覽"
                 risk_col1, risk_col2, risk_col3 = st.columns(3)
@@ -8406,9 +8874,9 @@ with stock_strategy_container:
                     if is_daytrade_mode:
                         if st.button("📈 更新盤中資料與當沖條件", key="refresh_daytrade_filter_metrics"):
                             if not st.session_state.get('sj_logged_in', False) or st.session_state.get('sj_api') is None:
-                                st.warning("當沖預覽需要先登入永豐 Shioaji，才能取得即時快照與分 K 資料。")
+                                st.warning("當沖預覽需要先登入永豐 Shioaji，才能取得即時串流與分 K 資料。")
                             else:
-                                with st.spinner("正在取得即時快照與分 K、計算 VWAP 與開盤條件..."):
+                                with st.spinner("正在讀取即時串流與分 K、計算 VWAP 與開盤條件..."):
                                     refreshed_data, updated_count = refresh_daytrade_metrics_for_codes(
                                         st.session_state.stock_data,
                                         st.session_state.get('sj_logged_in', False),
@@ -8912,7 +9380,7 @@ with stock_strategy_container:
                                 except: pass
                             
                             if contract:
-                                snap = sj_api.snapshots([contract])
+                                snap = get_stream_quotes(sj_api, [contract])
                                 if snap and len(snap) > 0:
                                     snapshot = snap[0]
                                     rt_price = snapshot.close
@@ -8989,7 +9457,7 @@ with stock_strategy_container:
                 indep_strategy_mode = st.radio(
                     "獨立計算模式", ["當沖預覽", "隔日／波段"], horizontal=True,
                     key="indep_strategy_mode",
-                    help="09:00–09:15 會取得即時快照＋1 分 K；09:15 後改用 5 分 K，計算 VWAP、開盤區間與量能。"
+                    help="09:00–09:15 會取得即時串流＋1 分 K；09:15 後改用 5 分 K，計算 VWAP、開盤區間與量能。"
                 )
                 indep_direction = st.radio("判斷方向", ["多頭", "空頭"], horizontal=True, key="indep_risk_direction")
             with indep_ctrl2:
@@ -9100,7 +9568,7 @@ with stock_strategy_container:
                     indep_disposition_codes = indep_market_risk_data.get('disposition', [])
                     indep_market_lists_updated = bool(indep_market_risk_data.get('updated')) and not indep_market_risk_data.get('errors')
                     if indep_is_daytrade and (not sj_logged or sj_api_obj is None):
-                        st.info("當沖預覽需要登入永豐 Shioaji 才能取得即時快照與分 K；目前仍會顯示日 K 資料，但盤中條件會標示為資料不足。")
+                        st.info("當沖預覽需要登入永豐 Shioaji 才能取得即時串流與分 K；目前仍會顯示日 K 資料，但盤中條件會標示為資料不足。")
                 
                 # 重新套用戰略備註與價差邏輯
                 for i, row in df_indep.iterrows():
@@ -10047,7 +10515,7 @@ with tab2:
 
                         if contract:
                             try:
-                                snap = sj_api.snapshots([contract])
+                                snap = get_stream_quotes(sj_api, [contract])
                                 if snap and len(snap) > 0:
                                     s = snap[0]
                                     rt_p = s.close if s.close > 0 else s.open
@@ -10525,7 +10993,7 @@ with tab_fibo:
                 is_cash_snapshot = (
                     updated_at == now_tw.date()
                     and dt_time(9, 0) <= now_tw.time() < dt_time(13, 35)
-                    and index_item[3] and '即時快照' in index_item[3]
+                    and index_item[3] and '即時串流' in index_item[3]
                 )
                 basis_reference = "加權盤中快照" if is_cash_snapshot else "最近加權日收盤"
                 index_change = float(index_result.get('change', 0) or 0)
@@ -10841,7 +11309,7 @@ with tab_fibo:
                         f"風險指標：{option_quote['risk_level']}；{premium_detail} 到期週 Gamma 風險高，"
                         "價格有效跌破／突破日線失效點時應優先退出，絕不留裸賣部位。"
                     )
-                    st.caption(f"資料來源：{option_quote['source']}（契約與即時快照）")
+                    st.caption(f"資料來源：{option_quote['source']}（契約與即時串流）")
                 elif option_quote:
                     option_title = f"{option_quote['name']}｜{option_quote['delivery_month']}｜{option_quote['expiry'].strftime('%Y/%m/%d')} 到期（剩 {option_quote['dte']} 天）"
                     st.markdown(f"**{option_title}**")

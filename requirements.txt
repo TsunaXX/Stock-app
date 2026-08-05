@@ -6,7 +6,7 @@ beautifulsoup4
 numpy
 twstock
 plotly
-shioaji
+shioaji>=1.7.0
 urllib3
 pdfplumber
 pillow
