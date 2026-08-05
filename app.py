@@ -3740,12 +3740,17 @@ def render_fibonacci_trade_suggestion(suggestion):
     """Render the Fibonacci plan below the chart in a concise, actionable form."""
     if not suggestion:
         return
-    st.markdown(
-        "<div style='font-size:18px;font-weight:700;'>🧭 費波操作建議 "
+    header_cols = st.columns([1.25, 2.75], vertical_alignment="center")
+    header_cols[0].markdown(
+        "<div style='font-size:18px;font-weight:700;white-space:nowrap;'>🧭 費波操作建議 "
         f"<span style='color:{suggestion['color']};'>｜{suggestion['action']}</span></div>",
         unsafe_allow_html=True,
     )
-    st.caption(f"結構訊號：{suggestion['signal']}。{suggestion['note']}")
+    header_cols[1].markdown(
+        f"<div style='color:#b8bec9;font-size:13px;padding-top:3px;'>"
+        f"結構訊號：{suggestion['signal']}；{suggestion['note']}</div>",
+        unsafe_allow_html=True,
+    )
 
     def price_text(value):
         return _format_fibo_trade_price(value, suggestion['asset_type'])
@@ -3754,7 +3759,7 @@ def render_fibonacci_trade_suggestion(suggestion):
         if suggestion['asset_type'] == 'futures':
             return f"微台 1 口：約 -${risk * 10:,.0f}／+${reward * 10:,.0f}"
         if suggestion['asset_type'] == 'stock':
-            return f"現股 1 張：約 -${risk * 1000:,.0f}／+${reward * 1000:,.0f}（未含費稅）"
+            return f"現股 1 張：約 -${risk * 1000:,.0f}／+${reward * 1000:,.0f}"
         return f"風險 {risk:,.2f} 點／目標 {reward:,.2f} 點"
 
     if suggestion['mode'] == 'range':
@@ -3766,9 +3771,8 @@ def render_fibonacci_trade_suggestion(suggestion):
         short_unit_note = f"（{amount_note(short_risk, short_reward)}）"
         short_label = '減碼／融券條件' if suggestion['asset_type'] == 'stock' else '做空條件'
         st.markdown(
-            f"- <span style='color:#ff4b4b;'>做多條件</span>：回測 **{price_text(long_entry)}** 止穩；停損 **{price_text(long_stop)}**；目標 **{price_text(long_target)}**。  \n"
-            f"{unit_note}  \n"
-            f"- <span style='color:#00c853;'>{short_label}</span>：反彈 **{price_text(short_entry)}** 受壓；停損 **{price_text(short_stop)}**；目標 **{price_text(short_target)}**。 {short_unit_note}",
+            f"- <span style='color:#ff4b4b;'>做多條件</span>：回測 **{price_text(long_entry)}** 止穩；停損 **{price_text(long_stop)}**；目標 **{price_text(long_target)}** {unit_note}  \n"
+            f"- <span style='color:#00c853;'>{short_label}</span>：反彈 **{price_text(short_entry)}** 受壓；停損 **{price_text(short_stop)}**；目標 **{price_text(short_target)}** {short_unit_note}",
             unsafe_allow_html=True,
         )
         return
@@ -3791,7 +3795,7 @@ def render_fibonacci_trade_suggestion(suggestion):
     elif suggestion['asset_type'] == 'stock':
         st.caption(
             f"以現股 1 張（1,000 股）試算：停損價差約 -${risk * 1000:,.0f}；"
-            f"目標價差約 +${reward * 1000:,.0f}；風報比 {suggestion['rr']:.2f}（未含手續費與證交稅）。"
+            f"目標價差約 +${reward * 1000:,.0f}；風報比 {suggestion['rr']:.2f}。"
         )
 
 
