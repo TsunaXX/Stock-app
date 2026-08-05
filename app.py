@@ -1671,6 +1671,31 @@ def fetch_market_temperature_data(code, lookback_days=180):
     return result, source
 
 
+def get_cached_market_temperature_data(code, lookback_days=180, max_age_seconds=180):
+    """Reuse slower daily history while still merging a fresh intraday snapshot."""
+    cache = st.session_state.setdefault('_market_temperature_history_cache', {})
+    logged_in = bool(st.session_state.get('sj_logged_in', False))
+    api = st.session_state.get('sj_api')
+    cache_key = (code, int(lookback_days), logged_in, id(api) if api is not None else None)
+    cached = cache.get(cache_key)
+    now = time.monotonic()
+    if cached and now - cached['saved_at'] <= max_age_seconds:
+        df = cached['df'].copy(deep=True)
+        df.attrs.update(cached.get('attrs', {}))
+        if logged_in and api is not None and not df.empty:
+            df = merge_market_temperature_snapshot(df, api, code)
+        return df, cached['source']
+
+    df, source = fetch_market_temperature_data(code, lookback_days=lookback_days)
+    cache[cache_key] = {
+        'saved_at': now,
+        'df': df.copy(deep=True),
+        'attrs': dict(df.attrs),
+        'source': source,
+    }
+    return df, source
+
+
 def calculate_market_temperature(df):
     """Return a transparent 0-100 trend / momentum temperature score."""
     required = {'High', 'Low', 'Close'}
@@ -1838,17 +1863,53 @@ def get_futures_intraday_state(api, direction):
         return empty_state
 
 
-def evaluate_trade_entry_state(plan, live_price, live_change, intraday_state, temperature_delta=0.0):
+def get_cached_futures_intraday_state(api, direction, max_age_seconds=8):
+    """Throttle the slower 15-minute K request; the price snapshot remains live."""
+    cache = st.session_state.setdefault('_trade_plan_intraday_cache', {})
+    cache_key = (direction, id(api) if api is not None else None)
+    cached = cache.get(cache_key)
+    now = time.monotonic()
+    if cached and now - cached['saved_at'] <= max_age_seconds:
+        return dict(cached['value'])
+    value = get_futures_intraday_state(api, direction)
+    cache.clear()
+    cache[cache_key] = {'saved_at': now, 'value': dict(value)}
+    return value
+
+
+def evaluate_trade_entry_state(
+    plan, live_price, live_change, intraday_state, temperature_delta=0.0,
+    entry_profile='積極（提早確認）',
+):
     """Separate the lagging trend regime from the immediate entry permission."""
     atr = max(float(plan.get('atr', 0) or 0), 1.0)
     shock_ratio = float(live_change or 0) / atr
     direction = plan['direction']
-    zone_tolerance = max(float(plan['zone_points']), atr * 0.25)
+    is_aggressive = str(entry_profile).startswith('積極')
+    zone_tolerance = max(float(plan['zone_points']), atr * (0.45 if is_aggressive else 0.25))
     near_entry = abs(float(live_price) - float(plan['entry_level'])) <= zone_tolerance
     bullish_break = bool(intraday_state.get('bullish_break'))
     bearish_break = bool(intraday_state.get('bearish_break'))
     is_up_bar = bool(intraday_state.get('is_up_bar'))
     is_down_bar = bool(intraday_state.get('is_down_bar'))
+    intraday_latest = intraday_state.get('latest')
+    vwap = intraday_state.get('vwap')
+    try:
+        intraday_latest = float(intraday_latest)
+    except (TypeError, ValueError):
+        intraday_latest = float(live_price)
+    try:
+        vwap = float(vwap)
+    except (TypeError, ValueError):
+        vwap = None
+    bullish_live = is_up_bar or (
+        is_aggressive and vwap is not None
+        and float(live_price) >= intraday_latest and float(live_price) > vwap
+    )
+    bearish_live = is_down_bar or (
+        is_aggressive and vwap is not None
+        and float(live_price) <= intraday_latest and float(live_price) < vwap
+    )
 
     state = {
         'stage': '等待確認', 'permission': '等待進場', 'color': '#ffc107',
@@ -1902,23 +1963,45 @@ def evaluate_trade_entry_state(plan, live_price, live_change, intraday_state, te
     if direction not in ('偏多', '偏空'):
         lower_edge = float(live_price) <= float(plan['support']) + zone_tolerance
         upper_edge = float(live_price) >= float(plan['resistance']) - zone_tolerance
-        if lower_edge and is_up_bar:
+        if lower_edge and bullish_live:
             state.update(
                 stage='區間下緣止跌', permission='允許試多', color='#ff4b4b', can_enter=True,
-                execution_direction='偏多', reason='價格位於費波支撐邊緣且 15 分 K 止跌；採區間反彈，不視為趨勢翻多。',
+                execution_direction='偏多', reason='價格位於費波支撐邊緣且盤中價格止跌轉強；採區間反彈，不視為趨勢翻多。',
             )
-        elif upper_edge and is_down_bar:
+        elif upper_edge and bearish_live:
             state.update(
                 stage='區間上緣受壓', permission='允許試空', color='#00c853', can_enter=True,
-                execution_direction='偏空', reason='價格位於費波壓力邊緣且 15 分 K 轉弱；採區間回落，不視為趨勢翻空。',
+                execution_direction='偏空', reason='價格位於費波壓力邊緣且盤中價格受壓轉弱；採區間回落，不視為趨勢翻空。',
                 entry_level=float(plan['resistance']),
                 invalidation=float(plan['resistance']) + max(float(plan['zone_points']), atr * 0.5),
                 target=float(plan['support']),
             )
         elif float(live_price) > float(plan['resistance']) and bullish_break:
-            state.update(stage='向上突破', permission='等待回測', reason='已突破費波壓力；等待回測原壓力不破，避免追在短線過熱處。')
+            if is_aggressive and shock_ratio < 1.0:
+                vwap_stop = vwap if vwap is not None and vwap < float(live_price) else -np.inf
+                stop = max(float(plan['resistance']) - atr * 0.45, vwap_stop)
+                risk = max(float(live_price) - stop, atr * 0.20)
+                state.update(
+                    stage='向上突破跟進', permission='允許小部位試多', color='#ff4b4b', can_enter=True,
+                    execution_direction='偏多', reason='價格突破費波壓力並站穩 VWAP／開盤區間；漲幅未達 1 ATR，可小部位跟進並嚴守突破失敗停損。',
+                    entry_level=float(live_price), invalidation=stop,
+                    target=max(float(plan['target']), float(live_price) + risk * 1.3),
+                )
+            else:
+                state.update(stage='向上突破', permission='等待回測', reason='已突破費波壓力；等待回測原壓力不破，避免追在短線過熱處。')
         elif float(live_price) < float(plan['support']) and bearish_break:
-            state.update(stage='向下跌破', permission='等待反抽', reason='已跌破費波支撐；等待反抽原支撐不過，避免追在短線超跌處。')
+            if is_aggressive and shock_ratio > -1.0:
+                vwap_stop = vwap if vwap is not None and vwap > float(live_price) else np.inf
+                stop = min(float(plan['support']) + atr * 0.45, vwap_stop)
+                risk = max(stop - float(live_price), atr * 0.20)
+                state.update(
+                    stage='向下跌破跟進', permission='允許小部位試空', color='#00c853', can_enter=True,
+                    execution_direction='偏空', reason='價格跌破費波支撐並落在 VWAP／開盤區間下方；跌幅未達 1 ATR，可小部位跟進並嚴守跌破失敗停損。',
+                    entry_level=float(live_price), invalidation=stop,
+                    target=min(float(plan['target']), float(live_price) - risk * 1.3),
+                )
+            else:
+                state.update(stage='向下跌破', permission='等待反抽', reason='已跌破費波支撐；等待反抽原支撐不過，避免追在短線超跌處。')
         else:
             state.update(stage='區間盤整', reason='價格未在區間邊緣形成確認，區間中段不建立方向部位。')
         return finalize(state)
@@ -1928,15 +2011,25 @@ def evaluate_trade_entry_state(plan, live_price, live_change, intraday_state, te
             state.update(stage='多方過熱', permission='禁止追多', reason='漲幅或價格延伸已過大；等待回測費波支撐後再評估。')
         elif bearish_break:
             state.update(stage='多方轉弱', permission='暫停做多', reason='15 分 K 已跌破 VWAP 與本段開盤區間低點，先等待重新站回。')
-        elif near_entry and is_up_bar:
-            state.update(stage='多方延續', permission='允許進場', color='#ff4b4b', can_enter=True, execution_direction='偏多', reason='價格位於費波支撐觀察區，且 15 分 K 止跌上收。')
+        elif near_entry and bullish_live:
+            state.update(
+                stage='多方提前確認' if is_aggressive and not is_up_bar else '多方延續',
+                permission='允許小部位進場' if is_aggressive else '允許進場', color='#ff4b4b', can_enter=True,
+                execution_direction='偏多',
+                reason='價格進入擴大後的費波觀察區，且即時價站上 VWAP 並轉強。' if is_aggressive and not is_up_bar else '價格位於費波支撐觀察區，且 15 分 K 止跌上收。',
+            )
     else:
         if shock_ratio <= -1.5 or float(live_price) < float(plan['support']) - atr * 0.5:
             state.update(stage='空方過熱', permission='禁止追空', reason='跌幅或價格延伸已過大；等待反彈至費波壓力後再評估。')
         elif bullish_break:
             state.update(stage='空方反彈轉強', permission='暫停做空', reason='15 分 K 已站上 VWAP 與本段開盤區間高點，先等待反彈失敗。')
-        elif near_entry and is_down_bar:
-            state.update(stage='空方延續', permission='允許進場', color='#00c853', can_enter=True, execution_direction='偏空', reason='價格位於費波壓力觀察區，且 15 分 K 受壓下收。')
+        elif near_entry and bearish_live:
+            state.update(
+                stage='空方提前確認' if is_aggressive and not is_down_bar else '空方延續',
+                permission='允許小部位進場' if is_aggressive else '允許進場', color='#00c853', can_enter=True,
+                execution_direction='偏空',
+                reason='價格進入擴大後的費波觀察區，且即時價跌破 VWAP 並轉弱。' if is_aggressive and not is_down_bar else '價格位於費波壓力觀察區，且 15 分 K 受壓下收。',
+            )
     return finalize(state)
 
 
@@ -2065,6 +2158,20 @@ def calculate_short_wave_plan(api, direction):
         }
     except Exception:
         return None
+
+
+def get_cached_short_wave_plan(api, direction, max_age_seconds=8):
+    """Reuse the 5-minute calculation briefly so one refresh does not reload all bars."""
+    cache = st.session_state.setdefault('_trade_plan_short_wave_cache', {})
+    cache_key = (direction, id(api) if api is not None else None)
+    cached = cache.get(cache_key)
+    now = time.monotonic()
+    if cached and now - cached['saved_at'] <= max_age_seconds:
+        return dict(cached['value']) if cached['value'] else None
+    value = calculate_short_wave_plan(api, direction)
+    cache.clear()
+    cache[cache_key] = {'saved_at': now, 'value': dict(value) if value else None}
+    return value
 
 
 def get_txo_target_contract_specs(expiry_choice, today=None):
@@ -2290,6 +2397,84 @@ def get_txo_snapshot_prices(api, contracts, sides):
     return prices
 
 
+def get_txo_snapshot_quotes(api, contracts):
+    """Read buy-side executable quotes and liquidity fields in one snapshot batch."""
+    quotes = []
+    try:
+        snapshot_contracts = [getattr(contract, 'shioaji_contract', contract) for contract in contracts]
+        snapshots = api.snapshots(snapshot_contracts)
+    except Exception:
+        snapshots = []
+    for index, contract in enumerate(contracts):
+        snapshot = snapshots[index] if index < len(snapshots) else None
+
+        def number(field):
+            try:
+                value = float(getattr(snapshot, field, 0) or 0)
+                return value if np.isfinite(value) and value > 0 else None
+            except (TypeError, ValueError):
+                return None
+
+        bid = number('buy_price')
+        ask = number('sell_price')
+        last = number('close')
+        premium = ask or last
+        mid = ((bid + ask) / 2) if bid is not None and ask is not None else premium
+        spread = (ask - bid) if bid is not None and ask is not None and ask >= bid else None
+        spread_pct = (spread / mid * 100) if spread is not None and mid else None
+        volume = number('total_volume') or 0.0
+        if ask is None:
+            liquidity = '報價不足'
+        elif bid is None or spread_pct is None or spread_pct > 25:
+            liquidity = '低'
+        elif spread_pct <= 8 and volume >= 50:
+            liquidity = '高'
+        else:
+            liquidity = '中'
+        quotes.append({
+            'contract': contract, 'bid': bid, 'ask': ask, 'last': last,
+            'premium': premium, 'spread': spread, 'spread_pct': spread_pct,
+            'volume': volume, 'liquidity': liquidity,
+        })
+    return quotes
+
+
+def rank_txo_directional_candidates(contracts, quotes, plan, is_buy_call, otm_profile):
+    """Select a strictly OTM contract by distance, target reachability and liquidity."""
+    spot = float(plan['latest'])
+    atr = max(float(plan.get('atr', 0) or 0), 1.0)
+    profile_settings = {
+        '淺價外（勝率優先）': (max(50.0, atr * 0.10), '履約價較接近現價，成本較高但較容易跟隨標的'),
+        '標準價外（成本／勝率平衡）': (max(100.0, atr * 0.25), '兼顧權利金、價差與目標可達性'),
+        '深價外（低成本高槓桿）': (max(150.0, atr * 0.45), '權利金較低，但歸零機率與時間價值衰減較高'),
+    }
+    desired_distance, profile_note = profile_settings.get(
+        otm_profile, profile_settings['標準價外（成本／勝率平衡）'],
+    )
+    target = float(plan['target'])
+    rows = []
+    for contract, quote in zip(contracts, quotes):
+        strike = float(getattr(contract, 'strike_price', 0) or 0)
+        strictly_otm = strike > spot if is_buy_call else strike < spot
+        if not strictly_otm:
+            continue
+        otm_points = strike - spot if is_buy_call else spot - strike
+        target_reachable = strike <= target if is_buy_call else strike >= target
+        distance_penalty = abs(otm_points - desired_distance) / max(desired_distance, 1.0)
+        spread_penalty = min(float(quote['spread_pct'] or 40.0) / 20.0, 3.0)
+        quote_penalty = 0.0 if quote['ask'] is not None else 4.0
+        liquidity_bonus = 0.35 if quote['liquidity'] == '高' else (0.15 if quote['liquidity'] == '中' else 0.0)
+        reach_penalty = 0.0 if target_reachable else 2.5
+        score = distance_penalty + spread_penalty + quote_penalty + reach_penalty - liquidity_bonus
+        rows.append({
+            **quote, 'contract': contract, 'strike': strike, 'otm_points': otm_points,
+            'otm_pct': otm_points / spot * 100 if spot else 0.0,
+            'target_reachable': target_reachable, 'score': score,
+            'profile_note': profile_note,
+        })
+    return min(rows, key=lambda row: row['score']) if rows else None
+
+
 def get_txo_spread_quote(api, plan, expiry_choice):
     """Find an OTM defined-risk credit spread for the selected TXO expiry."""
     if api is None or plan is None or plan['direction'] not in ('偏多', '偏空'):
@@ -2333,8 +2518,8 @@ def get_txo_spread_quote(api, plan, expiry_choice):
     }
 
 
-def get_txo_directional_quote(api, plan, expiry_choice):
-    """Find the nearest OTM buy-call (BC) or buy-put (BP) from SinoPac data."""
+def get_txo_directional_quote(api, plan, expiry_choice, otm_profile='標準價外（成本／勝率平衡）'):
+    """Find a strictly OTM BC/BP using distance, target reachability and live liquidity."""
     if api is None or plan is None or plan['direction'] not in ('偏多', '偏空'):
         return None
     expiry_options, selected_expiry, source = select_txo_expiry(api, expiry_choice)
@@ -2344,26 +2529,55 @@ def get_txo_directional_quote(api, plan, expiry_choice):
     is_buy_call = plan['direction'] == '偏多'
     right = 'C' if is_buy_call else 'P'
     contracts = [contract for contract in expiry_options if txo_right_value(contract) == right]
-    spot = plan['latest']
+    spot = float(plan['latest'])
     if is_buy_call:
-        candidates = [c for c in contracts if float(getattr(c, 'strike_price', 0)) >= spot]
-        contract = min(candidates, key=lambda c: float(c.strike_price)) if candidates else None
+        candidates = [c for c in contracts if float(getattr(c, 'strike_price', 0)) > spot]
     else:
-        candidates = [c for c in contracts if float(getattr(c, 'strike_price', 0)) <= spot]
-        contract = max(candidates, key=lambda c: float(c.strike_price)) if candidates else None
-    if contract is None:
+        candidates = [c for c in contracts if float(getattr(c, 'strike_price', 0)) < spot]
+    if not candidates:
         return None
 
-    premium = get_txo_snapshot_prices(api, [contract], ['buy'])[0]
+    atr = max(float(plan.get('atr', 0) or 0), 1.0)
+    desired_distance = {
+        '淺價外（勝率優先）': max(50.0, atr * 0.10),
+        '標準價外（成本／勝率平衡）': max(100.0, atr * 0.25),
+        '深價外（低成本高槓桿）': max(150.0, atr * 0.45),
+    }.get(otm_profile, max(100.0, atr * 0.25))
+    desired_strike = spot + desired_distance if is_buy_call else spot - desired_distance
+    nearby = sorted(candidates, key=lambda c: abs(float(c.strike_price) - desired_strike))[:8]
+    quotes = get_txo_snapshot_quotes(api, nearby)
+    selected = rank_txo_directional_candidates(nearby, quotes, plan, is_buy_call, otm_profile)
+    if selected is None:
+        return None
+    contract = selected['contract']
+    premium = selected['premium']
     dte = (selected_expiry - datetime.now(pytz.timezone('Asia/Taipei')).date()).days
+    strike = float(contract.strike_price)
+    breakeven = (strike + premium) if is_buy_call and premium is not None else (
+        strike - premium if premium is not None else None
+    )
+    target = float(plan['target'])
+    target_intrinsic = max(target - strike, 0.0) if is_buy_call else max(strike - target, 0.0)
+    target_pnl = (target_intrinsic - premium) * 50 if premium is not None else None
+    target_return_pct = (
+        (target_intrinsic - premium) / premium * 100
+        if premium is not None and premium > 0 else None
+    )
     return {
         'name': '單買買權（BC / Buy Call）' if is_buy_call else '單買賣權（BP / Buy Put）',
         'right': 'Call' if is_buy_call else 'Put', 'contract': contract,
-        'strike': float(contract.strike_price), 'expiry': selected_expiry, 'dte': dte,
+        'strike': strike, 'expiry': selected_expiry, 'dte': dte,
         'premium': premium, 'max_loss': premium * 50 if premium is not None else None,
         'risk_level': '高' if dte <= 1 else ('中高' if dte <= 3 else '中'),
         'source': source, 'delivery_month': str(getattr(contract, 'delivery_month', '')),
         'premium_basis': '永豐 Shioaji 快照：最佳賣價，缺值時以最後成交價替代',
+        'bid': selected['bid'], 'ask': selected['ask'], 'spread': selected['spread'],
+        'spread_pct': selected['spread_pct'], 'volume': selected['volume'],
+        'liquidity': selected['liquidity'], 'otm_points': selected['otm_points'],
+        'otm_pct': selected['otm_pct'], 'target_reachable': selected['target_reachable'],
+        'profile': otm_profile, 'profile_note': selected['profile_note'],
+        'breakeven': breakeven, 'target_intrinsic': target_intrinsic,
+        'target_pnl': target_pnl, 'target_return_pct': target_return_pct,
     }
 
 
@@ -9992,13 +10206,16 @@ with tab_fibo:
     ]
     thermometer_data = []
     for label, code in thermometer_specs:
-        temp_df, source = fetch_market_temperature_data(code)
+        temp_df, source = get_cached_market_temperature_data(code)
         result = calculate_market_temperature(temp_df)
         thermometer_data.append((label, code, temp_df, source, result))
 
     with tab_trade_plan:
         st.subheader("指數操作計畫")
         st.caption("日線費波決定主方向，5 分 K 提供短波當沖點位；即時報價僅供觀察，不會自動下單或構成投資建議。")
+        option_mode_choices = ["價差單（限定風險，偏結算）", "單買 BC／BP（低成本高波動，短線）"]
+        if st.session_state.get('trade_plan_option_mode_saved') not in option_mode_choices:
+            st.session_state['trade_plan_option_mode_saved'] = option_mode_choices[0]
         index_item = next((item for item in thermometer_data if item[1] == '^TWII'), None)
         futures_item = next((item for item in thermometer_data if item[1] == 'TWF=F'), None)
         plan = calculate_index_trade_plan(
@@ -10012,15 +10229,21 @@ with tab_fibo:
                 '偏多': ('偏多', '#ff4b4b'),
                 '偏空': ('偏空', '#00c853'),
             }.get(plan['direction'], ('區間盤整', '#ffc107'))
-            live_col, refresh_col = st.columns([6, 1])
-            with live_col:
-                live_snapshot = get_live_futures_snapshot(st.session_state.get('sj_api'), 'TMF')
+            profile_col, refresh_col = st.columns([6, 1])
+            with profile_col:
+                entry_profile = st.radio(
+                    "進場靈敏度",
+                    ["積極（提早確認）", "穩健（完整確認）"],
+                    horizontal=True,
+                    key="trade_plan_entry_profile",
+                    help="積極模式會擴大費波觀察區，並允許即時價站穩／跌破 VWAP 後提早小部位進場；過熱與反向急漲跌保護仍保留。",
+                )
             with refresh_col:
-                if st.button("↻ 即時更新", key="refresh_trade_plan_live", width='stretch'):
-                    st.rerun()
+                st.button("↻ 即時更新", key="refresh_trade_plan_live", width='stretch')
+            live_snapshot = get_live_futures_snapshot(st.session_state.get('sj_api'), 'TMF')
             live_price = live_snapshot['price'] if live_snapshot else plan['latest']
             live_change = live_snapshot['change'] if live_snapshot else float((futures_item[4] or {}).get('change', 0))
-            intraday_state = get_futures_intraday_state(
+            intraday_state = get_cached_futures_intraday_state(
                 st.session_state.get('sj_api'), plan['direction'],
             )
             previous_temperature = None
@@ -10031,7 +10254,7 @@ with tab_fibo:
                 if futures_item and futures_item[4] and previous_temperature else 0.0
             )
             trade_state = evaluate_trade_entry_state(
-                plan, live_price, live_change, intraday_state, temperature_delta,
+                plan, live_price, live_change, intraday_state, temperature_delta, entry_profile,
             )
             confirmation_text = intraday_state['confirmation_text']
             if trade_state['can_enter'] and trade_state['execution_direction'] == '偏多':
@@ -10068,7 +10291,10 @@ with tab_fibo:
             p3.metric("費波壓力", f"{plan['resistance']:,.0f}")
             p4.metric("費波區寬", f"± {plan['zone_points']:,.0f} 點")
             if live_snapshot:
-                st.caption(f"微台快照於 {datetime.now(pytz.timezone('Asia/Taipei')).strftime('%H:%M:%S')} 擷取；按「即時更新」可重新讀取夜盤／日盤最新報價。")
+                st.caption(
+                    f"微台快照於 {datetime.now(pytz.timezone('Asia/Taipei')).strftime('%H:%M:%S')} 擷取；"
+                    "按「即時更新」會更新最新快照，日線歷史快取 3 分鐘、15 分／5 分 K 快取 8 秒，以減少重複下載。"
+                )
 
             index_result = index_item[4] if index_item else None
             if index_result is not None:
@@ -10214,7 +10440,7 @@ with tab_fibo:
             )
             st.caption("僅在即時進場許可通過時啟用；使用最新 5 分 K 區間規劃短線進出。")
             short_wave_direction = trade_state['execution_direction'] if trade_state['can_enter'] else None
-            short_wave = calculate_short_wave_plan(st.session_state.get('sj_api'), short_wave_direction)
+            short_wave = get_cached_short_wave_plan(st.session_state.get('sj_api'), short_wave_direction)
             if short_wave:
                 sw1, sw2, sw3, sw4 = st.columns(4)
                 sw1.metric("短波進場區", f"{short_wave['entry']:,.0f} ± {short_wave['zone']:,.0f}")
@@ -10287,16 +10513,17 @@ with tab_fibo:
                         f"永豐商品根：`{target_specs[0]['root']}`｜目標契約：`{expected_contract}`｜預定到期日：{target_specs[0]['expiry'].strftime('%Y/%m/%d')}"
                         f"｜剩餘 {(target_specs[0]['expiry'] - datetime.now(pytz.timezone('Asia/Taipei')).date()).days} 天"
                     )
-                option_mode_choices = ["價差單（限定風險，偏結算）", "單買 BC／BP（低成本高波動，短線）"]
-                # Explicitly retain the selection across the immediate-refresh rerun.
-                if st.session_state.get('trade_plan_option_mode') not in option_mode_choices:
-                    st.session_state['trade_plan_option_mode'] = option_mode_choices[0]
+                # Widget keys are removed by Streamlit while this section is hidden, so
+                # keep a separate durable value that survives no-entry reruns.
+                if st.session_state.get('trade_plan_option_mode_widget') not in option_mode_choices:
+                    st.session_state['trade_plan_option_mode_widget'] = st.session_state['trade_plan_option_mode_saved']
                 option_mode = st.radio(
                     "操作方式",
                     option_mode_choices,
                     horizontal=True,
-                    key="trade_plan_option_mode",
+                    key="trade_plan_option_mode_widget",
                 )
+                st.session_state['trade_plan_option_mode_saved'] = option_mode
                 quote_plan = {
                     **plan,
                     'latest': live_price,
@@ -10305,10 +10532,31 @@ with tab_fibo:
                     'invalidation': trade_state['invalidation'],
                     'target': trade_state['target'],
                 }
+                otm_profile = None
+                if not option_mode.startswith("價差單"):
+                    otm_profile_choices = [
+                        "淺價外（勝率優先）",
+                        "標準價外（成本／勝率平衡）",
+                        "深價外（低成本高槓桿）",
+                    ]
+                    if st.session_state.get('trade_plan_otm_profile_saved') not in otm_profile_choices:
+                        st.session_state['trade_plan_otm_profile_saved'] = otm_profile_choices[1]
+                    if st.session_state.get('trade_plan_otm_profile_widget') not in otm_profile_choices:
+                        st.session_state['trade_plan_otm_profile_widget'] = st.session_state['trade_plan_otm_profile_saved']
+                    otm_profile = st.selectbox(
+                        "價外距離",
+                        otm_profile_choices,
+                        key="trade_plan_otm_profile_widget",
+                        help="淺價外較容易跟隨標的但成本較高；深價外成本低、槓桿高，但到期歸零機率也較高。",
+                    )
+                    st.session_state['trade_plan_otm_profile_saved'] = otm_profile
+
                 if option_mode.startswith("價差單"):
                     option_quote = get_txo_spread_quote(st.session_state.get('sj_api'), quote_plan, expiry_choice)
                 else:
-                    option_quote = get_txo_directional_quote(st.session_state.get('sj_api'), quote_plan, expiry_choice)
+                    option_quote = get_txo_directional_quote(
+                        st.session_state.get('sj_api'), quote_plan, expiry_choice, otm_profile,
+                    )
 
                 if option_quote and option_mode.startswith("價差單"):
                     option_title = f"{option_quote['name']}｜{option_quote['delivery_month']}｜{option_quote['expiry'].strftime('%Y/%m/%d')} 到期（剩 {option_quote['dte']} 天）"
@@ -10337,6 +10585,11 @@ with tab_fibo:
                     o2.metric("買進參考價", f"{option_quote['premium']:.1f} 點" if option_quote['premium'] is not None else "報價不足")
                     o3.metric("單口權利金成本", f"${option_quote['max_loss']:,.0f}" if option_quote['max_loss'] is not None else "報價不足")
                     o4.metric("最大風險（權利金）", f"${option_quote['max_loss']:,.0f}" if option_quote['max_loss'] is not None else "權利金全額")
+                    q1, q2, q3, q4 = st.columns(4)
+                    q1.metric("價外距離", f"{option_quote['otm_points']:,.0f} 點 ({option_quote['otm_pct']:.2f}%)")
+                    q2.metric("買賣價差", f"{option_quote['spread']:.1f} 點" if option_quote['spread'] is not None else "報價不足")
+                    q3.metric("損益兩平", f"{option_quote['breakeven']:,.1f}" if option_quote['breakeven'] is not None else "報價不足")
+                    q4.metric("流動性", option_quote['liquidity'])
                     st.warning(
                         f"風險指標：{option_quote['risk_level']}。此為 {option_quote['name']} 的快進快出方案；"
                         "僅在 5 分 K 確認後進場，標的觸及日線失效點或權利金回落約 40% 時優先退出。"
@@ -10346,9 +10599,17 @@ with tab_fibo:
                         "未含手續費與交易稅；買方最大風險即已付權利金。"
                     )
                     st.caption(
-                        "履約價挑選為最接近現價的價外契約，兼顧低成本與成交機會；不以遠價外的極低權利金取代進場確認。"
+                        f"篩選模式：{option_quote['profile']}；{option_quote['profile_note']}。"
+                        f"履約價為嚴格價外，且費波目標{'可涵蓋' if option_quote['target_reachable'] else '尚未涵蓋'}此履約價；"
+                        "系統會同時考慮價外距離、目標可達性與買賣價差，不以最低權利金當作唯一依據。"
                         f"資料來源：{option_quote['source']}（契約與報價）。"
                     )
+                    if option_quote['target_return_pct'] is not None:
+                        st.caption(
+                            f"若持有至到期且標的恰好到達費波目標，到期內含價值約 {option_quote['target_intrinsic']:.1f} 點，"
+                            f"相對目前買進參考價的情境報酬為 {option_quote['target_return_pct']:+.1f}%"
+                            f"（損益約 ${option_quote['target_pnl']:,.0f}，未含手續費與稅）。這是到期情境，不是勝率或報酬保證。"
+                        )
                 elif option_mode.startswith("價差單"):
                     st.warning(
                         f"永豐 Shioaji 尚未取得 {expiry_choice}（預期 `{expected_contract}`）的夜盤即時契約／報價，"
@@ -10371,8 +10632,7 @@ with tab_fibo:
             st.subheader("臺灣加權／期貨溫度計")
             st.caption("以 60 日位置、RSI、均線趨勢與 5 日動能合成 0–100 分；期貨納入夜盤至次日日盤的未完成交易日 K。")
         with refresh_col:
-            if st.button("🔄 更新", key="refresh_market_temperature", width='stretch'):
-                st.rerun()
+            st.button("🔄 更新", key="refresh_market_temperature", width='stretch')
 
         gauge_cols = st.columns(2)
         summary_rows = []
