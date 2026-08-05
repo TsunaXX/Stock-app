@@ -7109,7 +7109,7 @@ def render_futures_strategy_room():
         for position, column in enumerate(row.index):
             if column == '名稱':
                 styles[position] = name_style
-            elif column == '漲跌幅':
+            elif column in ('收盤價', '漲跌幅'):
                 styles[position] = 'color:#ff4b4b;font-weight:bold;' if change > 0 else ('color:#00c853;font-weight:bold;' if change < 0 else '')
             elif column == '方向':
                 styles[position] = 'color:#ff4b4b;font-weight:bold;' if direction == '偏多' else ('color:#00c853;font-weight:bold;' if direction == '偏空' else '')
