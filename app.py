@@ -3551,16 +3551,21 @@ def _round_fibo_asset_price(value, asset_type):
     return round_to_tick(value)
 
 
+def _format_fibo_number(value, decimals=2):
+    """Use grouped numbers while dropping insignificant trailing decimal zeroes."""
+    return f"{float(value):,.{decimals}f}".rstrip('0').rstrip('.')
+
+
 def _format_fibo_trade_price(value, asset_type):
     """Format futures as whole points and stocks with their actual tick decimals."""
     rounded = _round_fibo_asset_price(value, asset_type)
     if asset_type == 'futures':
         return f"{rounded:,.0f}"
     if asset_type == 'index':
-        return f"{rounded:,.2f}"
+        return _format_fibo_number(rounded)
     tick = get_taiwan_tick_size(max(float(rounded), 0.01))
     decimals = 2 if tick < 0.1 else (1 if tick < 1 else 0)
-    return f"{rounded:,.{decimals}f}"
+    return _format_fibo_number(rounded, decimals)
 
 
 def _fibo_pivots(data, width=2):
@@ -3746,21 +3751,17 @@ def render_fibonacci_trade_suggestion(suggestion):
         f"<span style='color:{suggestion['color']};'>｜{suggestion['action']}</span></div>",
         unsafe_allow_html=True,
     )
-    header_cols[1].markdown(
-        f"<div style='color:#b8bec9;font-size:13px;padding-top:3px;'>"
-        f"結構訊號：{suggestion['signal']}；{suggestion['note']}</div>",
-        unsafe_allow_html=True,
-    )
+    explanation = f"結構訊號：{suggestion['signal']}；{suggestion['note']}"
 
     def price_text(value):
         return _format_fibo_trade_price(value, suggestion['asset_type'])
 
     def amount_note(risk, reward):
         if suggestion['asset_type'] == 'futures':
-            return f"微台 1 口：約 -${risk * 10:,.0f}／+${reward * 10:,.0f}"
+            return f"微台1口：約 -{risk * 10:,.0f}／+{reward * 10:,.0f}"
         if suggestion['asset_type'] == 'stock':
-            return f"現股 1 張：約 -${risk * 1000:,.0f}／+${reward * 1000:,.0f}"
-        return f"風險 {risk:,.2f} 點／目標 {reward:,.2f} 點"
+            return f"現股1張：約 -{risk * 1000:,.0f}／+{reward * 1000:,.0f}"
+        return f"風險 {_format_fibo_number(risk)} 點／目標 {_format_fibo_number(reward)} 點"
 
     if suggestion['mode'] == 'range':
         long_entry, long_stop, long_target = suggestion['long']
@@ -3770,32 +3771,44 @@ def render_fibonacci_trade_suggestion(suggestion):
         unit_note = f"（{amount_note(long_risk, long_reward)}）"
         short_unit_note = f"（{amount_note(short_risk, short_reward)}）"
         short_label = '減碼／融券條件' if suggestion['asset_type'] == 'stock' else '做空條件'
-        st.markdown(
+        header_cols[1].markdown(
             f"- <span style='color:#ff4b4b;'>做多條件</span>：回測 **{price_text(long_entry)}** 止穩；停損 **{price_text(long_stop)}**；目標 **{price_text(long_target)}** {unit_note}  \n"
             f"- <span style='color:#00c853;'>{short_label}</span>：反彈 **{price_text(short_entry)}** 受壓；停損 **{price_text(short_stop)}**；目標 **{price_text(short_target)}** {short_unit_note}",
             unsafe_allow_html=True,
         )
+        st.caption(explanation)
         return
 
     entry, stop, target = suggestion['entry'], suggestion['stop'], suggestion['target']
     risk, reward = suggestion['risk'], suggestion['reward']
-    cols = st.columns(5)
-    cols[0].metric('參考進場', price_text(entry))
-    cols[1].metric('停損／出場', price_text(stop))
-    cols[2].metric('第一目標', price_text(target))
+    cols = header_cols[1].columns(5)
     metric_unit = '元/股' if suggestion['asset_type'] == 'stock' else '點'
-    metric_decimals = 2 if suggestion['asset_type'] == 'stock' else 0
-    cols[3].metric('預估風險', f"{risk:,.{metric_decimals}f} {metric_unit}")
-    cols[4].metric('預估獲利', f"{reward:,.{metric_decimals}f} {metric_unit}", help=f"風報比 {suggestion['rr']:.2f}" if suggestion['rr'] else None)
+    metric_decimals = 2 if suggestion['asset_type'] != 'futures' else 0
+
+    def compact_metric(container, label, value):
+        container.markdown(
+            f"<div style='white-space:nowrap;'>"
+            f"<div style='font-size:12px;font-weight:600;color:#e8eaed;'>{label}</div>"
+            f"<div style='font-size:22px;font-weight:500;line-height:1.25;color:#f5f5f5;'>"
+            f"{value}</div></div>",
+            unsafe_allow_html=True,
+        )
+
+    compact_metric(cols[0], '參考進場', price_text(entry))
+    compact_metric(cols[1], '停損／出場', price_text(stop))
+    compact_metric(cols[2], '第一目標', price_text(target))
+    compact_metric(cols[3], '預估風險', f"{_format_fibo_number(risk, metric_decimals)} {metric_unit}")
+    compact_metric(cols[4], '預估獲利', f"{_format_fibo_number(reward, metric_decimals)} {metric_unit}")
+    st.caption(explanation)
     if suggestion['asset_type'] == 'futures':
         st.caption(
-            f"以微台 1 口（每點 10 元）試算：停損約 -${risk * 10:,.0f}；"
-            f"到目標約 +${reward * 10:,.0f}；風報比 {suggestion['rr']:.2f}。"
+            f"微台1口試算：停損約 -{risk * 10:,.0f}；"
+            f"目標約 +{reward * 10:,.0f}；風報比 {suggestion['rr']:.2f}。"
         )
     elif suggestion['asset_type'] == 'stock':
         st.caption(
-            f"以現股 1 張（1,000 股）試算：停損價差約 -${risk * 1000:,.0f}；"
-            f"目標價差約 +${reward * 1000:,.0f}；風報比 {suggestion['rr']:.2f}。"
+            f"現股1張試算：停損價差約 -{risk * 1000:,.0f}；"
+            f"目標價差約 +{reward * 1000:,.0f}；風報比 {suggestion['rr']:.2f}。"
         )
 
 
