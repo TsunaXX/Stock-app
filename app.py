@@ -5047,7 +5047,7 @@ OPENING_SIGNAL_WEIGHTS = {
     'NQ_FUT': 12, 'YM_FUT': 8,
     'NIKKEI': 10, 'KOSPI': 10,
 }
-OPENING_SIGNAL_CACHE_VERSION = 3
+OPENING_SIGNAL_CACHE_VERSION = 4
 
 NASDAQ_MARKET_HEADERS = {
     'User-Agent': (
@@ -5136,7 +5136,78 @@ def _expected_us_close_date(taiwan_trading_day):
     return candidate
 
 
-def fetch_stooq_us_close_signals(trading_day, expected_date):
+def fetch_twelve_data_us_close_signals(api_key, expected_date):
+    """批次取得四檔美股 ETF 的最近完整日線，作為盤前主要來源。"""
+    if not api_key:
+        return [], ['Twelve Data API Key 未設定']
+
+    instruments = {
+        'DJI': ('道瓊', 'DIA', 'Twelve Data｜DIA 指數代理'),
+        'NASDAQ': ('那斯達克', 'QQQ', 'Twelve Data｜QQQ 指數代理'),
+        'SP500': ('標普500', 'SPY', 'Twelve Data｜SPY 指數代理'),
+        'SOX': ('費半', 'SOXX', 'Twelve Data｜SOXX 指數代理'),
+    }
+    try:
+        response = requests.get(
+            'https://api.twelvedata.com/time_series',
+            params={
+                'symbol': ','.join(item[1] for item in instruments.values()),
+                'interval': '1day', 'outputsize': 3,
+                'timezone': 'America/New_York', 'adjust': 'none',
+            },
+            headers={'Authorization': f'apikey {api_key}'}, timeout=10,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except Exception as exc:
+        return [], [f'Twelve Data：連線失敗（{exc}）']
+
+    if not isinstance(payload, dict):
+        return [], ['Twelve Data：回傳格式不正確']
+    top_message = str(payload.get('message', '')).strip()
+    if payload.get('status') == 'error' or payload.get('code'):
+        return [], [f"Twelve Data：{top_message or '服務拒絕本次請求'}"]
+
+    rows = []
+    errors = []
+    for key, (label, symbol, source) in instruments.items():
+        result = payload.get(symbol, {})
+        if not isinstance(result, dict):
+            errors.append(f'{label}：Twelve Data 未回傳資料')
+            continue
+        if result.get('status') == 'error' or result.get('code'):
+            errors.append(f"{label}：{str(result.get('message', 'Twelve Data 查詢失敗'))}")
+            continue
+        parsed = []
+        for record in result.get('values', []) or []:
+            try:
+                trade_date = datetime.strptime(str(record.get('datetime'))[:10], '%Y-%m-%d').date()
+            except (TypeError, ValueError):
+                continue
+            close = _safe_number(record.get('close'))
+            if close is not None and close > 0:
+                parsed.append((trade_date, close))
+        parsed.sort(key=lambda pair: pair[0], reverse=True)
+        if len(parsed) < 2:
+            errors.append(f'{label}：Twelve Data 收盤資料不足')
+            continue
+        latest_date, latest = parsed[0]
+        _, previous = parsed[1]
+        if latest_date != expected_date:
+            errors.append(
+                f'{label}：Twelve Data 停在 {latest_date:%m/%d}，應為 {expected_date:%m/%d}'
+            )
+            continue
+        rows.append({
+            'key': key, 'label': label, 'group': '美股收盤',
+            'price': latest, 'pct': (latest / previous - 1) * 100,
+            'time': f'{latest_date:%m/%d} 收盤',
+            'weight': OPENING_SIGNAL_WEIGHTS[key], 'source': source,
+        })
+    return rows, errors
+
+
+def fetch_stooq_us_close_signals(trading_day, expected_date, requested_keys=None):
     """以 Stooq 日線補齊 Nasdaq 清晨尚未更新的美股收盤資料。"""
     errors = []
     instruments = {
@@ -5145,6 +5216,8 @@ def fetch_stooq_us_close_signals(trading_day, expected_date):
         'SP500': ('標普500', [('^spx', 'Stooq｜S&P 500 指數'), ('spy.us', 'Stooq｜SPY 指數代理')]),
         'SOX': ('費半', [('^sox', 'Stooq｜費半指數'), ('soxx.us', 'Stooq｜SOXX 指數代理')]),
     }
+    if requested_keys is not None:
+        instruments = {key: value for key, value in instruments.items() if key in requested_keys}
     from_date = (expected_date - timedelta(days=12)).strftime('%Y%m%d')
     to_date = trading_day.strftime('%Y%m%d')
 
@@ -5198,7 +5271,7 @@ def fetch_stooq_us_close_signals(trading_day, expected_date):
     return rows, errors
 
 
-def fetch_nasdaq_us_close_signals(trading_day):
+def fetch_nasdaq_us_close_signals(trading_day, requested_keys=None):
     """從 Nasdaq 取得最近美股收盤，並拒絕早於最近應有交易日的資料。"""
     expected_date = _expected_us_close_date(trading_day)
     errors = []
@@ -5210,6 +5283,8 @@ def fetch_nasdaq_us_close_signals(trading_day):
         'SP500': ('標普500', 'SPY', 'etf', 'Nasdaq｜SPY 指數代理'),
         'SOX': ('費半', 'SOX', 'index', 'Nasdaq｜SOX 指數'),
     }
+    if requested_keys is not None:
+        instruments = {key: value for key, value in instruments.items() if key in requested_keys}
     from_date = (expected_date - timedelta(days=12)).isoformat()
     to_date = trading_day.isoformat()
 
@@ -5341,7 +5416,7 @@ def _opening_night_change(series, cutoff_at):
 
 
 @st.cache_data(ttl=300, max_entries=6, show_spinner=False)
-def fetch_opening_overseas_signals(trading_date_text, cutoff_text):
+def fetch_opening_overseas_signals(trading_date_text, cutoff_text, _twelve_data_api_key=''):
     """批次取得美股收盤、美期與日韓盤；固定以 08:30 前資料計算。"""
     tz_tw = pytz.timezone('Asia/Taipei')
     trading_day = datetime.strptime(trading_date_text, '%Y-%m-%d').date()
@@ -5356,15 +5431,30 @@ def fetch_opening_overseas_signals(trading_date_text, cutoff_text):
     }
 
     expected_us_close = _expected_us_close_date(trading_day)
-    stooq_rows, stooq_errors = fetch_stooq_us_close_signals(trading_day, expected_us_close)
-    nasdaq_rows, nasdaq_errors, _ = fetch_nasdaq_us_close_signals(trading_day)
-    # Stooq 在美股收盤後通常較早完成日線；Nasdaq 僅補齊缺少的市場。
-    us_close_by_key = {row['key']: row for row in stooq_rows}
-    for row in nasdaq_rows:
-        us_close_by_key.setdefault(row['key'], row)
+    twelve_rows, twelve_errors = fetch_twelve_data_us_close_signals(
+        _twelve_data_api_key, expected_us_close
+    )
+    us_close_by_key = {row['key']: row for row in twelve_rows}
+    missing_us_keys = {'DJI', 'NASDAQ', 'SP500', 'SOX'} - set(us_close_by_key)
+    stooq_errors = []
+    nasdaq_errors = []
+    if missing_us_keys:
+        stooq_rows, stooq_errors = fetch_stooq_us_close_signals(
+            trading_day, expected_us_close, missing_us_keys
+        )
+        for row in stooq_rows:
+            us_close_by_key.setdefault(row['key'], row)
+        missing_us_keys = {'DJI', 'NASDAQ', 'SP500', 'SOX'} - set(us_close_by_key)
+    if missing_us_keys:
+        nasdaq_rows, nasdaq_errors, _ = fetch_nasdaq_us_close_signals(
+            trading_day, missing_us_keys
+        )
+        for row in nasdaq_rows:
+            us_close_by_key.setdefault(row['key'], row)
     rows.extend(us_close_by_key.values())
     missing_us_keys = {'DJI', 'NASDAQ', 'SP500', 'SOX'} - set(us_close_by_key)
     if missing_us_keys:
+        errors.extend(twelve_errors)
         errors.extend(stooq_errors)
         errors.extend(nasdaq_errors)
 
@@ -5391,7 +5481,7 @@ def fetch_opening_overseas_signals(trading_date_text, cutoff_text):
     except Exception as exc:
         errors.append(f'盤前即時市場：{exc}')
     if not rows and not errors:
-        errors.append('Stooq／Nasdaq／盤前行情來源暫未回傳可用資料')
+        errors.append('Twelve Data／Stooq／Nasdaq／盤前行情來源暫未回傳可用資料')
     return rows, errors
 
 
@@ -5489,9 +5579,14 @@ def render_opening_direction_prompt():
         or overseas_cache.get('date') != trading_date_text
         or overseas_cache.get('version') != OPENING_SIGNAL_CACHE_VERSION
     )
+    try:
+        twelve_data_api_key = str(st.secrets.get('TWELVE_DATA_API_KEY', '')).strip()
+    except Exception:
+        twelve_data_api_key = ''
     if refresh or auto_refresh_window or cache_outdated:
         rows, errors = fetch_opening_overseas_signals(
-            trading_date_text, cutoff_at.strftime('%Y-%m-%d %H:%M')
+            trading_date_text, cutoff_at.strftime('%Y-%m-%d %H:%M'),
+            _twelve_data_api_key=twelve_data_api_key,
         )
         st.session_state.opening_overseas_signal = {
             'version': OPENING_SIGNAL_CACHE_VERSION,
@@ -5604,8 +5699,13 @@ def render_opening_direction_prompt():
             )
         st.caption(
             f'{phase}。美股採最近完整收盤；美期採 06:00 後、日韓採 08:00 後，盤後查看仍以 08:30 為截止。'
-            '美股收盤優先採 Stooq，缺值時以 Nasdaq 補齊；只有資料日等於最近應有美股交易日才會納入評分，ETF 代理會在來源欄明確標示。'
+            '美股收盤依序採 Twelve Data、Stooq、Nasdaq；只有資料日等於最近應有美股交易日才會納入評分，ETF 代理會在來源欄明確標示。'
             '分數代表跨市場方向一致度，不是勝率；個股仍需依原戰略備註、支撐壓力與進場條件確認。'
+        )
+        st.caption(
+            'Twelve Data API：已設定；實際採用來源請查看表格「來源」欄。'
+            if twelve_data_api_key else
+            'Twelve Data API：尚未在 Streamlit Secrets 設定，現在使用公開備援來源。'
         )
         if errors:
             st.warning('部分行情來源暫時無法取得：' + '；'.join(errors))
