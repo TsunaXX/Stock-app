@@ -41,10 +41,25 @@ try:
 except ImportError:
     si = None
 
+sj_import_error = None
 try:
     import shioaji as sj
-except ImportError:
+except BaseException as exc:
+    if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+        raise
+    # Shioaji contains native extensions. A missing/incompatible Linux wheel may
+    # raise OSError or a native panic instead of ImportError; the rest of the
+    # dashboard must remain available in that case.
     sj = None
+    sj_import_error = type(exc).__name__
+
+
+def get_app_secret(key, default=None):
+    """Read an optional Streamlit secret without crashing branch/local deployments."""
+    try:
+        return st.secrets.get(key, default)
+    except Exception:
+        return default
 
 
 # ==========================================
@@ -218,7 +233,9 @@ def _install_stream_callbacks(api):
         try:
             setter(callback)
             installed += 1
-        except Exception as exc:
+        except BaseException as exc:
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
             _remember_stream_error(state, f'{name}: {exc}')
 
     register('set_on_quote_stk_v1_callback', 'STK')
@@ -248,7 +265,9 @@ def _unsubscribe_market_stream(api, state, subscription_key, metadata):
     if callable(method):
         try:
             method(contract, quote_type=_shioaji_quote_type())
-        except Exception:
+        except BaseException as exc:
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
             pass
     with state['lock']:
         state['subscriptions'].pop(subscription_key, None)
@@ -312,7 +331,9 @@ def ensure_market_stream_subscription(api, contract):
         with state['lock']:
             state['subscriptions'][subscription_key]['status'] = 'active'
         return True
-    except Exception as exc:
+    except BaseException as exc:
+        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            raise
         with state['lock']:
             state['subscriptions'][subscription_key].update({
                 'status': 'error', 'retry_after': now_mono + 60
@@ -419,7 +440,9 @@ def get_stream_quotes(api, contracts, snapshot_fallback=True):
         missing_contracts = [contracts[index] for index in fallback_indices]
         try:
             snapshots = api.snapshots(missing_contracts) or []
-        except Exception:
+        except BaseException as exc:
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
             snapshots = []
         for index, contract, snapshot in zip(fallback_indices, missing_contracts, snapshots):
             _stream_store_snapshot(api, contract, snapshot)
@@ -5055,7 +5078,8 @@ def save_data_cache(df, ignored_set, candidates=None, saved_notes=None, fibo_tag
             json.dump(data_to_save_local, f, ensure_ascii=False, indent=4)
         
         # 記憶體與速度終極優化：將「轉換 Dict」與「轉 JSON 字串」等高耗 RAM 動作全部移入背景執行緒
-        if "gsheet_api_url" in st.secrets:
+        gsheet_api_url = get_app_secret('gsheet_api_url')
+        if gsheet_api_url:
             def bg_save(bg_df, bg_ignored, bg_cands, bg_notes, bg_tags, bg_cn, bg_signals):
                 try:
                     data_to_save = {
@@ -5068,7 +5092,7 @@ def save_data_cache(df, ignored_set, candidates=None, saved_notes=None, fibo_tag
                         "strategy_signal_log": bg_signals,
                     }
                     json_str = json.dumps(data_to_save, ensure_ascii=False)
-                    requests.post(st.secrets["gsheet_api_url"], json={"action": "save", "data": json_str}, timeout=5)
+                    requests.post(gsheet_api_url, json={"action": "save", "data": json_str}, timeout=5)
                 except Exception: pass
                 finally:
                     # 強制回收背景執行緒產生的巨大 JSON 與 Dict 記憶體
@@ -5083,9 +5107,10 @@ def save_data_cache(df, ignored_set, candidates=None, saved_notes=None, fibo_tag
     except Exception: pass
 
 def load_data_cache():
-    if "gsheet_api_url" in st.secrets:
+    gsheet_api_url = get_app_secret('gsheet_api_url')
+    if gsheet_api_url:
         try:
-            r = requests.get(st.secrets["gsheet_api_url"], timeout=5)
+            r = requests.get(gsheet_api_url, timeout=5)
             if r.status_code == 200 and r.text.strip():
                 data = json.loads(r.text)
                 df = pd.DataFrame(data.get('stock_data', []))
@@ -5211,19 +5236,20 @@ if 'cal_month' not in st.session_state: st.session_state.cal_month = now_tw.mont
 def init_shioaji_connection(api_key, secret_key):
     api = sj.Shioaji(simulation=False)
     api.login(api_key, secret_key)
-    _install_stream_callbacks(api)
     return api
 
 if 'font_size' not in st.session_state: st.session_state.font_size = saved_config.get('font_size', 15)
 if 'limit_rows' not in st.session_state: st.session_state.limit_rows = saved_config.get('limit_rows', 5)
 
 # 永豐API帳密：
+secret_sj_key = get_app_secret('sj_key', '')
+secret_sj_secret = get_app_secret('sj_secret', '')
 if 'sj_key' not in st.session_state: 
-    st.session_state.sj_key = st.secrets.get('sj_key', saved_config.get('sj_key', ''))
+    st.session_state.sj_key = secret_sj_key or saved_config.get('sj_key', '')
 if 'sj_secret' not in st.session_state: 
-    st.session_state.sj_secret = st.secrets.get('sj_secret', saved_config.get('sj_secret', ''))
+    st.session_state.sj_secret = secret_sj_secret or saved_config.get('sj_secret', '')
 if 'remember_sj' not in st.session_state: 
-    st.session_state.remember_sj = True if 'sj_key' in st.secrets else saved_config.get('remember_sj', False)
+    st.session_state.remember_sj = True if secret_sj_key else saved_config.get('remember_sj', False)
 
 if sj and st.session_state.remember_sj and st.session_state.sj_key and not st.session_state.get('manual_logout', False):
     try:
@@ -5234,13 +5260,19 @@ if sj and st.session_state.remember_sj and st.session_state.sj_key and not st.se
             api_obj.usage()
             st.session_state.sj_api = api_obj
             st.session_state.sj_logged_in = True
-        except Exception:
+        except BaseException as exc:
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
             # 若快取的連線已失效，則清除快取並強制重新登入
+            clear_market_stream(api_obj)
             init_shioaji_connection.clear()
             st.session_state.sj_api = init_shioaji_connection(st.session_state.sj_key, st.session_state.sj_secret)
             st.session_state.sj_logged_in = True
-    except Exception:
+    except BaseException as exc:
+        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            raise
         st.session_state.sj_logged_in = False
+        st.session_state.sj_connection_error = type(exc).__name__
 
 @st.cache_data(max_entries=1)
 def load_local_stock_names():
@@ -5272,7 +5304,10 @@ def search_code_online(query):
 with st.sidebar:
     st.header("🔑 永豐證券 API 登入")
     if sj is None:
-        st.error("⚠️ 未偵測到 shioaji 套件\n\n請先在終端機執行：\n`pip install shioaji`")
+        st.error(
+            "⚠️ Shioaji 暫時無法載入，已停用永豐即時行情；其他分頁仍可使用。"
+            + (f"（{sj_import_error}）" if sj_import_error else "")
+        )
     else:
         if st.session_state.get('sj_logged_in', False):
             st.success("✅ 永豐 API 已登入")
