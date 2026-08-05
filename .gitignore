@@ -8,6 +8,7 @@ data_cache.json
 url_cache.json
 search_cache.json
 cal_preferences.json
+company_event_snapshot.json
 strategy_signal_log.json
 
 # Local Streamlit secrets
