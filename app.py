@@ -4374,6 +4374,7 @@ def render_stock_strategy_explanation():
 - **原選股順序不變**：維持週轉率排行及原本的戰略備註；附加分析只補充支撐壓力、進出場點位與信心判讀。
 - **ATR**衡量正常波動幅度，不判斷多空；乖離越大，越不適合追價或追空。
 - **VWAP**是盤中成交量加權平均成本。當沖時，價格在 VWAP 上方偏多、下方偏空，並搭配 09:00–09:15 開盤區間及量能確認。
+- **開盤首 15 分鐘**按「更新盤中資料與當沖條件」後，會以 Shioaji 即時快照＋1 分 K 顯示形成中的高低點與動能；09:15 後自動改用 5 分 K 與完整開盤區間。
 - **進／停／目**分別為條件成立後的觀察進場、策略失效離場與第一目標。信心分是條件一致度，不是勝率。
 - **處置／注意**只代表官方名單查核。即時價格與漲跌幅需登入 Shioaji；盤中取最新快照，盤後保留最後成交價與漲跌幅。
 - 若股票有一般股期或小型股期，會依股票表順序自動附加到期貨戰略室排行之後。
@@ -5046,7 +5047,7 @@ OPENING_SIGNAL_WEIGHTS = {
     'NQ_FUT': 12, 'YM_FUT': 8,
     'NIKKEI': 10, 'KOSPI': 10,
 }
-OPENING_SIGNAL_CACHE_VERSION = 2
+OPENING_SIGNAL_CACHE_VERSION = 3
 
 NASDAQ_MARKET_HEADERS = {
     'User-Agent': (
@@ -5067,30 +5068,140 @@ def _parse_nasdaq_number(value):
     return _safe_number(cleaned)
 
 
-def _previous_weekday(day_value):
-    """Nasdaq 市場日端點失效時，提供只排除週末的保守備援日期。"""
-    candidate = day_value - timedelta(days=1)
-    while candidate.weekday() >= 5:
+def _nth_weekday(year, month, weekday, occurrence):
+    """回傳指定月份第 occurrence 個 weekday。"""
+    first = date(year, month, 1)
+    offset = (weekday - first.weekday()) % 7
+    return first + timedelta(days=offset + (occurrence - 1) * 7)
+
+
+def _last_weekday(year, month, weekday):
+    """回傳指定月份最後一個 weekday。"""
+    last_day = calendar.monthrange(year, month)[1]
+    candidate = date(year, month, last_day)
+    return candidate - timedelta(days=(candidate.weekday() - weekday) % 7)
+
+
+def _easter_sunday(year):
+    """Meeus/Jones/Butcher 演算法，用來推算美股休市的耶穌受難日。"""
+    a = year % 19
+    b, c = divmod(year, 100)
+    d, e = divmod(b, 4)
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i, k = divmod(c, 4)
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    month = (h + l - 7 * m + 114) // 31
+    day_value = (h + l - 7 * m + 114) % 31 + 1
+    return date(year, month, day_value)
+
+
+def _observed_us_holiday(day_value):
+    """美國固定日期假日遇週末時的交易所補休日。"""
+    if day_value.weekday() == 5:
+        return day_value - timedelta(days=1)
+    if day_value.weekday() == 6:
+        return day_value + timedelta(days=1)
+    return day_value
+
+
+def _us_market_holidays(year):
+    """建立 NYSE／Nasdaq 共同主要休市日，供盤前資料日期校驗。"""
+    holidays = {
+        _observed_us_holiday(date(year, 1, 1)),
+        _nth_weekday(year, 1, 0, 3),       # Martin Luther King Jr. Day
+        _nth_weekday(year, 2, 0, 3),       # Presidents' Day
+        _easter_sunday(year) - timedelta(days=2),
+        _last_weekday(year, 5, 0),         # Memorial Day
+        _observed_us_holiday(date(year, 6, 19)),
+        _observed_us_holiday(date(year, 7, 4)),
+        _nth_weekday(year, 9, 0, 1),       # Labor Day
+        _nth_weekday(year, 11, 3, 4),      # Thanksgiving
+        _observed_us_holiday(date(year, 12, 25)),
+    }
+    # 12/31 可能是下一年元旦的補休日。
+    next_new_year = _observed_us_holiday(date(year + 1, 1, 1))
+    if next_new_year.year == year:
+        holidays.add(next_new_year)
+    return holidays
+
+
+def _expected_us_close_date(taiwan_trading_day):
+    """臺股開盤前應已完成的最近一個美股交易日。"""
+    candidate = taiwan_trading_day - timedelta(days=1)
+    while candidate.weekday() >= 5 or candidate in _us_market_holidays(candidate.year):
         candidate -= timedelta(days=1)
     return candidate
 
 
+def fetch_stooq_us_close_signals(trading_day, expected_date):
+    """以 Stooq 日線補齊 Nasdaq 清晨尚未更新的美股收盤資料。"""
+    errors = []
+    instruments = {
+        'DJI': ('道瓊', [('^dji', 'Stooq｜道瓊指數'), ('dia.us', 'Stooq｜DIA 指數代理')]),
+        'NASDAQ': ('那斯達克', [('^ndq', 'Stooq｜Nasdaq 綜合指數'), ('qqq.us', 'Stooq｜QQQ 指數代理')]),
+        'SP500': ('標普500', [('^spx', 'Stooq｜S&P 500 指數'), ('spy.us', 'Stooq｜SPY 指數代理')]),
+        'SOX': ('費半', [('^sox', 'Stooq｜費半指數'), ('soxx.us', 'Stooq｜SOXX 指數代理')]),
+    }
+    from_date = (expected_date - timedelta(days=12)).strftime('%Y%m%d')
+    to_date = trading_day.strftime('%Y%m%d')
+
+    def fetch_one(item):
+        key, (label, candidates) = item
+        candidate_errors = []
+        for symbol, source in candidates:
+            try:
+                response = requests.get(
+                    'https://stooq.com/q/d/l/',
+                    params={'s': symbol, 'd1': from_date, 'd2': to_date, 'i': 'd'},
+                    headers={'User-Agent': NASDAQ_MARKET_HEADERS['User-Agent']}, timeout=8,
+                )
+                response.raise_for_status()
+                history = pd.read_csv(io.StringIO(response.text))
+                if not {'Date', 'Close'}.issubset(history.columns):
+                    raise ValueError('CSV 欄位不足')
+                history['Date'] = pd.to_datetime(history['Date'], errors='coerce').dt.date
+                history['Close'] = pd.to_numeric(history['Close'], errors='coerce')
+                history = history.dropna(subset=['Date', 'Close']).sort_values('Date')
+                if len(history) < 2:
+                    raise ValueError('收盤資料不足')
+                latest = history.iloc[-1]
+                latest_date = latest['Date']
+                if latest_date != expected_date:
+                    raise ValueError(
+                        f'資料停在 {latest_date:%m/%d}，應為 {expected_date:%m/%d}'
+                    )
+                previous = _safe_number(history.iloc[-2]['Close'])
+                latest_close = _safe_number(latest['Close'])
+                if previous is None or latest_close is None or previous <= 0:
+                    raise ValueError('收盤價格無效')
+                return {
+                    'key': key, 'label': label, 'group': '美股收盤',
+                    'price': latest_close, 'pct': (latest_close / previous - 1) * 100,
+                    'time': f'{latest_date:%m/%d} 收盤',
+                    'weight': OPENING_SIGNAL_WEIGHTS[key], 'source': source,
+                }, None
+            except Exception as exc:
+                candidate_errors.append(f'{symbol}：{exc}')
+        return None, f"{label}：{'；'.join(candidate_errors)}"
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        results = list(executor.map(fetch_one, instruments.items()))
+    rows = []
+    for row, error in results:
+        if row:
+            rows.append(row)
+        elif error:
+            errors.append(error)
+    return rows, errors
+
+
 def fetch_nasdaq_us_close_signals(trading_day):
     """從 Nasdaq 取得最近美股收盤，並拒絕早於最近應有交易日的資料。"""
-    expected_date = None
+    expected_date = _expected_us_close_date(trading_day)
     errors = []
-    try:
-        response = requests.get(
-            'https://api.nasdaq.com/api/market-info',
-            headers=NASDAQ_MARKET_HEADERS, timeout=7,
-        )
-        response.raise_for_status()
-        previous_trade_date = response.json().get('data', {}).get('previousTradeDate')
-        if previous_trade_date:
-            expected_date = datetime.strptime(previous_trade_date, '%b %d, %Y').date()
-    except Exception as exc:
-        errors.append(f'Nasdaq 交易日：{exc}')
-    expected_date = expected_date or _previous_weekday(trading_day)
 
     # Nasdaq 可直接提供 COMP／SOX；道瓊與標普以流動性高的 DIA／SPY 收盤報酬代理。
     instruments = {
@@ -5130,7 +5241,7 @@ def fetch_nasdaq_us_close_signals(trading_day):
                 return None, f'{label}：Nasdaq 收盤資料不足'
             latest_date, latest = parsed[0]
             _, previous = parsed[1]
-            if latest_date < expected_date:
+            if latest_date != expected_date:
                 return None, (
                     f'{label}：資料停在 {latest_date:%m/%d}，'
                     f'最近應有交易日為 {expected_date:%m/%d}，已排除評分'
@@ -5244,9 +5355,18 @@ def fetch_opening_overseas_signals(trading_date_text, cutoff_text):
         'KOSPI': ('韓股綜合', '^KS11', '08:00 日韓', dt_time(8, 0)),
     }
 
-    us_close_rows, us_close_errors, _ = fetch_nasdaq_us_close_signals(trading_day)
-    rows.extend(us_close_rows)
-    errors.extend(us_close_errors)
+    expected_us_close = _expected_us_close_date(trading_day)
+    stooq_rows, stooq_errors = fetch_stooq_us_close_signals(trading_day, expected_us_close)
+    nasdaq_rows, nasdaq_errors, _ = fetch_nasdaq_us_close_signals(trading_day)
+    # Stooq 在美股收盤後通常較早完成日線；Nasdaq 僅補齊缺少的市場。
+    us_close_by_key = {row['key']: row for row in stooq_rows}
+    for row in nasdaq_rows:
+        us_close_by_key.setdefault(row['key'], row)
+    rows.extend(us_close_by_key.values())
+    missing_us_keys = {'DJI', 'NASDAQ', 'SP500', 'SOX'} - set(us_close_by_key)
+    if missing_us_keys:
+        errors.extend(stooq_errors)
+        errors.extend(nasdaq_errors)
 
     try:
         downloaded = yf.download(
@@ -5271,7 +5391,7 @@ def fetch_opening_overseas_signals(trading_date_text, cutoff_text):
     except Exception as exc:
         errors.append(f'盤前即時市場：{exc}')
     if not rows and not errors:
-        errors.append('Nasdaq／盤前行情來源暫未回傳可用資料')
+        errors.append('Stooq／Nasdaq／盤前行情來源暫未回傳可用資料')
     return rows, errors
 
 
@@ -5484,7 +5604,7 @@ def render_opening_direction_prompt():
             )
         st.caption(
             f'{phase}。美股採最近完整收盤；美期採 06:00 後、日韓採 08:00 後，盤後查看仍以 08:30 為截止。'
-            '美股收盤改採 Nasdaq；COMP／SOX 為指數，DIA／SPY 分別代理道瓊／標普，舊於最近應有交易日會排除評分。'
+            '美股收盤優先採 Stooq，缺值時以 Nasdaq 補齊；只有資料日等於最近應有美股交易日才會納入評分，ETF 代理會在來源欄明確標示。'
             '分數代表跨市場方向一致度，不是勝率；個股仍需依原戰略備註、支撐壓力與進場條件確認。'
         )
         if errors:
@@ -5646,55 +5766,105 @@ RISK_METRIC_COLUMNS = [
     '_risk_close_position', '_risk_prev_high', '_risk_prev_low'
 ]
 
-# 當沖預覽只在使用者手動更新 5 分 K 時回填，避免影響原本選股載入速度。
+# 當沖預覽只在使用者手動更新時回填，避免影響原本選股載入速度。
 DAYTRADE_METRIC_COLUMNS = [
     '_daytrade_vwap', '_daytrade_or_high', '_daytrade_or_low',
     '_daytrade_volume_ratio', '_daytrade_close', '_daytrade_data_time'
 ]
+DAYTRADE_REQUIRED_COLUMNS = [
+    '_daytrade_vwap', '_daytrade_or_high', '_daytrade_or_low', '_daytrade_close'
+]
 
-def calculate_daytrade_metrics(intraday_df):
-    """由同一交易日的 5 分 K 計算 VWAP、開盤區間與相對量能。"""
+
+def _is_opening_micro_window(now_tw=None):
+    """09:00–09:15 使用快照與 1 分 K，之後再採完整 5 分 K。"""
+    current = now_tw or datetime.now(pytz.timezone('Asia/Taipei'))
+    return dt_time(9, 0) <= current.time() < dt_time(9, 15)
+
+
+def calculate_daytrade_metrics(intraday_df, live_snapshot=None, now_tw=None, interval_label='5 分 K'):
+    """計算當沖指標；開盤前 15 分鐘可直接使用即時快照與 1 分 K。"""
     required_columns = {'High', 'Low', 'Close', 'Volume'}
-    if intraday_df is None or intraday_df.empty or not required_columns.issubset(intraday_df.columns):
+    current = now_tw or datetime.now(pytz.timezone('Asia/Taipei'))
+    snapshot_opening = _is_opening_micro_window(current) and live_snapshot is not None
+    if (
+        not snapshot_opening
+        and (intraday_df is None or intraday_df.empty or not required_columns.issubset(intraday_df.columns))
+    ):
         return None
 
-    data = intraday_df.copy().sort_index()
-    data = data[(data.index.time >= dt_time(9, 0)) & (data.index.time <= dt_time(13, 30))]
-    data = data.dropna(subset=['High', 'Low', 'Close', 'Volume'])
-    if data.empty:
-        return None
+    data = intraday_df.copy().sort_index() if isinstance(intraday_df, pd.DataFrame) else pd.DataFrame()
+    if not data.empty and required_columns.issubset(data.columns):
+        data = data[(data.index.time >= dt_time(9, 0)) & (data.index.time <= dt_time(13, 30))]
+        data = data.dropna(subset=['High', 'Low', 'Close', 'Volume'])
+    else:
+        data = pd.DataFrame()
 
-    latest_day = data.index.normalize().max()
-    today = data[data.index.normalize() == latest_day].copy()
-    if len(today) < 3 or float(today['Volume'].sum()) <= 0:
-        return None
-
-    typical_price = (today['High'] + today['Low'] + today['Close']) / 3
-    cumulative_volume = today['Volume'].cumsum()
-    vwap = float((typical_price * today['Volume']).cumsum().iloc[-1] / cumulative_volume.iloc[-1])
-    opening_range = today[(today.index.time >= dt_time(9, 0)) & (today.index.time < dt_time(9, 15))]
-    if opening_range.empty:
-        return None
+    if snapshot_opening:
+        close = _safe_number(getattr(live_snapshot, 'close', None))
+        open_price = _safe_number(getattr(live_snapshot, 'open', None))
+        opening_high = _safe_number(getattr(live_snapshot, 'high', None))
+        opening_low = _safe_number(getattr(live_snapshot, 'low', None))
+        vwap = _safe_number(getattr(live_snapshot, 'average_price', None))
+        current_volume = _safe_number(getattr(live_snapshot, 'total_volume', None))
+        if None in (close, open_price, opening_high, opening_low) or current_volume is None or current_volume <= 0:
+            return None
+        if vwap is None or vwap <= 0:
+            vwap = (opening_high + opening_low + close) / 3
+        latest_day = pd.Timestamp(current.date())
+        cutoff_time = current.time()
+        data_time = current.strftime('%Y/%m/%d %H:%M:%S')
+        phase = '開盤形成中'
+        source = 'Shioaji 快照＋1 分 K 同時段量能'
+    else:
+        if data.empty:
+            return None
+        latest_day = data.index.normalize().max()
+        today = data[data.index.normalize() == latest_day].copy()
+        if today.empty or float(today['Volume'].sum()) <= 0:
+            return None
+        typical_price = (today['High'] + today['Low'] + today['Close']) / 3
+        cumulative_volume = today['Volume'].cumsum()
+        vwap = float((typical_price * today['Volume']).cumsum().iloc[-1] / cumulative_volume.iloc[-1])
+        opening_range = today[(today.index.time >= dt_time(9, 0)) & (today.index.time < dt_time(9, 15))]
+        if opening_range.empty:
+            return None
+        close = float(today['Close'].iloc[-1])
+        open_price = float(today['Open'].iloc[0]) if 'Open' in today.columns else float(today['Close'].iloc[0])
+        opening_high = float(opening_range['High'].max())
+        opening_low = float(opening_range['Low'].min())
+        current_volume = float(today['Volume'].sum())
+        cutoff_time = today.index[-1].time()
+        data_time = today.index[-1].strftime('%Y/%m/%d %H:%M')
+        forming_today = (
+            latest_day.date() == current.date()
+            and _is_opening_micro_window(current)
+        )
+        phase = '開盤形成中' if forming_today else '開盤區間完成'
+        source = interval_label
 
     # 以最近三個交易日相同的盤中截止時間比較累積量，避免直接拿全天量誤判。
-    cutoff_time = today.index[-1].time()
     daily_volume_to_cutoff = []
-    for trading_day, frame in data.groupby(data.index.normalize()):
-        if trading_day == latest_day:
-            continue
-        comparable = frame[frame.index.time <= cutoff_time]
-        if not comparable.empty:
-            daily_volume_to_cutoff.append(float(comparable['Volume'].sum()))
+    if not data.empty:
+        for trading_day, frame in data.groupby(data.index.normalize()):
+            if trading_day == latest_day:
+                continue
+            comparable = frame[frame.index.time <= cutoff_time]
+            if not comparable.empty:
+                daily_volume_to_cutoff.append(float(comparable['Volume'].sum()))
     average_prior_volume = np.mean(daily_volume_to_cutoff[-2:]) if daily_volume_to_cutoff else np.nan
-    volume_ratio = float(today['Volume'].sum() / average_prior_volume) if average_prior_volume and average_prior_volume > 0 else None
+    volume_ratio = float(current_volume / average_prior_volume) if average_prior_volume and average_prior_volume > 0 else None
 
     return {
         '_daytrade_vwap': round(vwap, 2),
-        '_daytrade_or_high': round(float(opening_range['High'].max()), 2),
-        '_daytrade_or_low': round(float(opening_range['Low'].min()), 2),
+        '_daytrade_or_high': round(opening_high, 2),
+        '_daytrade_or_low': round(opening_low, 2),
         '_daytrade_volume_ratio': round(volume_ratio, 2) if volume_ratio is not None else None,
-        '_daytrade_close': round(float(today['Close'].iloc[-1]), 2),
-        '_daytrade_data_time': today.index[-1].strftime('%Y/%m/%d %H:%M'),
+        '_daytrade_close': round(close, 2),
+        '_daytrade_open': round(open_price, 2),
+        '_daytrade_phase': phase,
+        '_daytrade_source': source,
+        '_daytrade_data_time': data_time,
     }
 
 def calculate_daytrade_filter_result(row, direction, attention_counts=None, disposition_codes=None, market_lists_updated=False, block_attention=True):
@@ -5708,15 +5878,18 @@ def calculate_daytrade_filter_result(row, direction, attention_counts=None, disp
     opening_high = _as_float(row.get('_daytrade_or_high'))
     opening_low = _as_float(row.get('_daytrade_or_low'))
     volume_ratio = _as_float(row.get('_daytrade_volume_ratio'))
+    open_price = _as_float(row.get('_daytrade_open'))
+    opening_phase = str(row.get('_daytrade_phase', '開盤區間完成'))
+    is_opening_micro = opening_phase == '開盤形成中'
     ma5 = _as_float(row.get('_ma5'))
     ma20 = _as_float(row.get('_risk_ma20'))
     ma20_slope = _as_float(row.get('_risk_ma20_slope'))
 
     if None in (close, vwap, opening_high, opening_low):
         return {
-            'score': 0, 'rule': '資料不足：先重抓 5 分 K', 'eligible': False,
+            'score': 0, 'rule': '資料不足：先更新盤中資料', 'eligible': False,
             'vwap_status': '—', 'opening_range': '—',
-            'detail': '尚未取得足夠的 5 分 K、VWAP 或開盤區間資料。', 'data_time': None
+            'detail': '尚未取得即時快照／分 K、VWAP 或開盤區間資料。', 'data_time': None
         }
 
     daily_trend_score = 0
@@ -5730,14 +5903,24 @@ def calculate_daytrade_filter_result(row, direction, attention_counts=None, disp
 
     vwap_aligned = close > vwap if is_long else close < vwap
     vwap_score = 25 if vwap_aligned else 0
-    range_broken = close > opening_high if is_long else close < opening_low
-    range_score = 15 if range_broken else 0
+    if is_opening_micro:
+        range_width = max(opening_high - opening_low, get_tick_size(close))
+        close_position = (close - opening_low) / range_width
+        open_aligned = open_price is not None and (close > open_price if is_long else close < open_price)
+        near_live_edge = close_position >= 0.70 if is_long else close_position <= 0.30
+        range_broken = bool(open_aligned and near_live_edge)
+        range_score = 12 if range_broken else (6 if open_aligned else 0)
+    else:
+        range_broken = close > opening_high if is_long else close < opening_low
+        range_score = 15 if range_broken else 0
     if volume_ratio is None:
         volume_score = 8
     elif volume_ratio >= 1.5:
         volume_score = 20
     elif volume_ratio >= 1.0:
         volume_score = 12
+    elif is_opening_micro and volume_ratio >= 0.8:
+        volume_score = 8
     else:
         volume_score = 0
 
@@ -5754,28 +5937,43 @@ def calculate_daytrade_filter_result(row, direction, attention_counts=None, disp
 
     score = daily_trend_score + vwap_score + volume_score + range_score + risk_score
     risk_blocked = is_disposed or (block_attention and attention_count >= 2)
-    eligible = not risk_blocked and vwap_aligned and range_broken and (volume_ratio is None or volume_ratio >= 1.0)
+    minimum_volume_ratio = 0.8 if is_opening_micro else 1.0
+    eligible = (
+        not risk_blocked and vwap_aligned and range_broken
+        and (volume_ratio is None or volume_ratio >= minimum_volume_ratio)
+    )
     direction_text = '站上' if is_long else '跌破'
-    range_text = '開盤區間高' if is_long else '開盤區間低'
+    range_text = ('目前開盤高檔' if is_long else '目前開盤低檔') if is_opening_micro else ('開盤區間高' if is_long else '開盤區間低')
     if risk_blocked:
         rule = '不交易：處置／注意風險'
     elif not vwap_aligned:
         rule = f'觀察：價格需{direction_text} VWAP'
     elif not range_broken:
-        rule = f'觀察：需{direction_text}{range_text}'
-    elif volume_ratio is not None and volume_ratio < 1.0:
+        rule = (
+            f'觀察：需維持 VWAP 並接近{range_text}'
+            if is_opening_micro else f'觀察：需{direction_text}{range_text}'
+        )
+    elif volume_ratio is not None and volume_ratio < minimum_volume_ratio:
         rule = '觀察：量能未達近期同時段平均'
     else:
-        rule = f'觸發：{direction_text} VWAP＋{direction_text}{range_text}'
+        rule = (
+            f'觸發：開盤動能{direction_text} VWAP＋接近{range_text}'
+            if is_opening_micro else f'觸發：{direction_text} VWAP＋{direction_text}{range_text}'
+        )
 
+    data_source = str(row.get('_daytrade_source', '—'))
     return {
         'score': score, 'rule': rule, 'eligible': eligible,
         'vwap_status': (
             '偏多：站上 VWAP' if close > vwap
             else ('偏空：跌破 VWAP' if close < vwap else '中性：貼近 VWAP')
         ),
-        'opening_range': f'{opening_low:.2f}－{opening_high:.2f}',
-        'detail': f'日 K 趨勢 {daily_trend_score}/25｜VWAP {vwap_score}/25｜量能 {volume_score}/20｜開盤區間 {range_score}/15｜風險 {risk_score}/15',
+        'opening_range': f"{'形成中 ' if is_opening_micro else ''}{fmt_price(opening_low)}－{fmt_price(opening_high)}",
+        'detail': (
+            f'日 K 趨勢 {daily_trend_score}/25｜VWAP {vwap_score}/25｜量能 {volume_score}/20｜'
+            f"{'開盤動能' if is_opening_micro else '開盤區間'} {range_score}/{'12' if is_opening_micro else '15'}｜"
+            f'風險 {risk_score}/15｜來源 {data_source}'
+        ),
         'data_time': row.get('_daytrade_data_time')
     }
 
@@ -5807,6 +6005,7 @@ def build_trade_plan(row, direction, is_daytrade_mode, filter_result):
         vwap = _as_float(row.get('_daytrade_vwap'))
         opening_high = _as_float(row.get('_daytrade_or_high'))
         opening_low = _as_float(row.get('_daytrade_or_low'))
+        opening_forming = str(row.get('_daytrade_phase', '')) == '開盤形成中'
         if None in (vwap, opening_high, opening_low):
             return {'summary': '—', 'detail': '缺少 VWAP 或開盤區間，不預判點位。'}
 
@@ -5819,7 +6018,11 @@ def build_trade_plan(row, direction, is_daytrade_mode, filter_result):
             limit_up = _as_float(row.get('當日漲停價'))
             if limit_up is not None and limit_up > entry:
                 target = min(target, _round(limit_up))
-            return _format_plan(entry, stop, target, '開盤區間高點突破後，維持 VWAP 上方')
+            trigger = (
+                '突破目前開盤高點且維持 VWAP 上方（區間形成中）'
+                if opening_forming else '開盤區間高點突破後，維持 VWAP 上方'
+            )
+            return _format_plan(entry, stop, target, trigger)
 
         entry = _round(opening_low - get_tick_size(opening_low))
         stop = _round(min(vwap, opening_high))
@@ -5829,7 +6032,11 @@ def build_trade_plan(row, direction, is_daytrade_mode, filter_result):
         limit_down = _as_float(row.get('當日跌停價'))
         if limit_down is not None and 0 < limit_down < entry:
             target = max(target, _round(limit_down))
-        return _format_plan(entry, stop, target, '開盤區間低點跌破後，維持 VWAP 下方')
+        trigger = (
+            '跌破目前開盤低點且維持 VWAP 下方（區間形成中）'
+            if opening_forming else '開盤區間低點跌破後，維持 VWAP 下方'
+        )
+        return _format_plan(entry, stop, target, trigger)
 
     atr14 = _as_float(row.get('_risk_atr14'))
     previous_high = _as_float(row.get('_risk_prev_high'))
@@ -6407,18 +6614,68 @@ def refresh_risk_metrics_for_codes(stock_data, futures_set, saved_notes_dict, na
         updated_count += int(row_mask.sum())
     return refreshed, updated_count
 
+def fetch_stock_snapshot_map(api, codes):
+    """以單一批次取得股票快照，避免逐檔重複請求。"""
+    if api is None:
+        return {}
+    contracts = []
+    for code in [str(value) for value in codes]:
+        try:
+            contract = api.Contracts.Stocks[code]
+        except (KeyError, TypeError, AttributeError):
+            try:
+                contract = api.contracts.get(code)
+            except (AttributeError, KeyError, TypeError):
+                contract = None
+        if contract is not None:
+            contracts.append(contract)
+    if not contracts:
+        return {}
+    try:
+        snapshots = api.snapshots(contracts) or []
+        return {
+            str(getattr(snapshot, 'code', '')): snapshot for snapshot in snapshots
+            if getattr(snapshot, 'code', None)
+        }
+    except Exception:
+        return {}
+
+
 def refresh_daytrade_metrics_for_codes(stock_data, sj_logged_in=False, sj_api=None):
-    """手動抓取 5 分 K 並回填當沖預覽欄位；不改動原本選股或下單資料。"""
+    """手動抓取盤中資料；09:00–09:15 採快照＋1 分 K，其後採 5 分 K。"""
     if stock_data.empty or '代號' not in stock_data.columns or not sj_logged_in or sj_api is None:
         return stock_data, 0
 
     codes = stock_data['代號'].astype(str).tolist()
+    now_tw = datetime.now(pytz.timezone('Asia/Taipei'))
+    opening_micro = _is_opening_micro_window(now_tw)
+    interval = '1m' if opening_micro else '5m'
+    interval_label = '1 分 K' if opening_micro else '5 分 K'
+    snapshot_map = fetch_stock_snapshot_map(sj_api, codes)
 
     def fetch_metrics(code):
         try:
             time.sleep(API_REQUEST_GAP_SECONDS)
-            intraday_df = fetch_shioaji_data(sj_api, code, interval='5m', lookback_days=3)
-            return code, calculate_daytrade_metrics(intraday_df)
+            intraday_df = fetch_shioaji_data(sj_api, code, interval=interval, lookback_days=3)
+            snapshot = snapshot_map.get(code)
+            metrics = calculate_daytrade_metrics(
+                intraday_df, live_snapshot=snapshot, now_tw=now_tw,
+                interval_label=interval_label,
+            )
+            if metrics and snapshot is not None:
+                price = _safe_number(getattr(snapshot, 'close', None))
+                change_rate = snapshot_change_rate(snapshot, price) if price is not None else None
+                metrics.update({
+                    '_quote_bid': _safe_number(getattr(snapshot, 'buy_price', None)),
+                    '_quote_ask': _safe_number(getattr(snapshot, 'sell_price', None)),
+                    '_quote_time': now_tw.strftime('%Y/%m/%d %H:%M:%S'),
+                })
+                if price is not None and price > 0:
+                    metrics['收盤價'] = price
+                    if change_rate is not None:
+                        metrics['漲跌幅'] = change_rate
+                        metrics['成交價價差'] = price_change_amount(price, change_rate)
+            return code, metrics
         except Exception:
             return code, None
 
@@ -7422,7 +7679,7 @@ with stock_strategy_container:
                 strategy_mode = st.radio(
                     "策略模式", ["當沖預覽", "隔日／波段"], horizontal=True,
                     key="risk_filter_strategy_mode",
-                    help="隔日／波段維持原有規則；當沖預覽以 5 分 K、VWAP 與開盤區間顯示盤中條件，不會自動下單。"
+                    help="隔日／波段維持原有規則；09:00–09:15 採即時快照＋1 分 K，之後採 5 分 K、VWAP 與完整開盤區間，不會自動下單。"
                 )
                 is_daytrade_mode = strategy_mode == "當沖預覽"
                 risk_col1, risk_col2, risk_col3 = st.columns(3)
@@ -7463,11 +7720,11 @@ with stock_strategy_container:
                         else:
                             st.warning("沒有可回填的資料；請確認標的至少有 20 個交易日的日 K。")
                     if is_daytrade_mode:
-                        if st.button("📈 重抓 5 分 K 並更新當沖條件", key="refresh_daytrade_filter_metrics"):
+                        if st.button("📈 更新盤中資料與當沖條件", key="refresh_daytrade_filter_metrics"):
                             if not st.session_state.get('sj_logged_in', False) or st.session_state.get('sj_api') is None:
-                                st.warning("當沖預覽需要先登入永豐 Shioaji，才能使用較即時的 5 分 K 資料。")
+                                st.warning("當沖預覽需要先登入永豐 Shioaji，才能取得即時快照與分 K 資料。")
                             else:
-                                with st.spinner("正在重抓 5 分 K、計算 VWAP 與開盤區間..."):
+                                with st.spinner("正在取得即時快照與分 K、計算 VWAP 與開盤條件..."):
                                     refreshed_data, updated_count = refresh_daytrade_metrics_for_codes(
                                         st.session_state.stock_data,
                                         st.session_state.get('sj_logged_in', False),
@@ -7481,7 +7738,7 @@ with stock_strategy_container:
                                         st.session_state.all_candidates,
                                         st.session_state.saved_notes
                                     )
-                                    st.toast(f"已更新 {updated_count} 檔的 5 分 K、VWAP 與開盤區間", icon="📈")
+                                    st.toast(f"已更新 {updated_count} 檔的即時成交、VWAP 與開盤條件", icon="📈")
                                     st.rerun()
                                 else:
                                     st.warning("沒有取得足夠的盤中 5 分 K；請確認 Shioaji 連線與交易時段資料。")
@@ -7513,13 +7770,13 @@ with stock_strategy_container:
                 if is_daytrade_mode:
                     daytrade_ready_mask = df_display.reindex(columns=DAYTRADE_METRIC_COLUMNS).apply(
                         lambda row: (
-                            all(_safe_number(row.get(column)) is not None for column in DAYTRADE_METRIC_COLUMNS[:-1])
+                            all(_safe_number(row.get(column)) is not None for column in DAYTRADE_REQUIRED_COLUMNS)
                             and parse_strategy_data_time(row.get('_daytrade_data_time')) is not None
                         ),
                         axis=1,
                     )
                     daytrade_ready_count = int(daytrade_ready_mask.sum())
-                    st.caption(f"當沖 5 分 K 指標：{daytrade_ready_count} / {len(df_display)} 檔可計算；僅在你手動按「重抓 5 分 K」時更新，不影響原本載入速度。")
+                    st.caption(f"當沖盤中指標：{daytrade_ready_count} / {len(df_display)} 檔可計算；09:00–09:15 使用快照＋1 分 K，09:15 後使用 5 分 K，僅在手動按更新時抓取。")
 
             market_risk_data = st.session_state.risk_filter_market_data
             attention_counts = market_risk_data.get('attention', {})
@@ -7757,7 +8014,7 @@ with stock_strategy_container:
             if is_daytrade_mode:
                 risk_column_config.update({
                     "VWAP 狀態": st.column_config.TextColumn(width=125, disabled=True, help="價格相對成交量加權平均價的位置；上方偏多、下方偏空。"),
-                    "開盤區間": st.column_config.TextColumn(width=105, disabled=True, help="09:00–09:15 的低點－高點。"),
+                    "開盤區間": st.column_config.TextColumn(width=125, disabled=True, help="09:00–09:15 顯示形成中的即時低點－高點；09:15 後固定為完整開盤區間。"),
                     "量能": st.column_config.TextColumn(width=80, disabled=True, help="目前累積量相對最近交易日同時段平均量。"),
                     "盤中觸發": st.column_config.TextColumn(width=190, disabled=True, help="僅在盤中條件同時成立時提供觀察提示，不是自動買賣指令。"),
                     "進出場預判": st.column_config.TextColumn(width=195, disabled=True, help="通過條件後，以開盤區間與 VWAP 推估進場、策略失效離場與第一目標；僅供觀察與回測。"),
@@ -7810,7 +8067,7 @@ with stock_strategy_container:
                 selected_risk_label = st.selectbox("查看策略信心明細", list(detail_options), key="risk_filter_detail_code")
                 selected_risk = risk_details[detail_options[selected_risk_label]]
                 rule_label = "盤中觸發" if is_daytrade_mode else "隔日規則"
-                data_time_text = f"｜5 分 K 更新：{selected_risk['data_time']}" if is_daytrade_mode and selected_risk.get('data_time') else ""
+                data_time_text = f"｜盤中資料更新：{selected_risk['data_time']}" if is_daytrade_mode and selected_risk.get('data_time') else ""
                 plan_text = selected_risk.get('trade_plan', {}).get('detail', '尚未預判點位。')
                 confidence_detail = selected_risk.get('confidence', {})
                 st.caption(
@@ -8048,7 +8305,7 @@ with stock_strategy_container:
                 indep_strategy_mode = st.radio(
                     "獨立計算模式", ["當沖預覽", "隔日／波段"], horizontal=True,
                     key="indep_strategy_mode",
-                    help="當沖預覽會在執行時額外抓取 5 分 K，計算 VWAP、開盤區間與量能。"
+                    help="09:00–09:15 會取得即時快照＋1 分 K；09:15 後改用 5 分 K，計算 VWAP、開盤區間與量能。"
                 )
                 indep_direction = st.radio("判斷方向", ["多頭", "空頭"], horizontal=True, key="indep_risk_direction")
             with indep_ctrl2:
@@ -8068,7 +8325,7 @@ with stock_strategy_container:
                         'errors': errors
                     }
             if indep_strategy_mode == "當沖預覽":
-                st.caption("VWAP 判讀：偏多＝站上 VWAP（紅色）；偏空＝跌破 VWAP（綠色）。執行分析時會手動取得 5 分 K。")
+                st.caption("VWAP 判讀：偏多＝站上 VWAP（紅色）；偏空＝跌破 VWAP（綠色）。09:00–09:15 使用快照＋1 分 K，之後使用 5 分 K。")
         col_q1, col_q2 = st.columns([5, 1.5])
         with col_q1:
             indep_selection = st.multiselect(
@@ -8094,6 +8351,15 @@ with stock_strategy_container:
                     st.session_state.futures_list = fetch_futures_list()
                 f_set = st.session_state.futures_list
                 notes_copy = dict(st.session_state.get('saved_notes', {}))
+                indep_now_tw = datetime.now(pytz.timezone('Asia/Taipei'))
+                indep_opening_micro = _is_opening_micro_window(indep_now_tw)
+                indep_intraday_interval = '1m' if indep_opening_micro else '5m'
+                indep_interval_label = '1 分 K' if indep_opening_micro else '5 分 K'
+                indep_codes = [item.split(' ', 1)[0] for item in indep_selection]
+                indep_snapshot_map = (
+                    fetch_stock_snapshot_map(sj_api_obj, indep_codes)
+                    if sj_logged and sj_api_obj is not None else {}
+                )
 
                 with st.spinner("正在獨立分析..."):
                     def _indep_worker(item):
@@ -8107,10 +8373,27 @@ with stock_strategy_container:
                         )
                         if result and risk_preview_enabled and indep_strategy_mode == "當沖預覽" and sj_logged and sj_api_obj is not None:
                             time.sleep(API_REQUEST_GAP_SECONDS)
-                            intraday_df = fetch_shioaji_data(sj_api_obj, q_code, interval='5m', lookback_days=3)
-                            daytrade_metrics = calculate_daytrade_metrics(intraday_df)
+                            intraday_df = fetch_shioaji_data(
+                                sj_api_obj, q_code, interval=indep_intraday_interval, lookback_days=3
+                            )
+                            snapshot = indep_snapshot_map.get(q_code)
+                            daytrade_metrics = calculate_daytrade_metrics(
+                                intraday_df, live_snapshot=snapshot, now_tw=indep_now_tw,
+                                interval_label=indep_interval_label,
+                            )
                             if daytrade_metrics:
                                 result.update(daytrade_metrics)
+                                if snapshot is not None:
+                                    price = _safe_number(getattr(snapshot, 'close', None))
+                                    change_rate = snapshot_change_rate(snapshot, price) if price is not None else None
+                                    if price is not None and price > 0:
+                                        result['收盤價'] = price
+                                        if change_rate is not None:
+                                            result['漲跌幅'] = change_rate
+                                            result['成交價價差'] = price_change_amount(price, change_rate)
+                                    result['_quote_bid'] = _safe_number(getattr(snapshot, 'buy_price', None))
+                                    result['_quote_ask'] = _safe_number(getattr(snapshot, 'sell_price', None))
+                                    result['_quote_time'] = indep_now_tw.strftime('%Y/%m/%d %H:%M:%S')
                         return result
 
                     with ThreadPoolExecutor(max_workers=ANALYSIS_MAX_WORKERS) as executor:
@@ -8133,7 +8416,7 @@ with stock_strategy_container:
                     indep_disposition_codes = indep_market_risk_data.get('disposition', [])
                     indep_market_lists_updated = bool(indep_market_risk_data.get('updated')) and not indep_market_risk_data.get('errors')
                     if indep_is_daytrade and (not sj_logged or sj_api_obj is None):
-                        st.info("當沖預覽需要登入永豐 Shioaji 才能取得 5 分 K；目前仍會顯示日 K 資料，但盤中條件會標示為資料不足。")
+                        st.info("當沖預覽需要登入永豐 Shioaji 才能取得即時快照與分 K；目前仍會顯示日 K 資料，但盤中條件會標示為資料不足。")
                 
                 # 重新套用戰略備註與價差邏輯
                 for i, row in df_indep.iterrows():
@@ -8282,7 +8565,7 @@ with stock_strategy_container:
                     if indep_is_daytrade:
                         indep_column_config.update({
                             "VWAP 狀態": st.column_config.TextColumn(width=125, disabled=True, help="偏多：站上 VWAP；偏空：跌破 VWAP。"),
-                            "開盤區間": st.column_config.TextColumn(width=105, disabled=True, help="09:00–09:15 的低點－高點。"),
+                            "開盤區間": st.column_config.TextColumn(width=125, disabled=True, help="09:00–09:15 顯示形成中的即時低點－高點；09:15 後固定為完整開盤區間。"),
                             "量能": st.column_config.TextColumn(width=80, disabled=True, help="目前累積量相對最近交易日同時段平均量。"),
                             "盤中觸發": st.column_config.TextColumn(width=190, disabled=True, help="僅為盤中觀察提示，不是自動買賣指令。"),
                             "進出場預判": st.column_config.TextColumn(width=195, disabled=True, help="以開盤區間與 VWAP 推估進場、策略失效離場與第一目標。"),
@@ -8331,7 +8614,7 @@ with stock_strategy_container:
                     selected_label = st.selectbox("查看獨立計算信心明細", list(detail_options), key="indep_risk_detail_code")
                     selected_result = indep_risk_details[detail_options[selected_label]]
                     rule_label = "盤中觸發" if indep_is_daytrade else "隔日規則"
-                    data_time_text = f"｜5 分 K 更新：{selected_result['data_time']}" if indep_is_daytrade and selected_result.get('data_time') else ""
+                    data_time_text = f"｜盤中資料更新：{selected_result['data_time']}" if indep_is_daytrade and selected_result.get('data_time') else ""
                     plan_text = selected_result.get('trade_plan', {}).get('detail', '尚未預判點位。')
                     confidence_detail = selected_result.get('confidence', {})
                     st.caption(
