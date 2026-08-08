@@ -32,7 +32,6 @@ from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
 
 # 關閉 SSL 驗證警告
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -738,6 +737,7 @@ TWSE_NEWS_URL = "https://www.twse.com.tw/news/newsList?response=json"
 FOMC_CALENDAR_URL = "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm"
 BLS_CPI_URL = "https://www.bls.gov/schedule/news_release/cpi.htm"
 BLS_EMPLOYMENT_URL = "https://www.bls.gov/schedule/news_release/empsit.htm"
+BLS_YEAR_SCHEDULE_URL = "https://www.bls.gov/schedule/{year}/home.htm"
 BLS_RELEASE_ICS_URL = "https://www.bls.gov/schedule/news_release/bls.ics"
 BLS_CPS_CALENDAR_URL = "https://www.bls.gov/cps/publications/release-calendar.htm"
 ADP_EMPLOYMENT_DATA_URL = "https://adpemploymentreport.com/ner_production.json"
@@ -919,36 +919,21 @@ def fetch_fomc_events(year):
 
 @st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
 def fetch_bls_cpi_events(year):
-    """解析 BLS 官方 CPI 發布日程並轉為台灣時間。"""
-    response = _calendar_get(BLS_CPI_URL)
-    if not response or "Access Denied" in response.text:
-        return []
-    text_value = BeautifulSoup(response.text, "html.parser").get_text(" ", strip=True)
-    month_lookup = {name: index for index, name in enumerate(
-        ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"], 1
-    )}
-    # BLS 版面通常以「Jun. 10, 2026 08:30 AM」呈現，允許中間有參考月份文字。
-    pattern = re.compile(r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.\s*(\d{1,2}),\s*(\d{4})\s*(\d{1,2}):(\d{2})\s*(AM|PM)", re.I)
-    events = []
-    seen = set()
-    for match in pattern.finditer(text_value):
-        month_name, day, event_year, hour, minute, meridiem = match.groups()
-        if int(event_year) != year:
-            continue
-        hour = int(hour) % 12 + (12 if meridiem.upper() == "PM" else 0)
-        taiwan_dt = _taiwan_time_from_eastern(year, month_lookup[month_name.title()], int(day), hour, int(minute))
-        if taiwan_dt.date() in seen:
-            continue
-        seen.add(taiwan_dt.date())
-        events.append({
-            "date": taiwan_dt.date().isoformat(),
-            "title": f"美國 CPI 公布（{taiwan_dt:%H:%M}）",
-            "detail": "BLS 官方排程；以台灣時間顯示。",
-            "closed": False,
-            "temporary": False,
-            "source": "U.S. Bureau of Labor Statistics",
-        })
-    return events
+    """CPI 先讀 BLS 官方 iCalendar，讀不到時改讀年度總表。"""
+    events = _parse_bls_release_ics(
+        _calendar_get(BLS_RELEASE_ICS_URL), year, "Consumer Price Index", "美國 CPI 公布"
+    )
+    if events:
+        return events
+    events = _parse_bls_year_schedule(
+        _calendar_get(BLS_YEAR_SCHEDULE_URL.format(year=year)), year,
+        "Consumer Price Index", "美國 CPI 公布",
+    )
+    if events:
+        return events
+    return _parse_official_release_schedule(
+        _calendar_get(BLS_CPI_URL), year, "美國 CPI 公布", "U.S. Bureau of Labor Statistics"
+    )
 
 
 def _parse_official_release_schedule(response, year, event_title, source):
@@ -985,41 +970,95 @@ def _parse_official_release_schedule(response, year, event_title, source):
     return events
 
 
-def _parse_bls_employment_ics(response, year):
-    """由 BLS 官方 iCalendar 備援解析 Employment Situation。"""
+def _parse_bls_year_schedule(response, year, release_name, event_title):
+    """解析 BLS 年度總表；此頁比個別新聞稿排程頁更穩定。"""
+    if not response or "Access Denied" in response.text:
+        return []
+    soup = BeautifulSoup(response.text, "html.parser")
+    month_lookup = {name: index for index, name in enumerate(
+        ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"], 1
+    )}
+    date_pattern = re.compile(
+        r"(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),?\s+"
+        r"(January|February|March|April|May|June|July|August|September|October|November|December)\s+"
+        r"(\d{1,2}),\s*(\d{4})\s+(\d{1,2}):(\d{2})\s*(AM|PM)",
+        re.I,
+    )
+    events, seen = [], set()
+    row_texts = [row.get_text(" ", strip=True) for row in soup.select("tr")]
+    if not row_texts:
+        row_texts = [text.strip() for text in soup.stripped_strings]
+    for row_text in row_texts:
+        if release_name.lower() not in row_text.lower():
+            continue
+        match = date_pattern.search(row_text)
+        if not match:
+            continue
+        month_name, day, event_year, hour, minute, meridiem = match.groups()
+        if int(event_year) != year:
+            continue
+        hour = int(hour) % 12 + (12 if meridiem.upper() == "PM" else 0)
+        taiwan_dt = _taiwan_time_from_eastern(
+            year, month_lookup[month_name.title()], int(day), hour, int(minute)
+        )
+        if taiwan_dt.date() in seen:
+            continue
+        seen.add(taiwan_dt.date())
+        events.append({
+            "date": taiwan_dt.date().isoformat(),
+            "title": f"{event_title}（{taiwan_dt:%H:%M}）",
+            "detail": "BLS 官方年度發布總表；已由美東時間換算為台灣時間。",
+            "closed": False,
+            "temporary": False,
+            "source": "U.S. Bureau of Labor Statistics（年度總表）",
+            "impact": "high",
+        })
+    return events
+
+
+def _parse_bls_release_ics(response, year, summary_pattern, event_title):
+    """從 BLS 官方 iCalendar 擷取指定新聞稿。"""
     if not response:
         return []
     events, seen = [], set()
     for block in re.split(r"BEGIN:VEVENT", response.text, flags=re.I)[1:]:
         unfolded = re.sub(r"\r?\n[ \t]", "", block)
-        if not re.search(r"SUMMARY[^:]*:.*Employment Situation", unfolded, re.I):
+        if not re.search(rf"SUMMARY[^:]*:.*(?:{summary_pattern})", unfolded, re.I):
             continue
         match = re.search(r"DTSTART([^:]*):(\d{8})(?:T(\d{6}))?(Z?)", unfolded, re.I)
         if not match:
             continue
         _attributes, date_digits, time_digits, utc_suffix = match.groups()
         try:
-            release_dt = datetime.strptime(
-                date_digits + (time_digits or '083000'), '%Y%m%d%H%M%S'
-            )
-            if utc_suffix.upper() == 'Z':
-                taiwan_dt = pytz.utc.localize(release_dt).astimezone(pytz.timezone('Asia/Taipei'))
+            release_dt = datetime.strptime(date_digits + (time_digits or "083000"), "%Y%m%d%H%M%S")
+            if utc_suffix.upper() == "Z":
+                taiwan_dt = pytz.utc.localize(release_dt).astimezone(pytz.timezone("Asia/Taipei"))
             else:
-                eastern = pytz.timezone('US/Eastern')
-                taiwan_dt = eastern.localize(release_dt).astimezone(pytz.timezone('Asia/Taipei'))
+                taiwan_dt = pytz.timezone("US/Eastern").localize(release_dt).astimezone(
+                    pytz.timezone("Asia/Taipei")
+                )
         except (ValueError, pytz.AmbiguousTimeError, pytz.NonExistentTimeError):
             continue
         if taiwan_dt.year != year or taiwan_dt.date() in seen:
             continue
         seen.add(taiwan_dt.date())
         events.append({
-            'date': taiwan_dt.date().isoformat(),
-            'title': f"美國大非農／失業率（{taiwan_dt:%H:%M}）",
-            'detail': 'BLS 官方 iCalendar 排程；以台灣時間顯示。',
-            'closed': False, 'temporary': False,
-            'source': 'U.S. Bureau of Labor Statistics（iCalendar）', 'impact': 'high',
+            "date": taiwan_dt.date().isoformat(),
+            "title": f"{event_title}（{taiwan_dt:%H:%M}）",
+            "detail": "BLS 官方 iCalendar；已由美東時間換算為台灣時間。",
+            "closed": False,
+            "temporary": False,
+            "source": "U.S. Bureau of Labor Statistics（iCalendar）",
+            "impact": "high",
         })
     return events
+
+
+def _parse_bls_employment_ics(response, year):
+    """由 BLS 官方 iCalendar 備援解析 Employment Situation。"""
+    return _parse_bls_release_ics(
+        response, year, "Employment Situation", "美國大非農／失業率"
+    )
 
 
 def _parse_bls_cps_employment_calendar(response, year):
@@ -1057,15 +1096,19 @@ def _parse_bls_cps_employment_calendar(response, year):
 @st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
 def fetch_bls_employment_events(year):
     """BLS Employment Situation：市場俗稱大非農，同時公布失業率。"""
-    events = _parse_official_release_schedule(
-        _calendar_get(BLS_EMPLOYMENT_URL),
-        year,
-        "美國大非農／失業率",
-        "U.S. Bureau of Labor Statistics",
+    events = _parse_bls_employment_ics(_calendar_get(BLS_RELEASE_ICS_URL), year)
+    if events:
+        return events
+    events = _parse_bls_year_schedule(
+        _calendar_get(BLS_YEAR_SCHEDULE_URL.format(year=year)), year,
+        "Employment Situation", "美國大非農／失業率",
     )
     if events:
         return events
-    events = _parse_bls_employment_ics(_calendar_get(BLS_RELEASE_ICS_URL), year)
+    events = _parse_official_release_schedule(
+        _calendar_get(BLS_EMPLOYMENT_URL), year,
+        "美國大非農／失業率", "U.S. Bureau of Labor Statistics",
+    )
     if events:
         return events
     return _parse_bls_cps_employment_calendar(_calendar_get(BLS_CPS_CALENDAR_URL), year)
@@ -1309,6 +1352,11 @@ def fetch_earnings_events(inputs):
                 "closed": False,
                 "temporary": False,
                 "source": "Yahoo Finance",
+                "ticker": selected_ticker,
+                "market": (
+                    "台股" if re.fullmatch(r"\d{4,6}\.(?:TW|TWO)", str(selected_ticker or ""), re.I)
+                    else "美股"
+                ),
             })
     return {"events": events, "resolved": resolved, "missing": missing}
 
@@ -1360,6 +1408,28 @@ def _format_compact_number(value, max_decimals=2, signed=False, thousands=True):
     if '.' in text_value:
         text_value = text_value.rstrip('0').rstrip('.')
     return text_value
+
+
+def render_index_plan_metric_cards(items):
+    """指數計畫主數值採較小字級；補充風險資訊維持原尺寸。"""
+    cards = ''.join(
+        "<div class='index-plan-main-card'>"
+        f"<div class='index-plan-main-label'>{html.escape(str(label))}</div>"
+        f"<div class='index-plan-main-value'>{html.escape(str(value))}</div>"
+        "</div>"
+        for label, value in items
+    )
+    st.markdown(
+        "<style>"
+        ".index-plan-main-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:1rem;margin:.2rem 0 .75rem}"
+        ".index-plan-main-card{text-align:center;min-width:0;padding:.15rem .35rem .45rem;border-bottom:1px solid rgba(128,128,128,.28)}"
+        ".index-plan-main-label{font-size:13px;font-weight:650;color:#f4f6f8;white-space:nowrap}"
+        ".index-plan-main-value{font-size:27px;line-height:1.22;font-weight:650;color:#f7f8fa;white-space:nowrap}"
+        "@media(max-width:700px){.index-plan-main-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:.55rem}.index-plan-main-value{font-size:23px}}"
+        "</style>"
+        f"<div class='index-plan-main-grid'>{cards}</div>",
+        unsafe_allow_html=True,
+    )
 
 
 def _roc_compact_date(value):
@@ -4860,10 +4930,11 @@ def _parse_goodinfo_turnover_table(page_html):
     return target_df.dropna(how="all").reset_index(drop=True)
 
 
-def fetch_goodinfo_data(max_attempts=2, minimum_wait_seconds=15):
-    """以瀏覽器抓取 Goodinfo 週轉率排行；保留 15 秒暖機並在阻擋時自動重試。"""
+def fetch_goodinfo_data(max_attempts=2, total_wait_seconds=14):
+    """以瀏覽器抓取 Goodinfo；載入完成立即回傳，重試共用 14 秒等待預算。"""
     url = "https://goodinfo.tw/tw/StockList.asp?RPT_TIME=&MARKET_CAT=%E7%86%B1%E9%96%80%E6%8E%92%E8%A1%8C&INDUSTRY_CAT=%E7%B4%AF%E8%A8%88%E6%88%90%E4%BA%A4%E9%87%8F%E9%80%B1%E8%BD%89%E7%8E%87%28%E7%95%B6%E6%97%A5%29%40%40%E7%B4%AF%E8%A8%88%E6%88%90%E4%BA%A4%E9%87%8F%E9%80%B1%E8%BD%89%E7%8E%87%40%40%E7%95%B6%E6%97%A5"
     chrome_options = Options()
+    chrome_options.page_load_strategy = "eager"
     chrome_options.add_argument("--headless=new")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
@@ -4887,7 +4958,7 @@ def fetch_goodinfo_data(max_attempts=2, minimum_wait_seconds=15):
     try:
         service = Service("/usr/bin/chromedriver") if os.path.exists("/usr/bin/chromedriver") else Service()
         driver = webdriver.Chrome(service=service, options=chrome_options)
-        driver.set_page_load_timeout(35)
+        driver.set_page_load_timeout(7)
         driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
             "source": """
             Object.defineProperty(navigator, 'webdriver', {
@@ -4896,26 +4967,33 @@ def fetch_goodinfo_data(max_attempts=2, minimum_wait_seconds=15):
             """
         })
         
-        for attempt in range(max(1, int(max_attempts))):
+        attempt_count = max(1, int(max_attempts))
+        overall_deadline = time.monotonic() + max(3, float(total_wait_seconds))
+        for attempt in range(attempt_count):
             try:
                 if attempt:
                     driver.delete_all_cookies()
+                remaining = overall_deadline - time.monotonic()
+                if remaining <= 0.5:
+                    break
+                attempts_left = attempt_count - attempt
+                attempt_budget = remaining if attempts_left == 1 else max(3.5, remaining * 0.62)
+                driver.set_page_load_timeout(max(2, min(7, attempt_budget)))
                 driver.get(url)
-                # Goodinfo 的動態內容與阻擋檢查通常需要完整等待；不要提早解析半張表。
-                time.sleep(max(1, float(minimum_wait_seconds)))
-                WebDriverWait(driver, 8).until(
-                    lambda current: "週轉率" in current.page_source and len(
-                        current.find_elements(By.TAG_NAME, "tr")
-                    ) >= 10
-                )
-                result = _parse_goodinfo_turnover_table(driver.page_source)
-                if result is not None and not result.empty:
-                    return result
+                attempt_deadline = min(overall_deadline, time.monotonic() + attempt_budget)
+                # 每 0.4 秒檢查一次；表格一完整就回傳，不再固定空等 15 秒。
+                while time.monotonic() < attempt_deadline:
+                    page_html = driver.page_source
+                    if "週轉率" in page_html and len(driver.find_elements(By.TAG_NAME, "tr")) >= 10:
+                        result = _parse_goodinfo_turnover_table(page_html)
+                        if result is not None and not result.empty:
+                            return result
+                    time.sleep(min(0.4, max(0.05, attempt_deadline - time.monotonic())))
                 raise ValueError("頁面已開啟，但週轉率排行表尚未完整載入")
             except Exception as exc:
                 last_error = exc
-                if attempt + 1 < max_attempts:
-                    time.sleep(2 * (attempt + 1))
+                if attempt + 1 < attempt_count and time.monotonic() < overall_deadline:
+                    time.sleep(0.25)
     except Exception as e:
         last_error = e
     finally:
@@ -4935,16 +5013,29 @@ st.markdown("""
     [data-testid="stSidebar"] button { white-space: nowrap !important; text-overflow: clip !important; padding-left: 5px !important; padding-right: 5px !important; }
     div.stButton > button { min-height: 45px; font-size: 20px; }
     .stButton { margin-top: 5px; }
-    .calendar-header { font-size: 2.5em; font-weight: 900; text-align: center; color: #ff9800; margin-bottom: 10px; line-height: 1.5; font-family: 'Arial', sans-serif; }
-    .cal-box { text-align: center; padding: 5px; border-radius: 4px; margin: 2px; min-height: 90px; border: 1px solid #555; font-size: 0.9em; display: flex; flex-direction: column; justify-content: space-between; }
+    .calendar-header { font-size: clamp(1.65rem, 4vw, 2.5rem); font-weight: 900; text-align: center; color: #ff9800; margin-bottom: 10px; line-height: 1.35; font-family: 'Arial', sans-serif; }
+    .calendar-desktop-grid { display:grid; grid-template-columns:minmax(42px,.42fr) repeat(7,minmax(105px,1fr)); gap:4px; align-items:stretch; overflow-x:auto; padding-bottom:4px; }
+    .calendar-day-head, .calendar-week-head { text-align:center; font-size:.82rem; font-weight:800; padding:5px 2px; color:#dfe6e9; }
+    .calendar-week-head { color:#ffb74d; }
+    .cal-box { text-align:left; padding:7px; border-radius:6px; min-height:112px; border:1px solid #4b5563; font-size:0.82rem; line-height:1.25; overflow-wrap:anywhere; }
     .cal-open { background-color: #000000 !important; color: #ffffff !important; }
     .cal-closed { background-color: #d32f2f !important; color: #ffffff !important; font-weight: bold; }
-    .cal-week { background-color: #f0f0f0; color: #333; font-weight: bold; display: flex; align-items: center; justify-content: center; font-size: 0.8em; }
+    .cal-week { background-color:#242a33; color:#ffb74d; font-weight:bold; display:flex; align-items:center; justify-content:center; font-size:.78rem; text-align:center; }
+    .cal-empty { background:rgba(128,128,128,.04); border-color:rgba(128,128,128,.12); }
+    .cal-date { font-size:1rem; font-weight:850; margin-bottom:4px; }
     .settle-m { color: #ffff00; font-weight: bold; font-size: 0.85em; margin-top: 2px; line-height: 1.2; } 
     .settle-w { color: #00e676; font-size: 0.8em; margin-top: 2px; } 
     .settle-f { color: #29b6f6; font-size: 0.8em; margin-top: 2px; } 
     .holiday-tag { font-size: 0.85em; margin-bottom: 2px; color: #ffeb3b; background-color: rgba(0,0,0,0.5); border-radius: 3px; padding: 1px;}
     .today-border { border: 3px solid #ffff00 !important; }
+    .calendar-mobile-list { display:none; }
+    @media (max-width: 700px) {
+        .calendar-desktop-grid { display:none; }
+        .calendar-mobile-list { display:flex; flex-direction:column; gap:7px; }
+        .calendar-mobile-day { padding:9px 10px; border-radius:7px; border:1px solid #4b5563; text-align:left; font-size:.86rem; line-height:1.3; }
+        .calendar-mobile-date { display:flex; justify-content:space-between; gap:8px; align-items:center; font-size:1rem; font-weight:850; margin-bottom:5px; }
+        .calendar-mobile-week { color:#ffb74d; font-size:.74rem; font-weight:750; white-space:nowrap; }
+    }
     div[data-testid="column"] { text-align: center; }
 </style>
 """, unsafe_allow_html=True)
@@ -5447,7 +5538,10 @@ def render_strategy_validation_room():
     for column in compact_number_columns:
         validation_display[column] = validation_display[column].map(_compact_number_text)
     validation_display['評分'] = pd.to_numeric(validation_display['評分'], errors='coerce')
-    validation_display['實際進場價'] = pd.to_numeric(validation_display['實際進場價'], errors='coerce')
+    # 使用文字欄承載可編輯數字，才能讓未填資料真正顯示空白（NumberColumn 會顯示 None）。
+    validation_display['實際進場價'] = validation_display['實際進場價'].map(
+        lambda value: '' if _safe_number(value) is None else _compact_number_text(value)
+    )
     for column in (set(display_columns) - set(compact_number_columns) - {'評分', '實際進場價'}):
         validation_display[column] = validation_display[column].map(_blank_display_text)
 
@@ -5510,8 +5604,8 @@ def render_strategy_validation_room():
             '刪除': st.column_config.CheckboxColumn('刪除', width=50, help='勾選後可一次刪除多筆訊號紀錄。'),
             '評分': st.column_config.NumberColumn('進場信心', format='%d'),
             '進場價': st.column_config.TextColumn(),
-            '實際進場價': st.column_config.NumberColumn(
-                '實際進場價 ✏️', min_value=0.0, format='%.12g',
+            '實際進場價': st.column_config.TextColumn(
+                '實際進場價 ✏️',
                 help='填入實際成交點位；留白時仍以計畫進場價計算。變更會自動儲存。'
             ),
             '停損價': st.column_config.TextColumn(),
@@ -6067,7 +6161,7 @@ def render_stock_strategy_controls():
             st.markdown("#### 外部資源")
 
             def perform_goodinfo_fetch():
-                with st.spinner("正在抓取最新資料；每次至少等待 15 秒，若遇阻擋會自動重試..."):
+                with st.spinner("正在抓取最新資料；載入完成會立即回傳，14 秒內會自動重試..."):
                     result = fetch_goodinfo_data()
                     if result is not None and not result.empty:
                         st.session_state['goodinfo_df'] = result.astype(str)
@@ -6078,7 +6172,7 @@ def render_stock_strategy_controls():
                         st.error("抓取失敗或查無資料，請稍後再試。")
 
             if st.button(
-                "📥 抓取 Goodinfo 週轉率排行", help="保留 15 秒動態載入時間；偵測到阻擋或空表時會自動重試一次。",
+                "📥 抓取 Goodinfo 週轉率排行", help="共用最長 14 秒動態等待預算；表格載入完成立即回傳，遇阻擋或空表會自動重試一次。",
                 use_container_width=True, key='fetch_goodinfo_in_stock_room'
             ):
                 perform_goodinfo_fetch()
@@ -11536,10 +11630,12 @@ with tab_fibo:
         ("臺股期貨", "TWF=F"),
     ]
     thermometer_data = []
-    for label, code in thermometer_specs:
-        temp_df, source = get_cached_market_temperature_data(code)
-        result = calculate_market_temperature(temp_df)
-        thermometer_data.append((label, code, temp_df, source, result))
+    # Streamlit tabs 仍會執行隱藏分頁程式；只在實際開啟需要的分頁時下載兩組溫度資料。
+    if tab_trade_plan.open or tab_fibo_thermometer.open:
+        for label, code in thermometer_specs:
+            temp_df, source = get_cached_market_temperature_data(code)
+            result = calculate_market_temperature(temp_df)
+            thermometer_data.append((label, code, temp_df, source, result))
 
     with tab_trade_plan:
         st.subheader("指數操作計畫")
@@ -11623,7 +11719,7 @@ with tab_fibo:
                     f"""<div style='line-height:1.25'>
                     <div style='font-size:14px;font-weight:600;color:#dfe6e9'>最新微台（{live_snapshot['contract_code']}）</div>
                     <div style='font-size:25px;font-weight:700;color:{live_snapshot['color']}'>{live_snapshot['price']:,.0f}</div>
-                    <div style='font-size:14px;font-weight:700;color:{live_snapshot['color']}'>{live_snapshot['arrow']} {abs(live_snapshot['change']):,.0f} ({live_snapshot['change_pct']:+.2f}%)</div>
+                    <div style='font-size:14px;font-weight:700;color:{live_snapshot['color']}'>{live_snapshot['arrow']} {abs(live_snapshot['change']):,.0f} ({_format_compact_number(live_snapshot['change_pct'], 2, signed=True)}%)</div>
                     </div>""",
                     unsafe_allow_html=True,
                 )
@@ -11681,7 +11777,7 @@ with tab_fibo:
                     f"""<div style='line-height:1.25'>
                     <div style='font-size:14px;font-weight:600;color:#dfe6e9'>{basis_reference}</div>
                     <div style='font-size:24px;font-weight:700;color:{index_color}'>{index_price:,.0f}</div>
-                    <div style='font-size:14px;font-weight:700;color:{index_color}'>{index_arrow} {abs(index_change):,.0f} ({index_change_pct:+.2f}%)</div>
+                    <div style='font-size:14px;font-weight:700;color:{index_color}'>{index_arrow} {abs(index_change):,.0f} ({_format_compact_number(index_change_pct, 2, signed=True)}%)</div>
                     </div>""",
                     unsafe_allow_html=True,
                 )
@@ -11689,7 +11785,7 @@ with tab_fibo:
                     f"""<div style='line-height:1.25'>
                     <div style='font-size:14px;font-weight:600;color:#dfe6e9'>期貨指數</div>
                     <div style='font-size:24px;font-weight:700;color:{futures_color}'>{live_price:,.0f}</div>
-                    <div style='font-size:14px;font-weight:700;color:{futures_color}'>{futures_arrow} {abs(futures_change):,.0f} ({futures_change_pct:+.2f}%)</div>
+                    <div style='font-size:14px;font-weight:700;color:{futures_color}'>{futures_arrow} {abs(futures_change):,.0f} ({_format_compact_number(futures_change_pct, 2, signed=True)}%)</div>
                     </div>""",
                     unsafe_allow_html=True,
                 )
@@ -11721,11 +11817,16 @@ with tab_fibo:
                 key="trade_plan_position_count",
                 help="此設定會連動更新進出依據與短波當沖的停損金額及預估收益。",
             )
-            c_entry, c_stop, c_target, c_rr = st.columns(4)
-            c_entry.metric("觀察進場區", f"{trade_state['entry_level']:,.0f}")
-            c_stop.metric("失效／停損", f"{trade_state['invalidation']:,.0f}")
-            c_target.metric("第一目標", f"{trade_state['target']:,.0f}")
-            c_rr.metric("預估風報比", f"1 : {trade_state['rr_ratio']:.2f}" if trade_state['rr_ratio'] is not None else "—")
+            render_index_plan_metric_cards([
+                ("觀察進場區", _format_compact_number(trade_state['entry_level'], 0)),
+                ("失效／停損", _format_compact_number(trade_state['invalidation'], 0)),
+                ("第一目標", _format_compact_number(trade_state['target'], 0)),
+                (
+                    "預估風報比",
+                    f"1 : {_format_compact_number(trade_state['rr_ratio'], 2)}"
+                    if trade_state['rr_ratio'] is not None else "—",
+                ),
+            ])
             entry_risk_level, entry_risk_color, entry_risk_ratio = get_trade_risk_level(
                 trade_state['risk_points'], plan['atr'],
             )
@@ -11757,7 +11858,10 @@ with tab_fibo:
                 <div style='font-size:19px;font-weight:700;color:#ff4b4b'>${entry_reward_amount:,.0f}</div>
                 </div>""", unsafe_allow_html=True,
             )
-            st.caption(f"風險等級以停損距離相對日 ATR 判定：{entry_risk_ratio:.2f} ATR；微台每點 10 元。")
+            st.caption(
+                f"風險等級以停損距離相對日 ATR 判定：{_format_compact_number(entry_risk_ratio, 2)} ATR；"
+                "微台每點 10 元。"
+            )
             if trade_state['can_enter']:
                 st.info(f"15 分 K：{confirmation_text} 目前符合「{trade_state['permission']}」條件，仍須依設定停損控制部位。")
             elif plan['direction'] in ('偏多', '偏空'):
@@ -11771,8 +11875,12 @@ with tab_fibo:
                 signal_details.append(
                     f"本段開盤區間 {intraday_state['opening_low']:,.0f}–{intraday_state['opening_high']:,.0f}"
                 )
-            signal_details.append(f"即時漲跌為日 ATR 的 {trade_state['shock_ratio']:+.2f} 倍")
-            signal_details.append(f"溫度變化 {trade_state['temperature_delta']:+.0f} 度")
+            signal_details.append(
+                f"即時漲跌為日 ATR 的 {_format_compact_number(trade_state['shock_ratio'], 2, signed=True)} 倍"
+            )
+            signal_details.append(
+                f"溫度變化 {_format_compact_number(trade_state['temperature_delta'], 0, signed=True)} 度"
+            )
             st.caption("｜".join(signal_details))
 
             st.divider()
@@ -11792,17 +11900,25 @@ with tab_fibo:
             st.caption(f"{short_direction_note}。短波採 EMA5 或前根高低點即時觸發，不等待完整 5 分 K 收盤。")
             short_wave = get_cached_short_wave_plan(st.session_state.get('sj_api'), short_wave_direction)
             if short_wave:
-                sw1, sw2, sw3, sw4 = st.columns(4)
-                sw1.metric("短波進場區", f"{short_wave['entry']:,.0f} ± {short_wave['zone']:,.0f}")
-                sw2.metric("短波停損", f"{short_wave['stop']:,.0f}")
-                sw3.metric("短波目標", f"{short_wave['target']:,.0f}")
-                sw4.metric("短波風報比", f"1 : {short_wave['rr']:.2f}" if short_wave['rr'] is not None else "—")
+                render_index_plan_metric_cards([
+                    (
+                        "短波進場區",
+                        f"{_format_compact_number(short_wave['entry'], 0)} ± {_format_compact_number(short_wave['zone'], 0)}",
+                    ),
+                    ("短波停損", _format_compact_number(short_wave['stop'], 0)),
+                    ("短波目標", _format_compact_number(short_wave['target'], 0)),
+                    (
+                        "短波風報比",
+                        f"1 : {_format_compact_number(short_wave['rr'], 2)}"
+                        if short_wave['rr'] is not None else "—",
+                    ),
+                ])
                 st.info(f"**快速進場條件：** {short_wave['trigger']}")
                 momentum_label = "已達快速觸發" if short_wave['momentum_ready'] else "接近觸發，等待穿越前根高低點"
                 momentum_color = '#ff4b4b' if short_wave_direction == '偏多' else '#00c853'
                 st.markdown(
                     f"<div style='font-size:14px;font-weight:700;color:{momentum_color}'>即時狀態：{momentum_label}｜"
-                    f"EMA5 {short_wave['ema_fast']:,.0f}｜量比 {short_wave['volume_ratio']:.2f}</div>",
+                    f"EMA5 {short_wave['ema_fast']:,.0f}｜量比 {_format_compact_number(short_wave['volume_ratio'], 2)}</div>",
                     unsafe_allow_html=True,
                 )
                 short_risk_level, short_risk_color, short_risk_ratio = get_trade_risk_level(
@@ -11837,7 +11953,8 @@ with tab_fibo:
                     </div>""", unsafe_allow_html=True,
                 )
                 st.caption(
-                    f"以最新 6 根 5 分 K、EMA5 與前根高低點計算；短波停損為日 ATR 的 {short_risk_ratio:.2f} 倍。"
+                    "以最新 6 根 5 分 K、EMA5 與前根高低點計算；短波停損為日 ATR 的 "
+                    f"{_format_compact_number(short_risk_ratio, 2)} 倍。"
                     "短波可先於日線進場許可觸發，但只適合小部位快進快出。"
                 )
             elif short_wave_direction:
@@ -12223,14 +12340,14 @@ with tab_fibo:
         selected_interval = list(interval_options.keys())[list(interval_options.values()).index(selected_interval_label)]
         st.session_state.fibo_interval = selected_interval 
         
-        if final_target.strip():
+        if tab_fibo_chart.open and final_target.strip():
             plot_fibonacci_chart(
                 final_target, selected_interval,
                 font_size=st.session_state.fibo_font_size,
                 ma_flags=ma_flags, ma_width=st.session_state.ma_w,
                 show_vol=s_vol, advice_container=advice_placeholder,
             )
-        else:
+        elif tab_fibo_chart.open:
             st.info("請在上方選擇或輸入股票/期貨以顯示圖表。")
 
     with tab_fibo_manual:
@@ -12445,20 +12562,33 @@ with tab3:
         "台股月營收",
         "美股季度／年度營收",
     ]
-    COMPANY_SUMMARY_GROUP = "公司財報／營收摘要"
-    CALENDAR_GROUP_OPTIONS = ["台股市場與休市", "美國高影響總經", COMPANY_SUMMARY_GROUP]
+    US_HIGH_IMPACT_EVENTS = [
+        "FOMC 利率決議", "美國 CPI", "美國大非農", "美國小非農 ADP", "美國初領失業金"
+    ]
+    US_HIGH_IMPACT_DESCRIPTIONS = {
+        "FOMC 利率決議": "聯準會利率決策與政策聲明",
+        "美國 CPI": "消費者物價指數，觀察通膨",
+        "美國大非農": "非農就業人數與失業率",
+        "美國小非農 ADP": "ADP 民間就業預估",
+        "美國初領失業金": "每週首次申請失業救濟人數",
+    }
+    TAIWAN_COMPANY_GROUP = "台股公司營收與財報"
+    US_COMPANY_GROUP = "美股公司營收與財報"
+    CALENDAR_GROUP_OPTIONS = [
+        "台股市場與休市", "美國高影響總經", TAIWAN_COMPANY_GROUP, US_COMPANY_GROUP
+    ]
     CALENDAR_GROUP_EVENTS = {
         "台股市場與休市": ["台股開休市", "台股突發休市公告"],
-        "美國高影響總經": ["FOMC 利率決議", "美國 CPI", "美國大非農", "美國小非農 ADP"],
-        COMPANY_SUMMARY_GROUP: ["指定股票財報", "台股月營收", "美股季度／年度營收"],
+        "美國高影響總經": US_HIGH_IMPACT_EVENTS,
+        TAIWAN_COMPANY_GROUP: ["台股公司財報", "台股月營收"],
+        US_COMPANY_GROUP: ["美股公司財報", "美股季度／年度營收"],
     }
-    US_EVENT_DENSITY_OPTIONS = ["核心（FOMC／CPI／大小非農）", "完整（含每週初領失業金）"]
 
     def normalize_calendar_preferences(saved=None):
         """將檔案或既有 Streamlit session 的舊版事件設定升級為目前格式。"""
         default_preferences = {
             "groups": CALENDAR_GROUP_OPTIONS.copy(),
-            "us_event_density": US_EVENT_DENSITY_OPTIONS[1],
+            "macro_events": US_HIGH_IMPACT_EVENTS.copy(),
             "tickers": "2330.TW",
         }
         if not isinstance(saved, dict):
@@ -12467,10 +12597,13 @@ with tab3:
         raw_groups = saved.get("groups", [])
         if isinstance(raw_groups, str):
             raw_groups = [raw_groups]
-        raw_groups = [
-            COMPANY_SUMMARY_GROUP if item == "個股財報與營收" else item
-            for item in raw_groups
-        ] if isinstance(raw_groups, (list, tuple, set)) else []
+        migrated_groups = []
+        for item in raw_groups if isinstance(raw_groups, (list, tuple, set)) else []:
+            if item in {"個股財報與營收", "公司財報／營收摘要"}:
+                migrated_groups.extend([TAIWAN_COMPANY_GROUP, US_COMPANY_GROUP])
+            else:
+                migrated_groups.append(item)
+        raw_groups = migrated_groups
         groups = [
             item for item in raw_groups
             if isinstance(item, str) and item in CALENDAR_GROUP_OPTIONS
@@ -12487,13 +12620,18 @@ with tab3:
                 if legacy_events.intersection(events)
             ] or CALENDAR_GROUP_OPTIONS.copy()
 
-        density = saved.get("us_event_density", default_preferences["us_event_density"])
-        if density not in US_EVENT_DENSITY_OPTIONS:
-            density = default_preferences["us_event_density"]
+        raw_macro_events = saved.get("macro_events", saved.get("events", []))
+        if isinstance(raw_macro_events, str):
+            raw_macro_events = [raw_macro_events]
+        macro_events = [
+            item for item in US_HIGH_IMPACT_EVENTS if item in set(raw_macro_events or [])
+        ]
+        if not macro_events:
+            macro_events = US_HIGH_IMPACT_EVENTS.copy()
         tickers = saved.get("tickers", default_preferences["tickers"])
         if tickers is None:
             tickers = default_preferences["tickers"]
-        return {"groups": groups, "us_event_density": density, "tickers": str(tickers)}
+        return {"groups": groups, "macro_events": macro_events, "tickers": str(tickers)}
 
     def load_calendar_preferences():
         if not os.path.exists(CAL_PREFERENCES_FILE):
@@ -12505,15 +12643,15 @@ with tab3:
         except (OSError, ValueError, TypeError):
             return normalize_calendar_preferences()
 
-    def save_calendar_preferences(groups, us_event_density, tickers, events):
+    def save_calendar_preferences(groups, macro_events, tickers, events):
         try:
             with open(CAL_PREFERENCES_FILE, "w", encoding="utf-8") as file:
                 json.dump({
                     "groups": groups,
-                    "us_event_density": us_event_density,
+                    "macro_events": macro_events,
                     "events": events,
                     "tickers": tickers,
-                    "calendar_events_version": 3,
+                    "calendar_events_version": 4,
                 }, file, ensure_ascii=False, indent=2)
         except OSError:
             pass
@@ -12579,38 +12717,46 @@ with tab3:
     st.markdown("---")
 
     with st.expander("🌐 網路同步與追蹤事件", expanded=False):
-        st.caption("先選追蹤類別，再決定美國事件密度；公司事件只讀取獨立分頁產生的快照，不會在行事曆查詢網路。")
-        filter_col, density_col = st.columns([1.35, 1])
-        with filter_col:
-            selected_event_groups = st.multiselect(
-                "追蹤類別",
-                options=CALENDAR_GROUP_OPTIONS,
-                default=st.session_state.calendar_preferences["groups"],
-                key="calendar_event_groups",
+        st.caption("選擇要顯示的事件；公司資料只讀取獨立分頁的最近快照，不會在切換月份時重新查詢。")
+        selected_event_groups = st.multiselect(
+            "追蹤類別",
+            options=CALENDAR_GROUP_OPTIONS,
+            default=st.session_state.calendar_preferences["groups"],
+            key="calendar_event_groups",
+        )
+
+        if "美國高影響總經" in selected_event_groups:
+            selected_macro_events = st.multiselect(
+                "美國高影響總經（勾選要呈現的事件）",
+                options=US_HIGH_IMPACT_EVENTS,
+                default=st.session_state.calendar_preferences.get(
+                    "macro_events", US_HIGH_IMPACT_EVENTS
+                ),
+                key="calendar_macro_events",
             )
-        with density_col:
-            density_options = US_EVENT_DENSITY_OPTIONS
-            saved_density = st.session_state.calendar_preferences.get("us_event_density", density_options[1])
-            us_event_density = st.selectbox(
-                "美國事件密度",
-                options=density_options,
-                index=density_options.index(saved_density) if saved_density in density_options else 1,
-                disabled="美國高影響總經" not in selected_event_groups,
-                key="calendar_us_event_density",
-            )
+            with st.expander("高影響總經包含什麼？", expanded=False):
+                st.markdown("\n".join(
+                    f"- **{event_name}**：{US_HIGH_IMPACT_DESCRIPTIONS[event_name]}"
+                    for event_name in US_HIGH_IMPACT_EVENTS
+                ))
+        else:
+            selected_macro_events = []
 
         selected_event_types = []
         for group in selected_event_groups:
-            selected_event_types.extend(CALENDAR_GROUP_EVENTS[group])
-        if "美國高影響總經" in selected_event_groups and us_event_density.startswith("完整"):
-            selected_event_types.append("美國初領失業金")
+            if group != "美國高影響總經":
+                selected_event_types.extend(CALENDAR_GROUP_EVENTS[group])
+        selected_event_types.extend(selected_macro_events)
         st.caption(
-            "目前顯示：" + (
+            "呈現模式：完整（只顯示已勾選事件）｜目前顯示：" + (
                 "｜".join(selected_event_groups) if selected_event_groups else "未選擇自動事件"
-            ) + ("｜含每週初領失業金" if "美國初領失業金" in selected_event_types else "")
+            ) + (
+                "｜總經：" + "、".join(selected_macro_events)
+                if selected_macro_events else ""
+            )
         )
         snapshot = st.session_state.company_event_snapshot
-        if COMPANY_SUMMARY_GROUP in selected_event_groups:
+        if {TAIWAN_COMPANY_GROUP, US_COMPANY_GROUP}.intersection(selected_event_groups):
             if snapshot.get("updated_at"):
                 st.caption(f"公司事件快照：{snapshot['updated_at']}｜追蹤：{snapshot.get('tickers', '—')}")
             else:
@@ -12631,12 +12777,12 @@ with tab3:
             if st.button("💾 儲存追蹤設定", key="save_calendar_preferences"):
                 st.session_state.calendar_preferences = {
                     "groups": selected_event_groups,
-                    "us_event_density": us_event_density,
+                    "macro_events": selected_macro_events,
                     "tickers": st.session_state.calendar_preferences.get("tickers", "2330.TW"),
                 }
                 save_calendar_preferences(
                     selected_event_groups,
-                    us_event_density,
+                    selected_macro_events,
                     st.session_state.calendar_preferences["tickers"],
                     selected_event_types,
                 )
@@ -12713,9 +12859,41 @@ with tab3:
         add_network_source('小非農 ADP', fetch_adp_employment_events(sel_year))
     if "美國初領失業金" in selected_event_types:
         add_network_source('初領失業金', build_us_initial_claims_events(sel_year))
-    if COMPANY_SUMMARY_GROUP in selected_event_groups:
-        # 僅合併獨立分頁已完成的快照；切換年月不會觸發 MOPS／Yahoo 查詢。
-        network_events.extend(st.session_state.company_event_snapshot.get("events", []))
+
+    company_snapshot = st.session_state.company_event_snapshot
+    earnings_events = list(company_snapshot.get("earnings", {}).get("events", []))
+    legacy_market_by_name = {}
+    for resolved_text in company_snapshot.get("earnings", {}).get("resolved", []):
+        match = re.search(r"→\s*(.*?)（([^（）]+)）", str(resolved_text))
+        if match:
+            legacy_market_by_name[match.group(1).strip()] = (
+                "台股" if re.fullmatch(r"\d{4,6}\.(?:TW|TWO)", match.group(2).strip(), re.I)
+                else "美股"
+            )
+
+    def company_earnings_for_market(market_name):
+        matched = []
+        for event in earnings_events:
+            event_market = event.get("market")
+            if not event_market:
+                ticker = str(event.get("ticker", ""))
+                if ticker:
+                    event_market = (
+                        "台股" if re.fullmatch(r"\d{4,6}\.(?:TW|TWO)", ticker, re.I) else "美股"
+                    )
+                else:
+                    company_name = str(event.get("title", "")).replace(" 財報預估日", "").strip()
+                    event_market = legacy_market_by_name.get(company_name)
+            if event_market == market_name:
+                matched.append(event)
+        return matched
+
+    if TAIWAN_COMPANY_GROUP in selected_event_groups:
+        network_events.extend(company_earnings_for_market("台股"))
+        network_events.extend(company_snapshot.get("taiwan_revenue", {}).get("events", []))
+    if US_COMPANY_GROUP in selected_event_groups:
+        network_events.extend(company_earnings_for_market("美股"))
+        network_events.extend(company_snapshot.get("us_revenue", {}).get("events", []))
     if "美國高影響總經" in selected_event_groups:
         us_count_text = '｜'.join(
             f"{label} {calendar_source_counts.get(label, 0)} 筆"
@@ -12884,10 +13062,6 @@ with tab3:
             if check_date not in real_settlements: real_settlements[check_date] = []
             real_settlements[check_date].append((s_type, s_code))
 
-    week_days = ["週", "日", "一", "二", "三", "四", "五", "六"]
-    cols = st.columns([0.4, 1, 1, 1, 1, 1, 1, 1])
-    for i, d in enumerate(week_days): cols[i].markdown(f"<div style='text-align: center; font-weight: bold;'>{d}</div>", unsafe_allow_html=True)
-
     cal_obj = calendar.Calendar(firstweekday=6)
     month_days = cal_obj.monthdayscalendar(sel_year, sel_month)
 
@@ -12907,103 +13081,113 @@ with tab3:
                         override_dict[d_obj].append(f"<div style='color:{col}; font-size:0.8em; margin-top:2px; font-weight:bold;'>{r['事件名稱']}</div>")
             except:
                 pass
-    # ---------------------------------------------
-
-    for week in month_days:
-        week_cols = st.columns([0.4, 1, 1, 1, 1, 1, 1, 1])
-        first_valid_day = next((d for d in week if d != 0), None)
-        if first_valid_day:
-            iso_week = date(sel_year, sel_month, first_valid_day).isocalendar()[1]
-            week_cols[0].markdown(f"<div class='cal-box cal-week'>{iso_week}</div>", unsafe_allow_html=True)
-        else: week_cols[0].markdown("")
-
-        for i, day in enumerate(week):
-            if day == 0:
-                week_cols[i+1].markdown("")
-                continue
-            
-            curr_date = date(sel_year, sel_month, day)
-            holiday_name = current_holidays.get((sel_month, day), "")
-            is_closed = is_market_closed_func(curr_date)
-            bg_class = "cal-closed" if is_closed else "cal-open"
-            border_style = "today-border" if curr_date == now_tw.date() else ""
-            
-            content_html = [f"<b>{day}</b>"]
+    def calendar_day_content(curr_date):
+        """建立單日事件內容，桌機月曆與手機清單共用，避免兩種版面日期不一致。"""
+        holiday_name = current_holidays.get((curr_date.month, curr_date.day), "")
+        content_html = []
+        if holiday_name:
             if holiday_name and holiday_name != "封關日": content_html.append(f"<div class='holiday-tag'>{html.escape(holiday_name)}</div>")
             if holiday_name == "封關日": content_html.append(f"<div style='color:#ff9800; font-size:0.8em;'>{html.escape(holiday_name)}</div>")
 
-            # 網路同步事件：突發休市會強制使用紅色底，並附上官方公告中的原因。
-            for event in network_event_dict.get(curr_date, []):
-                if event.get("closed") and not event.get("temporary"):
-                    # 已由 holiday_name 顯示，避免年度休市名稱重複。
-                    continue
-                if event.get("temporary"):
-                    prefix = "<div style='background:#B71C1C; color:#FFFFFF; padding:2px; margin-top:3px; font-size:0.78em; font-weight:900;'>"
-                    suffix = "</div>"
-                    detail = html.escape(str(event.get("detail", "")))
-                    content_html.append(f"{prefix}{html.escape(event.get('title', '台股突發休市'))}{suffix}")
-                    if detail:
-                        content_html.append(f"<div style='color:#FFCDD2; font-size:0.72em; margin-top:2px;'>{detail}</div>")
+        for event in network_event_dict.get(curr_date, []):
+            if event.get("closed") and not event.get("temporary"):
+                continue
+            if event.get("temporary"):
+                detail = html.escape(str(event.get("detail", "")))
+                content_html.append(
+                    "<div style='background:#B71C1C;color:#fff;padding:3px;margin-top:3px;"
+                    "font-size:.78em;font-weight:900;border-radius:3px'>"
+                    f"{html.escape(str(event.get('title', '台股突發休市')))}</div>"
+                )
+                if detail:
+                    content_html.append(f"<div style='color:#FFCDD2;font-size:.72em;margin-top:2px'>{detail}</div>")
+            else:
+                color = "#FF7043" if event.get("source") == "Federal Reserve" else "#00E5FF"
+                if "大非農" in event.get("title", ""):
+                    color = "#FF5252"
+                elif "小非農" in event.get("title", ""):
+                    color = "#FFB74D"
+                elif event.get("impact") == "routine":
+                    color = "#B0BEC5"
+                elif "CPI" in event.get("title", ""):
+                    color = "#00FA9A"
+                if "財報" in event.get("title", ""):
+                    color = "#FFD700"
+                if "MOPS" in event.get("source", ""):
+                    revenue = event.get("revenue", {})
+                    mom, yoy = str(revenue.get("mom", "--")), str(revenue.get("yoy", "--"))
+                    content_html.append(
+                        "<div style='font-size:.8em;margin-top:2px;font-weight:bold'>"
+                        f"<span style='color:#00E676'>{html.escape(str(revenue.get('company', '月營收事件')))} 月營收</span> "
+                        f"<span style='color:{_percent_color(mom)}'>MoM{html.escape(mom)}</span>／"
+                        f"<span style='color:{_percent_color(yoy)}'>YoY{html.escape(yoy)}</span></div>"
+                    )
+                elif event.get("source") == "Yahoo Finance（季度／年度營收）":
+                    revenue = event.get("revenue", {})
+                    qoq, yoy = str(revenue.get("qoq", "--")), str(revenue.get("yoy", "--"))
+                    content_html.append(
+                        "<div style='font-size:.8em;margin-top:2px;font-weight:bold'>"
+                        f"<span style='color:#FFD700'>{html.escape(str(revenue.get('company', '美股營收事件')))} 季營收</span> "
+                        f"<span style='color:{_percent_color(qoq)}'>QoQ{html.escape(qoq)}</span>／"
+                        f"<span style='color:{_percent_color(yoy)}'>YoY{html.escape(yoy)}</span></div>"
+                    )
                 else:
-                    color = "#FF7043" if event.get("source") == "Federal Reserve" else "#00E5FF"
-                    if "大非農" in event.get("title", ""):
-                        color = "#FF5252"
-                    elif "小非農" in event.get("title", ""):
-                        color = "#FFB74D"
-                    elif event.get("impact") == "routine":
-                        color = "#B0BEC5"
-                    elif "CPI" in event.get("title", ""):
-                        color = "#00FA9A"
-                    if "財報" in event.get("title", ""):
-                        color = "#FFD700"
-                    if "MOPS" in event.get("source", ""):
-                        revenue = event.get("revenue", {})
-                        mom, yoy = revenue.get("mom", "--"), revenue.get("yoy", "--")
-                        content_html.append(
-                            "<div style='font-size:0.8em; margin-top:2px; font-weight:bold;'>"
-                            f"<span style='color:#00E676;'>{html.escape(revenue.get('company', '月營收事件'))} 月營收</span> "
-                            f"<span style='color:{_percent_color(mom)};'>MoM{html.escape(mom)}</span>／"
-                            f"<span style='color:{_percent_color(yoy)};'>YoY{html.escape(yoy)}</span></div>"
-                        )
-                    elif event.get("source") == "Yahoo Finance（季度／年度營收）":
-                        revenue = event.get("revenue", {})
-                        qoq, yoy = revenue.get("qoq", "--"), revenue.get("yoy", "--")
-                        content_html.append(
-                            "<div style='font-size:0.8em; margin-top:2px; font-weight:bold;'>"
-                            f"<span style='color:#FFD700;'>{html.escape(revenue.get('company', '美股營收事件'))} 季營收</span> "
-                            f"<span style='color:{_percent_color(qoq)};'>QoQ{html.escape(qoq)}</span>／"
-                            f"<span style='color:{_percent_color(yoy)};'>YoY{html.escape(yoy)}</span></div>"
-                        )
-                    else:
-                        content_html.append(
-                            f"<div style='color:{color}; font-size:0.8em; margin-top:2px; font-weight:bold;'>"
-                            f"{html.escape(event.get('title', '未命名事件'))}</div>"
-                        )
-                    if event.get("source") == "Yahoo Finance":
-                        time_note = str(event.get("detail", "")).split("；", 1)[0].replace("Yahoo Finance｜", "")
-                        content_html.append(
-                            f"<div style='color:#B0BEC5; font-size:0.72em; margin-top:1px;'>"
-                            f"{html.escape(time_note)}</div>"
-                        )
-            
-            # 加入外國重要股市事件
-            if day in us_events:
-                content_html.extend(us_events[day])
-            
-            # --- 新增：注入自訂與校正事件 ---
-            if curr_date in override_dict:
-                content_html.extend(override_dict[curr_date])
-            # ------------------------------
-            
-            if curr_date in real_settlements:
-                infos = real_settlements[curr_date]
-                infos.sort(key=lambda x: 0 if x[0]=='M' else 1)
-                for s_type, s_code in infos:
-                    if s_type == 'M': content_html.append(f"<div class='settle-m'>台指期{s_code}結算<br>月選結算</div>")
-                    elif s_type == 'W': content_html.append(f"<div class='settle-w'>週選(三) {s_code}</div>")
-                    elif s_type == 'F': content_html.append(f"<div class='settle-f'>週選(五) {s_code}</div>")
+                    content_html.append(
+                        f"<div style='color:{color};font-size:.8em;margin-top:2px;font-weight:bold'>"
+                        f"{html.escape(str(event.get('title', '未命名事件')))}</div>"
+                    )
+                if event.get("source") == "Yahoo Finance":
+                    time_note = str(event.get("detail", "")).split("；", 1)[0].replace("Yahoo Finance｜", "")
+                    content_html.append(
+                        f"<div style='color:#B0BEC5;font-size:.72em;margin-top:1px'>{html.escape(time_note)}</div>"
+                    )
 
-            week_cols[i+1].markdown(f"<div class='cal-box {bg_class} {border_style}'>{''.join(content_html)}</div>", unsafe_allow_html=True)
+        content_html.extend(override_dict.get(curr_date, []))
+        infos = sorted(real_settlements.get(curr_date, []), key=lambda item: 0 if item[0] == 'M' else 1)
+        for settlement_type, settlement_code in infos:
+            if settlement_type == 'M':
+                content_html.append(f"<div class='settle-m'>台指期{settlement_code}結算<br>月選結算</div>")
+            elif settlement_type == 'W':
+                content_html.append(f"<div class='settle-w'>週選(三) {settlement_code}</div>")
+            elif settlement_type == 'F':
+                content_html.append(f"<div class='settle-f'>週選(五) {settlement_code}</div>")
+        return ''.join(content_html)
+
+    desktop_cells = ["<div class='calendar-week-head'>ISO<br>週</div>"]
+    desktop_cells.extend(
+        f"<div class='calendar-day-head'>{weekday}</div>" for weekday in ["日", "一", "二", "三", "四", "五", "六"]
+    )
+    mobile_cells = []
+    weekday_names = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"]
+    for week in month_days:
+        first_valid_day = next((day for day in week if day), None)
+        # 月曆從週日開始，但 ISO 週從週一開始；優先取該列週一作為週次基準。
+        iso_anchor_day = week[1] if len(week) > 1 and week[1] else first_valid_day
+        iso_week = date(sel_year, sel_month, iso_anchor_day).isocalendar().week
+        desktop_cells.append(f"<div class='cal-box cal-week'>W{iso_week}</div>")
+        for day in week:
+            if not day:
+                desktop_cells.append("<div class='cal-box cal-empty'></div>")
+                continue
+            curr_date = date(sel_year, sel_month, day)
+            day_content = calendar_day_content(curr_date)
+            bg_class = "cal-closed" if is_market_closed_func(curr_date) else "cal-open"
+            today_class = "today-border" if curr_date == now_tw.date() else ""
+            desktop_cells.append(
+                f"<div class='cal-box {bg_class} {today_class}'><div class='cal-date'>{day}</div>{day_content}</div>"
+            )
+            mobile_cells.append(
+                f"<div class='calendar-mobile-day {bg_class} {today_class}'>"
+                f"<div class='calendar-mobile-date'><span>{sel_month}/{day} {weekday_names[curr_date.weekday()]}</span>"
+                f"<span class='calendar-mobile-week'>ISO W{curr_date.isocalendar().week}</span></div>"
+                f"{day_content}</div>"
+            )
+
+    st.markdown(
+        f"<div class='calendar-desktop-grid'>{''.join(desktop_cells)}</div>"
+        f"<div class='calendar-mobile-list'>{''.join(mobile_cells)}</div>",
+        unsafe_allow_html=True,
+    )
 
 
 
@@ -13065,7 +13249,7 @@ with tab_company:
             st.session_state.calendar_preferences["tickers"] = company_ticker_input
             save_calendar_preferences(
                 st.session_state.calendar_preferences.get("groups", CALENDAR_GROUP_OPTIONS),
-                st.session_state.calendar_preferences.get("us_event_density", US_EVENT_DENSITY_OPTIONS[1]),
+                st.session_state.calendar_preferences.get("macro_events", US_HIGH_IMPACT_EVENTS),
                 company_ticker_input,
                 selected_event_types,
             )
