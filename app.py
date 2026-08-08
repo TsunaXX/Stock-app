@@ -31,6 +31,8 @@ from PIL import Image
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
 
 # 關閉 SSL 驗證警告
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -727,7 +729,8 @@ def is_warrant(code):
 # 網路同步行事曆資料來源（僅供「股市行事曆」分頁使用）
 # ==========================================
 CALENDAR_HTTP_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; TaiwanMarketCalendar/1.0)",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/json,text/calendar;q=0.9,*/*;q=0.8",
     "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
 }
 TWSE_HOLIDAY_URL = "https://www.twse.com.tw/holidaySchedule/holidaySchedule?response=json&queryYear={roc_year}"
@@ -735,17 +738,23 @@ TWSE_NEWS_URL = "https://www.twse.com.tw/news/newsList?response=json"
 FOMC_CALENDAR_URL = "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm"
 BLS_CPI_URL = "https://www.bls.gov/schedule/news_release/cpi.htm"
 BLS_EMPLOYMENT_URL = "https://www.bls.gov/schedule/news_release/empsit.htm"
+BLS_RELEASE_ICS_URL = "https://www.bls.gov/schedule/news_release/bls.ics"
+BLS_CPS_CALENDAR_URL = "https://www.bls.gov/cps/publications/release-calendar.htm"
 ADP_EMPLOYMENT_DATA_URL = "https://adpemploymentreport.com/ner_production.json"
+ADP_EMPLOYMENT_PAGE_URL = "https://adpemploymentreport.com/"
 
 
 def _calendar_get(url):
     """取得公開行事曆來源；失敗時回傳 None，讓既有行事曆仍可使用。"""
-    try:
-        response = requests.get(url, headers=CALENDAR_HTTP_HEADERS, timeout=12)
-        response.raise_for_status()
-        return response
-    except requests.RequestException:
-        return None
+    for attempt in range(3):
+        try:
+            response = requests.get(url, headers=CALENDAR_HTTP_HEADERS, timeout=(6, 18))
+            response.raise_for_status()
+            return response
+        except requests.RequestException:
+            if attempt < 2:
+                time.sleep(0.5 * (attempt + 1))
+    return None
 
 
 def _twse_announcement_detail(row, fallback):
@@ -976,27 +985,124 @@ def _parse_official_release_schedule(response, year, event_title, source):
     return events
 
 
+def _parse_bls_employment_ics(response, year):
+    """由 BLS 官方 iCalendar 備援解析 Employment Situation。"""
+    if not response:
+        return []
+    events, seen = [], set()
+    for block in re.split(r"BEGIN:VEVENT", response.text, flags=re.I)[1:]:
+        unfolded = re.sub(r"\r?\n[ \t]", "", block)
+        if not re.search(r"SUMMARY[^:]*:.*Employment Situation", unfolded, re.I):
+            continue
+        match = re.search(r"DTSTART([^:]*):(\d{8})(?:T(\d{6}))?(Z?)", unfolded, re.I)
+        if not match:
+            continue
+        _attributes, date_digits, time_digits, utc_suffix = match.groups()
+        try:
+            release_dt = datetime.strptime(
+                date_digits + (time_digits or '083000'), '%Y%m%d%H%M%S'
+            )
+            if utc_suffix.upper() == 'Z':
+                taiwan_dt = pytz.utc.localize(release_dt).astimezone(pytz.timezone('Asia/Taipei'))
+            else:
+                eastern = pytz.timezone('US/Eastern')
+                taiwan_dt = eastern.localize(release_dt).astimezone(pytz.timezone('Asia/Taipei'))
+        except (ValueError, pytz.AmbiguousTimeError, pytz.NonExistentTimeError):
+            continue
+        if taiwan_dt.year != year or taiwan_dt.date() in seen:
+            continue
+        seen.add(taiwan_dt.date())
+        events.append({
+            'date': taiwan_dt.date().isoformat(),
+            'title': f"美國大非農／失業率（{taiwan_dt:%H:%M}）",
+            'detail': 'BLS 官方 iCalendar 排程；以台灣時間顯示。',
+            'closed': False, 'temporary': False,
+            'source': 'U.S. Bureau of Labor Statistics（iCalendar）', 'impact': 'high',
+        })
+    return events
+
+
+def _parse_bls_cps_employment_calendar(response, year):
+    """BLS 主排程與 ICS 都被阻擋時，使用 CPS 官方發布日曆交叉備援。"""
+    if not response:
+        return []
+    text_value = BeautifulSoup(response.text, 'html.parser').get_text(' ', strip=True)
+    month_lookup = {name: index for index, name in enumerate(
+        ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'], 1
+    )}
+    date_pattern = re.compile(
+        r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.\s*(\d{1,2}),\s*(\d{4})",
+        re.I,
+    )
+    events, seen = [], set()
+    for match in date_pattern.finditer(text_value):
+        if int(match.group(3)) != year or 'Employment Situation' not in text_value[match.end():match.end() + 180]:
+            continue
+        taiwan_dt = _taiwan_time_from_eastern(
+            year, month_lookup[match.group(1).title()], int(match.group(2)), 8, 30
+        )
+        if taiwan_dt.date() in seen:
+            continue
+        seen.add(taiwan_dt.date())
+        events.append({
+            'date': taiwan_dt.date().isoformat(),
+            'title': f"美國大非農／失業率（{taiwan_dt:%H:%M}）",
+            'detail': 'BLS CPS 官方發布日曆備援；以台灣時間顯示。',
+            'closed': False, 'temporary': False,
+            'source': 'U.S. Bureau of Labor Statistics（CPS）', 'impact': 'high',
+        })
+    return events
+
+
 @st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
 def fetch_bls_employment_events(year):
     """BLS Employment Situation：市場俗稱大非農，同時公布失業率。"""
-    return _parse_official_release_schedule(
+    events = _parse_official_release_schedule(
         _calendar_get(BLS_EMPLOYMENT_URL),
         year,
         "美國大非農／失業率",
         "U.S. Bureau of Labor Statistics",
     )
+    if events:
+        return events
+    events = _parse_bls_employment_ics(_calendar_get(BLS_RELEASE_ICS_URL), year)
+    if events:
+        return events
+    return _parse_bls_cps_employment_calendar(_calendar_get(BLS_CPS_CALENDAR_URL), year)
 
 
 @st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
 def fetch_adp_employment_events(year):
     """由 ADP 官方資料端點取得每月小非農日期，固定 08:15 ET 發布。"""
     response = _calendar_get(ADP_EMPLOYMENT_DATA_URL)
-    if not response:
-        return []
-    try:
-        report_days = response.json().get("futureReports", [])
-    except (TypeError, ValueError, AttributeError):
-        return []
+    report_date_texts = []
+
+    def collect_report_dates(value):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key.lower() == 'reportdate' and isinstance(item, str):
+                    report_date_texts.append(item.strip())
+                else:
+                    collect_report_dates(item)
+        elif isinstance(value, list):
+            for item in value:
+                collect_report_dates(item)
+
+    if response:
+        try:
+            collect_report_dates(response.json())
+        except (TypeError, ValueError, AttributeError):
+            pass
+    # JSON 欄位改版或只保留未來日期時，再讀 ADP 官方首頁的 Calendar 文字。
+    page_response = _calendar_get(ADP_EMPLOYMENT_PAGE_URL)
+    if page_response:
+        page_text = BeautifulSoup(page_response.text, 'html.parser').get_text(' ', strip=True)
+        calendar_match = re.search(
+            r"Upcoming Reports:\s*(.*?)(?:Upcoming reports\s*\(weekly|$)",
+            page_text, re.I | re.S,
+        )
+        if calendar_match:
+            report_date_texts.append(calendar_match.group(1))
     month_lookup = {name: index for index, name in enumerate(
         ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"], 1
     )}
@@ -1004,25 +1110,29 @@ def fetch_adp_employment_events(year):
         r"(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2}),\s*(\d{4})",
         re.I,
     )
+    official_fallback_dates = {
+        # ADP 2026 年官方 Calendar；補回端點會因日期已過而移除的歷史月份。
+        2026: [(1, 7), (2, 4), (3, 4), (4, 1), (5, 6), (6, 3), (7, 1),
+               (8, 5), (9, 2), (9, 30), (11, 4), (12, 2)],
+    }
+    parsed_dates = []
+    for report_text in report_date_texts:
+        for match in pattern.finditer(str(report_text)):
+            month_name, day, event_year = match.groups()
+            if int(event_year) == year:
+                parsed_dates.append((month_lookup[month_name.title()], int(day)))
+    parsed_dates.extend(official_fallback_dates.get(year, []))
+
     events, seen = [], set()
-    for report_day in report_days:
-        report_date = str(report_day.get("reportDate", "")).strip()
-        if report_date.lower().startswith("upcoming reports (weekly"):
-            break
-        match = pattern.fullmatch(report_date)
-        if not match:
-            continue
-        month_name, day, event_year = match.groups()
-        if int(event_year) != year:
-            continue
-        taiwan_dt = _taiwan_time_from_eastern(year, month_lookup[month_name.title()], int(day), 8, 15)
+    for month, day in parsed_dates:
+        taiwan_dt = _taiwan_time_from_eastern(year, month, day, 8, 15)
         if taiwan_dt.date() in seen:
             continue
         seen.add(taiwan_dt.date())
         events.append({
             "date": taiwan_dt.date().isoformat(),
             "title": f"美國小非農 ADP（{taiwan_dt:%H:%M}）",
-            "detail": "ADP National Employment Report 官方日曆；以台灣時間顯示。",
+            "detail": "ADP National Employment Report 官方 Calendar；以台灣時間顯示。",
             "closed": False,
             "temporary": False,
             "source": "ADP Research Institute",
@@ -1237,6 +1347,19 @@ def _compact_number_text(value):
     if number is None or not math.isfinite(number):
         return ''
     return format(number, '.12g')
+
+
+def _format_compact_number(value, max_decimals=2, signed=False, thousands=True):
+    """保留必要小數並移除尾端 0，供操作計畫卡片顯示。"""
+    number = _to_number(value)
+    if number is None or not math.isfinite(number):
+        return '—'
+    sign = '+' if signed else ''
+    separator = ',' if thousands else ''
+    text_value = f"{number:{sign}{separator}.{max(0, int(max_decimals))}f}"
+    if '.' in text_value:
+        text_value = text_value.rstrip('0').rstrip('.')
+    return text_value
 
 
 def _roc_compact_date(value):
@@ -3109,7 +3232,31 @@ def rank_txo_directional_candidates(
     return rows
 
 
-def get_txo_spread_quote(api, plan, expiry_choice):
+def _txo_contract_strike(contract):
+    value = contract.get('strike') if isinstance(contract, dict) else getattr(contract, 'strike_price', None)
+    return _safe_number(value)
+
+
+def _select_txo_spread_hedge(contracts, short_contract, is_bull_put, preferred_width=100):
+    """價差只採 50／100 點；預設先找 100 點，缺少時才退回 50 點。"""
+    short_strike = _txo_contract_strike(short_contract)
+    if short_strike is None:
+        return None
+    widths = [50] if int(preferred_width) == 50 else [100, 50]
+    for width in widths:
+        target_strike = short_strike - width if is_bull_put else short_strike + width
+        match = next(
+            (contract for contract in contracts
+             if _txo_contract_strike(contract) is not None
+             and abs(_txo_contract_strike(contract) - target_strike) < 0.01),
+            None,
+        )
+        if match is not None:
+            return match
+    return None
+
+
+def get_txo_spread_quote(api, plan, expiry_choice, preferred_width=100):
     """Find an OTM defined-risk credit spread for the selected TXO expiry."""
     if api is None or plan is None or plan['direction'] not in ('偏多', '偏空'):
         return None
@@ -3125,14 +3272,13 @@ def get_txo_spread_quote(api, plan, expiry_choice):
         desired = min(plan['invalidation'] - plan['zone_points'], spot - 1)
         short_candidates = [c for c in contracts if float(getattr(c, 'strike_price', 0)) <= desired]
         short_contract = max(short_candidates, key=lambda c: float(c.strike_price)) if short_candidates else None
-        long_candidates = [c for c in contracts if short_contract is not None and float(c.strike_price) < float(short_contract.strike_price)]
-        long_contract = max(long_candidates, key=lambda c: float(c.strike_price)) if long_candidates else None
     else:
         desired = max(plan['invalidation'] + plan['zone_points'], spot + 1)
         short_candidates = [c for c in contracts if float(getattr(c, 'strike_price', 0)) >= desired]
         short_contract = min(short_candidates, key=lambda c: float(c.strike_price)) if short_candidates else None
-        long_candidates = [c for c in contracts if short_contract is not None and float(c.strike_price) > float(short_contract.strike_price)]
-        long_contract = min(long_candidates, key=lambda c: float(c.strike_price)) if long_candidates else None
+    long_contract = _select_txo_spread_hedge(
+        contracts, short_contract, is_bull_put, preferred_width
+    ) if short_contract is not None else None
     if short_contract is None or long_contract is None:
         return None
 
@@ -3271,6 +3417,23 @@ def recommend_txo_strategy(directional_quote, spread_quote, plan):
     }
 
 
+def render_option_metric_cards(title, items):
+    """以小字、分組卡片呈現選擇權資訊，避免多排大型 metric 難以掃讀。"""
+    cards = ''.join(
+        "<div style='background:#10151d;border:1px solid #303845;border-radius:6px;padding:8px 10px;'>"
+        f"<div style='font-size:11px;color:#aeb8c5;line-height:1.2'>{html.escape(str(label))}</div>"
+        f"<div style='font-size:17px;font-weight:700;color:{color};line-height:1.35;margin-top:2px'>"
+        f"{html.escape(str(value))}</div></div>"
+        for label, value, color in items
+    )
+    st.markdown(
+        f"<div style='font-size:13px;font-weight:700;color:#dfe6e9;margin:10px 0 5px'>{html.escape(title)}</div>"
+        "<div style='display:grid;grid-template-columns:repeat(auto-fit,minmax(125px,1fr));gap:7px;'>"
+        f"{cards}</div>",
+        unsafe_allow_html=True,
+    )
+
+
 def _taifex_number(value):
     """Convert a TAIFEX table cell to float, retaining unavailable values as None."""
     text = str(value).strip().replace(',', '')
@@ -3368,7 +3531,7 @@ def get_taifex_txo_directional_quote(plan, expiry_choice):
     }
 
 
-def get_taifex_txo_spread_quote(plan, expiry_choice):
+def get_taifex_txo_spread_quote(plan, expiry_choice, preferred_width=100):
     """Offer a defined-risk TXO spread from official daily rows when needed."""
     if plan is None or plan['direction'] not in ('偏多', '偏空'):
         return None
@@ -3383,14 +3546,13 @@ def get_taifex_txo_spread_quote(plan, expiry_choice):
         desired = min(plan['invalidation'] - plan['zone_points'], spot - 1)
         short_candidates = [record for record in contracts if record['strike'] <= desired]
         short_contract = max(short_candidates, key=lambda record: record['strike']) if short_candidates else None
-        long_candidates = [record for record in contracts if short_contract and record['strike'] < short_contract['strike']]
-        long_contract = max(long_candidates, key=lambda record: record['strike']) if long_candidates else None
     else:
         desired = max(plan['invalidation'] + plan['zone_points'], spot + 1)
         short_candidates = [record for record in contracts if record['strike'] >= desired]
         short_contract = min(short_candidates, key=lambda record: record['strike']) if short_candidates else None
-        long_candidates = [record for record in contracts if short_contract and record['strike'] > short_contract['strike']]
-        long_contract = min(long_candidates, key=lambda record: record['strike']) if long_candidates else None
+    long_contract = _select_txo_spread_hedge(
+        contracts, short_contract, is_bull_put, preferred_width
+    ) if short_contract is not None else None
     if short_contract is None or long_contract is None:
         return None
     short_premium = short_contract['bid'] or short_contract['last']
@@ -3745,9 +3907,9 @@ def render_fibonacci_trade_suggestion(suggestion):
     """Render the Fibonacci plan below the chart in a concise, actionable form."""
     if not suggestion:
         return
-    header_cols = st.columns([1.25, 2.75], vertical_alignment="center")
+    header_cols = st.columns([1.25, 2.75], vertical_alignment="top")
     header_cols[0].markdown(
-        "<div style='font-size:18px;font-weight:700;white-space:nowrap;'>🧭 費波操作建議 "
+        "<div style='font-size:17px;font-weight:700;white-space:nowrap;margin-top:-5px;'>🧭 費波操作建議 "
         f"<span style='color:{suggestion['color']};'>｜{suggestion['action']}</span></div>",
         unsafe_allow_html=True,
     )
@@ -3782,14 +3944,14 @@ def render_fibonacci_trade_suggestion(suggestion):
     entry, stop, target = suggestion['entry'], suggestion['stop'], suggestion['target']
     risk, reward = suggestion['risk'], suggestion['reward']
     cols = header_cols[1].columns(5)
-    metric_unit = '元/股' if suggestion['asset_type'] == 'stock' else '點'
+    metric_unit = '元' if suggestion['asset_type'] == 'stock' else '點'
     metric_decimals = 2 if suggestion['asset_type'] != 'futures' else 0
 
     def compact_metric(container, label, value):
         container.markdown(
             f"<div style='white-space:nowrap;'>"
             f"<div style='font-size:12px;font-weight:600;color:#e8eaed;'>{label}</div>"
-            f"<div style='font-size:22px;font-weight:500;line-height:1.25;color:#f5f5f5;'>"
+            f"<div style='font-size:19px;font-weight:500;line-height:1.25;color:#f5f5f5;'>"
             f"{value}</div></div>",
             unsafe_allow_html=True,
         )
@@ -4659,7 +4821,47 @@ def get_tw_stocker_data(direction):
         pass
     return pd.DataFrame()
 
-def fetch_goodinfo_data():
+def _parse_goodinfo_turnover_table(page_html):
+    """挑出 Goodinfo 週轉率排行表，並拒絕阻擋頁或尚未載入的空表。"""
+    try:
+        tables = pd.read_html(io.StringIO(page_html))
+    except (ValueError, TypeError):
+        return None
+
+    candidates = []
+    for table in tables:
+        if table.shape[0] < 10 or table.shape[1] < 5:
+            continue
+        raw_columns = table.columns
+        column_text = "|".join(
+            str(item) for column in raw_columns
+            for item in (column if isinstance(column, tuple) else (column,))
+        )
+        score = sum(keyword in column_text for keyword in ("代號", "名稱", "週轉率", "成交"))
+        candidates.append((score, table.shape[0] * table.shape[1], table.copy()))
+    if not candidates:
+        return None
+
+    # 欄名命中週轉率語意優先；版面異動時才退回最大資料表。
+    target_df = max(candidates, key=lambda item: (item[0], item[1]))[2]
+    if isinstance(target_df.columns, pd.MultiIndex):
+        new_columns = []
+        for column in target_df.columns:
+            cleaned_parts = []
+            for item in column:
+                item_text = re.sub(r"\s+", "", str(item)).strip()
+                if item_text and not item_text.startswith("Unnamed"):
+                    if not cleaned_parts or cleaned_parts[-1] != item_text:
+                        cleaned_parts.append(item_text)
+            new_columns.append("_".join(cleaned_parts))
+        target_df.columns = new_columns
+    else:
+        target_df.columns = [re.sub(r"\s+", "", str(column)).strip() for column in target_df.columns]
+    return target_df.dropna(how="all").reset_index(drop=True)
+
+
+def fetch_goodinfo_data(max_attempts=2, minimum_wait_seconds=15):
+    """以瀏覽器抓取 Goodinfo 週轉率排行；保留 15 秒暖機並在阻擋時自動重試。"""
     url = "https://goodinfo.tw/tw/StockList.asp?RPT_TIME=&MARKET_CAT=%E7%86%B1%E9%96%80%E6%8E%92%E8%A1%8C&INDUSTRY_CAT=%E7%B4%AF%E8%A8%88%E6%88%90%E4%BA%A4%E9%87%8F%E9%80%B1%E8%BD%89%E7%8E%87%28%E7%95%B6%E6%97%A5%29%40%40%E7%B4%AF%E8%A8%88%E6%88%90%E4%BA%A4%E9%87%8F%E9%80%B1%E8%BD%89%E7%8E%87%40%40%E7%95%B6%E6%97%A5"
     chrome_options = Options()
     chrome_options.add_argument("--headless=new")
@@ -4677,12 +4879,15 @@ def fetch_goodinfo_data():
     chrome_options.add_experimental_option('useAutomationExtension', False)
     chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36")
 
-    chrome_options.binary_location = "/usr/bin/chromium"
+    if os.path.exists("/usr/bin/chromium"):
+        chrome_options.binary_location = "/usr/bin/chromium"
 
+    driver = None
+    last_error = None
     try:
-        service = Service("/usr/bin/chromedriver")
+        service = Service("/usr/bin/chromedriver") if os.path.exists("/usr/bin/chromedriver") else Service()
         driver = webdriver.Chrome(service=service, options=chrome_options)
-        
+        driver.set_page_load_timeout(35)
         driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
             "source": """
             Object.defineProperty(navigator, 'webdriver', {
@@ -4691,42 +4896,33 @@ def fetch_goodinfo_data():
             """
         })
         
-        driver.get(url)
-        time.sleep(15) # 等待動態表格載入
-        
-        html = driver.page_source
-        
-        tables = pd.read_html(io.StringIO(html))
-        
-        target_df = None
-        for df in tables:
-            if df.shape[0] > 10 and df.shape[1] > 5:
-                if target_df is None or (df.shape[0] * df.shape[1] > target_df.shape[0] * target_df.shape[1]):
-                    target_df = df
-                    
-        if target_df is not None:
-            if isinstance(target_df.columns, pd.MultiIndex):
-                new_columns = []
-                for col in target_df.columns:
-                    cleaned_parts = []
-                    for item in col:
-                        # 加上 .replace(' ', '') 移除所有空白字元
-                        item_str = str(item).replace(' ', '').strip()
-                        if item_str and not item_str.startswith('Unnamed'):
-                            if not cleaned_parts or cleaned_parts[-1] != item_str:
-                                cleaned_parts.append(item_str)
-                    new_columns.append('_'.join(cleaned_parts))
-                target_df.columns = new_columns
-            else:
-                # 預防若表格非多層欄位，也一併移除空白
-                target_df.columns = [str(c).replace(' ', '').strip() for c in target_df.columns]
-            return target_df
+        for attempt in range(max(1, int(max_attempts))):
+            try:
+                if attempt:
+                    driver.delete_all_cookies()
+                driver.get(url)
+                # Goodinfo 的動態內容與阻擋檢查通常需要完整等待；不要提早解析半張表。
+                time.sleep(max(1, float(minimum_wait_seconds)))
+                WebDriverWait(driver, 8).until(
+                    lambda current: "週轉率" in current.page_source and len(
+                        current.find_elements(By.TAG_NAME, "tr")
+                    ) >= 10
+                )
+                result = _parse_goodinfo_turnover_table(driver.page_source)
+                if result is not None and not result.empty:
+                    return result
+                raise ValueError("頁面已開啟，但週轉率排行表尚未完整載入")
+            except Exception as exc:
+                last_error = exc
+                if attempt + 1 < max_attempts:
+                    time.sleep(2 * (attempt + 1))
     except Exception as e:
-        st.error(f"系統發生異常: {e}")
-        return None
+        last_error = e
     finally:
-        if 'driver' in locals():
+        if driver is not None:
             driver.quit()
+    if last_error is not None:
+        st.error(f"Goodinfo 抓取失敗（已自動重試）：{last_error}")
     return None
 
 # ==========================================
@@ -4760,6 +4956,7 @@ DATA_CACHE_FILE = "data_cache.json"
 URL_CACHE_FILE = "url_cache.json"
 SEARCH_CACHE_FILE = "search_cache.json"
 STRATEGY_SIGNAL_LOG_FILE = "strategy_signal_log.json"
+FIBO_TAG_CACHE_FILE = "fibo_tags.json"
 DEFAULT_FIBO_TAGS = ["台積電(2330)", "鴻海(2317)", "聯發科(2454)", "和椿(6215)", "晶彩科(3535)"]
 ANALYSIS_MAX_WORKERS = 2
 API_REQUEST_GAP_SECONDS = 0.1
@@ -5022,6 +5219,7 @@ def register_strategy_signals(records):
             continue
         record.update({
             'dedupe_key': dedupe_key, '建立時間': now_text, '最後更新': now_text,
+            '實際進場價': _safe_number(record.get('實際進場價')),
             '結果': '追蹤中', 'MFE(R)': 0.0, 'MAE(R)': 0.0, '結果(R)': None,
             '15分(R)': None, '30分(R)': None, '60分(R)': None, '收盤(R)': None,
         })
@@ -5041,7 +5239,10 @@ def update_strategy_signal_outcomes(price_map):
     for record in records:
         key = str(record.get('商品鍵', ''))
         current_price = _safe_number(price_map.get(key))
-        entry = _safe_number(record.get('進場價'))
+        # 使用者有填實際成交點位時，以實際進場價計算所有後續 R 與結果；否則沿用計畫價。
+        entry = _safe_number(record.get('實際進場價'))
+        if entry is None:
+            entry = _safe_number(record.get('進場價'))
         stop = _safe_number(record.get('停損價'))
         target = _safe_number(record.get('目標價'))
         if current_price is None or None in (entry, stop, target):
@@ -5099,7 +5300,7 @@ def render_strategy_validation_room():
         st.markdown("""
         1. **先記錄**：在股票或期貨戰略室按「記錄目前表格的已觸發訊號」。它會一次保存表內符合門檻的標的，不是只保存目前查看的那一檔；同一交易日、商品、策略、方向與進場價只會保存一筆。
         2. **再更新**：回到原戰略室按即時更新報價／分析時，該次取得的最新價會更新已記錄訊號的追蹤結果；策略驗證頁本身**不會額外抓行情**。
-        3. **怎麼看表格**：建立時間、策略、方向、進場／停損／目標是建立訊號當下的計畫；最新價與 15／30／60 分(R)、收盤(R)是後續表現。結果「達標」代表到第一目標，「停損」代表觸及策略失效點。
+        3. **怎麼看表格**：建立時間、策略、方向、進場／停損／目標是建立訊號當下的計畫；可在「實際進場價」填入真實成交點位，後續 R、MFE、MAE 與結果會優先以它計算，留白則沿用計畫進場價。最新價與 15／30／60 分(R)、收盤(R)是後續表現。
         4. **R、MFE、MAE**：1R 是進場到失效點的距離，不是金額；例如多方進場 100、停損 95，1R = 5。MFE 是建立訊號後最有利曾走到多少 R，MAE 是最不利曾回撤多少 R，可用來檢查進場是否太晚、停損是否太近，不等於實際損益。
         5. **刪除與匯出**：可在下方明細勾選多筆「刪除」，再按刪除按鈕移除勾選紀錄；匯出按鈕會下載目前篩選後的 CSV。
         """)
@@ -5163,7 +5364,7 @@ def render_strategy_validation_room():
         st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
         export_columns = [
             '建立時間', '市場', '代碼', '名稱', '策略', '方向', '訊號狀態', '評分', '信心判讀',
-            '進場價', '停損價', '目標價', '最新價', '15分(R)', '30分(R)', '60分(R)', '收盤(R)',
+            '進場價', '實際進場價', '停損價', '目標價', '最新價', '15分(R)', '30分(R)', '60分(R)', '收盤(R)',
             '結果', 'MFE(R)', 'MAE(R)', '結果(R)', '資料狀態'
         ]
         csv_data = filtered.reindex(columns=export_columns).to_csv(index=False).encode('utf-8-sig')
@@ -5230,7 +5431,7 @@ def render_strategy_validation_room():
 
     display_columns = [
         '建立時間', '市場', '代碼', '名稱', '策略', '方向', '訊號狀態', '評分', '信心判讀',
-        '進場價', '停損價', '目標價', '最新價', '15分(R)', '30分(R)', '60分(R)', '收盤(R)',
+        '進場價', '實際進場價', '停損價', '目標價', '最新價', '15分(R)', '30分(R)', '60分(R)', '收盤(R)',
         '結果', 'MFE(R)', 'MAE(R)', '結果(R)', '資料狀態'
     ]
     for column in display_columns:
@@ -5246,7 +5447,8 @@ def render_strategy_validation_room():
     for column in compact_number_columns:
         validation_display[column] = validation_display[column].map(_compact_number_text)
     validation_display['評分'] = pd.to_numeric(validation_display['評分'], errors='coerce')
-    for column in (set(display_columns) - set(compact_number_columns) - {'評分'}):
+    validation_display['實際進場價'] = pd.to_numeric(validation_display['實際進場價'], errors='coerce')
+    for column in (set(display_columns) - set(compact_number_columns) - {'評分', '實際進場價'}):
         validation_display[column] = validation_display[column].map(_blank_display_text)
 
     def style_validation_row(row):
@@ -5308,6 +5510,10 @@ def render_strategy_validation_room():
             '刪除': st.column_config.CheckboxColumn('刪除', width=50, help='勾選後可一次刪除多筆訊號紀錄。'),
             '評分': st.column_config.NumberColumn('進場信心', format='%d'),
             '進場價': st.column_config.TextColumn(),
+            '實際進場價': st.column_config.NumberColumn(
+                '實際進場價 ✏️', min_value=0.0, format='%.12g',
+                help='填入實際成交點位；留白時仍以計畫進場價計算。變更會自動儲存。'
+            ),
             '停損價': st.column_config.TextColumn(),
             '目標價': st.column_config.TextColumn(),
             '最新價': st.column_config.TextColumn(),
@@ -5319,8 +5525,50 @@ def render_strategy_validation_room():
             'MAE(R)': st.column_config.TextColumn('MAE', help='Maximum Adverse Excursion：訊號後最大不利變動，單位為 R。'),
             '結果(R)': st.column_config.TextColumn(help='達標或策略失效時的結果；以 R 表示。'),
         },
-        disabled=display_columns, hide_index=True, width='stretch', key=table_key,
+        disabled=[column for column in display_columns if column != '實際進場價'],
+        hide_index=True, width='stretch', key=table_key,
     )
+    actual_entry_changed = False
+    for position, edited_value in enumerate(edited_validation['實際進場價'].tolist()):
+        record_id = int(validation_display.iloc[position]['_紀錄ID'])
+        new_value = _safe_number(edited_value)
+        old_value = _safe_number(records[record_id].get('實際進場價'))
+        if new_value != old_value:
+            record = records[record_id]
+            record['實際進場價'] = new_value
+            record['最後更新'] = datetime.now(
+                pytz.timezone('Asia/Taipei')
+            ).strftime('%Y/%m/%d %H:%M:%S')
+            effective_entry = new_value if new_value is not None else _safe_number(record.get('進場價'))
+            latest = _safe_number(record.get('最新價'))
+            stop = _safe_number(record.get('停損價'))
+            target = _safe_number(record.get('目標價'))
+            if None not in (effective_entry, latest, stop, target) and abs(effective_entry - stop) > 0:
+                risk_distance = abs(effective_entry - stop)
+                is_long = str(record.get('方向')) in ('多頭', '偏多')
+                favorable = (latest - effective_entry) if is_long else (effective_entry - latest)
+                adverse = (effective_entry - latest) if is_long else (latest - effective_entry)
+                record['MFE(R)'] = round(max(0, favorable / risk_distance), 2)
+                record['MAE(R)'] = round(max(0, adverse / risk_distance), 2)
+                stopped = latest <= stop if is_long else latest >= stop
+                targeted = latest >= target if is_long else latest <= target
+                if stopped:
+                    record['結果'], record['結果(R)'] = '停損', -1.0
+                elif targeted:
+                    record['結果'] = '達標'
+                    record['結果(R)'] = round(abs(target - effective_entry) / risk_distance, 2)
+                else:
+                    record['結果'], record['結果(R)'] = '追蹤中', None
+            actual_entry_changed = True
+    if actual_entry_changed:
+        if save_strategy_signal_log(records):
+            save_data_cache(
+                st.session_state.stock_data, st.session_state.ignored_stocks,
+                st.session_state.all_candidates, st.session_state.saved_notes
+            )
+            st.toast('實際進場價已儲存；後續行情更新將以此計算盈虧與結果。', icon='✅')
+        else:
+            st.error('實際進場價儲存失敗，請確認檔案是否可寫入。')
     selected_mask = edited_validation['刪除'].fillna(False).astype(bool).to_numpy()
     selected_ids = set(validation_display.iloc[selected_mask]['_紀錄ID'].astype(int).tolist())
     delete_col, hint_col = st.columns([2, 4])
@@ -5343,6 +5591,18 @@ def render_strategy_validation_room():
         else:
             st.error('訊號刪除失敗，請確認紀錄檔是否可寫入。')
 
+def load_fibo_tag_cache():
+    """快速標籤使用獨立檔案，避免其他設定寫入或股票快取清除時被覆蓋。"""
+    if not os.path.exists(FIBO_TAG_CACHE_FILE):
+        return []
+    try:
+        with open(FIBO_TAG_CACHE_FILE, 'r', encoding='utf-8') as file:
+            tags = json.load(file)
+        return [str(tag) for tag in tags[:5]] if isinstance(tags, list) and len(tags) >= 5 else []
+    except (OSError, ValueError, TypeError):
+        return []
+
+
 def save_fibo_config():
     config = load_config()
     fibo_tags = [
@@ -5357,7 +5617,10 @@ def save_fibo_config():
     if 'ma_w' in st.session_state:
         config['ma_width'] = st.session_state.ma_w
     try:
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f: json.dump(config, f)
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(config, f, ensure_ascii=False)
+        with open(FIBO_TAG_CACHE_FILE, "w", encoding="utf-8") as file:
+            json.dump(fibo_tags, file, ensure_ascii=False, indent=2)
     except Exception: pass
     # 同步寫入 Google Sheets
     save_data_cache(st.session_state.stock_data, st.session_state.ignored_stocks, st.session_state.all_candidates, st.session_state.saved_notes, fibo_tags)
@@ -5524,7 +5787,10 @@ if 'cached_notes' not in st.session_state: st.session_state.cached_notes = {}
 saved_config = load_config()
 configured_fibo_tags = saved_config.get('fibo_tags', [])
 cached_fibo_tags = st.session_state.get('fibo_tags', [])
-if isinstance(configured_fibo_tags, list) and len(configured_fibo_tags) >= 5:
+dedicated_fibo_tags = load_fibo_tag_cache()
+if len(dedicated_fibo_tags) >= 5:
+    fibo_tags_source = dedicated_fibo_tags
+elif isinstance(configured_fibo_tags, list) and len(configured_fibo_tags) >= 5:
     fibo_tags_source = configured_fibo_tags
 elif isinstance(cached_fibo_tags, list) and len(cached_fibo_tags) >= 5:
     fibo_tags_source = cached_fibo_tags
@@ -5723,11 +5989,6 @@ def render_stock_strategy_controls():
 
         with settings_col:
             st.markdown("#### 顯示設定")
-            current_font_size = st.slider(
-                "字體大小（表格）", min_value=12, max_value=72,
-                value=st.session_state.font_size, key='font_size_slider'
-            )
-            st.session_state.font_size = current_font_size
             hide_non_stock = st.checkbox(
                 "隱藏非個股（ETF／權證／債券）", value=True,
                 key='stock_hide_non_stock'
@@ -5748,7 +6009,7 @@ def render_stock_strategy_controls():
             st.session_state.limit_rows = current_limit_rows
             if st.button("💾 儲存股票設定", use_container_width=True, key='save_stock_room_settings'):
                 if save_config(
-                    current_font_size, current_limit_rows,
+                    st.session_state.get('font_size', 15), current_limit_rows,
                     st.session_state.sj_key, st.session_state.sj_secret,
                     st.session_state.remember_sj
                 ):
@@ -5806,7 +6067,7 @@ def render_stock_strategy_controls():
             st.markdown("#### 外部資源")
 
             def perform_goodinfo_fetch():
-                with st.spinner("正在抓取最新資料，約需 15 秒..."):
+                with st.spinner("正在抓取最新資料；每次至少等待 15 秒，若遇阻擋會自動重試..."):
                     result = fetch_goodinfo_data()
                     if result is not None and not result.empty:
                         st.session_state['goodinfo_df'] = result.astype(str)
@@ -5817,7 +6078,7 @@ def render_stock_strategy_controls():
                         st.error("抓取失敗或查無資料，請稍後再試。")
 
             if st.button(
-                "📥 抓取 Goodinfo 週轉率排行", help="需等待動態表格載入",
+                "📥 抓取 Goodinfo 週轉率排行", help="保留 15 秒動態載入時間；偵測到阻擋或空表時會自動重試一次。",
                 use_container_width=True, key='fetch_goodinfo_in_stock_room'
             ):
                 perform_goodinfo_fetch()
@@ -5843,7 +6104,7 @@ def render_stock_strategy_controls():
                 "🚨 上櫃處置公告", "https://www.tpex.org.tw/zh-tw/announce/market/disposal.html",
                 use_container_width=True
             )
-    return current_font_size, hide_non_stock, show_3d_hilo
+    return hide_non_stock, show_3d_hilo
 
 def render_stock_strategy_explanation():
     """股票戰略室的靜態說明，與操作設定分開並預設折疊。"""
@@ -7117,7 +7378,35 @@ def fetch_market_risk_lists():
     attention_counts = {}
     disposition_codes = set()
     errors = []
-    headers = {'User-Agent': 'Mozilla/5.0'}
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36',
+        'Accept': 'application/json, text/plain, */*',
+        'Accept-Language': 'zh-TW,zh;q=0.9,en;q=0.8',
+        'Cache-Control': 'no-cache',
+    }
+    session = requests.Session()
+
+    def fetch_json(name, url, expected_type):
+        """官方站偶發回空頁或 5xx；同一次按鈕內完成重試，不要求使用者連按。"""
+        last_error = None
+        for attempt in range(3):
+            try:
+                response = session.get(
+                    url, headers=headers, params={'_': int(time.time() * 1000)} if attempt else None,
+                    timeout=(6, 18),
+                )
+                response.raise_for_status()
+                payload = response.json()
+                if not isinstance(payload, expected_type):
+                    raise ValueError(f"回傳格式應為 {expected_type.__name__}")
+                if isinstance(payload, dict) and not isinstance(payload.get('data', []), list):
+                    raise ValueError("缺少名單資料列")
+                return payload
+            except (requests.RequestException, ValueError, json.JSONDecodeError) as exc:
+                last_error = exc
+                if attempt < 2:
+                    time.sleep(0.8 * (attempt + 1))
+        raise RuntimeError(f"{name} 已重試 3 次仍失敗：{last_error}")
 
     def parse_twse_rows(payload, target, is_attention=False):
         fields = payload.get('fields', [])
@@ -7140,9 +7429,7 @@ def fetch_market_risk_lists():
         ('上市處置', 'https://www.twse.com.tw/announcement/punish?response=json', disposition_codes, False),
     ]:
         try:
-            response = requests.get(url, headers=headers, timeout=5)
-            response.raise_for_status()
-            parse_twse_rows(response.json(), target, is_attention)
+            parse_twse_rows(fetch_json(name, url, dict), target, is_attention)
         except Exception as exc:
             errors.append(f'{name}: {exc}')
 
@@ -7152,9 +7439,7 @@ def fetch_market_risk_lists():
         ('上櫃處置', 'https://www.tpex.org.tw/openapi/v1/tpex_disposal_information', False, False),
     ]:
         try:
-            response = requests.get(url, headers=headers, timeout=5)
-            response.raise_for_status()
-            for record in response.json():
+            for record in fetch_json(name, url, list):
                 code_match = re.search(r'\d{4,6}', str(record.get('SecuritiesCompanyCode', '')))
                 if not code_match:
                     continue
@@ -7168,6 +7453,7 @@ def fetch_market_risk_lists():
         except Exception as exc:
             errors.append(f'{name}: {exc}')
 
+    session.close()
     return attention_counts, sorted(disposition_codes), errors
 
 def _as_float(value, default=None):
@@ -8356,6 +8642,22 @@ def render_futures_strategy_room():
         }
         st.info("期交所資料暫時無法取得，已還原上次成功保存的期貨表格。")
 
+    # 契約到期或從官方清單移除後，同步清掉快速新增與行情快取，避免舊列黏在表尾。
+    valid_contract_keys = set(universe.get('契約鍵', pd.Series(dtype=str)).astype(str))
+    expired_manual_keys = {
+        str(key) for key in st.session_state.futures_strategy_manual
+        if str(key) not in valid_contract_keys
+    }
+    if expired_manual_keys:
+        st.session_state.futures_strategy_manual = [
+            key for key in st.session_state.futures_strategy_manual
+            if str(key) not in expired_manual_keys
+        ]
+        for cache_name in ('futures_strategy_live_cache', 'futures_strategy_rank_cache'):
+            cache_value = st.session_state.get(cache_name, {})
+            for key in expired_manual_keys:
+                cache_value.pop(key, None)
+
     def persist_futures_room_state(snapshot=None):
         return save_futures_strategy_state(
             universe=snapshot if isinstance(snapshot, pd.DataFrame) else universe,
@@ -8410,7 +8712,7 @@ def render_futures_strategy_room():
 
     saved_metadata = persisted_futures_state.get('metadata', {})
     if (
-        refresh_official or not saved_universe_records
+        refresh_official or expired_manual_keys or not saved_universe_records
         or universe_meta.get('updated') != (saved_metadata.get('updated') if isinstance(saved_metadata, dict) else None)
     ):
         persist_futures_room_state(universe)
@@ -8424,6 +8726,11 @@ def render_futures_strategy_room():
     if live_time:
         status_text += f"｜即時更新：{live_time}"
     st.caption(status_text)
+    st.caption(
+        "資料說明：『行情資料』是期交所該交易日收盤後的成交量與結算行情；"
+        "『保證金』是該生效日的官方標準。夜盤或次一交易日官方檔尚未更新時，日期會維持上一個已完成日盤；"
+        "盤中／夜盤請另按『即時更新成交量排行』或『即時更新報價與分析』。"
+    )
     if universe_meta.get('errors'):
         st.warning("部分官方資料未完整取得：" + "｜".join(universe_meta['errors']))
 
@@ -8761,23 +9068,29 @@ def render_futures_strategy_room():
         f"{row['期貨代碼']} {row['契約月份']}｜{row['名稱']}｜成交 {int(row['當日成交口數']):,} 口": str(row['契約鍵'])
         for _, row in universe.iterrows()
     }
-    add_col, add_button_col = st.columns([5, 1])
-    with add_col:
-        selected_to_add = st.multiselect(
-            "輸入中文名稱或期貨代碼", list(option_map), key='futures_quick_add',
-            placeholder='例如：CDF、台積電期貨'
-        )
-    with add_button_col:
-        st.markdown("<div style='margin-top:28px'></div>", unsafe_allow_html=True)
-        if st.button("➕ 加到表格", use_container_width=True, key='add_futures_to_table'):
-            for label in selected_to_add:
-                key = option_map[label]
-                if key not in st.session_state.futures_strategy_manual:
-                    st.session_state.futures_strategy_manual.append(key)
-                st.session_state.futures_strategy_ignored.discard(key)
-            st.session_state.futures_strategy_editor_revision += 1
-            persist_futures_room_state()
-            st.rerun()
+    key_to_option = {key: label for label, key in option_map.items()}
+    default_manual_labels = [
+        key_to_option[key] for key in st.session_state.futures_strategy_manual
+        if key in key_to_option
+    ]
+    selected_to_add = st.multiselect(
+        "輸入中文名稱或期貨代碼（取消選取即從快速新增清單移除）",
+        list(option_map), default=default_manual_labels, key='futures_quick_add',
+        placeholder='例如：CDF、台積電期貨'
+    )
+    selected_manual_keys = [option_map[label] for label in selected_to_add if label in option_map]
+    if selected_manual_keys != st.session_state.futures_strategy_manual:
+        removed_manual_keys = set(st.session_state.futures_strategy_manual) - set(selected_manual_keys)
+        st.session_state.futures_strategy_manual = selected_manual_keys
+        for key in selected_manual_keys:
+            st.session_state.futures_strategy_ignored.discard(key)
+        for cache_name in ('futures_strategy_live_cache', 'futures_strategy_rank_cache'):
+            cache_value = st.session_state.get(cache_name, {})
+            for key in removed_manual_keys:
+                cache_value.pop(key, None)
+        st.session_state.futures_strategy_editor_revision += 1
+        persist_futures_room_state()
+        st.rerun()
 
     if st.session_state.futures_strategy_ignored:
         with st.expander("🚫 管理已隱藏期貨", expanded=False):
@@ -8859,7 +9172,7 @@ with tab1:
 with stock_strategy_container:
     stock_settings_col, stock_help_col = st.columns([3, 2])
     with stock_settings_col:
-        current_font_size, hide_non_stock, show_3d_hilo = render_stock_strategy_controls()
+        hide_non_stock, show_3d_hilo = render_stock_strategy_controls()
     with stock_help_col:
         render_stock_strategy_explanation()
     col_search = st.expander(
@@ -9137,7 +9450,7 @@ with stock_strategy_container:
             clean_name = row['名稱'].replace('🔴 ', '').replace('🟢 ', '').replace('⚪ ', '')
             df_display.at[i, "名稱"] = clean_name
 
-        note_width_px = calculate_note_width(df_display['戰略備註'], current_font_size)
+        note_width_px = calculate_note_width(df_display['戰略備註'], 15)
         df_display["移除"] = False
         points_map = df_display.set_index('代號')['_points'].to_dict() if '_points' in df_display.columns else {}
         auto_notes_dict = df_display.set_index('代號')['_auto_note'].to_dict() if '_auto_note' in df_display.columns else {}
@@ -9417,7 +9730,10 @@ with stock_strategy_container:
         def style_tab1_df(row):
             styles = [''] * len(row)
             note = str(row.get('戰略備註', ''))
+            # 精簡主表不顯示「狀態」，但名稱底色仍必須依原列的漲／跌停狀態判斷。
             st_val = str(row.get('狀態', ''))
+            if not st_val and row.name in df_display.index:
+                st_val = str(df_display.at[row.name, '狀態'])
             risk_val = str(row.get('風險', ''))
             vwap_val = str(row.get('VWAP 狀態', ''))
             signal_state = str(row.get('訊號狀態', ''))
@@ -9445,7 +9761,6 @@ with stock_strategy_container:
                 price_c = 'color: #ff4b4b;' if c_val > 0 else ('color: #00e676;' if c_val < 0 else '')
             except: pass
             
-            st_val = str(row.get('狀態', ''))
             status_c = 'color: #ff4b4b;' if st_val in ["漲停", "強"] else ('color: #00e676;' if st_val in ["跌停", "弱"] else ('color: #ffeb3b;' if st_val == "命中" else ''))
             
             for idx, col in enumerate(row.index):
@@ -11541,7 +11856,7 @@ with tab_fibo:
             elif short_wave_direction not in ('偏多', '偏空'):
                 st.info("盤中方向尚未形成，暫不建立 BC／BP 或方向價差；等待 VWAP 與 5 分 K 動能確認。")
             else:
-                control_expiry, control_mode, control_money, control_refresh = st.columns([1.2, 2.2, 1.4, 0.8])
+                control_expiry, control_mode, control_money, control_width, control_refresh = st.columns([1.1, 2, 1.25, 1.35, 0.75])
                 with control_expiry:
                     expiry_choice = st.selectbox(
                         "到期別", ["最近到期", "週三選", "週五選", "月選"], key="trade_plan_expiry_choice",
@@ -11571,6 +11886,12 @@ with tab_fibo:
                         help="自動評選會同時比較價外、平價與價內的模型獲利機率、成本效率及流動性。",
                     )
                 st.session_state['trade_plan_moneyness_saved'] = moneyness_preference
+                with control_width:
+                    spread_width_label = st.selectbox(
+                        "價差寬度", ["100 點優先", "50 點"], key="trade_plan_spread_width",
+                        help="100 點優先：先找相差 100 點的保護腿，缺少該履約價時自動退回 50 點。",
+                    )
+                spread_width = 50 if spread_width_label.startswith('50') else 100
                 with control_refresh:
                     # Align the button with the lower selectbox control instead of its label.
                     st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
@@ -11588,7 +11909,7 @@ with tab_fibo:
                     'target': option_target,
                 }
                 quote_signature = (
-                    expiry_choice, option_mode, moneyness_preference, short_wave_direction,
+                    expiry_choice, option_mode, moneyness_preference, spread_width, short_wave_direction,
                     round(float(live_price), 0), round(float(option_target), 0), round(float(option_stop), 0),
                     id(st.session_state.get('sj_api')),
                 )
@@ -11602,7 +11923,7 @@ with tab_fibo:
                         )
                     if option_mode.startswith("自動") or option_mode.startswith("價差單"):
                         spread_quote = get_txo_spread_quote(
-                            st.session_state.get('sj_api'), quote_plan, expiry_choice,
+                            st.session_state.get('sj_api'), quote_plan, expiry_choice, spread_width,
                         )
                     option_cache = {
                         'signature': quote_signature, 'directional': directional_quote,
@@ -11638,26 +11959,25 @@ with tab_fibo:
                 if option_quote and display_spread:
                     option_title = f"{option_quote['name']}｜{option_quote['delivery_month']}｜{option_quote['expiry'].strftime('%Y/%m/%d')} 到期（剩 {option_quote['dte']} 天）"
                     st.markdown(f"**{option_title}**")
-                    o1, o2, o3, o4 = st.columns(4)
-                    o1.metric("賣方價外履約價", f"{option_quote['short_strike']:,.0f} {option_quote['right']}")
-                    o2.metric("保護買方履約價", f"{option_quote['long_strike']:,.0f} {option_quote['right']}")
-                    o3.metric("預估淨權利金", f"${option_quote['net_credit']:,.0f}" if option_quote['net_credit'] is not None else "報價不足")
-                    o4.metric("單組最大風險", f"${option_quote['max_loss']:,.0f}")
-                    s1, s2, s3, s4 = st.columns(4)
-                    s1.metric("最大獲利", f"${option_quote['max_profit']:,.0f}" if option_quote['max_profit'] is not None else "報價不足")
-                    s2.metric("損益兩平", f"{option_quote['breakeven']:,.1f}" if option_quote['breakeven'] is not None else "報價不足")
-                    s3.metric(
-                        "模型勝率",
-                        f"{option_quote['model_probability'] * 100:.1f}%" if option_quote['model_probability'] is not None else "無法估算",
-                    )
-                    s4.metric(
-                        "模型期望損益",
-                        f"${option_quote['expected_pnl']:+,.0f}" if option_quote['expected_pnl'] is not None else "無法估算",
-                    )
+                    spread_width_value = abs(option_quote['short_strike'] - option_quote['long_strike'])
+                    render_option_metric_cards("契約組合", [
+                        ("賣方價外履約價", f"{_format_compact_number(option_quote['short_strike'], 0)} {option_quote['right']}", '#f5f5f5'),
+                        ("保護買方履約價", f"{_format_compact_number(option_quote['long_strike'], 0)} {option_quote['right']}", '#f5f5f5'),
+                        ("履約價差", f"{_format_compact_number(spread_width_value, 0)} 點", '#29b6f6'),
+                    ])
+                    render_option_metric_cards("風險與模型", [
+                        ("預估淨權利金", f"${_format_compact_number(option_quote['net_credit'], 0)}" if option_quote['net_credit'] is not None else "報價不足", '#ffb300'),
+                        ("最大獲利", f"${_format_compact_number(option_quote['max_profit'], 0)}" if option_quote['max_profit'] is not None else "報價不足", '#ff4b4b'),
+                        ("單組最大風險", f"${_format_compact_number(option_quote['max_loss'], 0)}", '#00c853'),
+                        ("損益兩平", _format_compact_number(option_quote['breakeven'], 2) if option_quote['breakeven'] is not None else "報價不足", '#f5f5f5'),
+                        ("模型勝率", f"{_format_compact_number(option_quote['model_probability'] * 100, 2)}%" if option_quote['model_probability'] is not None else "無法估算", '#29b6f6'),
+                        ("模型期望損益", f"${_format_compact_number(option_quote['expected_pnl'], 0, signed=True)}" if option_quote['expected_pnl'] is not None else "無法估算", '#f5f5f5'),
+                    ])
                     premium_detail = "即時買賣價不足，最大風險先以履約價差 × 50 元估算。"
                     if option_quote['short_premium'] is not None and option_quote['long_premium'] is not None:
                         premium_detail = (
-                            f"賣方權利金 {option_quote['short_premium']:.1f}、保護買方權利金 {option_quote['long_premium']:.1f}，"
+                            f"賣方權利金 {_format_compact_number(option_quote['short_premium'], 2)}、"
+                            f"保護買方權利金 {_format_compact_number(option_quote['long_premium'], 2)}，"
                             "以賣方買價與買方賣價保守估算。"
                         )
                     st.caption(
@@ -11668,28 +11988,22 @@ with tab_fibo:
                 elif option_quote:
                     option_title = f"{option_quote['name']}｜{option_quote['delivery_month']}｜{option_quote['expiry'].strftime('%Y/%m/%d')} 到期（剩 {option_quote['dte']} 天）"
                     st.markdown(f"**{option_title}**")
-                    o1, o2, o3, o4 = st.columns(4)
-                    o1.metric("建議買進", f"{option_quote['strike']:,.0f} {option_quote['right']}")
-                    o2.metric("買進參考價", f"{option_quote['premium']:.1f} 點" if option_quote['premium'] is not None else "報價不足")
-                    o3.metric("單口權利金成本", f"${option_quote['max_loss']:,.0f}" if option_quote['max_loss'] is not None else "報價不足")
-                    o4.metric("最大風險（權利金）", f"${option_quote['max_loss']:,.0f}" if option_quote['max_loss'] is not None else "權利金全額")
-                    q1, q2, q3, q4 = st.columns(4)
-                    q1.metric("價內外", f"{option_quote['moneyness']}｜距現價 {option_quote['distance_points']:,.0f} 點")
-                    q2.metric("買賣價差", f"{option_quote['spread']:.1f} 點" if option_quote['spread'] is not None else "報價不足")
-                    q3.metric("損益兩平", f"{option_quote['breakeven']:,.1f}" if option_quote['breakeven'] is not None else "報價不足")
-                    q4.metric("流動性", option_quote['liquidity'])
-                    m1, m2, m3, m4, m5 = st.columns(5)
-                    m1.metric(
-                        "模型勝率",
-                        f"{option_quote['model_probability'] * 100:.1f}%" if option_quote['model_probability'] is not None else "無法估算",
-                    )
-                    m2.metric(
-                        "模型期望損益",
-                        f"${option_quote['expected_pnl']:+,.0f}" if option_quote['expected_pnl'] is not None else "無法估算",
-                    )
-                    m3.metric("模型波動率", f"{option_quote['model_volatility'] * 100:.1f}%")
-                    m4.metric("目標情境損益", f"${option_quote['target_pnl']:+,.0f}")
-                    m5.metric("停損情境損益", f"${option_quote['stop_pnl']:+,.0f}")
+                    render_option_metric_cards("契約與成交", [
+                        ("建議買進", f"{_format_compact_number(option_quote['strike'], 0)} {option_quote['right']}", '#f5f5f5'),
+                        ("買進參考價", f"{_format_compact_number(option_quote['premium'], 2)} 點" if option_quote['premium'] is not None else "報價不足", '#ffb300'),
+                        ("價內外", f"{option_quote['moneyness']}｜距現價 {_format_compact_number(option_quote['distance_points'], 0)} 點", '#29b6f6'),
+                        ("買賣價差", f"{_format_compact_number(option_quote['spread'], 2)} 點" if option_quote['spread'] is not None else "報價不足", '#f5f5f5'),
+                        ("流動性", option_quote['liquidity'], '#f5f5f5'),
+                    ])
+                    render_option_metric_cards("成本、風險與模型", [
+                        ("單口權利金成本", f"${_format_compact_number(option_quote['max_loss'], 0)}" if option_quote['max_loss'] is not None else "報價不足", '#00c853'),
+                        ("損益兩平", _format_compact_number(option_quote['breakeven'], 2) if option_quote['breakeven'] is not None else "報價不足", '#f5f5f5'),
+                        ("模型勝率", f"{_format_compact_number(option_quote['model_probability'] * 100, 2)}%" if option_quote['model_probability'] is not None else "無法估算", '#29b6f6'),
+                        ("模型波動率", f"{_format_compact_number(option_quote['model_volatility'] * 100, 2)}%", '#f5f5f5'),
+                        ("模型期望損益", f"${_format_compact_number(option_quote['expected_pnl'], 0, signed=True)}" if option_quote['expected_pnl'] is not None else "無法估算", '#f5f5f5'),
+                        ("目標情境損益", f"${_format_compact_number(option_quote['target_pnl'], 0, signed=True)}", '#ff4b4b'),
+                        ("停損情境損益", f"${_format_compact_number(option_quote['stop_pnl'], 0, signed=True)}", '#00c853'),
+                    ])
                     st.warning(
                         f"風險指標：{option_quote['risk_level']}。此為 {option_quote['name']} 的快進快出方案；"
                         "僅在 5 分 K 確認後進場，標的觸及日線失效點或權利金回落約 40% 時優先退出。"
@@ -11707,8 +12021,9 @@ with tab_fibo:
                     )
                     if option_quote['target_return_pct'] is not None:
                         st.caption(
-                            f"若標的到達短波目標且剩餘時間約為目前的 65%，模型權利金情境報酬約 {option_quote['target_return_pct']:+.1f}%"
-                            f"（損益約 ${option_quote['target_pnl']:+,.0f}）；停損情境約 ${option_quote['stop_pnl']:+,.0f}。"
+                            f"若標的到達短波目標且剩餘時間約為目前的 65%，模型權利金情境報酬約 {_format_compact_number(option_quote['target_return_pct'], 2, signed=True)}%"
+                            f"（損益約 ${_format_compact_number(option_quote['target_pnl'], 0, signed=True)}）；"
+                            f"停損情境約 ${_format_compact_number(option_quote['stop_pnl'], 0, signed=True)}。"
                             "未計手續費、稅及波動率即時改變。"
                         )
                     if option_quote.get('alternatives'):
@@ -11716,15 +12031,15 @@ with tab_fibo:
                         for candidate in option_quote['alternatives']:
                             comparison_rows.append({
                                 "價內外": candidate['moneyness'],
-                                "履約價": f"{candidate['strike']:,.0f}",
-                                "買進價": f"{candidate['premium']:.1f}",
-                                "模型勝率": f"{candidate['model_probability'] * 100:.1f}%" if candidate['model_probability'] is not None else "—",
-                                "IV／模型波動率": f"{candidate['model_volatility'] * 100:.1f}%",
-                                "期望損益": f"${candidate['expected_pnl']:+,.0f}" if candidate['expected_pnl'] is not None else "—",
-                                "目標損益": f"${candidate['target_pnl']:+,.0f}",
-                                "停損損益": f"${candidate['stop_pnl']:+,.0f}",
+                                "履約價": _format_compact_number(candidate['strike'], 0),
+                                "買進價": _format_compact_number(candidate['premium'], 2),
+                                "模型勝率": f"{_format_compact_number(candidate['model_probability'] * 100, 2)}%" if candidate['model_probability'] is not None else "—",
+                                "IV／模型波動率": f"{_format_compact_number(candidate['model_volatility'] * 100, 2)}%",
+                                "期望損益": f"${_format_compact_number(candidate['expected_pnl'], 0, signed=True)}" if candidate['expected_pnl'] is not None else "—",
+                                "目標損益": f"${_format_compact_number(candidate['target_pnl'], 0, signed=True)}",
+                                "停損損益": f"${_format_compact_number(candidate['stop_pnl'], 0, signed=True)}",
                                 "流動性": candidate['liquidity'],
-                                "綜合分數": f"{candidate['score']:.1f}",
+                                "綜合分數": _format_compact_number(candidate['score'], 2),
                             })
                         st.markdown("##### 履約價比較")
                         st.dataframe(pd.DataFrame(comparison_rows), width='stretch', hide_index=True)
@@ -11828,6 +12143,9 @@ with tab_fibo:
             c3.text_input("快速標籤 3", key="custom_tag_3", on_change=format_fibo_tag, args=("custom_tag_3",))
             c4.text_input("快速標籤 4", key="custom_tag_4", on_change=format_fibo_tag, args=("custom_tag_4",))
             c5.text_input("快速標籤 5", key="custom_tag_5", on_change=format_fibo_tag, args=("custom_tag_5",))
+            if st.button("💾 儲存快速標籤", key="save_fibo_quick_tags", use_container_width=True):
+                save_fibo_config()
+                st.toast("快速標籤已同步儲存", icon="✅")
 
         st.write("📌 **快速查詢標籤** (點擊按鈕直接帶入)")
         btn_labels = [
@@ -11881,7 +12199,10 @@ with tab_fibo:
         s_ma20 = col_m3.checkbox("20MA (綠)", value=True)
         s_ma60 = col_m4.checkbox("60MA (黃)", value=True)
         s_vol = col_v.checkbox("📊 顯示成交量", value=True)
-        ma_w = col_w.slider("均線粗細", min_value=1.0, max_value=5.0, value=st.session_state.ma_w, step=0.5, key="ma_w", on_change=save_fibo_config, label_visibility="collapsed")
+        ma_w = col_w.slider(
+            "均線粗細", min_value=1.0, max_value=5.0, step=0.5,
+            key="ma_w", on_change=save_fibo_config, label_visibility="collapsed"
+        )
         
         ma_flags = {'5': s_ma5, '10': s_ma10, '20': s_ma20, '60': s_ma60}
 
@@ -12373,21 +12694,40 @@ with tab3:
 
     # 將使用者選擇的資料來源合併成統一事件格式；台股突發休市永遠覆蓋交易日狀態。
     network_events = list(twse_temporary_events)
+    calendar_source_counts = {}
+
+    def add_network_source(label, events):
+        event_list = list(events or [])
+        calendar_source_counts[label] = len(event_list)
+        network_events.extend(event_list)
+
     if "台股開休市" in selected_event_types:
-        network_events.extend(twse_holiday_events)
+        add_network_source('台股開休市', twse_holiday_events)
     if "FOMC 利率決議" in selected_event_types:
-        network_events.extend(fetch_fomc_events(sel_year))
+        add_network_source('FOMC', fetch_fomc_events(sel_year))
     if "美國 CPI" in selected_event_types:
-        network_events.extend(fetch_bls_cpi_events(sel_year))
+        add_network_source('CPI', fetch_bls_cpi_events(sel_year))
     if "美國大非農" in selected_event_types:
-        network_events.extend(fetch_bls_employment_events(sel_year))
+        add_network_source('大非農', fetch_bls_employment_events(sel_year))
     if "美國小非農 ADP" in selected_event_types:
-        network_events.extend(fetch_adp_employment_events(sel_year))
+        add_network_source('小非農 ADP', fetch_adp_employment_events(sel_year))
     if "美國初領失業金" in selected_event_types:
-        network_events.extend(build_us_initial_claims_events(sel_year))
+        add_network_source('初領失業金', build_us_initial_claims_events(sel_year))
     if COMPANY_SUMMARY_GROUP in selected_event_groups:
         # 僅合併獨立分頁已完成的快照；切換年月不會觸發 MOPS／Yahoo 查詢。
         network_events.extend(st.session_state.company_event_snapshot.get("events", []))
+    if "美國高影響總經" in selected_event_groups:
+        us_count_text = '｜'.join(
+            f"{label} {calendar_source_counts.get(label, 0)} 筆"
+            for label in ('FOMC', 'CPI', '大非農', '小非農 ADP')
+        )
+        st.caption(f"{sel_year} 官方高影響事件套用檢查：{us_count_text}。事件已換算為台灣日期與時間。")
+        missing_core_sources = [
+            label for label in ('FOMC', 'CPI', '大非農', '小非農 ADP')
+            if calendar_source_counts.get(label, 0) == 0
+        ]
+        if missing_core_sources:
+            st.warning("以下官方來源本次未讀到資料：" + '、'.join(missing_core_sources) + "；可按『更新市場行事曆』重試。")
 
     def get_us_events(y, m):
         events = {}
