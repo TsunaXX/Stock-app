@@ -3382,6 +3382,12 @@ def option_profit_probability(spot, breakeven, years, volatility, is_call, rate=
     return _normal_cdf(d2) if is_call else _normal_cdf(-d2)
 
 
+def _txo_strike_step(contracts, default=50.0):
+    strikes = sorted({float(getattr(contract, 'strike_price', 0) or 0) for contract in contracts})
+    gaps = [right - left for left, right in zip(strikes, strikes[1:]) if right > left]
+    return float(np.median(gaps)) if gaps else float(default)
+
+
 def rank_txo_directional_candidates(
     contracts, quotes, plan, is_buy_call, moneyness_preference, selected_expiry,
 ):
@@ -3430,9 +3436,24 @@ def rank_txo_directional_candidates(
         flow_score = float(np.clip((float(quote.get('book_balance', 0) or 0) + 1) / 2, 0, 1))
         capital_efficiency = float(np.clip(max(target_pnl, 0.0) / max(premium * 50, 1.0), 0, 2)) / 2
         probability_score = float(probability or 0.0)
+        spread_pct_value = quote.get('spread_pct')
+        spread_quality = (
+            float(np.clip(1 - float(spread_pct_value) / 30, 0, 1))
+            if spread_pct_value is not None else 0.0
+        )
+        payoff_ratio = max(target_pnl, 0.0) / max(abs(min(stop_pnl, 0.0)), 1.0)
+        payoff_score = float(np.clip(payoff_ratio / 3, 0, 1))
+        expected_score = float(np.clip((float(expected_pnl or 0) / max(premium * 50, 1.0) + 1) / 2, 0, 1))
+        if moneyness == '價外':
+            moneyness_score = 1.0 if target_reachable else 0.1
+        elif moneyness == '平價':
+            moneyness_score = 0.85
+        else:
+            moneyness_score = 0.70
         score = 100 * (
-            0.35 * probability_score + 0.20 * capital_efficiency + 0.15 * liquidity_score
-            + 0.10 * volume_score + 0.10 * flow_score + 0.10 * float(target_reachable)
+            0.24 * probability_score + 0.16 * capital_efficiency + 0.14 * liquidity_score
+            + 0.10 * spread_quality + 0.09 * volume_score + 0.07 * flow_score
+            + 0.08 * payoff_score + 0.07 * expected_score + 0.05 * moneyness_score
         )
         rows.append({
             **quote, 'contract': contract, 'strike': strike, 'moneyness': moneyness,
@@ -3484,12 +3505,13 @@ def get_txo_spread_quote(api, plan, expiry_choice, preferred_width=100):
     right = 'P' if is_bull_put else 'C'
     contracts = [contract for contract in expiry_options if txo_right_value(contract) == right]
     spot = plan['latest']
+    strike_step = _txo_strike_step(contracts)
     if is_bull_put:
-        desired = min(plan['invalidation'] - plan['zone_points'], spot - 1)
+        desired = min(plan['entry_level'] - plan['zone_points'] * 0.5, spot - strike_step)
         short_candidates = [c for c in contracts if float(getattr(c, 'strike_price', 0)) <= desired]
         short_contract = max(short_candidates, key=lambda c: float(c.strike_price)) if short_candidates else None
     else:
-        desired = max(plan['invalidation'] + plan['zone_points'], spot + 1)
+        desired = max(plan['entry_level'] + plan['zone_points'] * 0.5, spot + strike_step)
         short_candidates = [c for c in contracts if float(getattr(c, 'strike_price', 0)) >= desired]
         short_contract = min(short_candidates, key=lambda c: float(c.strike_price)) if short_candidates else None
     long_contract = _select_txo_spread_hedge(
@@ -3561,8 +3583,23 @@ def get_txo_directional_quote(api, plan, expiry_choice, moneyness_preference='�
     if not contracts:
         return None
 
-    # Compare only the bounded near-price chain: four strikes on each side plus ATM.
-    nearby = sorted(contracts, key=lambda c: abs(float(c.strike_price) - spot))[:12]
+    # Cover the live price, stop and target instead of blindly taking only the
+    # nearest strikes.  This keeps OTM candidates reachable while bounding API use.
+    strike_step = _txo_strike_step(contracts)
+    lower_bound = min(spot, float(plan['target']), float(plan['invalidation'])) - strike_step * 2
+    upper_bound = max(spot, float(plan['target']), float(plan['invalidation'])) + strike_step * 2
+    nearby = [
+        contract for contract in contracts
+        if lower_bound <= float(getattr(contract, 'strike_price', 0) or 0) <= upper_bound
+    ]
+    if not nearby:
+        nearby = sorted(contracts, key=lambda c: abs(float(c.strike_price) - spot))[:18]
+    elif len(nearby) > 24:
+        anchors = (spot, float(plan['target']), float(plan['invalidation']))
+        nearby = sorted(
+            nearby,
+            key=lambda c: min(abs(float(c.strike_price) - anchor) for anchor in anchors),
+        )[:24]
     quotes = get_txo_snapshot_quotes(api, nearby)
     ranked = rank_txo_directional_candidates(
         nearby, quotes, plan, is_buy_call, moneyness_preference, selected_expiry,
@@ -3648,6 +3685,98 @@ def render_option_metric_cards(title, items):
         f"{cards}</div>",
         unsafe_allow_html=True,
     )
+
+
+def build_txo_payoff_chart(option_quote, plan, is_spread=False):
+    """Build an interactive expiry payoff curve in TWD per option position."""
+    if not option_quote or not plan:
+        return None
+    spot = float(plan.get('latest', 0) or 0)
+    target = float(plan.get('target', spot) or spot)
+    stop = float(plan.get('invalidation', spot) or spot)
+    if spot <= 0:
+        return None
+
+    if is_spread:
+        credit_points = option_quote.get('net_credit_points')
+        if credit_points is None and option_quote.get('net_credit') is not None:
+            credit_points = float(option_quote['net_credit']) / 50
+        if credit_points is None:
+            return None
+        short_strike = float(option_quote['short_strike'])
+        long_strike = float(option_quote['long_strike'])
+        strikes = [short_strike, long_strike]
+        is_put = option_quote.get('right') == 'Put'
+    else:
+        premium = option_quote.get('premium')
+        if premium is None:
+            return None
+        strike = float(option_quote['strike'])
+        strikes = [strike]
+        is_call = option_quote.get('right') == 'Call'
+
+    key_points = [spot, target, stop, *strikes]
+    if option_quote.get('breakeven') is not None:
+        key_points.append(float(option_quote['breakeven']))
+    span = max(max(key_points) - min(key_points), float(plan.get('atr', 0) or 0) * 2, 400.0)
+    lower = math.floor((min(key_points) - span * 0.35) / 50) * 50
+    upper = math.ceil((max(key_points) + span * 0.35) / 50) * 50
+    underlying = np.linspace(lower, upper, 241)
+
+    if is_spread:
+        if is_put:
+            payoff_points = (
+                float(credit_points)
+                - np.maximum(short_strike - underlying, 0)
+                + np.maximum(long_strike - underlying, 0)
+            )
+        else:
+            payoff_points = (
+                float(credit_points)
+                - np.maximum(underlying - short_strike, 0)
+                + np.maximum(underlying - long_strike, 0)
+            )
+    else:
+        intrinsic = np.maximum(underlying - strike, 0) if is_call else np.maximum(strike - underlying, 0)
+        payoff_points = intrinsic - float(premium)
+    payoff_twd = payoff_points * 50
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=underlying, y=payoff_twd, mode='lines', name='到期損益',
+        line=dict(color='#dfe6e9', width=2.5),
+        hovertemplate='結算指數 %{x:,.0f}<br>損益 $%{y:,.0f}<extra></extra>',
+    ))
+    fig.add_trace(go.Scatter(
+        x=underlying, y=np.where(payoff_twd >= 0, payoff_twd, np.nan),
+        mode='lines', line=dict(color='#ff4b4b', width=3), name='獲利',
+        hovertemplate='結算指數 %{x:,.0f}<br>獲利 $%{y:,.0f}<extra></extra>',
+    ))
+    fig.add_trace(go.Scatter(
+        x=underlying, y=np.where(payoff_twd < 0, payoff_twd, np.nan),
+        mode='lines', line=dict(color='#00c853', width=3), name='虧損',
+        hovertemplate='結算指數 %{x:,.0f}<br>虧損 $%{y:,.0f}<extra></extra>',
+    ))
+    fig.add_hline(y=0, line_color='#7f8c8d', line_width=1)
+    markers = [
+        ('目前', spot, '#29b6f6'), ('目標', target, '#ff4b4b'), ('停損', stop, '#00c853'),
+    ]
+    if option_quote.get('breakeven') is not None:
+        markers.append(('損益兩平', float(option_quote['breakeven']), '#ffb300'))
+    for label, value, color in markers:
+        fig.add_vline(x=value, line_color=color, line_dash='dot', line_width=1)
+        fig.add_annotation(
+            x=value, y=1, yref='paper', text=f"{label} {value:,.0f}",
+            showarrow=False, xanchor='left', yanchor='bottom', font=dict(size=11, color=color),
+        )
+    fig.update_layout(
+        template='plotly_dark', height=390, margin=dict(l=35, r=20, t=42, b=35),
+        title=dict(text='到期損益曲線（每口／每組）', font=dict(size=16)),
+        xaxis_title='到期結算指數', yaxis_title='損益（元）',
+        legend=dict(orientation='h', y=1.12, x=1, xanchor='right'),
+        hovermode='x unified',
+    )
+    return fig
 
 
 def _taifex_number(value):
@@ -3790,12 +3919,18 @@ def get_taifex_txo_spread_quote(plan, expiry_choice, preferred_width=100):
 
 def calculate_index_trade_plan(index_df, index_result, futures_df, futures_result):
     """Build a rule-based TAIEX futures plan from existing thermometer and Fibonacci data."""
-    if futures_result is None or futures_df.empty:
+    has_futures = futures_result is not None and not futures_df.empty
+    has_index = index_result is not None and not index_df.empty
+    if not has_futures and not has_index:
         return None
 
     now_tw = datetime.now(pytz.timezone('Asia/Taipei'))
     is_night_session = now_tw.time() >= dt_time(15, 0) or now_tw.time() < dt_time(5, 0)
-    if is_night_session or index_result is None:
+    if not has_futures:
+        primary_df, primary_result, market_label = index_df, index_result, "加權指數（最近完整交易日）"
+        direction = index_result['status']
+        alignment_note = "期貨日 K 暫時不足，改用證交所加權指數最近完整日 K 建立假日／休市參考計畫。"
+    elif is_night_session or not has_index:
         primary_df, primary_result, market_label = futures_df, futures_result, "臺股期貨（夜盤優先）"
         direction = futures_result['status']
         alignment_note = "夜盤以期貨日夜盤 K 與期貨溫度計判讀。"
@@ -11790,7 +11925,7 @@ with tab_fibo:
     ]
     thermometer_data = []
     # Streamlit tabs 仍會執行隱藏分頁程式；只在實際開啟需要的分頁時下載兩組溫度資料。
-    if tab_trade_plan.open or tab_fibo_thermometer.open:
+    if tab_trade_plan.open or tab_option_plan.open or tab_fibo_thermometer.open:
         for label, code in thermometer_specs:
             temp_df, source = get_cached_market_temperature_data(code)
             result = calculate_market_temperature(temp_df)
@@ -12127,11 +12262,38 @@ with tab_fibo:
         if tab_option_plan.open:
             st.subheader("選擇權操作計畫")
             st.caption("獨立載入最近到期週三選、週五選或月選；比較價外／平價／價內單買與限定風險價差。")
+            option_now = datetime.now(pytz.timezone('Asia/Taipei'))
+            data_status = []
+            for label, item in (("加權", index_item), ("期貨", futures_item)):
+                data_frame = item[2] if item else pd.DataFrame()
+                source_name = item[3] if item else "尚未取得資料來源"
+                required_columns = {'High', 'Low', 'Close'}
+                valid_rows = (
+                    len(data_frame.dropna(subset=['High', 'Low', 'Close']))
+                    if not data_frame.empty and required_columns.issubset(data_frame.columns) else 0
+                )
+                latest_date = (
+                    pd.Timestamp(data_frame.index[-1]).strftime('%Y/%m/%d')
+                    if valid_rows else "無資料"
+                )
+                data_status.append(f"{label} {valid_rows} 根（最新 {latest_date}；{source_name}）")
+            st.caption("計畫資料：" + "｜".join(data_status))
+            if is_market_closed_func(option_now.date()):
+                st.info(
+                    "目前為休市日，計畫會沿用最近完整交易日的日 K；不會建立假日零成交量 K 棒。"
+                    "履約價與損益曲線仍可試算，但即時買賣價、價差與流動性應等開盤後重新更新。"
+                )
+            option_is_closed = is_market_closed_func(option_now.date())
+            option_direction = locals().get('short_wave_direction')
+            if option_is_closed and plan and plan.get('direction') in ('偏多', '偏空'):
+                # 休市時沒有有效的盤中 5 分 K，改採最近完整交易日的日線方向。
+                option_direction = plan['direction']
             if plan is None:
                 st.info(
-                    "目前缺少足夠的加權或期貨日 K，暫時無法建立選擇權操作計畫。"
+                    "目前可用日 K 少於 20 根或高低價欄位不完整，暫時無法建立選擇權操作計畫。"
+                    "系統已同時嘗試期貨日 K 與證交所加權指數備援；請檢查上方資料根數與最新日期。"
                 )
-            elif short_wave_direction not in ('偏多', '偏空'):
+            elif option_direction not in ('偏多', '偏空'):
                 st.info("盤中方向尚未形成，暫不建立 BC／BP 或方向價差；等待 VWAP 與 5 分 K 動能確認。")
             else:
                 control_expiry, control_mode, control_money, control_width, control_refresh = st.columns([1.1, 2, 1.25, 1.35, 0.75])
@@ -12175,20 +12337,22 @@ with tab_fibo:
                     st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
                     refresh_option_plan = st.button("↻ 更新", key="refresh_option_plan", width='stretch')
 
-                option_entry = short_wave['entry'] if short_wave else trade_state['entry_level']
-                option_stop = short_wave['stop'] if short_wave else trade_state['invalidation']
-                option_target = short_wave['target'] if short_wave else trade_state['target']
+                use_intraday_option_levels = not option_is_closed and short_wave
+                option_entry = short_wave['entry'] if use_intraday_option_levels else plan['entry_level']
+                option_stop = short_wave['stop'] if use_intraday_option_levels else plan['invalidation']
+                option_target = short_wave['target'] if use_intraday_option_levels else plan['target']
+                option_price = live_price if not option_is_closed else plan['latest']
                 quote_plan = {
                     **plan,
-                    'latest': live_price,
-                    'direction': short_wave_direction,
+                    'latest': option_price,
+                    'direction': option_direction,
                     'entry_level': option_entry,
                     'invalidation': option_stop,
                     'target': option_target,
                 }
                 quote_signature = (
-                    expiry_choice, option_mode, moneyness_preference, spread_width, short_wave_direction,
-                    round(float(live_price), 0), round(float(option_target), 0), round(float(option_stop), 0),
+                    expiry_choice, option_mode, moneyness_preference, spread_width, option_direction,
+                    round(float(option_price), 0), round(float(option_target), 0), round(float(option_stop), 0),
                     id(st.session_state.get('sj_api')),
                 )
                 option_cache = st.session_state.get('_option_plan_quote_cache')
@@ -12219,7 +12383,7 @@ with tab_fibo:
                     unsafe_allow_html=True,
                 )
                 st.caption(
-                    f"方向：{'BC／Call' if short_wave_direction == '偏多' else 'BP／Put'}｜"
+                    f"方向：{'BC／Call' if option_direction == '偏多' else 'BP／Put'}｜"
                     f"報價更新：{option_cache['updated_at'].strftime('%H:%M:%S')}｜資料只在本分頁開啟或按更新時載入。"
                 )
                 with st.expander("模型勝率與損益怎麼算"):
@@ -12341,6 +12505,19 @@ with tab_fibo:
                     diagnostic = st.session_state.get('txo_contract_diagnostic')
                     if diagnostic:
                         st.caption(f"契約讀取診斷：{diagnostic}")
+                else:
+                    payoff_chart = build_txo_payoff_chart(option_quote, quote_plan, display_spread)
+                    if payoff_chart is not None:
+                        st.plotly_chart(
+                            payoff_chart, width='stretch',
+                            config={'displayModeBar': False, 'scrollZoom': False},
+                        )
+                        st.caption(
+                            "曲線為到期結算損益，每口／每組乘數 50 元；紅色為獲利、綠色為虧損。"
+                            "到期前的實際損益仍會受剩餘時間、隱含波動率與買賣價差影響。"
+                        )
+                    else:
+                        st.info("即時權利金或淨收權利金不足，暫時無法繪製可驗證的損益曲線。")
 
     with tab_fibo_thermometer:
         title_col, refresh_col = st.columns([6, 1])
