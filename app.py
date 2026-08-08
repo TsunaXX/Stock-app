@@ -742,6 +742,7 @@ BLS_RELEASE_ICS_URL = "https://www.bls.gov/schedule/news_release/bls.ics"
 BLS_CPS_CALENDAR_URL = "https://www.bls.gov/cps/publications/release-calendar.htm"
 ADP_EMPLOYMENT_DATA_URL = "https://adpemploymentreport.com/ner_production.json"
 ADP_EMPLOYMENT_PAGE_URL = "https://adpemploymentreport.com/"
+TRADINGVIEW_CALENDAR_URL = "https://economic-calendar.tradingview.com/events"
 
 
 def _calendar_get(url):
@@ -780,6 +781,88 @@ def _taiwan_time_from_eastern(year, month, day, hour, minute=0):
     eastern = pytz.timezone("US/Eastern")
     taipei = pytz.timezone("Asia/Taipei")
     return eastern.localize(datetime(year, month, day, hour, minute)).astimezone(taipei)
+
+
+@st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
+def fetch_tradingview_us_calendar(year):
+    """免 API Key 的美國經濟日曆備援；保留原始資料來源欄位供畫面標示。"""
+    headers = {
+        **CALENDAR_HTTP_HEADERS,
+        "Origin": "https://www.tradingview.com",
+        "Referer": "https://www.tradingview.com/economic-calendar/",
+    }
+    # 單次回傳上限為 2,000 筆，整年查詢會在年中被截斷，因此分季並行取得。
+    quarter_ranges = [(1, 3), (4, 6), (7, 9), (10, 12)]
+
+    def fetch_quarter(month_range):
+        start_month, end_month = month_range
+        end_day = calendar.monthrange(year, end_month)[1]
+        params = {
+            "from": f"{year}-{start_month:02}-01T00:00:00.000Z",
+            "to": f"{year}-{end_month:02}-{end_day:02}T23:59:59.999Z",
+            "countries": "US",
+        }
+        for attempt in range(2):
+            try:
+                response = requests.get(
+                    TRADINGVIEW_CALENDAR_URL, params=params, headers=headers, timeout=(6, 25)
+                )
+                response.raise_for_status()
+                payload = response.json()
+                rows = payload.get("result", []) if isinstance(payload, dict) else []
+                return rows if isinstance(rows, list) else []
+            except (requests.RequestException, ValueError, TypeError):
+                if attempt == 0:
+                    time.sleep(0.5)
+        return []
+
+    combined = {}
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        for quarter_rows in executor.map(fetch_quarter, quarter_ranges):
+            for row in quarter_rows:
+                row_key = str(row.get("id") or f"{row.get('title')}|{row.get('date')}")
+                combined[row_key] = row
+    return sorted(combined.values(), key=lambda row: str(row.get("date", "")))
+
+
+def _tradingview_macro_events(year, event_type):
+    """將 TradingView 的 CPI／NFP UTC 時間轉為台灣日期，排除核心 CPI 與年度修訂。"""
+    events, seen = [], set()
+    for row in fetch_tradingview_us_calendar(year):
+        title = str(row.get("title", "")).strip()
+        indicator = str(row.get("indicator", "")).strip()
+        ticker = str(row.get("ticker", "")).strip()
+        if event_type == "cpi":
+            matched = ticker == "ECONOMICS:USCPI" or (
+                title.upper() == "CPI" and indicator.lower() == "consumer price index cpi"
+            )
+            event_title = "美國 CPI 公布"
+        else:
+            matched = title.lower() == "non farm payrolls" and ticker == "ECONOMICS:USNFP"
+            event_title = "美國大非農／失業率"
+        if not matched:
+            continue
+        try:
+            release_dt = pd.Timestamp(row.get("date"))
+            if release_dt.tzinfo is None:
+                release_dt = release_dt.tz_localize("UTC")
+            taiwan_dt = release_dt.tz_convert("Asia/Taipei")
+        except (TypeError, ValueError):
+            continue
+        if taiwan_dt.year != year or taiwan_dt.date() in seen:
+            continue
+        seen.add(taiwan_dt.date())
+        original_source = str(row.get("source", "BLS")).strip() or "BLS"
+        events.append({
+            "date": taiwan_dt.date().isoformat(),
+            "title": f"{event_title}（{taiwan_dt:%H:%M}）",
+            "detail": f"TradingView 免費經濟日曆備援；原始發布單位：{original_source}。",
+            "closed": False,
+            "temporary": False,
+            "source": "TradingView Economic Calendar",
+            "impact": "high",
+        })
+    return events
 
 
 @st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
@@ -919,7 +1002,10 @@ def fetch_fomc_events(year):
 
 @st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
 def fetch_bls_cpi_events(year):
-    """CPI 先讀 BLS 官方 iCalendar，讀不到時改讀年度總表。"""
+    """CPI 以免金鑰經濟日曆為主，BLS 官方來源作交叉備援。"""
+    events = _tradingview_macro_events(year, "cpi")
+    if events:
+        return events
     events = _parse_bls_release_ics(
         _calendar_get(BLS_RELEASE_ICS_URL), year, "Consumer Price Index", "美國 CPI 公布"
     )
@@ -931,9 +1017,10 @@ def fetch_bls_cpi_events(year):
     )
     if events:
         return events
-    return _parse_official_release_schedule(
+    events = _parse_official_release_schedule(
         _calendar_get(BLS_CPI_URL), year, "美國 CPI 公布", "U.S. Bureau of Labor Statistics"
     )
+    return events
 
 
 def _parse_official_release_schedule(response, year, event_title, source):
@@ -1096,6 +1183,9 @@ def _parse_bls_cps_employment_calendar(response, year):
 @st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
 def fetch_bls_employment_events(year):
     """BLS Employment Situation：市場俗稱大非農，同時公布失業率。"""
+    events = _tradingview_macro_events(year, "nfp")
+    if events:
+        return events
     events = _parse_bls_employment_ics(_calendar_get(BLS_RELEASE_ICS_URL), year)
     if events:
         return events
@@ -1111,7 +1201,8 @@ def fetch_bls_employment_events(year):
     )
     if events:
         return events
-    return _parse_bls_cps_employment_calendar(_calendar_get(BLS_CPS_CALENDAR_URL), year)
+    events = _parse_bls_cps_employment_calendar(_calendar_get(BLS_CPS_CALENDAR_URL), year)
+    return events
 
 
 @st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
@@ -1410,6 +1501,38 @@ def _format_compact_number(value, max_decimals=2, signed=False, thousands=True):
     return text_value
 
 
+# Pandas Styler／Streamlit 表格若未另外指定格式，也統一去除浮點尾端 0。
+pd.options.display.float_format = lambda value: _format_compact_number(value, 8)
+
+
+def _content_column_width(values, min_width=44, max_width=180):
+    """只依儲存格內容估算欄寬，不讓較長的欄位標題撐出大段空白。"""
+    try:
+        series = pd.Series(values).dropna().astype(str)
+    except (TypeError, ValueError):
+        return min_width
+    if series.empty:
+        return min_width
+    lengths = series.map(lambda text: sum(2 if ord(char) > 127 else 1 for char in text))
+    content_length = float(lengths.quantile(0.95)) if len(lengths) > 4 else float(lengths.max())
+    return max(min_width, min(max_width, int(content_length * 7 + 12)))
+
+
+def compact_table_column_config(frame, min_width=44, max_width=180):
+    """建立內容優先的緊湊表格欄寬，數值欄同步移除尾端 0。"""
+    raw_frame = getattr(frame, "data", frame)
+    if not isinstance(raw_frame, pd.DataFrame):
+        return {}
+    config = {}
+    for column in raw_frame.columns:
+        width = _content_column_width(raw_frame[column], min_width, max_width)
+        if pd.api.types.is_numeric_dtype(raw_frame[column]):
+            config[column] = st.column_config.NumberColumn(format="%.12g", width=width)
+        else:
+            config[column] = st.column_config.TextColumn(width=width)
+    return config
+
+
 def render_index_plan_metric_cards(items):
     """指數計畫主數值採較小字級；補充風險資訊維持原尺寸。"""
     cards = ''.join(
@@ -1432,6 +1555,17 @@ def render_index_plan_metric_cards(items):
     )
 
 
+def render_index_level_metric(container, label, value):
+    """指數計畫頂端價位採與即時微台相近的緊湊字級。"""
+    container.markdown(
+        "<div style='line-height:1.2;text-align:left'>"
+        f"<div style='font-size:13px;font-weight:650;color:#f4f6f8'>{html.escape(str(label))}</div>"
+        f"<div style='font-size:25px;font-weight:650;color:#f7f8fa;margin-top:5px;white-space:nowrap'>{html.escape(str(value))}</div>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+
 def _roc_compact_date(value):
     digits = re.sub(r"\D", "", str(value))
     if len(digits) != 7:
@@ -1444,7 +1578,7 @@ def _roc_compact_date(value):
 
 def _signed_percent(value):
     number = _to_number(value)
-    return "--" if number is None else f"{number:+.2f}%"
+    return "--" if number is None else f"{_format_compact_number(number, 2, signed=True)}%"
 
 
 def _latest_completed_roc_month():
@@ -1544,7 +1678,7 @@ def _signed_percent_arrow(value):
     if number is None:
         return '—'
     arrow = '↑' if number > 0 else ('↓' if number < 0 else '→')
-    return f'{arrow} {number:+.2f}%'
+    return f"{arrow} {_format_compact_number(number, 2, signed=True)}%"
 
 
 def _percent_badge_html(value, font_size=14):
@@ -1625,9 +1759,9 @@ def _usd_currency(value):
     if number is None:
         return "--"
     if abs(number) >= 1_000_000_000:
-        return f"US${number / 1_000_000_000:,.2f}B"
+        return f"US${_format_compact_number(number / 1_000_000_000, 2)}B"
     if abs(number) >= 1_000_000:
-        return f"US${number / 1_000_000:,.2f}M"
+        return f"US${_format_compact_number(number / 1_000_000, 2)}M"
     return f"US${number:,.0f}"
 
 
@@ -1797,9 +1931,9 @@ def fetch_us_revenue_events(inputs):
             annual_revenue = annual_values[0][1] if annual_values else None
             previous_annual = annual_values[1][1] if len(annual_values) > 1 else None
             annual_yoy_value = _growth_percent(annual_revenue, previous_annual)
-            qoq = "--" if qoq_value is None else f"{qoq_value:+.2f}%"
-            yoy = "--" if yoy_value is None else f"{yoy_value:+.2f}%"
-            annual_yoy = "--" if annual_yoy_value is None else f"{annual_yoy_value:+.2f}%"
+            qoq = "--" if qoq_value is None else f"{_format_compact_number(qoq_value, 2, signed=True)}%"
+            yoy = "--" if yoy_value is None else f"{_format_compact_number(yoy_value, 2, signed=True)}%"
+            annual_yoy = "--" if annual_yoy_value is None else f"{_format_compact_number(annual_yoy_value, 2, signed=True)}%"
             revenue_data = {
                 "company": item["display_name"],
                 "ticker": ticker,
@@ -1888,7 +2022,11 @@ def render_company_event_snapshot(snapshot):
                 "公司／事件": event.get("title", ""),
                 "公布時間": str(event.get("detail", "")).split("；", 1)[0].replace("Yahoo Finance｜", ""),
             } for event in earnings_events]
-            st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+            earnings_frame = pd.DataFrame(rows)
+            st.dataframe(
+                earnings_frame, column_config=compact_table_column_config(earnings_frame),
+                hide_index=True, use_container_width=True,
+            )
         else:
             st.info("目前快照沒有可用的財報日期。")
         if earnings_result.get("resolved"):
@@ -1909,7 +2047,7 @@ def render_company_event_snapshot(snapshot):
                 metric_cols[0].markdown(_revenue_metric_html("當月營收", _thousand_currency(revenue.get("current_month")), str(revenue.get("mom", "--")) + " MoM"), unsafe_allow_html=True)
                 metric_cols[1].markdown(_revenue_metric_html("去年當月營收", _thousand_currency(revenue.get("last_year_month")), str(revenue.get("yoy", "--")) + " YoY"), unsafe_allow_html=True)
                 metric_cols[2].markdown(_revenue_metric_html("本年累計營收", _thousand_currency(revenue.get("ytd")), str(revenue.get("ytd_yoy", "--")) + " 累計 YoY"), unsafe_allow_html=True)
-                st.dataframe(pd.DataFrame([{
+                revenue_frame = pd.DataFrame([{
                     "資料年月": revenue.get("revenue_month", ""),
                     "當月營收": _thousand_currency(revenue.get("current_month")),
                     "上月營收": _thousand_currency(revenue.get("previous_month")),
@@ -1917,7 +2055,11 @@ def render_company_event_snapshot(snapshot):
                     "本年累計營收": _thousand_currency(revenue.get("ytd")),
                     "去年累計營收": _thousand_currency(revenue.get("last_year_ytd")),
                     "備註": revenue.get("note", "-"),
-                }]), hide_index=True, use_container_width=True)
+                }])
+                st.dataframe(
+                    revenue_frame, column_config=compact_table_column_config(revenue_frame),
+                    hide_index=True, use_container_width=True,
+                )
         if taiwan_result.get("missing"):
             st.info("未取得台股月營收：" + "； ".join(taiwan_result["missing"]))
 
@@ -1934,13 +2076,17 @@ def render_company_event_snapshot(snapshot):
                 metric_cols[0].markdown(_revenue_metric_html("季度營收", _usd_currency(revenue.get("quarter_revenue")), str(revenue.get("qoq", "--")) + " QoQ"), unsafe_allow_html=True)
                 metric_cols[1].markdown(_revenue_metric_html("去年同期季營收", _usd_currency(revenue.get("year_ago_quarter")), str(revenue.get("yoy", "--")) + " YoY"), unsafe_allow_html=True)
                 metric_cols[2].markdown(_revenue_metric_html("年度營收", _usd_currency(revenue.get("annual_revenue")), str(revenue.get("annual_yoy", "--")) + " 年 YoY"), unsafe_allow_html=True)
-                st.dataframe(pd.DataFrame([{
+                us_revenue_frame = pd.DataFrame([{
                     "季度營收": _usd_currency(revenue.get("quarter_revenue")),
                     "前一季營收": _usd_currency(revenue.get("previous_quarter")),
                     "去年同期季營收": _usd_currency(revenue.get("year_ago_quarter")),
                     "年度營收": _usd_currency(revenue.get("annual_revenue")),
                     "前年度營收": _usd_currency(revenue.get("previous_annual")),
-                }]), hide_index=True, use_container_width=True)
+                }])
+                st.dataframe(
+                    us_revenue_frame, column_config=compact_table_column_config(us_revenue_frame),
+                    hide_index=True, use_container_width=True,
+                )
         if us_result.get("missing"):
             st.info("未取得美股營收：" + "； ".join(us_result["missing"]))
 
@@ -3470,13 +3616,13 @@ def recommend_txo_strategy(directional_quote, spread_quote, plan):
     liquidity = directional_quote.get('liquidity')
     if valid_spread and (iv_ratio >= 1.20 or (dte <= 1 and probability < 0.45)):
         reason = (
-            f"隱含／模型波動率約為 20 日實現波動率的 {iv_ratio:.2f} 倍，"
+            f"隱含／模型波動率約為 20 日實現波動率的 {_format_compact_number(iv_ratio, 2)} 倍，"
             "單買權利金相對偏貴或到期時間過短；限定風險價差較能降低時間價值與波動率回落風險。"
         )
         return {'choice': '價差單', 'color': '#ffc107', 'reason': reason, 'iv_ratio': iv_ratio}
     if probability >= 0.42 and liquidity in ('高', '中'):
         reason = (
-            f"模型到期獲利機率約 {probability * 100:.1f}%，且流動性為{liquidity}；"
+            f"模型到期獲利機率約 {_format_compact_number(probability * 100, 1)}%，且流動性為{liquidity}；"
             f"目前以{directional_quote['moneyness']} {directional_quote['right']} 快進快出較合適。"
         )
         return {'choice': f"單買 {directional_quote['right']}", 'color': '#ff4b4b' if plan['direction'] == '偏多' else '#00c853', 'reason': reason, 'iv_ratio': iv_ratio}
@@ -4035,12 +4181,12 @@ def render_fibonacci_trade_suggestion(suggestion):
     if suggestion['asset_type'] == 'futures':
         st.caption(
             f"微台1口試算：停損約 -{risk * 10:,.0f}；"
-            f"目標約 +{reward * 10:,.0f}；風報比 {suggestion['rr']:.2f}。"
+            f"目標約 +{reward * 10:,.0f}；風報比 {_format_compact_number(suggestion['rr'], 2)}。"
         )
     elif suggestion['asset_type'] == 'stock':
         st.caption(
             f"現股1張試算：停損價差約 -{risk * 1000:,.0f}；"
-            f"目標價差約 +{reward * 1000:,.0f}；風報比 {suggestion['rr']:.2f}。"
+            f"目標價差約 +{reward * 1000:,.0f}；風報比 {_format_compact_number(suggestion['rr'], 2)}。"
         )
 
 
@@ -4607,7 +4753,7 @@ def plot_fibonacci_chart(
                     vol_num = "無資料(缺漏)"
                     vol_unit = ""
                 else:
-                    vol_num = f"{vol:,.2f}"
+                    vol_num = _format_compact_number(vol, 2)
                     vol_unit = " 億"
             else:
                 vol_num = f"{vol:,.0f}"
@@ -4623,12 +4769,13 @@ def plot_fibonacci_chart(
         # 標題改為各自獨立套用顏色
         title_html = (
             f"<span style='color:{color_main};'>{disp_title}{ticker_suffix}</span> - {interval_name} {date_str} "
-            f"開 <span style='color:{color_op};'>{op:.2f}</span> "
-            f"高 <span style='color:{color_hi};'>{hi:.2f}</span> "
-            f"低 <span style='color:{color_lo};'>{lo:.2f}</span> "
-            f"收 <span style='color:{color_cl};'>{cl:.2f}</span>{price_unit} "
+            f"開 <span style='color:{color_op};'>{_format_compact_number(op, 2)}</span> "
+            f"高 <span style='color:{color_hi};'>{_format_compact_number(hi, 2)}</span> "
+            f"低 <span style='color:{color_lo};'>{_format_compact_number(lo, 2)}</span> "
+            f"收 <span style='color:{color_cl};'>{_format_compact_number(cl, 2)}</span>{price_unit} "
             f"量 {vol_num}{vol_unit} "
-            f"<span style='color:{color_main};'>{sign}{chg:.2f}({sign}{pct_chg:.2f}%)</span>"
+            f"<span style='color:{color_main};'>{_format_compact_number(chg, 2, signed=True)}"
+            f"({_format_compact_number(pct_chg, 2, signed=True)}%)</span>"
         )
     except Exception:
         title_html = f"{display_name}{ticker_suffix} - {interval_name}"
@@ -5017,7 +5164,8 @@ st.markdown("""
     .calendar-desktop-grid { display:grid; grid-template-columns:minmax(42px,.42fr) repeat(7,minmax(105px,1fr)); gap:4px; align-items:stretch; overflow-x:auto; padding-bottom:4px; }
     .calendar-day-head, .calendar-week-head { text-align:center; font-size:.82rem; font-weight:800; padding:5px 2px; color:#dfe6e9; }
     .calendar-week-head { color:#ffb74d; }
-    .cal-box { text-align:left; padding:7px; border-radius:6px; min-height:112px; border:1px solid #4b5563; font-size:0.82rem; line-height:1.25; overflow-wrap:anywhere; }
+    .cal-box { text-align:left; padding:7px; border-radius:6px; min-height:112px; border:1px solid #4b5563; font-size:0.9rem; line-height:1.3; overflow-wrap:anywhere; }
+    .calendar-desktop-grid .cal-box > div:not(.cal-date) { font-size:0.78rem !important; line-height:1.3; }
     .cal-open { background-color: #000000 !important; color: #ffffff !important; }
     .cal-closed { background-color: #d32f2f !important; color: #ffffff !important; font-weight: bold; }
     .cal-week { background-color:#242a33; color:#ffb74d; font-weight:bold; display:flex; align-items:center; justify-content:center; font-size:.78rem; text-align:center; }
@@ -5028,11 +5176,22 @@ st.markdown("""
     .settle-f { color: #29b6f6; font-size: 0.8em; margin-top: 2px; } 
     .holiday-tag { font-size: 0.85em; margin-bottom: 2px; color: #ffeb3b; background-color: rgba(0,0,0,0.5); border-radius: 3px; padding: 1px;}
     .today-border { border: 3px solid #ffff00 !important; }
+    div[data-testid="stDataFrame"], div[data-testid="stDataEditor"] { font-size:0.84rem; }
+    div[data-testid="stDataFrame"] [role="gridcell"],
+    div[data-testid="stDataFrame"] [role="columnheader"],
+    div[data-testid="stDataEditor"] [role="gridcell"],
+    div[data-testid="stDataEditor"] [role="columnheader"] {
+        padding-left:3px !important;
+        padding-right:3px !important;
+    }
+    div[data-testid="stDataFrame"] [role="columnheader"],
+    div[data-testid="stDataEditor"] [role="columnheader"] { white-space:nowrap; }
     .calendar-mobile-list { display:none; }
     @media (max-width: 700px) {
         .calendar-desktop-grid { display:none; }
         .calendar-mobile-list { display:flex; flex-direction:column; gap:7px; }
-        .calendar-mobile-day { padding:9px 10px; border-radius:7px; border:1px solid #4b5563; text-align:left; font-size:.86rem; line-height:1.3; }
+        .calendar-mobile-day { padding:9px 10px; border-radius:7px; border:1px solid #4b5563; text-align:left; font-size:.9rem; line-height:1.35; }
+        .calendar-mobile-day > div:not(.calendar-mobile-date) { font-size:.84rem !important; }
         .calendar-mobile-date { display:flex; justify-content:space-between; gap:8px; align-items:center; font-size:1rem; font-weight:850; margin-bottom:5px; }
         .calendar-mobile-week { color:#ffb74d; font-size:.74rem; font-weight:750; white-space:nowrap; }
     }
@@ -5473,8 +5632,8 @@ def render_strategy_validation_room():
     metric1, metric2, metric3, metric4 = st.columns(4)
     metric1.metric('訊號數', len(filtered))
     metric2.metric('追蹤中', int((filtered.get('結果', pd.Series(dtype=str)) == '追蹤中').sum()))
-    metric3.metric('已完成勝率', f'{hit_rate:.1f}%', help='只計算已有達標或停損結果的訊號。')
-    metric4.metric('平均結果', f'{average_r:+.2f} R', help='R 為進場至停損的風險距離。')
+    metric3.metric('已完成勝率', f'{_format_compact_number(hit_rate, 1)}%', help='只計算已有達標或停損結果的訊號。')
+    metric4.metric('平均結果', f'{_format_compact_number(average_r, 2, signed=True)} R', help='R 為進場至停損的風險距離。')
 
     if not completed.empty:
         group_columns = [column for column in ['市場', '策略', '方向', '信心判讀'] if column in completed.columns]
@@ -5995,7 +6154,7 @@ with st.sidebar:
             try:
                 usage = st.session_state.sj_api.usage()
                 rem_mb = usage.remaining_bytes / (1024 * 1024)
-                st.caption(f"📊 API 今日剩餘流量: {rem_mb:.2f} MB")
+                st.caption(f"📊 API 今日剩餘流量: {_format_compact_number(rem_mb, 2)} MB")
             except Exception:
                 st.caption("📊 API 今日剩餘流量: 暫時無法獲取 (連線讀取中)")
 
@@ -7451,7 +7610,7 @@ def render_opening_direction_prompt():
                 details[['群組', '市場', '價格', '漲跌幅', '資料時間', '權重', '來源']]
                 .style.apply(style_opening_detail, axis=1),
                 column_config={
-                    '價格': st.column_config.NumberColumn(format='%.2f', width=100),
+                    '價格': st.column_config.NumberColumn(format='%.12g', width=78),
                     '漲跌幅': st.column_config.TextColumn(width=90),
                     '權重': st.column_config.NumberColumn(format='%d', width=60),
                 },
@@ -7633,7 +7792,7 @@ def calculate_risk_filter_result(row, direction, max_extension_atr, attention_co
     elif attention_count >= 2:
         rule = '高風險：僅等待確認'
     elif too_extended:
-        rule = f'排除：乖離超過 {max_extension_atr:.1f} ATR'
+        rule = f'排除：乖離超過 {_format_compact_number(max_extension_atr, 1)} ATR'
 
     return {
         'score': score, 'risk': risk_label, 'extension': extension,
@@ -9029,22 +9188,22 @@ def render_futures_strategy_room():
     def futures_column_config(include_ignore=True):
         config = {
             '忽略': st.column_config.CheckboxColumn('隱藏', width=45),
-            '期貨代碼': st.column_config.TextColumn(width=55, disabled=True),
-            '契約月份': st.column_config.TextColumn(width=65, disabled=True),
-            '名稱': st.column_config.TextColumn(width=120, disabled=True),
+            '期貨代碼': st.column_config.TextColumn(width=48, disabled=True),
+            '契約月份': st.column_config.TextColumn(width=58, disabled=True),
+            '名稱': st.column_config.TextColumn(width=88, disabled=True),
             '交易時段': st.column_config.TextColumn(width=55, disabled=True),
-            '當日成交口數': st.column_config.NumberColumn(format='%d', width=85, disabled=True),
-            '未平倉量': st.column_config.NumberColumn(format='%d', width=80, disabled=True),
-            '方向': st.column_config.TextColumn(width=55, disabled=True),
-            '支撐壓力': st.column_config.TextColumn(width=135, disabled=True),
-            '進出場點位': st.column_config.TextColumn(width=190, disabled=True, help='進＝條件成立後觀察價；停＝失效點；目＝第一目標。'),
-            '觸發條件': st.column_config.TextColumn(width=120, disabled=True, help='條件成立後才評估進場；未成立時不以預判價直接下單。'),
-            '當日漲停價': st.column_config.NumberColumn(format='%.12g', width=80, disabled=True, help='依期交所漲跌資料反推參考價後估算；實際限制以期交所與券商下單畫面為準。'),
-            '當日跌停價': st.column_config.NumberColumn(format='%.12g', width=80, disabled=True, help='依期交所漲跌資料反推參考價後估算；實際限制以期交所與券商下單畫面為準。'),
-            '收盤價': st.column_config.TextColumn('成交價', width=85, disabled=True),
-            '漲跌幅': st.column_config.TextColumn(width=85, disabled=True),
-            '所需保證金': st.column_config.NumberColumn(format='%,.0f', width=90, disabled=True),
-            '維持保證金': st.column_config.NumberColumn(format='%,.0f', width=90, disabled=True),
+            '當日成交口數': st.column_config.NumberColumn(format='%d', width=72, disabled=True),
+            '未平倉量': st.column_config.NumberColumn(format='%d', width=70, disabled=True),
+            '方向': st.column_config.TextColumn(width=48, disabled=True),
+            '支撐壓力': st.column_config.TextColumn(width=108, disabled=True),
+            '進出場點位': st.column_config.TextColumn(width=155, disabled=True, help='進＝條件成立後觀察價；停＝失效點；目＝第一目標。'),
+            '觸發條件': st.column_config.TextColumn(width=96, disabled=True, help='條件成立後才評估進場；未成立時不以預判價直接下單。'),
+            '當日漲停價': st.column_config.NumberColumn(format='%.12g', width=70, disabled=True, help='依期交所漲跌資料反推參考價後估算；實際限制以期交所與券商下單畫面為準。'),
+            '當日跌停價': st.column_config.NumberColumn(format='%.12g', width=70, disabled=True, help='依期交所漲跌資料反推參考價後估算；實際限制以期交所與券商下單畫面為準。'),
+            '收盤價': st.column_config.TextColumn('成交價', width=70, disabled=True),
+            '漲跌幅': st.column_config.TextColumn(width=70, disabled=True),
+            '所需保證金': st.column_config.NumberColumn(format='%,.0f', width=82, disabled=True),
+            '維持保證金': st.column_config.NumberColumn(format='%,.0f', width=82, disabled=True),
             '訊號狀態': st.column_config.TextColumn(width=105, disabled=True, help='等待、接近、觸發或失效；不會自動下單。'),
             '信心分': st.column_config.ProgressColumn('進場信心', min_value=0, max_value=100, format='%d', width=90, help='綜合觸發位置、成交量、未平倉、價差、報價與市場方向；代表條件一致度，不是勝率。'),
             '信心判讀': st.column_config.TextColumn(width=80, disabled=True, help='高／中高／中／低；若追離進場點、條件失效或資料過期會自動降級。'),
@@ -9055,7 +9214,7 @@ def render_futures_strategy_room():
                 width=75, disabled=True,
                 help='最佳賣價－最佳買價換算成跳動單位；跳數越少通常代表進出成本較低、報價較連續。無即時買賣價時顯示「—」。'
             ),
-            '量倉比': st.column_config.NumberColumn(format='%.2f', width=70, disabled=True, help='當日成交口數 ÷ 未平倉量。'),
+            '量倉比': st.column_config.NumberColumn(format='%.12g', width=58, disabled=True, help='當日成交口數 ÷ 未平倉量。'),
             '到期提醒': st.column_config.TextColumn(
                 width=75, disabled=True,
                 help='依目前契約距到期日的天數提示。接近到期時注意流動性、轉倉與近月／次月價格差；不是強制平倉通知。'
@@ -9726,13 +9885,13 @@ with stock_strategy_container:
                     df_display.at[i, 'VWAP 狀態'] = result['vwap_status']
                     df_display.at[i, '開盤區間'] = result['opening_range']
                     volume_ratio = _as_float(row.get('_daytrade_volume_ratio'))
-                    df_display.at[i, '量能'] = f"{volume_ratio:.2f}x" if volume_ratio is not None else "資料不足"
+                    df_display.at[i, '量能'] = f"{_format_compact_number(volume_ratio, 2)}x" if volume_ratio is not None else "資料不足"
                     df_display.at[i, '當沖評分'] = result['score']
                     df_display.at[i, '盤中觸發'] = result['rule']
                 else:
                     df_display.at[i, '風險'] = result['risk']
                     df_display.at[i, '評分'] = result['score']
-                    df_display.at[i, '乖離'] = f"{result['extension']:+.1f} ATR" if result['extension'] is not None else "—"
+                    df_display.at[i, '乖離'] = f"{_format_compact_number(result['extension'], 1, signed=True)} ATR" if result['extension'] is not None else "—"
                     df_display.at[i, '隔日規則'] = result['rule']
                 trade_plan = build_trade_plan(row, risk_direction, is_daytrade_mode, result)
                 result['trade_plan'] = trade_plan
@@ -9915,31 +10074,31 @@ with stock_strategy_container:
         risk_column_config = {}
         if risk_preview_enabled:
             risk_column_config = {
-                "風險": st.column_config.TextColumn("處置／注意", width=125, disabled=True, help="官方注意與處置查核結果；不預測漲跌方向。"),
-                "訊號狀態": st.column_config.TextColumn(width=105, disabled=True, help="將原條件濃縮為等待、接近、觸發或暫停；原規則仍在明細。"),
-                "市場一致": st.column_config.TextColumn(width=110, disabled=True, help="目前方向是否與近月臺指期環境一致；不改變原排序。"),
-                "資料狀態": st.column_config.TextColumn(width=115, disabled=True, help="顯示即時、手動／暫存、官方日行情或資料過期。"),
+                "風險": st.column_config.TextColumn("處置／注意", width=95, disabled=True, help="官方注意與處置查核結果；不預測漲跌方向。"),
+                "訊號狀態": st.column_config.TextColumn(width=88, disabled=True, help="將原條件濃縮為等待、接近、觸發或暫停；原規則仍在明細。"),
+                "市場一致": st.column_config.TextColumn(width=90, disabled=True, help="目前方向是否與近月臺指期環境一致；不改變原排序。"),
+                "資料狀態": st.column_config.TextColumn(width=96, disabled=True, help="顯示即時、手動／暫存、官方日行情或資料過期。"),
                 "買賣價差": st.column_config.TextColumn(
                     width=75, disabled=True,
                     help="即時最佳賣價與最佳買價的距離，換算為跳動單位；跳數越少通常代表報價較連續、進出成本較低。無即時買賣價時顯示「—」。"
                 ),
                 "信心分": st.column_config.ProgressColumn("進場信心", min_value=0, max_value=100, format="%d", width=100, help="綜合方向條件、觸發位置、市場一致與資料狀態；代表條件一致度，不是勝率。"),
-                "信心判讀": st.column_config.TextColumn(width=80, disabled=True, help="高／中高／中／低；追離進場點、條件失效或資料過期時會降級。"),
-                "支撐壓力": st.column_config.TextColumn(width=160, disabled=True, help="當沖採開盤區間與 VWAP；隔日／波段沿用原戰略價位，顯示最接近目前價格的支撐與壓力。"),
+                "信心判讀": st.column_config.TextColumn(width=70, disabled=True, help="高／中高／中／低；追離進場點、條件失效或資料過期時會降級。"),
+                "支撐壓力": st.column_config.TextColumn(width=120, disabled=True, help="當沖採開盤區間與 VWAP；隔日／波段沿用原戰略價位，顯示最接近目前價格的支撐與壓力。"),
             }
             if is_daytrade_mode:
                 risk_column_config.update({
-                    "VWAP 狀態": st.column_config.TextColumn(width=125, disabled=True, help="價格相對成交量加權平均價的位置；上方偏多、下方偏空。"),
-                    "開盤區間": st.column_config.TextColumn(width=125, disabled=True, help="09:00–09:15 顯示形成中的即時低點－高點；09:15 後固定為完整開盤區間。"),
-                    "量能": st.column_config.TextColumn(width=80, disabled=True, help="目前累積量相對最近交易日同時段平均量。"),
-                    "盤中觸發": st.column_config.TextColumn(width=190, disabled=True, help="僅在盤中條件同時成立時提供觀察提示，不是自動買賣指令。"),
-                    "進出場預判": st.column_config.TextColumn(width=195, disabled=True, help="通過條件後，以開盤區間與 VWAP 推估進場、策略失效離場與第一目標；僅供觀察與回測。"),
+                    "VWAP 狀態": st.column_config.TextColumn(width=95, disabled=True, help="價格相對成交量加權平均價的位置；上方偏多、下方偏空。"),
+                    "開盤區間": st.column_config.TextColumn(width=100, disabled=True, help="09:00–09:15 顯示形成中的即時低點－高點；09:15 後固定為完整開盤區間。"),
+                    "量能": st.column_config.TextColumn(width=65, disabled=True, help="目前累積量相對最近交易日同時段平均量。"),
+                    "盤中觸發": st.column_config.TextColumn(width=150, disabled=True, help="僅在盤中條件同時成立時提供觀察提示，不是自動買賣指令。"),
+                    "進出場預判": st.column_config.TextColumn(width=160, disabled=True, help="通過條件後，以開盤區間與 VWAP 推估進場、策略失效離場與第一目標；僅供觀察與回測。"),
                 })
             else:
                 risk_column_config.update({
-                    "乖離": st.column_config.TextColumn(width=90, disabled=True, help="收盤價相對 20 日線的 ATR 距離；數值越大越不宜追價或追空。"),
-                    "隔日規則": st.column_config.TextColumn(width=160, disabled=True, help="僅在隔日條件成真時才列入評估，不是自動買賣指令。"),
-                    "進出場預判": st.column_config.TextColumn(width=195, disabled=True, help="通過條件後，以昨高／昨低與 ATR 推估進場、策略失效離場與第一目標；僅供觀察與回測。"),
+                    "乖離": st.column_config.TextColumn(width=75, disabled=True, help="收盤價相對 20 日線的 ATR 距離；數值越大越不宜追價或追空。"),
+                    "隔日規則": st.column_config.TextColumn(width=130, disabled=True, help="僅在隔日條件成真時才列入評估，不是自動買賣指令。"),
+                    "進出場預判": st.column_config.TextColumn(width=160, disabled=True, help="通過條件後，以昨高／昨低與 ATR 推估進場、策略失效離場與第一目標；僅供觀察與回測。"),
                 })
 
         stock_table_signature = abs(hash((
@@ -9953,13 +10112,13 @@ with stock_strategy_container:
             column_config={
                 **risk_column_config,
                 "移除": st.column_config.CheckboxColumn("刪除", width=40, help="勾選後刪除並自動遞補"),
-                "代號": st.column_config.TextColumn(disabled=True, width=50), 
-                "名稱": st.column_config.TextColumn(disabled=True, width="small"),
-                "收盤價": st.column_config.TextColumn("成交價", width="small", disabled=True),
-                "漲跌幅": st.column_config.TextColumn(disabled=True, width="small"),
-                "期貨": st.column_config.TextColumn(width=80, disabled=True),
-                "當日漲停價": st.column_config.TextColumn(width="small", disabled=True),
-                "當日跌停價": st.column_config.TextColumn(width="small", disabled=True),
+                "代號": st.column_config.TextColumn(disabled=True, width=_content_column_width(df_display.get("代號"), 44, 62)),
+                "名稱": st.column_config.TextColumn(disabled=True, width=_content_column_width(df_display.get("名稱"), 48, 88)),
+                "收盤價": st.column_config.TextColumn("成交價", width=_content_column_width(df_display.get("收盤價"), 52, 78), disabled=True),
+                "漲跌幅": st.column_config.TextColumn(disabled=True, width=_content_column_width(df_display.get("漲跌幅"), 56, 78)),
+                "期貨": st.column_config.TextColumn(width=_content_column_width(df_display.get("期貨"), 44, 70), disabled=True),
+                "當日漲停價": st.column_config.TextColumn(width=_content_column_width(df_display.get("當日漲停價"), 54, 78), disabled=True),
+                "當日跌停價": st.column_config.TextColumn(width=_content_column_width(df_display.get("當日跌停價"), 54, 78), disabled=True),
                 "成交價價差": st.column_config.TextColumn(
                     width=80, disabled=True,
                     help="目前成交價減去昨日收盤價；正值為上漲點數，負值為下跌點數。"
@@ -10381,11 +10540,11 @@ with stock_strategy_container:
                             df_indep.at[i, 'VWAP 狀態'] = result['vwap_status']
                             df_indep.at[i, '開盤區間'] = result['opening_range']
                             volume_ratio = _as_float(row.get('_daytrade_volume_ratio'))
-                            df_indep.at[i, '量能'] = f"{volume_ratio:.2f}x" if volume_ratio is not None else "資料不足"
+                            df_indep.at[i, '量能'] = f"{_format_compact_number(volume_ratio, 2)}x" if volume_ratio is not None else "資料不足"
                             df_indep.at[i, '盤中觸發'] = result['rule']
                         else:
                             df_indep.at[i, '風險'] = result['risk']
-                            df_indep.at[i, '乖離'] = f"{result['extension']:+.1f} ATR" if result['extension'] is not None else "—"
+                            df_indep.at[i, '乖離'] = f"{_format_compact_number(result['extension'], 1, signed=True)} ATR" if result['extension'] is not None else "—"
                             df_indep.at[i, '隔日規則'] = result['rule']
                         trade_plan = build_trade_plan(row, indep_direction, indep_is_daytrade, result)
                         result['trade_plan'] = trade_plan
@@ -10470,40 +10629,40 @@ with stock_strategy_container:
                 indep_column_config = {}
                 if risk_preview_enabled:
                     indep_column_config.update({
-                        "風險": st.column_config.TextColumn("處置／注意", width=125, disabled=True, help="官方注意與處置查核結果；不預測漲跌方向。"),
-                        "訊號狀態": st.column_config.TextColumn(width=105, disabled=True),
+                        "風險": st.column_config.TextColumn("處置／注意", width=95, disabled=True, help="官方注意與處置查核結果；不預測漲跌方向。"),
+                        "訊號狀態": st.column_config.TextColumn(width=88, disabled=True),
                         "信心分": st.column_config.ProgressColumn("進場信心", min_value=0, max_value=100, format="%d", width=100, help="條件一致度，不是勝率。"),
                         "信心判讀": st.column_config.TextColumn(width=80, disabled=True),
-                        "支撐壓力": st.column_config.TextColumn(width=160, disabled=True),
-                        "市場一致": st.column_config.TextColumn(width=110, disabled=True),
-                        "資料狀態": st.column_config.TextColumn(width=115, disabled=True),
+                        "支撐壓力": st.column_config.TextColumn(width=120, disabled=True),
+                        "市場一致": st.column_config.TextColumn(width=90, disabled=True),
+                        "資料狀態": st.column_config.TextColumn(width=96, disabled=True),
                     })
                     if indep_is_daytrade:
                         indep_column_config.update({
-                            "VWAP 狀態": st.column_config.TextColumn(width=125, disabled=True, help="偏多：站上 VWAP；偏空：跌破 VWAP。"),
-                            "開盤區間": st.column_config.TextColumn(width=125, disabled=True, help="09:00–09:15 顯示形成中的即時低點－高點；09:15 後固定為完整開盤區間。"),
-                            "量能": st.column_config.TextColumn(width=80, disabled=True, help="目前累積量相對最近交易日同時段平均量。"),
-                            "盤中觸發": st.column_config.TextColumn(width=190, disabled=True, help="僅為盤中觀察提示，不是自動買賣指令。"),
-                            "進出場預判": st.column_config.TextColumn(width=195, disabled=True, help="以開盤區間與 VWAP 推估進場、策略失效離場與第一目標。"),
+                            "VWAP 狀態": st.column_config.TextColumn(width=95, disabled=True, help="偏多：站上 VWAP；偏空：跌破 VWAP。"),
+                            "開盤區間": st.column_config.TextColumn(width=100, disabled=True, help="09:00–09:15 顯示形成中的即時低點－高點；09:15 後固定為完整開盤區間。"),
+                            "量能": st.column_config.TextColumn(width=65, disabled=True, help="目前累積量相對最近交易日同時段平均量。"),
+                            "盤中觸發": st.column_config.TextColumn(width=150, disabled=True, help="僅為盤中觀察提示，不是自動買賣指令。"),
+                            "進出場預判": st.column_config.TextColumn(width=160, disabled=True, help="以開盤區間與 VWAP 推估進場、策略失效離場與第一目標。"),
                         })
                     else:
                         indep_column_config.update({
-                            "乖離": st.column_config.TextColumn(width=90, disabled=True),
-                            "隔日規則": st.column_config.TextColumn(width=160, disabled=True),
-                            "進出場預判": st.column_config.TextColumn(width=195, disabled=True, help="以昨高／昨低與 ATR 推估進場、策略失效離場與第一目標。"),
+                            "乖離": st.column_config.TextColumn(width=75, disabled=True),
+                            "隔日規則": st.column_config.TextColumn(width=130, disabled=True),
+                            "進出場預判": st.column_config.TextColumn(width=160, disabled=True, help="以昨高／昨低與 ATR 推估進場、策略失效離場與第一目標。"),
                         })
 
                 st.dataframe(
                     styled_indep,
                     column_config={
                         **indep_column_config,
-                        "代號": st.column_config.TextColumn(width=50), 
-                        "名稱": st.column_config.TextColumn(width="small"),
-                        "收盤價": st.column_config.TextColumn("成交價", width="small"),
-                        "漲跌幅": st.column_config.TextColumn(width="small"),
-                        "期貨": st.column_config.TextColumn(width=80), 
-                        "當日漲停價": st.column_config.TextColumn(width="small"),
-                        "當日跌停價": st.column_config.TextColumn(width="small"),
+                        "代號": st.column_config.TextColumn(width=_content_column_width(df_indep.get("代號"), 44, 62)),
+                        "名稱": st.column_config.TextColumn(width=_content_column_width(df_indep.get("名稱"), 48, 88)),
+                        "收盤價": st.column_config.TextColumn("成交價", width=_content_column_width(df_indep.get("收盤價"), 52, 78)),
+                        "漲跌幅": st.column_config.TextColumn(width=_content_column_width(df_indep.get("漲跌幅"), 56, 78)),
+                        "期貨": st.column_config.TextColumn(width=_content_column_width(df_indep.get("期貨"), 44, 70)),
+                        "當日漲停價": st.column_config.TextColumn(width=_content_column_width(df_indep.get("當日漲停價"), 54, 78)),
+                        "當日跌停價": st.column_config.TextColumn(width=_content_column_width(df_indep.get("當日跌停價"), 54, 78)),
                         "成交價價差": st.column_config.TextColumn(
                             width=80,
                             help="目前成交價減去昨日收盤價；正值為上漲點數，負值為下跌點數。"
@@ -10545,7 +10704,7 @@ with tab2:
     with tab2_1:
         c1, c2, c3, c4, c5 = st.columns(5)
         with c1:
-            calc_price = st.number_input("基準價格", value=float(st.session_state.calc_base_price), step=0.01, format="%.2f", key="input_base_price")
+            calc_price = st.number_input("基準價格", value=float(st.session_state.calc_base_price), step=0.01, format="%.12g", key="input_base_price")
             if calc_price != st.session_state.calc_base_price:
                 st.session_state.calc_base_price = calc_price
                 st.session_state.calc_view_price = apply_tick_rules(calc_price)
@@ -10559,7 +10718,7 @@ with tab2:
         with stop_col1:
             day_stop_loss_percent = st.number_input(
                 "停損幅度 (%)", value=5.0, min_value=0.0, max_value=100.0,
-                step=0.5, format="%.1f", key="day_stop_loss_percent"
+                step=0.5, format="%.12g", key="day_stop_loss_percent"
             )
         with stop_col2:
             day_is_long = "多" in direction
@@ -10572,7 +10731,7 @@ with tab2:
         col_t1, col_t2 = st.columns([1, 4])
         with col_t1:
             # 將 value 設為 None 並加入 placeholder，實現預設為空值
-            target_p = st.number_input("輸入目標價", value=None, step=0.5, format="%.2f", key="input_target_price", placeholder="請輸入...")
+            target_p = st.number_input("輸入目標價", value=None, step=0.5, format="%.12g", key="input_target_price", placeholder="請輸入...")
         with col_t2:
             fee_rate = 0.001425; tax_rate = 0.0015
             base_p = st.session_state.calc_base_price
@@ -10607,10 +10766,10 @@ with tab2:
                 
                 html_str = f"""
                 <div style="font-size: 16px; display: flex; flex-wrap: wrap; gap: 15px; padding: 10px; background-color: rgba(255,255,255,0.05); border-radius: 8px; margin-top: 28px;">
-                    <div>預估損益: <span style="color: {t_color}; font-weight: bold;">{int(t_profit):,} ({t_roi:+.2f}%)</span></div>
+                    <div>預估損益: <span style="color: {t_color}; font-weight: bold;">{int(t_profit):,} ({_format_compact_number(t_roi, 2, signed=True)}%)</span></div>
                     <div>手續費總和: <span style="color: #cccccc;">{int(t_total_fee):,}</span></div>
                     <div>交易稅: <span style="color: #cccccc;">{int(t_tax):,}</span></div>
-                    <div>價差: <span style="color: {diff_color}; font-weight: bold;">{diff_val:+.2f}</span></div>
+                    <div>價差: <span style="color: {diff_color}; font-weight: bold;">{_format_compact_number(diff_val, 2, signed=True)}</span></div>
                 </div>
                 """
             else:
@@ -10681,7 +10840,7 @@ with tab2:
             is_base = (abs(p - base_p) < 0.001)
             
             calc_data.append({
-                "成交價": fmt_price(p), "漲跌": diff_str, "預估損益": int(profit), "報酬率%": f"{roi:+.2f}%",
+                "成交價": fmt_price(p), "漲跌": diff_str, "預估損益": int(profit), "報酬率%": f"{_format_compact_number(roi, 2, signed=True)}%",
                 "手續費": int(total_fee), "交易稅": int(tax), "_profit": profit, "_note_type": note_type, "_is_base": is_base
             })
             
@@ -10709,7 +10868,7 @@ with tab2:
     with tab2_2:
         c2_1, c2_2, c2_3, c2_4, c2_5 = st.columns(5)
         with c2_1:
-            swing_calc_price = st.number_input("基準價格", value=None, step=0.5, format="%.2f", key="input_swing_base_price", placeholder="請輸入...")
+            swing_calc_price = st.number_input("基準價格", value=None, step=0.5, format="%.12g", key="input_swing_base_price", placeholder="請輸入...")
         with c2_2: swing_shares = st.number_input("股數", value=1000, step=1000, key="swing_shares")
         with c2_3: swing_discount = st.number_input("手續費折扣 (折)", value=2.8, step=0.1, min_value=0.1, max_value=10.0, key="swing_discount")
         with c2_4: swing_min_fee = st.number_input("最低手續費 (元)", value=20, step=1, key="swing_min_fee")
@@ -10737,7 +10896,7 @@ with tab2:
         with swing_stop_col1:
             swing_stop_loss_percent = st.number_input(
                 "停損幅度 (%)", value=5.0, min_value=0.0, max_value=100.0,
-                step=0.5, format="%.1f", key="swing_stop_loss_percent"
+                step=0.5, format="%.12g", key="swing_stop_loss_percent"
             )
         with swing_stop_col2:
             swing_is_long = swing_type != "融券(空)"
@@ -10755,7 +10914,7 @@ with tab2:
         st.markdown("##### 🎯 目標價快速試算")
         col_st1, col_st2 = st.columns([1, 4])
         with col_st1:
-            swing_target_p = st.number_input("輸入目標價", value=None, step=0.5, format="%.2f", key="swing_target_price", placeholder="請輸入...")
+            swing_target_p = st.number_input("輸入目標價", value=None, step=0.5, format="%.12g", key="swing_target_price", placeholder="請輸入...")
         with col_st2:
             if swing_calc_price is not None and swing_target_p is not None:
                 s_base_p = swing_calc_price
@@ -10805,7 +10964,7 @@ with tab2:
                 
                 swing_html_str = (
                     f"<div style='font-size: 16px; display: flex; flex-wrap: wrap; gap: 15px; padding: 10px; background-color: rgba(255,255,255,0.05); border-radius: 8px; margin-top: 28px;'>"
-                    f"<div>預估損益: <span style='color: {t_color}; font-weight: bold;'>{int(t_profit):,} ({t_roi:+.2f}%)</span></div>"
+                    f"<div>預估損益: <span style='color: {t_color}; font-weight: bold;'>{int(t_profit):,} ({_format_compact_number(t_roi, 2, signed=True)}%)</span></div>"
                     f"<div>手續費總和: <span style='color: #cccccc;'>{int(t_total_fee):,}</span></div>"
                     f"<div>交易稅: <span style='color: #cccccc;'>{int(t_tax):,}</span></div>"
                 )
@@ -10813,7 +10972,7 @@ with tab2:
                     swing_html_str += f"<div>利息: <span style='color: #cccccc;'>{int(t_interest):,}</span></div>"
                     if swing_type == "融券(空)":
                         swing_html_str += f"<div>借券費: <span style='color: #cccccc;'>{int(t_borrow_fee):,}</span></div>"
-                swing_html_str += f"<div>價差: <span style='color: {t_diff_color}; font-weight: bold;'>{t_diff_val:+.2f}</span></div></div>"
+                swing_html_str += f"<div>價差: <span style='color: {t_diff_color}; font-weight: bold;'>{_format_compact_number(t_diff_val, 2, signed=True)}</span></div></div>"
                 st.markdown(swing_html_str, unsafe_allow_html=True)
             else:
                 st.markdown(f"""
@@ -10904,15 +11063,15 @@ with tab2:
                 is_base = (abs(p - s_base_p) < 0.001)
                 
                 row_data = {
-                    "成交價": fmt_price(p), "漲跌": diff_str, "預估損益": int(profit), "報酬率%": f"{roi:+.2f}%",
+                    "成交價": fmt_price(p), "漲跌": diff_str, "預估損益": int(profit), "報酬率%": f"{_format_compact_number(roi, 2, signed=True)}%",
                     "手續費": int(total_fee), "交易稅": int(tax)
                 }
                 if swing_type in ["融資(多)", "融券(空)"]:
                     if swing_type == "融券(空)":
                         row_data["借券費"] = int(borrow_fee)
                     row_data["利息"] = int(interest)
-                    row_data["維持率%"] = f"{maintenance_ratio:.1f}%" if maintenance_ratio > 0 else "-"
-                    row_data["強制回補價"] = f"{call_price:.2f}" if call_price > 0 else "-"
+                    row_data["維持率%"] = f"{_format_compact_number(maintenance_ratio, 1)}%" if maintenance_ratio > 0 else "-"
+                    row_data["強制回補價"] = _format_compact_number(call_price, 2) if call_price > 0 else "-"
                     
                 row_data["_profit"] = profit
                 row_data["_is_base"] = is_base
@@ -11335,7 +11494,7 @@ with tab2:
 
             c_p1, c_p2 = st.columns(2)
             with c_p1:
-                entry_p = st.number_input("進場價 (點)", value=None, format="%.2f", placeholder="輸入進場價", key="opt_entry_p")
+                entry_p = st.number_input("進場價 (點)", value=None, format="%.12g", placeholder="輸入進場價", key="opt_entry_p")
                 
                 # --- 顯示最新成交價及重新整理按鈕 ---
                 if opt_main_tab in ["台指期", "個股期貨"]:
@@ -11364,7 +11523,7 @@ with tab2:
                             sign = "+" if diff > 0 else ""
                             # 新增：計算漲跌幅百分比
                             pct_chg = (diff / ref_p * 100) if ref_p else 0.0
-                            st.markdown(f"<div style='font-size:20px; margin:0px;'>最新成交價: <span style='color:{color}; font-weight:bold;'>{rt_p:g}</span> <span style='font-size:16px; color:{color};'>({sign}{diff:g})({pct_chg:+.2f}%)</span></div>", unsafe_allow_html=True)
+                            st.markdown(f"<div style='font-size:20px; margin:0px;'>最新成交價: <span style='color:{color}; font-weight:bold;'>{rt_p:g}</span> <span style='font-size:16px; color:{color};'>({_format_compact_number(diff, 2, signed=True)})({_format_compact_number(pct_chg, 2, signed=True)}%)</span></div>", unsafe_allow_html=True)
                         else:
                             st.markdown("<div style='font-size:20px; margin:0px; color:#aaa;'>最新成交價: 尚未更新</div>", unsafe_allow_html=True)
                     with c_rt2:
@@ -11374,10 +11533,10 @@ with tab2:
                 # ------------------------------------
 
             with c_p2:
-                exit_p = st.number_input("出場/目標價 (點)", value=None, format="%.2f", placeholder="輸入目標價", key="opt_exit_p")
+                exit_p = st.number_input("出場/目標價 (點)", value=None, format="%.12g", placeholder="輸入目標價", key="opt_exit_p")
 
             st.markdown("###### ⇆ 停損及保證金設定")
-            sl_p = st.number_input("停損價 (點) - 用於風報比", value=None, format="%.2f", placeholder="輸入停損價", key="opt_sl_p")
+            sl_p = st.number_input("停損價 (點) - 用於風報比", value=None, format="%.12g", placeholder="輸入停損價", key="opt_sl_p")
             
             # 手續費記憶
             config = load_config()
@@ -11550,7 +11709,7 @@ with tab2:
                     st.markdown(f"""
                     <div class="opt-card">
                         <div class="opt-label">預估保證金總額</div>
-                        <div class="opt-value">{int(actual_margin_req * opt_lots):,} 元 <span style="font-size: 14px; font-weight: normal; color: #aaa;">(報酬率: {roi:.2f}%)</span></div>
+                        <div class="opt-value">{int(actual_margin_req * opt_lots):,} 元 <span style="font-size: 14px; font-weight: normal; color: #aaa;">(報酬率: {_format_compact_number(roi, 2)}%)</span></div>
                     </div>
                     """, unsafe_allow_html=True)
 
@@ -11561,7 +11720,7 @@ with tab2:
                         reward_pt = pt_diff if pt_diff > 0 else 0
                         rrr = reward_pt / risk_pt if risk_pt != 0 else 0
 
-                        st.markdown(f"<div style='text-align: right; font-size: 20px; font-weight: bold; margin-bottom: 5px;'>1 : {rrr:.2f}</div>", unsafe_allow_html=True)
+                        st.markdown(f"<div style='text-align: right; font-size: 20px; font-weight: bold; margin-bottom: 5px;'>1 : {_format_compact_number(rrr, 2)}</div>", unsafe_allow_html=True)
 
                         total_rr = risk_pt + reward_pt
                         if total_rr > 0:
@@ -11725,9 +11884,11 @@ with tab_fibo:
                 )
             else:
                 p1.metric("最新期貨（日 K）", f"{plan['latest']:,.0f}")
-            p2.metric("費波支撐", f"{plan['support']:,.0f}")
-            p3.metric("費波壓力", f"{plan['resistance']:,.0f}")
-            p4.metric("費波區寬", f"± {plan['zone_points']:,.0f} 點")
+            render_index_level_metric(p2, "費波支撐", _format_compact_number(plan['support'], 0))
+            render_index_level_metric(p3, "費波壓力", _format_compact_number(plan['resistance'], 0))
+            render_index_level_metric(
+                p4, "費波區寬", f"± {_format_compact_number(plan['zone_points'], 0)} 點"
+            )
             if live_snapshot:
                 st.caption(
                     f"微台快照於 {datetime.now(pytz.timezone('Asia/Taipei')).strftime('%H:%M:%S')} 擷取；"
@@ -12159,7 +12320,12 @@ with tab_fibo:
                                 "綜合分數": _format_compact_number(candidate['score'], 2),
                             })
                         st.markdown("##### 履約價比較")
-                        st.dataframe(pd.DataFrame(comparison_rows), width='stretch', hide_index=True)
+                        comparison_frame = pd.DataFrame(comparison_rows)
+                        st.dataframe(
+                            comparison_frame,
+                            column_config=compact_table_column_config(comparison_frame),
+                            width='stretch', hide_index=True,
+                        )
                 elif display_spread:
                     st.warning(
                         f"永豐 Shioaji 尚未取得 {expiry_choice}（預期 `{expected_contract}`）的夜盤即時契約／報價，"
@@ -12201,12 +12367,12 @@ with tab_fibo:
                     f"""<div style='line-height:1.25'>
                     <div style='font-size:14px;font-weight:600;color:#dfe6e9'>最新</div>
                     <div style='font-size:31px;font-weight:700;color:{result['price_color']}'>{result['close']:,.0f}</div>
-                    <div style='font-size:15px;font-weight:700;color:{result['price_color']}'>{result['price_arrow']} {abs(result['change']):,.0f} ({result['change_pct']:+.2f}%)</div>
+                    <div style='font-size:15px;font-weight:700;color:{result['price_color']}'>{result['price_arrow']} {abs(result['change']):,.0f} ({_format_compact_number(result['change_pct'], 2, signed=True)}%)</div>
                     </div>""",
                     unsafe_allow_html=True
                 )
-                m2.metric("RSI(14)", f"{result['rsi']:.1f}")
-                m3.metric("5日動能", f"{result['momentum']:+.2f}%")
+                m2.metric("RSI(14)", _format_compact_number(result['rsi'], 1))
+                m3.metric("5日動能", f"{_format_compact_number(result['momentum'], 2, signed=True)}%")
                 st.markdown(f"**狀態：** <span style='color:{result['color']}; font-size:18px; font-weight:700'>{result['status']}</span>", unsafe_allow_html=True)
                 st.info(f"入場觀察：{result['entry']}")
                 st.warning(f"出場／風控：{result['exit_rule']}")
@@ -12217,14 +12383,19 @@ with tab_fibo:
                     "市場": label,
                     "溫度": result['score'],
                     "狀態": result['status'],
-                    "60日位置": f"{result['range_score']:.1f}",
+                    "60日位置": _format_compact_number(result['range_score'], 1),
                     "MA20": f"{result['ma20']:,.0f}",
                     "MA60": f"{result['ma60']:,.0f}",
                 })
 
         if summary_rows:
             st.markdown("#### 判讀摘要")
-            st.dataframe(pd.DataFrame(summary_rows), width='stretch', hide_index=True)
+            temperature_frame = pd.DataFrame(summary_rows)
+            st.dataframe(
+                temperature_frame,
+                column_config=compact_table_column_config(temperature_frame),
+                width='stretch', hide_index=True,
+            )
 
         with st.expander("溫度計判讀規則"):
             st.markdown("""
@@ -12357,9 +12528,9 @@ with tab_fibo:
         with col_table:
             col_h, col_l = st.columns(2)
             with col_h:
-                fibo_high = st.number_input("輸入波段高點：", value=None, step=1.0, format="%.2f")
+                fibo_high = st.number_input("輸入波段高點：", value=None, step=1.0, format="%.12g")
             with col_l:
-                fibo_low = st.number_input("輸入波段低點：", value=None, step=1.0, format="%.2f")
+                fibo_low = st.number_input("輸入波段低點：", value=None, step=1.0, format="%.12g")
                 
             if fibo_high is not None and fibo_low is not None:
                 if fibo_high > 0 and fibo_low > 0 and fibo_high >= fibo_low:
@@ -12373,7 +12544,7 @@ with tab_fibo:
                         r_label = "1" if r == 1.0 else ("0" if r == 0.0 else f"{r:g}")
                         fibo_data.append({
                             "比例": r_label,
-                            "計算點位": f"{calc_price:.2f}",
+                            "計算點位": _format_compact_number(calc_price, 2),
                             "_raw_r": r 
                         })
                     
@@ -12433,7 +12604,7 @@ with tab_db:
                 try:
                     v = float(val)
                     yi_val = v / 100000000
-                    return f"{int(v):,}  ({yi_val:+.2f}億)"
+                    return f"{int(v):,}  ({_format_compact_number(yi_val, 2, signed=True)}億)"
                 except:
                     return str(val)
             
@@ -12769,6 +12940,7 @@ with tab3:
                 fetch_fomc_events.clear()
                 fetch_bls_cpi_events.clear()
                 fetch_bls_employment_events.clear()
+                fetch_tradingview_us_calendar.clear()
                 fetch_adp_employment_events.clear()
                 build_us_initial_claims_events.clear()
                 st.toast("已更新市場與總經行事曆；公司資料請在獨立分頁同步。", icon="🔄")
@@ -12788,7 +12960,7 @@ with tab3:
                 )
                 st.toast("追蹤設定已儲存。", icon="✅")
 
-    st.caption("行事曆資料來源：TWSE、Federal Reserve、U.S. BLS、U.S. Department of Labor、ADP；公司財報與營收顯示獨立分頁的最近快照。")
+    st.caption("行事曆資料來源：TWSE、Federal Reserve、TradingView 免費經濟日曆（CPI／大非農備援）、U.S. BLS、U.S. Department of Labor、ADP；公司財報與營收顯示獨立分頁的最近快照。")
 
     def change_month(delta):
         st.session_state.cal_month += delta
@@ -12899,13 +13071,13 @@ with tab3:
             f"{label} {calendar_source_counts.get(label, 0)} 筆"
             for label in ('FOMC', 'CPI', '大非農', '小非農 ADP')
         )
-        st.caption(f"{sel_year} 官方高影響事件套用檢查：{us_count_text}。事件已換算為台灣日期與時間。")
+        st.caption(f"{sel_year} 高影響事件來源檢查：{us_count_text}。事件已換算為台灣日期與時間。")
         missing_core_sources = [
             label for label in ('FOMC', 'CPI', '大非農', '小非農 ADP')
             if calendar_source_counts.get(label, 0) == 0
         ]
         if missing_core_sources:
-            st.warning("以下官方來源本次未讀到資料：" + '、'.join(missing_core_sources) + "；可按『更新市場行事曆』重試。")
+            st.warning("以下資料來源本次未讀到資料：" + '、'.join(missing_core_sources) + "；可按『更新市場行事曆』重試。")
 
     def get_us_events(y, m):
         events = {}
