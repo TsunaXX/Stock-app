@@ -5776,7 +5776,14 @@ def render_strategy_validation_room():
 
     data = pd.DataFrame(records)
     data['_紀錄ID'] = data.index
-    market_options = ['全部'] + sorted(str(value) for value in data.get('市場', pd.Series(dtype=str)).dropna().unique())
+    available_markets = {
+        str(value) for value in data.get('市場', pd.Series(dtype=str)).dropna().unique()
+    }
+    market_options = (
+        ['全部']
+        + [market for market in ('股票', '期貨') if market in available_markets]
+        + sorted(available_markets - {'股票', '期貨'})
+    )
     filter_col1, filter_col2, export_col = st.columns([2, 2, 2])
     with filter_col1:
         market_filter = st.selectbox('市場', market_options, key='signal_log_market_filter')
@@ -6641,9 +6648,9 @@ def render_stock_strategy_explanation():
 - **VWAP**是盤中成交量加權平均成本。當沖時，價格在 VWAP 上方偏多、下方偏空，並搭配 09:00–09:15 開盤區間及量能確認。
 - **開盤首 15 分鐘**按「更新盤中資料與當沖條件」後，會以 Shioaji 即時串流＋1 分 K 顯示形成中的高低點與動能；09:15 後自動改用 5 分 K 與完整開盤區間。
 - **進／停／目**分別為條件成立後的觀察進場、策略失效離場與第一目標。信心分是條件一致度，不是勝率。
-- **注意股票**：證交所／櫃買中心依成交價、成交量、週轉率或集中度等異常交易指標公告，目的是提醒交易風險；不代表一定會漲跌，也不等同已被處置。
-- **處置股票**：主管機關已在公告期間採取較嚴格的交易措施，例如延長撮合間隔、預收款券或限制申報量；實際措施與起訖日仍以官方公告為準。
-- **處置／注意欄位**只代表官方名單查核，不是買賣訊號。即時價格與漲跌幅需登入 Shioaji；盤中取最新快照，盤後保留最後成交價與漲跌幅。
+- **表格「處置／注意」訊號**：`🟡 注意 1` 代表官方名單目前累計 1 次注意，仍可觀察但風險分會降低；`🔴 注意 2`（或更高）代表累計至少 2 次注意，預設「封鎖注意累計 ≥ 2」會排除；櫃買的「注意累計異常」也會至少標為注意 2。
+- `🚫 處置中` 代表已列入處置名單，直接排除；`🟢 官方名單未列示` 代表本次查核未列名；`⚪ 未查核` 代表官方來源尚未完整讀取，不會被誤當成安全。
+- 這些訊號只反映官方名單與本系統風險門檻，不預測漲跌方向。即時價格與漲跌幅需登入 Shioaji；盤中取最新快照，盤後保留最後成交價與漲跌幅。
 - 若股票有一般股期或小型股期，會依股票表順序自動附加到期貨戰略室排行之後。
         """)
 
