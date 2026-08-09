@@ -3199,7 +3199,6 @@ def select_txo_expiry(api, expiry_choice):
     """
     target_specs = get_txo_target_contract_specs(expiry_choice)
     requested_delivery_months = [item['delivery_month'] for item in target_specs]
-    options, source = get_txo_option_contracts(api, target_specs)
     today = datetime.now(pytz.timezone('Asia/Taipei')).date()
 
     def save_diagnostic(message):
@@ -3228,13 +3227,37 @@ def select_txo_expiry(api, expiry_choice):
             return True
         return expiry.weekday() == 2 and 15 <= expiry.day <= 21
 
-    # 週三／週五／月選先以期交所交割月份代碼指定合約：例如 202608W1、202607F5、202608。
-    # 即使舊版 Shioaji 未附 delivery_date，也可直接選到正確的週選契約。
+    # 「最近到期」必須按日期逐一查找。舊邏輯一次載入三種到期別後，只要第一批
+    # 沒找到 W2，就可能在後續迴圈直接接受 202608 月選，造成畫面上方與建議契約不一致。
+    options = []
+    sources = []
+    seen_contracts = set()
     for spec in target_specs:
-        exact_contracts = [contract for contract in options if delivery_month(contract) == spec['delivery_month']]
+        batch_options, batch_source = get_txo_option_contracts(api, [spec])
+        sources.append(batch_source)
+        exact_contracts = [
+            contract for contract in batch_options
+            if delivery_month(contract) == spec['delivery_month']
+            or expiry_date(contract) == spec['expiry']
+            or (
+                spec['root'] != 'TXO'
+                and delivery_month(contract) == spec['delivery_month'][:6]
+            )
+        ]
         if exact_contracts:
-            save_diagnostic(f"{source}｜已取得 {len(exact_contracts)} 筆 {spec['delivery_month']} 契約")
-            return exact_contracts, spec['expiry'], source
+            save_diagnostic(f"{batch_source}｜已取得 {len(exact_contracts)} 筆 {spec['delivery_month']} 契約")
+            return exact_contracts, spec['expiry'], batch_source
+        for contract in batch_options:
+            contract_key = str(
+                getattr(contract, 'code', '')
+                or getattr(contract, 'symbol', '')
+                or id(contract)
+            )
+            if contract_key not in seen_contracts:
+                options.append(contract)
+                seen_contracts.add(contract_key)
+
+    source = '／'.join(dict.fromkeys(sources)) if sources else '永豐 Shioaji 未提供 TXO 選擇權契約檔'
 
     active = [(contract, expiry_date(contract)) for contract in options]
     active = [(contract, expiry) for contract, expiry in active if expiry is not None and expiry >= today]
@@ -3255,6 +3278,22 @@ def select_txo_expiry(api, expiry_choice):
     selected_contracts = [contract for contract, expiry in active if expiry == selected_expiry]
     save_diagnostic(f"{source}｜已取得 {len(selected_contracts)} 筆 {selected_expiry:%Y/%m/%d} 到期契約")
     return selected_contracts, selected_expiry, source
+
+
+def txo_contract_delivery_label(contract, expiry):
+    """依實際到期日產生契約月份，修正部分 SDK 將週選只回傳 YYYYMM 的情況。"""
+    try:
+        normalized = str(getattr(contract, 'delivery_month', '')).replace('/', '').replace('-', '').upper()
+    except Exception:
+        normalized = ''
+    if expiry is None:
+        return normalized
+    week = (expiry.day - 1) // 7 + 1
+    if expiry.weekday() == 2 and not (15 <= expiry.day <= 21):
+        return f"{expiry:%Y%m}W{week}"
+    if expiry.weekday() == 4:
+        return f"{expiry:%Y%m}F{week}"
+    return f"{expiry:%Y%m}" if 15 <= expiry.day <= 21 and expiry.weekday() == 2 else (normalized or f"{expiry:%Y%m}")
 
 
 def txo_right_value(contract):
@@ -3564,7 +3603,7 @@ def get_txo_spread_quote(api, plan, expiry_choice, preferred_width=100):
         'breakeven': breakeven, 'model_probability': model_probability,
         'expected_pnl': expected_pnl, 'model_volatility': model_vol,
         'implied_volatility': implied_vol,
-        'source': source, 'delivery_month': str(getattr(short_contract, 'delivery_month', '')),
+        'source': source, 'delivery_month': txo_contract_delivery_label(short_contract, selected_expiry),
     }
 
 
@@ -3620,7 +3659,7 @@ def get_txo_directional_quote(api, plan, expiry_choice, moneyness_preference='�
         'strike': strike, 'expiry': selected_expiry, 'dte': dte,
         'premium': premium, 'max_loss': premium * 50 if premium is not None else None,
         'risk_level': '高' if dte <= 1 else ('中高' if dte <= 3 else '中'),
-        'source': source, 'delivery_month': str(getattr(contract, 'delivery_month', '')),
+        'source': source, 'delivery_month': txo_contract_delivery_label(contract, selected_expiry),
         'premium_basis': '永豐 Shioaji 快照：最佳賣價，缺值時以最後成交價替代',
         'bid': selected['bid'], 'ask': selected['ask'], 'spread': selected['spread'],
         'spread_pct': selected['spread_pct'], 'volume': selected['volume'],
@@ -5428,7 +5467,12 @@ def load_strategy_signal_log():
     try:
         with open(STRATEGY_SIGNAL_LOG_FILE, "r", encoding="utf-8") as file:
             records = json.load(file)
-        return records if isinstance(records, list) else []
+        if not isinstance(records, list):
+            return []
+        for record in records:
+            if isinstance(record, dict) and record.get('策略') == '當沖預覽':
+                record['策略'] = '當沖'
+        return records
     except (OSError, ValueError, TypeError):
         return []
 
@@ -5733,15 +5777,26 @@ def render_strategy_validation_room():
     data = pd.DataFrame(records)
     data['_紀錄ID'] = data.index
     market_options = ['全部'] + sorted(str(value) for value in data.get('市場', pd.Series(dtype=str)).dropna().unique())
-    strategy_options = ['全部'] + sorted(str(value) for value in data.get('策略', pd.Series(dtype=str)).dropna().unique())
     filter_col1, filter_col2, export_col = st.columns([2, 2, 2])
     with filter_col1:
         market_filter = st.selectbox('市場', market_options, key='signal_log_market_filter')
+
+    # 策略選單必須跟著市場分層。過去先列出全部市場的策略，切到「期貨」後仍可能
+    # 保留股票策略，產生空表；空表的 pandas dtype 又會與 TextColumn 設定衝突。
+    market_scoped_data = data.copy()
+    if market_filter != '全部':
+        market_scoped_data = market_scoped_data[
+            market_scoped_data['市場'].astype(str) == market_filter
+        ]
+    strategy_options = ['全部'] + sorted(
+        str(value)
+        for value in market_scoped_data.get('策略', pd.Series(dtype=str)).dropna().unique()
+    )
+    if st.session_state.get('signal_log_strategy_filter', '全部') not in strategy_options:
+        st.session_state['signal_log_strategy_filter'] = '全部'
     with filter_col2:
         strategy_filter = st.selectbox('策略', strategy_options, key='signal_log_strategy_filter')
-    filtered = data.copy()
-    if market_filter != '全部':
-        filtered = filtered[filtered['市場'].astype(str) == market_filter]
+    filtered = market_scoped_data.copy()
     if strategy_filter != '全部':
         filtered = filtered[filtered['策略'].astype(str) == strategy_filter]
 
@@ -5758,6 +5813,10 @@ def render_strategy_validation_room():
             file_name=f"strategy-signals-{datetime.now().strftime('%Y%m%d')}.csv",
             mime='text/csv', use_container_width=True,
         )
+
+    if filtered.empty:
+        st.info('此市場目前沒有符合所選策略的紀錄。')
+        return
 
     completed = filtered[filtered.get('結果', pd.Series(index=filtered.index, dtype=str)).isin(['達標', '停損'])]
     wins = int((completed.get('結果', pd.Series(dtype=str)) == '達標').sum()) if not completed.empty else 0
@@ -5892,8 +5951,16 @@ def render_strategy_validation_room():
         return styles
 
     table_key = f"strategy_validation_editor_{abs(hash(tuple(validation_display['_紀錄ID'].tolist())))}"
+    editor_frame = validation_display.drop(columns=['_紀錄ID']).copy()
+    editor_frame['刪除'] = editor_frame['刪除'].fillna(False).astype(bool)
+    editor_frame['評分'] = pd.to_numeric(editor_frame['評分'], errors='coerce').astype(float)
+    for column in display_columns:
+        if column != '評分':
+            editor_frame[column] = editor_frame[column].fillna('').astype(str)
     edited_validation = st.data_editor(
-        validation_display.drop(columns=['_紀錄ID']).style.apply(style_validation_row, axis=1),
+        # 可編輯表格不傳 Styler，避免 Streamlit 1.5x／Python 3.14 對 Styler
+        # 推斷出的 schema 與 TextColumn 設定不一致而直接拋出 APIException。
+        editor_frame,
         column_config={
             '刪除': st.column_config.CheckboxColumn('刪除', width=50, help='勾選後可一次刪除多筆訊號紀錄。'),
             '評分': st.column_config.NumberColumn('進場信心', format='%d'),
@@ -5985,10 +6052,25 @@ def load_fibo_tag_cache():
         return []
     try:
         with open(FIBO_TAG_CACHE_FILE, 'r', encoding='utf-8') as file:
-            tags = json.load(file)
+            payload = json.load(file)
+        tags = payload.get('tags', []) if isinstance(payload, dict) else payload
         return [str(tag) for tag in tags[:5]] if isinstance(tags, list) and len(tags) >= 5 else []
     except (OSError, ValueError, TypeError):
         return []
+
+
+def _write_json_atomic(path, payload, *, indent=None):
+    """完整寫入後再替換原檔，避免兩個 Streamlit 工作階段留下半份 JSON。"""
+    temp_path = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    with open(temp_path, 'w', encoding='utf-8') as file:
+        json.dump(payload, file, ensure_ascii=False, indent=indent)
+    os.replace(temp_path, path)
+
+
+@st.cache_resource(show_spinner=False)
+def get_data_cache_sync_lock():
+    """同一個 Streamlit 服務內，序列化不同裝置的遠端快取讀寫。"""
+    return threading.RLock()
 
 
 def save_fibo_config():
@@ -6005,12 +6087,16 @@ def save_fibo_config():
     if 'ma_w' in st.session_state:
         config['ma_width'] = st.session_state.ma_w
     try:
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(config, f, ensure_ascii=False)
-        with open(FIBO_TAG_CACHE_FILE, "w", encoding="utf-8") as file:
-            json.dump(fibo_tags, file, ensure_ascii=False, indent=2)
+        updated_at = datetime.now(pytz.timezone('Asia/Taipei')).isoformat()
+        config['fibo_tags_updated_at'] = updated_at
+        _write_json_atomic(CONFIG_FILE, config)
+        _write_json_atomic(
+            FIBO_TAG_CACHE_FILE,
+            {'version': 2, 'updated_at': updated_at, 'tags': fibo_tags},
+            indent=2,
+        )
     except Exception: pass
-    # 同步寫入 Google Sheets
+    # 標籤是明確儲存動作，傳入 fibo_tags 讓雲端同步不被視為一般股票快取寫入。
     save_data_cache(st.session_state.stock_data, st.session_state.ignored_stocks, st.session_state.all_candidates, st.session_state.saved_notes, fibo_tags)
 
 def save_data_cache(df, ignored_set, candidates=None, saved_notes=None, fibo_tags=None):
@@ -6018,8 +6104,26 @@ def save_data_cache(df, ignored_set, candidates=None, saved_notes=None, fibo_tag
         candidates = []
     if saved_notes is None:
         saved_notes = {}
+    explicit_fibo_tag_save = fibo_tags is not None
     if fibo_tags is None:
-        fibo_tags = st.session_state.get('fibo_tags', list(DEFAULT_FIBO_TAGS))
+        # 一般股票／期貨儲存不得拿目前瀏覽器的舊 session 覆寫其他裝置剛存的標籤。
+        dedicated_tags = load_fibo_tag_cache()
+        fibo_tags = (
+            dedicated_tags if len(dedicated_tags) >= 5
+            else st.session_state.get('fibo_tags', list(DEFAULT_FIBO_TAGS))
+        )
+    fibo_tags = [str(tag) for tag in list(fibo_tags)[:5]]
+    gsheet_api_url = get_app_secret('gsheet_api_url')
+    if gsheet_api_url and not explicit_fibo_tag_save:
+        try:
+            remote_response = requests.get(gsheet_api_url, timeout=3)
+            if remote_response.status_code == 200 and remote_response.text.strip():
+                remote_payload = json.loads(remote_response.text)
+                remote_tags = remote_payload.get('fibo_tags', []) if isinstance(remote_payload, dict) else []
+                if isinstance(remote_tags, list) and len(remote_tags) >= 5:
+                    fibo_tags = [str(tag) for tag in remote_tags[:5]]
+        except (requests.RequestException, ValueError, TypeError):
+            pass
     try:
         # 只在主執行緒做最輕量的複製，避免鎖死 UI
         df_save = df.fillna("").copy()
@@ -6049,32 +6153,63 @@ def save_data_cache(df, ignored_set, candidates=None, saved_notes=None, fibo_tag
             json.dump(data_to_save_local, f, ensure_ascii=False, indent=4)
         
         # 記憶體與速度終極優化：將「轉換 Dict」與「轉 JSON 字串」等高耗 RAM 動作全部移入背景執行緒
-        gsheet_api_url = get_app_secret('gsheet_api_url')
         if gsheet_api_url:
-            def bg_save(bg_df, bg_ignored, bg_cands, bg_notes, bg_tags, bg_cn, bg_signals):
+            def bg_save(bg_df, bg_ignored, bg_cands, bg_notes, bg_tags, bg_cn, bg_signals, sync_lock):
                 try:
-                    data_to_save = {
-                        "stock_data": bg_df.to_dict(orient='records'), 
-                        "ignored_stocks": bg_ignored, 
-                        "all_candidates": bg_cands, 
-                        "saved_notes": bg_notes, 
-                        "fibo_tags": bg_tags,
-                        "cached_notes": bg_cn,
-                        "strategy_signal_log": bg_signals,
-                    }
-                    json_str = json.dumps(data_to_save, ensure_ascii=False)
-                    requests.post(gsheet_api_url, json={"action": "save", "data": json_str}, timeout=5)
+                    with sync_lock:
+                        # 取得鎖後再讀一次遠端標籤，確保排在快速標籤儲存之後的舊分頁
+                        # 只更新股票資料，不會把剛同步的標籤覆寫掉。
+                        try:
+                            latest_response = requests.get(gsheet_api_url, timeout=3)
+                            if latest_response.status_code == 200 and latest_response.text.strip():
+                                latest_payload = json.loads(latest_response.text)
+                                latest_tags = latest_payload.get('fibo_tags', []) if isinstance(latest_payload, dict) else []
+                                if isinstance(latest_tags, list) and len(latest_tags) >= 5:
+                                    bg_tags = [str(tag) for tag in latest_tags[:5]]
+                        except (requests.RequestException, ValueError, TypeError):
+                            pass
+                        data_to_save = {
+                            "stock_data": bg_df.to_dict(orient='records'),
+                            "ignored_stocks": bg_ignored,
+                            "all_candidates": bg_cands,
+                            "saved_notes": bg_notes,
+                            "fibo_tags": bg_tags,
+                            "cached_notes": bg_cn,
+                            "strategy_signal_log": bg_signals,
+                        }
+                        json_str = json.dumps(data_to_save, ensure_ascii=False)
+                        requests.post(gsheet_api_url, json={"action": "save", "data": json_str}, timeout=5)
                 except Exception: pass
                 finally:
                     # 強制回收背景執行緒產生的巨大 JSON 與 Dict 記憶體
                     gc.collect()
 
-            import threading
-            threading.Thread(
-                target=bg_save,
-                args=(df_save, ignored_list, candidates, saved_notes, fibo_tags, cached_notes, signal_records),
-                daemon=True,
-            ).start()
+            if explicit_fibo_tag_save:
+                # 快速標籤按下儲存後先完成遠端寫入，避免另一個裝置緊接著以舊值覆蓋。
+                data_to_save = {
+                    "stock_data": df_save.to_dict(orient='records'),
+                    "ignored_stocks": ignored_list,
+                    "all_candidates": candidates,
+                    "saved_notes": saved_notes,
+                    "fibo_tags": fibo_tags,
+                    "cached_notes": cached_notes,
+                    "strategy_signal_log": signal_records,
+                }
+                with get_data_cache_sync_lock():
+                    requests.post(
+                        gsheet_api_url,
+                        json={"action": "save", "data": json.dumps(data_to_save, ensure_ascii=False)},
+                        timeout=5,
+                    )
+            else:
+                threading.Thread(
+                    target=bg_save,
+                    args=(
+                        df_save, ignored_list, candidates, saved_notes, fibo_tags,
+                        cached_notes, signal_records, get_data_cache_sync_lock(),
+                    ),
+                    daemon=True,
+                ).start()
     except Exception: pass
 
 def load_data_cache():
@@ -6506,7 +6641,9 @@ def render_stock_strategy_explanation():
 - **VWAP**是盤中成交量加權平均成本。當沖時，價格在 VWAP 上方偏多、下方偏空，並搭配 09:00–09:15 開盤區間及量能確認。
 - **開盤首 15 分鐘**按「更新盤中資料與當沖條件」後，會以 Shioaji 即時串流＋1 分 K 顯示形成中的高低點與動能；09:15 後自動改用 5 分 K 與完整開盤區間。
 - **進／停／目**分別為條件成立後的觀察進場、策略失效離場與第一目標。信心分是條件一致度，不是勝率。
-- **處置／注意**只代表官方名單查核。即時價格與漲跌幅需登入 Shioaji；盤中取最新快照，盤後保留最後成交價與漲跌幅。
+- **注意股票**：證交所／櫃買中心依成交價、成交量、週轉率或集中度等異常交易指標公告，目的是提醒交易風險；不代表一定會漲跌，也不等同已被處置。
+- **處置股票**：主管機關已在公告期間採取較嚴格的交易措施，例如延長撮合間隔、預收款券或限制申報量；實際措施與起訖日仍以官方公告為準。
+- **處置／注意欄位**只代表官方名單查核，不是買賣訊號。即時價格與漲跌幅需登入 Shioaji；盤中取最新快照，盤後保留最後成交價與漲跌幅。
 - 若股票有一般股期或小型股期，會依股票表順序自動附加到期貨戰略室排行之後。
         """)
 
@@ -7940,7 +8077,7 @@ RISK_METRIC_COLUMNS = [
     '_risk_close_position', '_risk_prev_high', '_risk_prev_low'
 ]
 
-# 當沖預覽只在使用者手動更新時回填，避免影響原本選股載入速度。
+# 當沖資料只在使用者手動更新時回填，避免影響原本選股載入速度。
 DAYTRADE_METRIC_COLUMNS = [
     '_daytrade_vwap', '_daytrade_or_high', '_daytrade_or_low',
     '_daytrade_volume_ratio', '_daytrade_close', '_daytrade_data_time'
@@ -9878,6 +10015,8 @@ with stock_strategy_container:
         stock_notify = False
 
         if risk_preview_enabled:
+            if st.session_state.get('risk_filter_strategy_mode') == '當沖預覽':
+                st.session_state['risk_filter_strategy_mode'] = '當沖'
             if 'risk_filter_market_data' not in st.session_state:
                 st.session_state.risk_filter_market_data = {
                     'attention': {}, 'disposition': [], 'updated': None, 'errors': []
@@ -9885,11 +10024,11 @@ with stock_strategy_container:
 
             with st.expander("🧭 選股條件與進場信心設定", expanded=False):
                 strategy_mode = st.radio(
-                    "策略模式", ["當沖預覽", "隔日／波段"], horizontal=True,
+                    "策略模式", ["當沖", "隔日／波段"], horizontal=True,
                     key="risk_filter_strategy_mode",
                     help="隔日／波段維持原有規則；09:00–09:15 採即時串流＋1 分 K，之後採 5 分 K、VWAP 與完整開盤區間，不會自動下單。"
                 )
-                is_daytrade_mode = strategy_mode == "當沖預覽"
+                is_daytrade_mode = strategy_mode == "當沖"
                 risk_col1, risk_col2, risk_col3 = st.columns(3)
                 with risk_col1:
                     risk_direction = st.radio("判斷方向", ["多頭", "空頭"], horizontal=True, key="risk_filter_direction")
@@ -9930,7 +10069,7 @@ with stock_strategy_container:
                     if is_daytrade_mode:
                         if st.button("📈 更新盤中資料與當沖條件", key="refresh_daytrade_filter_metrics"):
                             if not st.session_state.get('sj_logged_in', False) or st.session_state.get('sj_api') is None:
-                                st.warning("當沖預覽需要先登入永豐 Shioaji，才能取得即時串流與分 K 資料。")
+                                st.warning("當沖需要先登入永豐 Shioaji，才能取得即時串流與分 K 資料。")
                             else:
                                 with st.spinner("正在讀取即時串流與分 K、計算 VWAP 與開盤條件..."):
                                     refreshed_data, updated_count = refresh_daytrade_metrics_for_codes(
@@ -10506,6 +10645,8 @@ with stock_strategy_container:
         st.markdown("### ⚡獨立計算")
         indep_strategy_mode = None
         if risk_preview_enabled:
+            if st.session_state.get('indep_strategy_mode') == '當沖預覽':
+                st.session_state['indep_strategy_mode'] = '當沖'
             if 'risk_filter_market_data' not in st.session_state:
                 st.session_state.risk_filter_market_data = {
                     'attention': {}, 'disposition': [], 'updated': None, 'errors': []
@@ -10513,7 +10654,7 @@ with stock_strategy_container:
             indep_ctrl1, indep_ctrl2, indep_ctrl3 = st.columns(3)
             with indep_ctrl1:
                 indep_strategy_mode = st.radio(
-                    "獨立計算模式", ["當沖預覽", "隔日／波段"], horizontal=True,
+                    "獨立計算模式", ["當沖", "隔日／波段"], horizontal=True,
                     key="indep_strategy_mode",
                     help="09:00–09:15 會取得即時串流＋1 分 K；09:15 後改用 5 分 K，計算 VWAP、開盤區間與量能。"
                 )
@@ -10534,7 +10675,7 @@ with stock_strategy_container:
                         'updated': datetime.now(pytz.timezone('Asia/Taipei')).strftime('%Y/%m/%d %H:%M:%S'),
                         'errors': errors
                     }
-            if indep_strategy_mode == "當沖預覽":
+            if indep_strategy_mode == "當沖":
                 st.caption("VWAP 判讀：偏多＝站上 VWAP（紅色）；偏空＝跌破 VWAP（綠色）。09:00–09:15 使用快照＋1 分 K，之後使用 5 分 K。")
         col_q1, col_q2 = st.columns([5, 1.5])
         with col_q1:
@@ -10581,7 +10722,7 @@ with stock_strategy_container:
                             q_code, q_name, None, f_set, notes_copy,
                             c_map_q, sj_logged, sj_api_obj
                         )
-                        if result and risk_preview_enabled and indep_strategy_mode == "當沖預覽" and sj_logged and sj_api_obj is not None:
+                        if result and risk_preview_enabled and indep_strategy_mode == "當沖" and sj_logged and sj_api_obj is not None:
                             time.sleep(API_REQUEST_GAP_SECONDS)
                             intraday_df = fetch_shioaji_data(
                                 sj_api_obj, q_code, interval=indep_intraday_interval, lookback_days=3
@@ -10617,7 +10758,7 @@ with stock_strategy_container:
 
             if indep_data:
                 df_indep = pd.DataFrame(indep_data)
-                indep_is_daytrade = risk_preview_enabled and indep_strategy_mode == "當沖預覽"
+                indep_is_daytrade = risk_preview_enabled and indep_strategy_mode == "當沖"
                 indep_risk_details = {}
 
                 if risk_preview_enabled:
@@ -10626,7 +10767,7 @@ with stock_strategy_container:
                     indep_disposition_codes = indep_market_risk_data.get('disposition', [])
                     indep_market_lists_updated = bool(indep_market_risk_data.get('updated')) and not indep_market_risk_data.get('errors')
                     if indep_is_daytrade and (not sj_logged or sj_api_obj is None):
-                        st.info("當沖預覽需要登入永豐 Shioaji 才能取得即時串流與分 K；目前仍會顯示日 K 資料，但盤中條件會標示為資料不足。")
+                        st.info("當沖需要登入永豐 Shioaji 才能取得即時串流與分 K；目前仍會顯示日 K 資料，但盤中條件會標示為資料不足。")
                 
                 # 重新套用戰略備註與價差邏輯
                 for i, row in df_indep.iterrows():
