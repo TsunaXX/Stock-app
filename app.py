@@ -1513,6 +1513,78 @@ def build_us_initial_claims_events(year):
     return events
 
 
+def _calendar_business_days(year, month, closed_dates=()):
+    """建立指定月份的工作日；closed_dates 可帶入交易所正式與突發休市日。"""
+    closed = set(closed_dates or ())
+    return [
+        date(year, month, day)
+        for day in range(1, calendar.monthrange(year, month)[1] + 1)
+        if date(year, month, day).weekday() < 5 and date(year, month, day) not in closed
+    ]
+
+
+def build_us_quadruple_witching_events(year):
+    """建立美股季月第三個週五的四巫日；遇美股休市則提前至前一交易日。"""
+    events = []
+    for month in (3, 6, 9, 12):
+        expiration_date = _nth_weekday(year, month, calendar.FRIDAY, 3)
+        scheduled_date = expiration_date
+        while expiration_date.weekday() >= 5 or expiration_date in _us_market_holidays(expiration_date.year):
+            expiration_date -= timedelta(days=1)
+        holiday_note = "；原第三個週五遇美股休市，提前至前一交易日" if expiration_date != scheduled_date else ""
+        events.append({
+            "date": expiration_date.isoformat(),
+            "title": "美股四巫日",
+            "detail": f"美股股指期貨、股指選擇權與個股選擇權集中到期{holiday_note}。",
+            "closed": False,
+            "temporary": False,
+            "source": "Cboe expiration calendar",
+            "impact": "high",
+        })
+    return events
+
+
+def build_sgx_ftse_taiwan_settlement_events(year, taiwan_closed_dates=()):
+    """依 SGX 規則，以每月倒數第二個臺灣交易日建立富台指期結算事件。"""
+    events = []
+    for month in range(1, 13):
+        business_days = _calendar_business_days(year, month, taiwan_closed_dates)
+        if len(business_days) < 2:
+            continue
+        settlement_date = business_days[-2]
+        events.append({
+            "date": settlement_date.isoformat(),
+            "title": "富台指期結算（TWN）",
+            "detail": "SGX FTSE Taiwan Index Futures：契約月倒數第二個臺灣交易日為最後交易／結算日。",
+            "closed": False,
+            "temporary": False,
+            "source": "Singapore Exchange（SGX）",
+            "impact": "high",
+        })
+    return events
+
+
+def build_msci_quarterly_rebalance_events(year, taiwan_closed_dates=()):
+    """將 MSCI 2／5／8／11 月指數檢討標在當月最後臺灣交易日收盤。"""
+    events = []
+    review_names = {2: "2月季度檢討", 5: "5月半年度檢討", 8: "8月季度檢討", 11: "11月半年度檢討"}
+    for month in review_names:
+        business_days = _calendar_business_days(year, month, taiwan_closed_dates)
+        if not business_days:
+            continue
+        implementation_date = business_days[-1]
+        events.append({
+            "date": implementation_date.isoformat(),
+            "title": "MSCI 季調生效（收盤後）",
+            "detail": f"MSCI {review_names[month]}：依方法論於該月最後交易日收盤實施，次一交易日生效。",
+            "closed": False,
+            "temporary": False,
+            "source": "MSCI Index Review",
+            "impact": "high",
+        })
+    return events
+
+
 EARNINGS_TICKER_ALIASES = {
     "META": ("META", "Meta Platforms（Facebook）"),
     "FACEBOOK": ("META", "Meta Platforms（Facebook）"),
@@ -13253,6 +13325,9 @@ with tab3:
         "美國大非農",
         "美國小非農 ADP",
         "美國初領失業金",
+        "美股四巫日",
+        "富台指期結算",
+        "MSCI 季度調整",
         "指定股票財報",
         "台股月營收",
         "美股季度／年度營收",
@@ -13276,14 +13351,23 @@ with tab3:
     }
     TAIWAN_COMPANY_GROUP = "台股公司營收與財報"
     US_COMPANY_GROUP = "美股公司營收與財報"
-    CALENDAR_GROUP_OPTIONS = [
-        "台股市場與休市", "美國高影響總經", TAIWAN_COMPANY_GROUP, US_COMPANY_GROUP
+    SETTLEMENT_REBALANCE_GROUP = "國際結算與指數調整"
+    SETTLEMENT_REBALANCE_EVENTS = ["美股四巫日", "富台指期結算", "MSCI 季度調整"]
+    SETTLEMENT_REBALANCE_DESCRIPTIONS = {
+        "美股四巫日": "3／6／9／12 月衍生性商品集中到期；遇美股休市提前",
+        "富台指期結算": "SGX 富台指期每月倒數第二個臺灣交易日結算",
+        "MSCI 季度調整": "2／5／8／11 月最後臺灣交易日收盤執行指數調整",
+    }
+    LEGACY_CALENDAR_GROUP_OPTIONS = [
+        "台股市場與休市", "美國高影響總經", TAIWAN_COMPANY_GROUP, US_COMPANY_GROUP,
     ]
+    CALENDAR_GROUP_OPTIONS = LEGACY_CALENDAR_GROUP_OPTIONS + [SETTLEMENT_REBALANCE_GROUP]
     CALENDAR_GROUP_EVENTS = {
         "台股市場與休市": ["台股開休市", "台股突發休市公告"],
         "美國高影響總經": US_HIGH_IMPACT_EVENTS,
         TAIWAN_COMPANY_GROUP: ["台股公司財報", "台股月營收"],
         US_COMPANY_GROUP: ["美股公司財報", "美股季度／年度營收"],
+        SETTLEMENT_REBALANCE_GROUP: SETTLEMENT_REBALANCE_EVENTS,
     }
 
     def normalize_calendar_preferences(saved=None):
@@ -13291,6 +13375,7 @@ with tab3:
         default_preferences = {
             "groups": CALENDAR_GROUP_OPTIONS.copy(),
             "macro_events": US_HIGH_IMPACT_EVENTS.copy(),
+            "settlement_events": SETTLEMENT_REBALANCE_EVENTS.copy(),
             "tickers": "2330.TW",
         }
         if not isinstance(saved, dict):
@@ -13306,10 +13391,16 @@ with tab3:
             else:
                 migrated_groups.append(item)
         raw_groups = migrated_groups
-        groups = [
+        # 舊版若使用全部預設群組，自動加入新版的結算／季調群組；自訂群組則維持原設定。
+        if (
+            set(LEGACY_CALENDAR_GROUP_OPTIONS).issubset(set(raw_groups))
+            and SETTLEMENT_REBALANCE_GROUP not in raw_groups
+        ):
+            raw_groups.append(SETTLEMENT_REBALANCE_GROUP)
+        groups = list(dict.fromkeys(
             item for item in raw_groups
             if isinstance(item, str) and item in CALENDAR_GROUP_OPTIONS
-        ] if isinstance(raw_groups, (list, tuple, set)) else []
+        )) if isinstance(raw_groups, (list, tuple, set)) else []
         if not groups:
             legacy_events = saved.get("events", [])
             if isinstance(legacy_events, str):
@@ -13334,10 +13425,23 @@ with tab3:
         ]
         if not macro_events:
             macro_events = US_HIGH_IMPACT_EVENTS.copy()
+        raw_settlement_events = saved.get("settlement_events", saved.get("events", []))
+        if isinstance(raw_settlement_events, str):
+            raw_settlement_events = [raw_settlement_events]
+        settlement_events = [
+            item for item in SETTLEMENT_REBALANCE_EVENTS if item in set(raw_settlement_events or [])
+        ]
+        if not settlement_events:
+            settlement_events = SETTLEMENT_REBALANCE_EVENTS.copy()
         tickers = saved.get("tickers", default_preferences["tickers"])
         if tickers is None:
             tickers = default_preferences["tickers"]
-        return {"groups": groups, "macro_events": macro_events, "tickers": str(tickers)}
+        return {
+            "groups": groups,
+            "macro_events": macro_events,
+            "settlement_events": settlement_events,
+            "tickers": str(tickers),
+        }
 
     def load_calendar_preferences():
         if not os.path.exists(CAL_PREFERENCES_FILE):
@@ -13349,15 +13453,20 @@ with tab3:
         except (OSError, ValueError, TypeError):
             return normalize_calendar_preferences()
 
-    def save_calendar_preferences(groups, macro_events, tickers, events):
+    def save_calendar_preferences(groups, macro_events, tickers, events, settlement_events=None):
+        if settlement_events is None:
+            settlement_events = st.session_state.get("calendar_preferences", {}).get(
+                "settlement_events", SETTLEMENT_REBALANCE_EVENTS
+            )
         try:
             with open(CAL_PREFERENCES_FILE, "w", encoding="utf-8") as file:
                 json.dump({
                     "groups": groups,
                     "macro_events": macro_events,
+                    "settlement_events": settlement_events,
                     "events": events,
                     "tickers": tickers,
-                    "calendar_events_version": 5,
+                    "calendar_events_version": 6,
                 }, file, ensure_ascii=False, indent=2)
         except OSError:
             pass
@@ -13448,17 +13557,38 @@ with tab3:
         else:
             selected_macro_events = []
 
+        if SETTLEMENT_REBALANCE_GROUP in selected_event_groups:
+            selected_settlement_events = st.multiselect(
+                "國際結算與指數調整（勾選要呈現的事件）",
+                options=SETTLEMENT_REBALANCE_EVENTS,
+                default=st.session_state.calendar_preferences.get(
+                    "settlement_events", SETTLEMENT_REBALANCE_EVENTS
+                ),
+                key="calendar_settlement_events",
+            )
+            with st.expander("結算與季調包含什麼？", expanded=False):
+                st.markdown("\n".join(
+                    f"- **{event_name}**：{SETTLEMENT_REBALANCE_DESCRIPTIONS[event_name]}"
+                    for event_name in SETTLEMENT_REBALANCE_EVENTS
+                ))
+        else:
+            selected_settlement_events = []
+
         selected_event_types = []
         for group in selected_event_groups:
-            if group != "美國高影響總經":
+            if group not in {"美國高影響總經", SETTLEMENT_REBALANCE_GROUP}:
                 selected_event_types.extend(CALENDAR_GROUP_EVENTS[group])
         selected_event_types.extend(selected_macro_events)
+        selected_event_types.extend(selected_settlement_events)
         st.caption(
             "呈現模式：完整（只顯示已勾選事件）｜目前顯示：" + (
                 "｜".join(selected_event_groups) if selected_event_groups else "未選擇自動事件"
             ) + (
                 "｜總經：" + "、".join(selected_macro_events)
                 if selected_macro_events else ""
+            ) + (
+                "｜結算季調：" + "、".join(selected_settlement_events)
+                if selected_settlement_events else ""
             )
         )
         snapshot = st.session_state.company_event_snapshot
@@ -13489,6 +13619,7 @@ with tab3:
                 st.session_state.calendar_preferences = {
                     "groups": selected_event_groups,
                     "macro_events": selected_macro_events,
+                    "settlement_events": selected_settlement_events,
                     "tickers": st.session_state.calendar_preferences.get("tickers", "2330.TW"),
                 }
                 save_calendar_preferences(
@@ -13496,10 +13627,11 @@ with tab3:
                     selected_macro_events,
                     st.session_state.calendar_preferences["tickers"],
                     selected_event_types,
+                    selected_settlement_events,
                 )
                 st.toast("追蹤設定已儲存。", icon="✅")
 
-    st.caption("行事曆資料來源：TWSE、Federal Reserve、U.S. BLS、U.S. BEA、ISM、U.S. Department of Labor、ADP，以及 TradingView 免費經濟日曆備援；公司財報與營收顯示獨立分頁的最近快照。")
+    st.caption("行事曆資料來源：TWSE、Federal Reserve、U.S. BLS、U.S. BEA、ISM、U.S. Department of Labor、ADP、Cboe、SGX、MSCI，以及 TradingView 免費經濟日曆備援；公司財報與營收顯示獨立分頁的最近快照。")
 
     def change_month(delta):
         st.session_state.cal_month += delta
@@ -13548,6 +13680,12 @@ with tab3:
     temporary_closures = {
         pd.Timestamp(event["date"]).date(): event for event in twse_temporary_events
     }
+    taiwan_closed_dates = {
+        date(sel_year, month, day)
+        for (month, day), holiday_name in current_holidays.items()
+        if holiday_name != "封關日"
+    }
+    taiwan_closed_dates.update(temporary_closures.keys())
 
     # 將使用者選擇的資料來源合併成統一事件格式；台股突發休市永遠覆蓋交易日狀態。
     network_events = list(twse_temporary_events)
@@ -13576,6 +13714,18 @@ with tab3:
         add_network_source('小非農 ADP', fetch_adp_employment_events(sel_year))
     if "美國初領失業金" in selected_event_types:
         add_network_source('初領失業金', build_us_initial_claims_events(sel_year))
+    if "美股四巫日" in selected_event_types:
+        add_network_source('美股四巫日', build_us_quadruple_witching_events(sel_year))
+    if "富台指期結算" in selected_event_types:
+        add_network_source(
+            '富台指期結算',
+            build_sgx_ftse_taiwan_settlement_events(sel_year, taiwan_closed_dates),
+        )
+    if "MSCI 季度調整" in selected_event_types:
+        add_network_source(
+            'MSCI 季調',
+            build_msci_quarterly_rebalance_events(sel_year, taiwan_closed_dates),
+        )
 
     company_snapshot = st.session_state.company_event_snapshot
     earnings_events = list(company_snapshot.get("earnings", {}).get("events", []))
@@ -13846,6 +13996,12 @@ with tab3:
                     color = "#42A5F5"
                 elif "ISM" in event.get("title", ""):
                     color = "#AB47BC"
+                elif "四巫日" in event.get("title", ""):
+                    color = "#FF00FF"
+                elif "富台" in event.get("title", ""):
+                    color = "#FFB74D"
+                elif "MSCI" in event.get("title", ""):
+                    color = "#FF9800"
                 if "財報" in event.get("title", ""):
                     color = "#FFD700"
                 if "MOPS" in event.get("source", ""):
