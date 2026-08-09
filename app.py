@@ -743,6 +743,8 @@ BLS_CPS_CALENDAR_URL = "https://www.bls.gov/cps/publications/release-calendar.ht
 ADP_EMPLOYMENT_DATA_URL = "https://adpemploymentreport.com/ner_production.json"
 ADP_EMPLOYMENT_PAGE_URL = "https://adpemploymentreport.com/"
 TRADINGVIEW_CALENDAR_URL = "https://economic-calendar.tradingview.com/events"
+BEA_RELEASE_SCHEDULE_URL = "https://www.bea.gov/news/schedule"
+ISM_RELEASE_CALENDAR_URL = "https://www.ismworld.org/supply-management-news-and-reports/reports/rob-report-calendar/"
 
 
 def _calendar_get(url):
@@ -826,7 +828,7 @@ def fetch_tradingview_us_calendar(year):
 
 
 def _tradingview_macro_events(year, event_type):
-    """將 TradingView 的 CPI／NFP UTC 時間轉為台灣日期，排除核心 CPI 與年度修訂。"""
+    """將 TradingView 的高影響美國總經事件轉為台灣日期與時間。"""
     events, seen = [], set()
     for row in fetch_tradingview_us_calendar(year):
         title = str(row.get("title", "")).strip()
@@ -837,9 +839,24 @@ def _tradingview_macro_events(year, event_type):
                 title.upper() == "CPI" and indicator.lower() == "consumer price index cpi"
             )
             event_title = "美國 CPI 公布"
-        else:
+        elif event_type == "nfp":
             matched = title.lower() == "non farm payrolls" and ticker == "ECONOMICS:USNFP"
             event_title = "美國大非農／失業率"
+        elif event_type == "gdp":
+            matched = title.lower().startswith("gdp growth rate") and ticker == "ECONOMICS:USGDPQQ"
+            event_title = "美國 GDP 公布"
+        elif event_type == "core_pce":
+            matched = title.lower() in {
+                "core pce price index mom", "core pce price index yoy",
+            } and ticker in {
+                "ECONOMICS:USCPCEPIMM", "ECONOMICS:USCPCEPIAC",
+            }
+            event_title = "美國核心 PCE 公布"
+        elif event_type == "ism_manufacturing":
+            matched = title.lower() == "ism manufacturing pmi" and ticker == "ECONOMICS:USBCOI"
+            event_title = "美國 ISM 製造業指數"
+        else:
+            return []
         if not matched:
             continue
         try:
@@ -863,6 +880,162 @@ def _tradingview_macro_events(year, event_type):
             "impact": "high",
         })
     return events
+
+
+def _merge_macro_events(fallback_events, official_events):
+    """同日同類事件以官方排程覆蓋備援來源，並保留官方頁尚未列出的歷史日期。"""
+    merged = {
+        str(event.get("date", "")): event
+        for event in fallback_events or [] if event.get("date")
+    }
+    for event in official_events or []:
+        if event.get("date"):
+            merged[str(event["date"])] = event
+    return sorted(merged.values(), key=lambda event: (str(event.get("date", "")), str(event.get("title", ""))))
+
+
+@st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
+def fetch_bea_release_schedule_html():
+    """集中快取 BEA 發布排程，避免 GDP 與核心 PCE 各下載一次。"""
+    response = _calendar_get(BEA_RELEASE_SCHEDULE_URL)
+    return response.text if response and "Access Denied" not in response.text else ""
+
+
+def _parse_bea_release_schedule(page_html, year, release_type):
+    """解析 BEA 官方 GDP／Personal Income and Outlays 發布排程。"""
+    if not page_html:
+        return []
+    soup = BeautifulSoup(page_html, "html.parser")
+    if not re.search(fr"\bYear\s+{year}\b", soup.get_text(" ", strip=True), re.I):
+        return []
+    month_lookup = {name: index for index, name in enumerate(
+        ["January", "February", "March", "April", "May", "June",
+         "July", "August", "September", "October", "November", "December"], 1
+    )}
+    date_pattern = re.compile(
+        r"^(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2})$",
+        re.I,
+    )
+    time_pattern = re.compile(r"^(\d{1,2}):(\d{2})\s*(AM|PM)$", re.I)
+    event_title = "美國 GDP 公布" if release_type == "gdp" else "美國核心 PCE 公布"
+    events, seen = [], set()
+    for row in soup.select("tr"):
+        release_title_node = row.select_one(".release-title")
+        release_date_node = row.select_one(".release-date")
+        release_time_node = row.select_one(".scheduled-date small")
+        if not (release_title_node and release_date_node and release_time_node):
+            continue
+        release_title = release_title_node.get_text(" ", strip=True)
+        if release_type == "gdp":
+            matched = bool(re.match(r"^GDP\s*\(", release_title, re.I))
+        elif release_type == "core_pce":
+            matched = release_title.lower().startswith("personal income and outlays")
+        else:
+            return []
+        if not matched:
+            continue
+        date_match = date_pattern.match(release_date_node.get_text(" ", strip=True))
+        time_match = time_pattern.match(release_time_node.get_text(" ", strip=True))
+        if not (date_match and time_match):
+            continue
+        month_name, day = date_match.groups()
+        hour, minute, meridiem = time_match.groups()
+        hour = int(hour) % 12 + (12 if meridiem.upper() == "PM" else 0)
+        try:
+            taiwan_dt = _taiwan_time_from_eastern(
+                year, month_lookup[month_name.title()], int(day), hour, int(minute)
+            )
+        except (ValueError, pytz.AmbiguousTimeError, pytz.NonExistentTimeError):
+            continue
+        if taiwan_dt.date() in seen:
+            continue
+        seen.add(taiwan_dt.date())
+        events.append({
+            "date": taiwan_dt.date().isoformat(),
+            "title": f"{event_title}（{taiwan_dt:%H:%M}）",
+            "detail": f"BEA 官方發布排程：{release_title}；已由美東時間換算為台灣時間。",
+            "closed": False,
+            "temporary": False,
+            "source": "U.S. Bureau of Economic Analysis",
+            "impact": "high",
+        })
+    return events
+
+
+@st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
+def fetch_bea_gdp_events(year):
+    """GDP 以 BEA 官方排程為準，TradingView 補足官方頁未保留的歷史發布日期。"""
+    fallback_events = _tradingview_macro_events(year, "gdp")
+    official_events = _parse_bea_release_schedule(fetch_bea_release_schedule_html(), year, "gdp")
+    return _merge_macro_events(fallback_events, official_events)
+
+
+@st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
+def fetch_bea_core_pce_events(year):
+    """核心 PCE 隨 BEA Personal Income and Outlays 發布，並以 TradingView 補歷史日期。"""
+    fallback_events = _tradingview_macro_events(year, "core_pce")
+    official_events = _parse_bea_release_schedule(fetch_bea_release_schedule_html(), year, "core_pce")
+    return _merge_macro_events(fallback_events, official_events)
+
+
+@st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
+def fetch_ism_manufacturing_events(year):
+    """擷取 ISM 製造業 PMI；僅接受明確的 ISM Manufacturing PMI 主指標。"""
+    fallback_events = _tradingview_macro_events(year, "ism_manufacturing")
+    official_events = []
+    # ISM 頁面可能對伺服器回傳驗證頁；保留已由官方 2026 日曆核對的完整日期，補足年底尚未進入備援 API 的月份。
+    verified_official_dates = {
+        2026: [(1, 5), (2, 2), (3, 2), (4, 1), (5, 1), (6, 1),
+               (7, 1), (8, 3), (9, 1), (10, 1), (11, 2), (12, 1)],
+    }
+    response = None if year in verified_official_dates else _calendar_get(ISM_RELEASE_CALENDAR_URL)
+    soup = BeautifulSoup(response.text, "html.parser") if response else BeautifulSoup("", "html.parser")
+    month_lookup = {name: index for index, name in enumerate(
+        ["January", "February", "March", "April", "May", "June",
+         "July", "August", "September", "October", "November", "December"], 1
+    )}
+    seen = set()
+    for row in soup.select("tr"):
+        cells = row.find_all(["th", "td"])
+        if len(cells) < 2:
+            continue
+        month_match = re.search(
+            r"(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})",
+            cells[0].get_text(" ", strip=True), re.I,
+        )
+        day_match = re.search(r"\b(\d{1,2})\b", cells[1].get_text(" ", strip=True))
+        if not month_match or not day_match or int(month_match.group(2)) != year:
+            continue
+        taiwan_dt = _taiwan_time_from_eastern(
+            year, month_lookup[month_match.group(1).title()], int(day_match.group(1)), 10
+        )
+        if taiwan_dt.date() in seen:
+            continue
+        seen.add(taiwan_dt.date())
+        official_events.append({
+            "date": taiwan_dt.date().isoformat(),
+            "title": f"美國 ISM 製造業指數（{taiwan_dt:%H:%M}）",
+            "detail": "ISM 官方發布日曆；已由美東時間換算為台灣時間。",
+            "closed": False,
+            "temporary": False,
+            "source": "Institute for Supply Management",
+            "impact": "high",
+        })
+    for month, day in verified_official_dates.get(year, []):
+        taiwan_dt = _taiwan_time_from_eastern(year, month, day, 10)
+        if taiwan_dt.date() in seen:
+            continue
+        seen.add(taiwan_dt.date())
+        official_events.append({
+            "date": taiwan_dt.date().isoformat(),
+            "title": f"美國 ISM 製造業指數（{taiwan_dt:%H:%M}）",
+            "detail": "ISM 2026 官方發布日曆；已由美東時間換算為台灣時間。",
+            "closed": False,
+            "temporary": False,
+            "source": "Institute for Supply Management",
+            "impact": "high",
+        })
+    return _merge_macro_events(fallback_events, official_events)
 
 
 @st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
@@ -1003,24 +1176,23 @@ def fetch_fomc_events(year):
 @st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
 def fetch_bls_cpi_events(year):
     """CPI 以免金鑰經濟日曆為主，BLS 官方來源作交叉備援。"""
-    events = _tradingview_macro_events(year, "cpi")
-    if events:
-        return events
-    events = _parse_bls_release_ics(
+    fallback_events = _tradingview_macro_events(year, "cpi")
+    official_events = _parse_bls_release_ics(
         _calendar_get(BLS_RELEASE_ICS_URL), year, "Consumer Price Index", "美國 CPI 公布"
     )
-    if events:
-        return events
-    events = _parse_bls_year_schedule(
-        _calendar_get(BLS_YEAR_SCHEDULE_URL.format(year=year)), year,
-        "Consumer Price Index", "美國 CPI 公布",
+    if not official_events:
+        official_events = _parse_bls_year_schedule(
+            _calendar_get(BLS_YEAR_SCHEDULE_URL.format(year=year)), year,
+            "Consumer Price Index", "美國 CPI 公布",
+        )
+    if not official_events:
+        official_events = _parse_official_release_schedule(
+            _calendar_get(BLS_CPI_URL), year, "美國 CPI 公布", "U.S. Bureau of Labor Statistics"
+        )
+    official_events = _merge_macro_events(
+        _verified_bls_2026_events(year, "cpi"), official_events
     )
-    if events:
-        return events
-    events = _parse_official_release_schedule(
-        _calendar_get(BLS_CPI_URL), year, "美國 CPI 公布", "U.S. Bureau of Labor Statistics"
-    )
-    return events
+    return _merge_macro_events(fallback_events, official_events)
 
 
 def _parse_official_release_schedule(response, year, event_title, source):
@@ -1141,6 +1313,32 @@ def _parse_bls_release_ics(response, year, summary_pattern, event_title):
     return events
 
 
+def _verified_bls_2026_events(year, release_type):
+    """BLS 官網阻擋伺服器請求時，補入已核對的 2026 完整官方排程。"""
+    verified_dates = {
+        "cpi": [(1, 13), (2, 13), (3, 11), (4, 10), (5, 12), (6, 10),
+                (7, 14), (8, 12), (9, 11), (10, 14), (11, 10), (12, 10)],
+        "employment": [(1, 9), (2, 11), (3, 6), (4, 3), (5, 8), (6, 5),
+                       (7, 2), (8, 7), (9, 4), (10, 2), (11, 6), (12, 4)],
+    }
+    if year != 2026 or release_type not in verified_dates:
+        return []
+    event_title = "美國 CPI 公布" if release_type == "cpi" else "美國大非農／失業率"
+    events = []
+    for month, day in verified_dates[release_type]:
+        taiwan_dt = _taiwan_time_from_eastern(year, month, day, 8, 30)
+        events.append({
+            "date": taiwan_dt.date().isoformat(),
+            "title": f"{event_title}（{taiwan_dt:%H:%M}）",
+            "detail": "BLS 2026 官方發布排程；已由美東時間換算為台灣時間。",
+            "closed": False,
+            "temporary": False,
+            "source": "U.S. Bureau of Labor Statistics（2026 官方排程）",
+            "impact": "high",
+        })
+    return events
+
+
 def _parse_bls_employment_ics(response, year):
     """由 BLS 官方 iCalendar 備援解析 Employment Situation。"""
     return _parse_bls_release_ics(
@@ -1183,26 +1381,24 @@ def _parse_bls_cps_employment_calendar(response, year):
 @st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
 def fetch_bls_employment_events(year):
     """BLS Employment Situation：市場俗稱大非農，同時公布失業率。"""
-    events = _tradingview_macro_events(year, "nfp")
-    if events:
-        return events
-    events = _parse_bls_employment_ics(_calendar_get(BLS_RELEASE_ICS_URL), year)
-    if events:
-        return events
-    events = _parse_bls_year_schedule(
-        _calendar_get(BLS_YEAR_SCHEDULE_URL.format(year=year)), year,
-        "Employment Situation", "美國大非農／失業率",
+    fallback_events = _tradingview_macro_events(year, "nfp")
+    official_events = _parse_bls_employment_ics(_calendar_get(BLS_RELEASE_ICS_URL), year)
+    if not official_events:
+        official_events = _parse_bls_year_schedule(
+            _calendar_get(BLS_YEAR_SCHEDULE_URL.format(year=year)), year,
+            "Employment Situation", "美國大非農／失業率",
+        )
+    if not official_events:
+        official_events = _parse_official_release_schedule(
+            _calendar_get(BLS_EMPLOYMENT_URL), year,
+            "美國大非農／失業率", "U.S. Bureau of Labor Statistics",
+        )
+    if not official_events:
+        official_events = _parse_bls_cps_employment_calendar(_calendar_get(BLS_CPS_CALENDAR_URL), year)
+    official_events = _merge_macro_events(
+        _verified_bls_2026_events(year, "employment"), official_events
     )
-    if events:
-        return events
-    events = _parse_official_release_schedule(
-        _calendar_get(BLS_EMPLOYMENT_URL), year,
-        "美國大非農／失業率", "U.S. Bureau of Labor Statistics",
-    )
-    if events:
-        return events
-    events = _parse_bls_cps_employment_calendar(_calendar_get(BLS_CPS_CALENDAR_URL), year)
-    return events
+    return _merge_macro_events(fallback_events, official_events)
 
 
 @st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
@@ -1211,20 +1407,16 @@ def fetch_adp_employment_events(year):
     response = _calendar_get(ADP_EMPLOYMENT_DATA_URL)
     report_date_texts = []
 
-    def collect_report_dates(value):
-        if isinstance(value, dict):
-            for key, item in value.items():
-                if key.lower() == 'reportdate' and isinstance(item, str):
-                    report_date_texts.append(item.strip())
-                else:
-                    collect_report_dates(item)
-        elif isinstance(value, list):
-            for item in value:
-                collect_report_dates(item)
-
     if response:
         try:
-            collect_report_dates(response.json())
+            payload = response.json()
+            # futureReports 先列月度 NER，分隔文字後才是 weekly NER pulse；不可遞迴收集全部日期。
+            for report in payload.get("futureReports", []) if isinstance(payload, dict) else []:
+                report_date = str(report.get("reportDate", "")).strip() if isinstance(report, dict) else ""
+                if "weekly NER pulse" in report_date:
+                    break
+                if report_date:
+                    report_date_texts.append(report_date)
         except (TypeError, ValueError, AttributeError):
             pass
     # JSON 欄位改版或只保留未來日期時，再讀 ADP 官方首頁的 Calendar 文字。
@@ -1272,7 +1464,7 @@ def fetch_adp_employment_events(year):
             "source": "ADP Research Institute",
             "impact": "high",
         })
-    return events
+    return sorted(events, key=lambda event: str(event.get("date", "")))
 
 
 def _us_weekly_claims_release_date(year, month, day):
@@ -1294,26 +1486,30 @@ def _us_weekly_claims_release_date(year, month, day):
 def build_us_initial_claims_events(year):
     """建立美國勞工部每週四 08:30 ET 的初領失業金預定發布時間。"""
     events = []
-    for month in range(1, 13):
-        for week in calendar.monthcalendar(year, month):
-            day = week[calendar.THURSDAY]
-            if not day:
-                continue
-            release_date = _us_weekly_claims_release_date(year, month, day)
-            taiwan_dt = _taiwan_time_from_eastern(
-                release_date.year, release_date.month, release_date.day, 8, 30
-            )
-            scheduled_date = date(year, month, day)
-            holiday_note = "；遇聯邦假日，預定提前至週三" if release_date != scheduled_date else ""
-            events.append({
-                "date": taiwan_dt.date().isoformat(),
-                "title": f"美國初領失業金人數（{taiwan_dt:%H:%M}）",
-                "detail": f"U.S. Department of Labor 例行週度發布時間{holiday_note}；最終以官方公告為準。",
-                "closed": False,
-                "temporary": False,
-                "source": "U.S. Department of Labor",
-                "impact": "routine",
-            })
+    # 同時計算下一年第一週，讓元旦遇週四而提前到 12/31 的事件歸在實際發布年份。
+    for scheduled_year in (year, year + 1):
+        for month in range(1, 13):
+            for week in calendar.monthcalendar(scheduled_year, month):
+                day = week[calendar.THURSDAY]
+                if not day:
+                    continue
+                release_date = _us_weekly_claims_release_date(scheduled_year, month, day)
+                taiwan_dt = _taiwan_time_from_eastern(
+                    release_date.year, release_date.month, release_date.day, 8, 30
+                )
+                if taiwan_dt.year != year:
+                    continue
+                scheduled_date = date(scheduled_year, month, day)
+                holiday_note = "；遇聯邦假日，預定提前至週三" if release_date != scheduled_date else ""
+                events.append({
+                    "date": taiwan_dt.date().isoformat(),
+                    "title": f"美國初領失業金人數（{taiwan_dt:%H:%M}）",
+                    "detail": f"U.S. Department of Labor 例行週度發布時間{holiday_note}；最終以官方公告為準。",
+                    "closed": False,
+                    "temporary": False,
+                    "source": "U.S. Department of Labor",
+                    "impact": "routine",
+                })
     return events
 
 
@@ -13051,6 +13247,9 @@ with tab3:
         "台股突發休市公告",
         "FOMC 利率決議",
         "美國 CPI",
+        "美國核心 PCE",
+        "美國 GDP",
+        "美國 ISM 製造業指數",
         "美國大非農",
         "美國小非農 ADP",
         "美國初領失業金",
@@ -13058,12 +13257,19 @@ with tab3:
         "台股月營收",
         "美股季度／年度營收",
     ]
-    US_HIGH_IMPACT_EVENTS = [
+    LEGACY_US_HIGH_IMPACT_EVENTS = [
         "FOMC 利率決議", "美國 CPI", "美國大非農", "美國小非農 ADP", "美國初領失業金"
+    ]
+    US_HIGH_IMPACT_EVENTS = [
+        "FOMC 利率決議", "美國 CPI", "美國核心 PCE", "美國 GDP",
+        "美國 ISM 製造業指數", "美國大非農", "美國小非農 ADP", "美國初領失業金",
     ]
     US_HIGH_IMPACT_DESCRIPTIONS = {
         "FOMC 利率決議": "聯準會利率決策與政策聲明",
         "美國 CPI": "消費者物價指數，觀察通膨",
+        "美國核心 PCE": "BEA 個人消費支出物價指數（排除食品與能源），Fed 重點通膨指標",
+        "美國 GDP": "BEA 國內生產毛額的初值、修正值與終值",
+        "美國 ISM 製造業指數": "ISM 製造業 PMI，觀察製造業景氣擴張或收縮",
         "美國大非農": "非農就業人數與失業率",
         "美國小非農 ADP": "ADP 民間就業預估",
         "美國初領失業金": "每週首次申請失業救濟人數",
@@ -13119,8 +13325,12 @@ with tab3:
         raw_macro_events = saved.get("macro_events", saved.get("events", []))
         if isinstance(raw_macro_events, str):
             raw_macro_events = [raw_macro_events]
+        raw_macro_event_set = set(raw_macro_events or [])
+        # 舊版若採用完整預設清單，自動帶入新版新增的 GDP／核心 PCE／ISM；自訂子集合則維持原選擇。
+        if set(LEGACY_US_HIGH_IMPACT_EVENTS).issubset(raw_macro_event_set):
+            raw_macro_event_set.update(US_HIGH_IMPACT_EVENTS)
         macro_events = [
-            item for item in US_HIGH_IMPACT_EVENTS if item in set(raw_macro_events or [])
+            item for item in US_HIGH_IMPACT_EVENTS if item in raw_macro_event_set
         ]
         if not macro_events:
             macro_events = US_HIGH_IMPACT_EVENTS.copy()
@@ -13147,7 +13357,7 @@ with tab3:
                     "macro_events": macro_events,
                     "events": events,
                     "tickers": tickers,
-                    "calendar_events_version": 4,
+                    "calendar_events_version": 5,
                 }, file, ensure_ascii=False, indent=2)
         except OSError:
             pass
@@ -13264,6 +13474,10 @@ with tab3:
                 fetch_twse_temporary_closure_events.clear()
                 fetch_fomc_events.clear()
                 fetch_bls_cpi_events.clear()
+                fetch_bea_release_schedule_html.clear()
+                fetch_bea_core_pce_events.clear()
+                fetch_bea_gdp_events.clear()
+                fetch_ism_manufacturing_events.clear()
                 fetch_bls_employment_events.clear()
                 fetch_tradingview_us_calendar.clear()
                 fetch_adp_employment_events.clear()
@@ -13285,7 +13499,7 @@ with tab3:
                 )
                 st.toast("追蹤設定已儲存。", icon="✅")
 
-    st.caption("行事曆資料來源：TWSE、Federal Reserve、TradingView 免費經濟日曆（CPI／大非農備援）、U.S. BLS、U.S. Department of Labor、ADP；公司財報與營收顯示獨立分頁的最近快照。")
+    st.caption("行事曆資料來源：TWSE、Federal Reserve、U.S. BLS、U.S. BEA、ISM、U.S. Department of Labor、ADP，以及 TradingView 免費經濟日曆備援；公司財報與營收顯示獨立分頁的最近快照。")
 
     def change_month(delta):
         st.session_state.cal_month += delta
@@ -13350,6 +13564,12 @@ with tab3:
         add_network_source('FOMC', fetch_fomc_events(sel_year))
     if "美國 CPI" in selected_event_types:
         add_network_source('CPI', fetch_bls_cpi_events(sel_year))
+    if "美國核心 PCE" in selected_event_types:
+        add_network_source('核心 PCE', fetch_bea_core_pce_events(sel_year))
+    if "美國 GDP" in selected_event_types:
+        add_network_source('GDP', fetch_bea_gdp_events(sel_year))
+    if "美國 ISM 製造業指數" in selected_event_types:
+        add_network_source('ISM 製造業', fetch_ism_manufacturing_events(sel_year))
     if "美國大非農" in selected_event_types:
         add_network_source('大非農', fetch_bls_employment_events(sel_year))
     if "美國小非農 ADP" in selected_event_types:
@@ -13392,13 +13612,27 @@ with tab3:
         network_events.extend(company_earnings_for_market("美股"))
         network_events.extend(company_snapshot.get("us_revenue", {}).get("events", []))
     if "美國高影響總經" in selected_event_groups:
+        source_labels_by_option = {
+            "FOMC 利率決議": "FOMC",
+            "美國 CPI": "CPI",
+            "美國核心 PCE": "核心 PCE",
+            "美國 GDP": "GDP",
+            "美國 ISM 製造業指數": "ISM 製造業",
+            "美國大非農": "大非農",
+            "美國小非農 ADP": "小非農 ADP",
+            "美國初領失業金": "初領失業金",
+        }
+        selected_source_labels = [
+            source_labels_by_option[event_name]
+            for event_name in selected_macro_events if event_name in source_labels_by_option
+        ]
         us_count_text = '｜'.join(
             f"{label} {calendar_source_counts.get(label, 0)} 筆"
-            for label in ('FOMC', 'CPI', '大非農', '小非農 ADP')
+            for label in selected_source_labels
         )
         st.caption(f"{sel_year} 高影響事件來源檢查：{us_count_text}。事件已換算為台灣日期與時間。")
         missing_core_sources = [
-            label for label in ('FOMC', 'CPI', '大非農', '小非農 ADP')
+            label for label in selected_source_labels
             if calendar_source_counts.get(label, 0) == 0
         ]
         if missing_core_sources:
@@ -13606,8 +13840,12 @@ with tab3:
                     color = "#FFB74D"
                 elif event.get("impact") == "routine":
                     color = "#B0BEC5"
-                elif "CPI" in event.get("title", ""):
+                elif "CPI" in event.get("title", "") or "核心 PCE" in event.get("title", ""):
                     color = "#00FA9A"
+                elif "GDP" in event.get("title", ""):
+                    color = "#42A5F5"
+                elif "ISM" in event.get("title", ""):
+                    color = "#AB47BC"
                 if "財報" in event.get("title", ""):
                     color = "#FFD700"
                 if "MOPS" in event.get("source", ""):
@@ -13650,7 +13888,7 @@ with tab3:
                 content_html.append(f"<div class='settle-f'>週選(五) {settlement_code}</div>")
         return ''.join(content_html)
 
-    desktop_cells = ["<div class='calendar-week-head'>ISO<br>週</div>"]
+    desktop_cells = ["<div class='calendar-week-head'>週</div>"]
     desktop_cells.extend(
         f"<div class='calendar-day-head'>{weekday}</div>" for weekday in ["日", "一", "二", "三", "四", "五", "六"]
     )
@@ -13658,7 +13896,7 @@ with tab3:
     weekday_names = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"]
     for week in month_days:
         first_valid_day = next((day for day in week if day), None)
-        # 月曆從週日開始，但 ISO 週從週一開始；優先取該列週一作為週次基準。
+        # 月曆從週日開始，但週次從週一開始；優先取該列週一作為週次基準。
         iso_anchor_day = week[1] if len(week) > 1 and week[1] else first_valid_day
         iso_week = date(sel_year, sel_month, iso_anchor_day).isocalendar().week
         desktop_cells.append(f"<div class='cal-box cal-week'>W{iso_week}</div>")
@@ -13676,7 +13914,7 @@ with tab3:
             mobile_cells.append(
                 f"<div class='calendar-mobile-day {bg_class} {today_class}'>"
                 f"<div class='calendar-mobile-date'><span>{sel_month}/{day} {weekday_names[curr_date.weekday()]}</span>"
-                f"<span class='calendar-mobile-week'>ISO W{curr_date.isocalendar().week}</span></div>"
+                f"<span class='calendar-mobile-week'>W{curr_date.isocalendar().week}</span></div>"
                 f"{day_content}</div>"
             )
 
