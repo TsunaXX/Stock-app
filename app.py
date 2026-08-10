@@ -6140,20 +6140,29 @@ def render_strategy_validation_room():
                     'color:#ff4b4b;font-weight:bold;' if '多' in direction
                     else ('color:#00c853;font-weight:bold;' if '空' in direction else '')
                 )
+            elif column == '名稱':
+                styles[position] = 'font-weight:bold;'
+            elif column == '市場':
+                styles[position] = (
+                    'color:#64b5f6;font-weight:bold;' if '股票' in str(row.get(column, ''))
+                    else ('color:#ffb74d;font-weight:bold;' if '期貨' in str(row.get(column, '')) else '')
+                )
             elif column == '訊號狀態':
-                if signal_state.startswith(('✅', '🔵')):
-                    styles[position] = 'color:#ff4b4b;font-weight:bold;'
+                if signal_state.startswith('✅'):
+                    styles[position] = 'color:#ffb300;font-weight:bold;'
+                elif signal_state.startswith('🔵'):
+                    styles[position] = 'color:#64b5f6;font-weight:bold;'
                 elif signal_state.startswith(('⛔', '🔴')):
-                    styles[position] = 'color:#00c853;font-weight:bold;'
+                    styles[position] = 'color:#ff4b4b;font-weight:bold;'
                 elif signal_state.startswith('🟡'):
                     styles[position] = 'color:#ffb300;font-weight:bold;'
             elif column == '信心判讀':
                 if confidence.startswith('🟢'):
-                    styles[position] = 'color:#ff4b4b;font-weight:bold;'
+                    styles[position] = 'color:#00c853;font-weight:bold;'
                 elif confidence.startswith(('🟡', '🟠')):
                     styles[position] = 'color:#ffb300;font-weight:bold;'
                 elif confidence.startswith('🔴'):
-                    styles[position] = 'color:#00c853;font-weight:bold;'
+                    styles[position] = 'color:#ff4b4b;font-weight:bold;'
             elif column == '結果':
                 if result_text == '達標':
                     styles[position] = 'color:#ff4b4b;font-weight:bold;'
@@ -6177,6 +6186,10 @@ def render_strategy_validation_room():
                     styles[position] = 'color:#ff4b4b;font-weight:bold;'
                 elif data_health.startswith('🟡'):
                     styles[position] = 'color:#ffb300;'
+                elif data_health.startswith('🔵'):
+                    styles[position] = 'color:#64b5f6;'
+                elif data_health.startswith('⚪'):
+                    styles[position] = 'color:#9e9e9e;'
         return styles
 
     table_key = f"strategy_validation_editor_{abs(hash(tuple(validation_display['_紀錄ID'].tolist())))}"
@@ -6186,6 +6199,17 @@ def render_strategy_validation_room():
     for column in display_columns:
         if column != '評分':
             editor_frame[column] = editor_frame[column].fillna('').astype(str)
+
+    # 完整資料先以唯讀彩色表呈現；下方編輯器保留實際進場價與多選刪除功能。
+    color_frame = editor_frame.drop(columns=['刪除']).copy()
+    color_frame['評分'] = color_frame['評分'].map(_compact_number_text)
+    st.dataframe(
+        color_frame.style.apply(style_validation_row, axis=1),
+        hide_index=True, width='stretch', row_height=30,
+    )
+    st.caption('顏色提示：多方／上漲／達標為紅色，空方／下跌／停損為綠色；黃色代表追蹤中或等待確認。')
+    editor_frame = editor_frame[['刪除', '市場', '代碼', '名稱', '實際進場價']].copy()
+    st.markdown('##### ✏️ 編輯實際進場價／勾選刪除')
     edited_validation = st.data_editor(
         # 可編輯表格不傳 Styler，避免 Streamlit 1.5x／Python 3.14 對 Styler
         # 推斷出的 schema 與 TextColumn 設定不一致而直接拋出 APIException。
@@ -6209,7 +6233,7 @@ def render_strategy_validation_room():
             'MAE(R)': st.column_config.TextColumn('MAE', help='Maximum Adverse Excursion：訊號後最大不利變動，單位為 R。'),
             '結果(R)': st.column_config.TextColumn(help='達標或策略失效時的結果；以 R 表示。'),
         },
-        disabled=[column for column in display_columns if column != '實際進場價'],
+        disabled=['市場', '代碼', '名稱'],
         hide_index=True, width='stretch', key=table_key,
     )
     actual_entry_changed = False
