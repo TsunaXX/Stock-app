@@ -5480,260 +5480,27 @@ def get_tw_stocker_data(direction):
         pass
     return pd.DataFrame()
 
-def _parse_goodinfo_turnover_table(page_html):
-    """挑出 Goodinfo 週轉率排行表，並拒絕阻擋頁或尚未載入的空表。"""
-    try:
-        # 固定使用 requirements 已具備的 lxml；形成中的頁面若沒有完整 table，
-        # 不讓 pandas 退回未安裝的 html5lib 而中止整次重試。
-        tables = pd.read_html(io.StringIO(page_html), flavor='lxml')
-    except (ValueError, TypeError, ImportError):
-        return None
-
-    candidates = []
-    for table in tables:
-        if table.shape[0] < 10 or table.shape[1] < 5:
-            continue
-        normalized = table.copy()
-        if isinstance(normalized.columns, pd.MultiIndex):
-            new_columns = []
-            for column in normalized.columns:
-                cleaned_parts = []
-                for item in column:
-                    item_text = re.sub(r"\s+", "", str(item)).strip()
-                    if item_text and not item_text.startswith("Unnamed"):
-                        if not cleaned_parts or cleaned_parts[-1] != item_text:
-                            cleaned_parts.append(item_text)
-                new_columns.append("_".join(cleaned_parts))
-            normalized.columns = new_columns
-        else:
-            normalized.columns = [re.sub(r"\s+", "", str(column)).strip() for column in normalized.columns]
-
-        column_text = "|".join(map(str, normalized.columns))
-        code_column = next((column for column in normalized.columns if "代號" in str(column)), None)
-        name_column = next((column for column in normalized.columns if "名稱" in str(column)), None)
-        if code_column is None or name_column is None:
-            continue
-        valid_codes = normalized[code_column].astype(str).str.extract(r"(\d{4,6})", expand=False).notna().sum()
-        if valid_codes < 10:
-            continue
-        score = sum(keyword in column_text for keyword in ("代號", "名稱", "週轉", "成交"))
-        candidates.append((score, int(valid_codes), normalized.shape[0] * normalized.shape[1], normalized))
-    if not candidates:
-        return None
-
-    # Goodinfo 目前的完成表格不一定在 HTML 文字中保留「週轉率」字樣，
-    # 因此以代號／名稱欄與有效股票代號數量確認，而不是只比對單一關鍵字。
-    target_df = max(candidates, key=lambda item: (item[0], item[1], item[2]))[3]
-    return target_df.dropna(how="all").reset_index(drop=True)
-
-
-GOODINFO_FALLBACK_CACHE_FILE = "goodinfo_turnover_cache.json"
-
-
-def _goodinfo_numeric_series(series):
-    """把官方行情中的逗號、符號與空值安全轉成數值。"""
-    return pd.to_numeric(
-        series.astype(str).str.replace(',', '', regex=False)
-        .str.replace(r'[^0-9+\-.]', '', regex=True),
-        errors='coerce'
-    )
-
-
-def _roc_market_date(value):
-    text = re.sub(r'\D', '', str(value or ''))
-    if len(text) == 7:
-        try:
-            return f"{int(text[:3]) + 1911}/{text[3:5]}/{text[5:7]}"
-        except ValueError:
-            pass
-    return str(value or '').strip()
-
-
-@st.cache_data(ttl=300, max_entries=1, show_spinner=False)
-def fetch_official_turnover_ranking():
-    """以 TWSE／TPEx 官方 OpenAPI 建立上市櫃股票週轉率排行。"""
-    endpoints = {
-        'twse_quote': 'https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL',
-        'twse_profile': 'https://openapi.twse.com.tw/v1/opendata/t187ap03_L',
-        'tpex_turnover': 'https://www.tpex.org.tw/openapi/v1/tpex_daily_turnover',
-        'tpex_quote': 'https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes',
-    }
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (compatible; StockStrategyRoom/1.0)',
-        'Accept': 'application/json',
-    }
-
-    def request_records(item):
-        name, endpoint = item
-        response = requests.get(endpoint, headers=headers, timeout=12)
-        response.raise_for_status()
-        payload = response.json()
-        if not isinstance(payload, list) or not payload:
-            raise ValueError(f'{name} 未回傳有效資料')
-        return name, payload
-
-    payloads = {}
-    errors = []
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        futures = [executor.submit(request_records, item) for item in endpoints.items()]
-        for future in as_completed(futures):
-            try:
-                name, payload = future.result()
-                payloads[name] = payload
-            except Exception as exc:
-                errors.append(str(exc))
-
-    market_frames = []
-    if {'twse_quote', 'twse_profile'}.issubset(payloads):
-        quote = pd.DataFrame(payloads['twse_quote']).copy()
-        profile = pd.DataFrame(payloads['twse_profile']).copy()
-        required_profile = {'公司代號', '公司簡稱', '已發行普通股數或TDR原股發行股數'}
-        if {'Code', 'TradeVolume', 'ClosingPrice', 'Change', 'Date'}.issubset(quote.columns) and required_profile.issubset(profile.columns):
-            profile = profile.rename(columns={
-                '公司代號': 'Code',
-                '公司簡稱': 'ProfileName',
-                '已發行普通股數或TDR原股發行股數': 'IssueShares',
-            })
-            listed = quote.merge(profile[['Code', 'ProfileName', 'IssueShares']], on='Code', how='inner')
-            listed['TradeVolumeNum'] = _goodinfo_numeric_series(listed['TradeVolume'])
-            listed['IssueSharesNum'] = _goodinfo_numeric_series(listed['IssueShares'])
-            listed['CloseNum'] = _goodinfo_numeric_series(listed['ClosingPrice'])
-            listed['ChangeNum'] = _goodinfo_numeric_series(listed['Change'])
-            listed['TurnoverNum'] = listed['TradeVolumeNum'] / listed['IssueSharesNum'] * 100
-            listed['PreviousClose'] = listed['CloseNum'] - listed['ChangeNum']
-            listed['ChangePctNum'] = listed['ChangeNum'] / listed['PreviousClose'].replace(0, np.nan) * 100
-            market_frames.append(pd.DataFrame({
-                '代號': listed['Code'].astype(str),
-                '名稱': listed['ProfileName'].astype(str).str.strip(),
-                '成交': listed['CloseNum'],
-                '漲跌價': listed['ChangeNum'],
-                '漲跌幅': listed['ChangePctNum'],
-                '更新日期': listed['Date'].map(_roc_market_date),
-                '當日成交量週轉率(%)': listed['TurnoverNum'],
-            }))
-        else:
-            errors.append('TWSE 官方欄位格式不完整')
-
-    if {'tpex_turnover', 'tpex_quote'}.issubset(payloads):
-        turnover = pd.DataFrame(payloads['tpex_turnover']).copy()
-        quote = pd.DataFrame(payloads['tpex_quote']).copy()
-        code_col = 'SecuritiesCompanyCode'
-        required_turnover = {code_col, 'CompanyName', 'TurnoverRatio', 'Date'}
-        if required_turnover.issubset(turnover.columns) and {code_col, 'Close', 'Change'}.issubset(quote.columns):
-            otc = turnover.merge(
-                quote[[code_col, 'Close', 'Change']], on=code_col, how='left'
-            )
-            otc['CloseNum'] = _goodinfo_numeric_series(otc['Close'])
-            otc['ChangeNum'] = _goodinfo_numeric_series(otc['Change'])
-            otc['PreviousClose'] = otc['CloseNum'] - otc['ChangeNum']
-            otc['ChangePctNum'] = otc['ChangeNum'] / otc['PreviousClose'].replace(0, np.nan) * 100
-            market_frames.append(pd.DataFrame({
-                '代號': otc[code_col].astype(str),
-                '名稱': otc['CompanyName'].astype(str).str.strip(),
-                '成交': otc['CloseNum'],
-                '漲跌價': otc['ChangeNum'],
-                '漲跌幅': otc['ChangePctNum'],
-                '更新日期': otc['Date'].map(_roc_market_date),
-                '當日成交量週轉率(%)': _goodinfo_numeric_series(otc['TurnoverRatio']),
-            }))
-        else:
-            errors.append('TPEx 官方欄位格式不完整')
-
-    if not market_frames:
-        raise ValueError('；'.join(errors) if errors else '官方週轉率資料皆為空白')
-
-    result = pd.concat(market_frames, ignore_index=True)
-    result['代號'] = result['代號'].str.extract(r'(\d{4})', expand=False)
-    result = result.dropna(subset=['代號', '當日成交量週轉率(%)'])
-    result = result[result['當日成交量週轉率(%)'] >= 0]
-    result = result.sort_values('當日成交量週轉率(%)', ascending=False).drop_duplicates('代號')
-    result.insert(0, '排名', np.arange(1, len(result) + 1))
-    for column in ('成交', '漲跌價', '漲跌幅', '當日成交量週轉率(%)'):
-        result[column] = result[column].round(2)
-    return result.head(500).reset_index(drop=True), errors
-
-
-def _save_goodinfo_fallback_cache(dataframe, source):
-    try:
-        payload = {
-            'saved_at': datetime.now(pytz.timezone('Asia/Taipei')).isoformat(),
-            'source': source,
-            'records': dataframe.to_dict(orient='records'),
-        }
-        temporary = f'{GOODINFO_FALLBACK_CACHE_FILE}.tmp'
-        with open(temporary, 'w', encoding='utf-8') as file:
-            json.dump(payload, file, ensure_ascii=False)
-        os.replace(temporary, GOODINFO_FALLBACK_CACHE_FILE)
-    except Exception:
-        pass
-
-
-def _load_goodinfo_fallback_cache(max_age_hours=36):
-    try:
-        with open(GOODINFO_FALLBACK_CACHE_FILE, 'r', encoding='utf-8') as file:
-            payload = json.load(file)
-        saved_at = datetime.fromisoformat(str(payload.get('saved_at', '')))
-        if saved_at.tzinfo is None:
-            saved_at = pytz.timezone('Asia/Taipei').localize(saved_at)
-        age = datetime.now(pytz.timezone('Asia/Taipei')) - saved_at.astimezone(pytz.timezone('Asia/Taipei'))
-        dataframe = pd.DataFrame(payload.get('records', []))
-        if age <= timedelta(hours=max_age_hours) and not dataframe.empty and {'代號', '名稱'}.issubset(dataframe.columns):
-            return dataframe, payload.get('source', '最近成功資料'), saved_at
-    except Exception:
-        pass
-    return None, None, None
-
-
-def _summarize_goodinfo_error(error):
-    text = str(error or '').strip()
-    if not text:
-        return '來源未回應'
-    text = text.split('Stacktrace:', 1)[0]
-    text = re.sub(r'\s+', ' ', text).strip()
-    return text[:220] + ('…' if len(text) > 220 else '')
-
-
-def fetch_goodinfo_data(max_attempts=2, total_wait_seconds=14):
-    """以瀏覽器抓取 Goodinfo；通過 Cookie 初始化後等待完整排行，完成即回傳。"""
+def fetch_goodinfo_data():
+    """使用原始流程：開啟 Goodinfo 後固定等待 15 秒，再解析完整排行表。"""
     url = "https://goodinfo.tw/tw/StockList.asp?RPT_TIME=&MARKET_CAT=%E7%86%B1%E9%96%80%E6%8E%92%E8%A1%8C&INDUSTRY_CAT=%E7%B4%AF%E8%A8%88%E6%88%90%E4%BA%A4%E9%87%8F%E9%80%B1%E8%BD%89%E7%8E%87%28%E7%95%B6%E6%97%A5%29%40%40%E7%B4%AF%E8%A8%88%E6%88%90%E4%BA%A4%E9%87%8F%E9%80%B1%E8%BD%89%E7%8E%87%40%40%E7%95%B6%E6%97%A5"
     chrome_options = Options()
-    # Goodinfo 會先跳驗證頁，再由 JavaScript 重導向並載入大型排行；不等待瀏覽器
-    # 宣告整頁完成，改由下方 DOM 條件判定，避免廣告資源造成 renderer timeout。
-    chrome_options.page_load_strategy = "none"
     chrome_options.add_argument("--headless=new")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--disable-gpu")
     chrome_options.add_argument("--window-size=1920x1080")
-    chrome_options.add_argument("--disable-extensions")
-    chrome_options.add_experimental_option(
-        "prefs", {"profile.managed_default_content_settings.images": 2}
-    )
+    chrome_options.add_argument("--single-process")
+    chrome_options.add_argument("--no-zygote")
+    chrome_options.add_argument("--disable-software-rasterizer")
     chrome_options.add_argument("--disable-blink-features=AutomationControlled")
     chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
     chrome_options.add_experimental_option('useAutomationExtension', False)
     chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36")
 
-    if os.path.exists("/usr/bin/chromium"):
-        chrome_options.binary_location = "/usr/bin/chromium"
-
-    driver = None
-    last_error = None
-    best_result = None
-
-    def consume_alert():
-        try:
-            alert = driver.switch_to.alert
-            alert_text = str(alert.text or '').strip()
-            alert.accept()
-            return alert_text
-        except Exception:
-            return ''
-
+    chrome_options.binary_location = "/usr/bin/chromium"
     try:
-        service = Service("/usr/bin/chromedriver") if os.path.exists("/usr/bin/chromedriver") else Service()
+        service = Service("/usr/bin/chromedriver")
         driver = webdriver.Chrome(service=service, options=chrome_options)
-        driver.set_page_load_timeout(12)
         driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
             "source": """
             Object.defineProperty(navigator, 'webdriver', {
@@ -5741,99 +5508,42 @@ def fetch_goodinfo_data(max_attempts=2, total_wait_seconds=14):
             })
             """
         })
-        
-        attempt_count = max(1, int(max_attempts))
-        overall_deadline = time.monotonic() + max(3, float(total_wait_seconds))
-        for attempt in range(attempt_count):
-            try:
-                # Goodinfo 會先建立 CLIENT_KEY 再以 REINIT 重新導向；重試時必須沿用
-                # 同一組 Cookie，否則每次都會回到初始化頁而看不到排行表。
-                remaining = overall_deadline - time.monotonic()
-                if remaining <= 0.5:
-                    break
-                attempts_left = attempt_count - attempt
-                attempt_budget = remaining if attempts_left == 1 else max(8, remaining * 0.75)
-                driver.set_page_load_timeout(max(3, min(12, attempt_budget)))
-                request_url = url if attempt == 0 else f"{url}&RETRY_TS={int(time.time() * 1000)}"
-                try:
-                    driver.get(request_url)
-                except Exception as navigation_error:
-                    # Goodinfo 的廣告與大型排行可能讓 Chrome 先回報 renderer timeout，
-                    # 但頁面與 AJAX 仍在背景載入；保留該頁並繼續檢查 DOM。
-                    last_error = navigation_error
-                    alert_text = consume_alert()
-                    if alert_text:
-                        raise RuntimeError(f'Goodinfo 提示：{alert_text}')
-                attempt_deadline = min(overall_deadline, time.monotonic() + attempt_budget)
-                last_parsed_row_count = -1
-                # 動態表格通常先出現約 50 列骨架，之後才補齊完整排行；至少取得
-                # 100 筆就立即回傳，若來源當下不足 100 筆則在等待結束後保留最佳結果。
-                while time.monotonic() < attempt_deadline:
-                    alert_text = consume_alert()
-                    if alert_text:
-                        raise RuntimeError(f'Goodinfo 提示：{alert_text}')
-                    try:
-                        page_html = driver.page_source
-                        row_count = len(driver.find_elements(By.TAG_NAME, "tr"))
-                    except Exception as dom_error:
-                        alert_text = consume_alert()
-                        if alert_text:
-                            raise RuntimeError(f'Goodinfo 提示：{alert_text}') from dom_error
-                        raise
-                    if row_count >= 20 and row_count != last_parsed_row_count:
-                        last_parsed_row_count = row_count
-                        result = _parse_goodinfo_turnover_table(page_html)
-                        if result is not None and not result.empty:
-                            if best_result is None or len(result) > len(best_result):
-                                best_result = result
-                            if len(result) >= 100:
-                                st.session_state['goodinfo_fetch_source'] = 'Goodinfo 動態排行'
-                                _save_goodinfo_fallback_cache(result, 'Goodinfo 動態排行')
-                                return result
-                    time.sleep(min(0.4, max(0.05, attempt_deadline - time.monotonic())))
-                raise ValueError("頁面已開啟，但週轉率排行表尚未完整載入")
-            except Exception as exc:
-                last_error = exc
-                if attempt + 1 < attempt_count and time.monotonic() < overall_deadline:
-                    time.sleep(0.25)
-    except Exception as e:
-        last_error = e
-    finally:
-        if driver is not None:
-            driver.quit()
-    if best_result is not None and not best_result.empty:
-        st.session_state['goodinfo_fetch_source'] = 'Goodinfo 動態排行（部分完成）'
-        _save_goodinfo_fallback_cache(best_result, 'Goodinfo 動態排行（部分完成）')
-        return best_result
+        driver.get(url)
+        time.sleep(15)
 
-    official_error = None
-    try:
-        official_result, official_warnings = fetch_official_turnover_ranking()
-        if official_result is not None and not official_result.empty:
-            source = '證交所／櫃買中心官方週轉率排行'
-            st.session_state['goodinfo_fetch_source'] = source
-            _save_goodinfo_fallback_cache(official_result, source)
-            reason = f'（Goodinfo：{_summarize_goodinfo_error(last_error)}）' if last_error is not None else ''
-            st.warning(f'Goodinfo 動態頁暫時無法使用，已自動改用官方資料{reason}')
-            if official_warnings:
-                st.caption('部分官方來源未回應，已使用可取得的市場資料：' + '；'.join(official_warnings))
-            return official_result
+        page_html = driver.page_source
+        tables = pd.read_html(io.StringIO(page_html))
+
+        target_df = None
+        for dataframe in tables:
+            if dataframe.shape[0] > 10 and dataframe.shape[1] > 5:
+                if target_df is None or (
+                    dataframe.shape[0] * dataframe.shape[1]
+                    > target_df.shape[0] * target_df.shape[1]
+                ):
+                    target_df = dataframe
+
+        if target_df is not None:
+            if isinstance(target_df.columns, pd.MultiIndex):
+                new_columns = []
+                for column in target_df.columns:
+                    cleaned_parts = []
+                    for item in column:
+                        item_text = str(item).replace(' ', '').strip()
+                        if item_text and not item_text.startswith('Unnamed'):
+                            if not cleaned_parts or cleaned_parts[-1] != item_text:
+                                cleaned_parts.append(item_text)
+                    new_columns.append('_'.join(cleaned_parts))
+                target_df.columns = new_columns
+            else:
+                target_df.columns = [str(column).replace(' ', '').strip() for column in target_df.columns]
+            return target_df
     except Exception as exc:
-        official_error = exc
-
-    cached_result, cached_source, cached_at = _load_goodinfo_fallback_cache()
-    if cached_result is not None and not cached_result.empty:
-        st.session_state['goodinfo_fetch_source'] = f'{cached_source}（暫存）'
-        st.warning(f"即時來源暫時無法使用，已載入 {cached_at.strftime('%Y/%m/%d %H:%M')} 的最近成功資料。")
-        return cached_result
-
-    error_parts = []
-    if last_error is not None:
-        error_parts.append(f'Goodinfo：{_summarize_goodinfo_error(last_error)}')
-    if official_error is not None:
-        error_parts.append(f'官方備援：{_summarize_goodinfo_error(official_error)}')
-    if error_parts:
-        st.error('抓取失敗（已依序嘗試 Goodinfo、官方資料與最近成功暫存）：' + '；'.join(error_parts))
+        st.error(f"系統發生異常: {exc}")
+        return None
+    finally:
+        if 'driver' in locals():
+            driver.quit()
     return None
 
 # ==========================================
@@ -7202,19 +6912,18 @@ def render_stock_strategy_controls():
             st.markdown("#### 外部資源")
 
             def perform_goodinfo_fetch():
-                with st.spinner("正在載入週轉率排行；Goodinfo 最多等待 14 秒，失敗會自動切換官方資料..."):
+                with st.spinner("正在抓取最新資料，約需 15 秒..."):
                     result = fetch_goodinfo_data()
                     if result is not None and not result.empty:
                         st.session_state['goodinfo_df'] = result.astype(str)
                         st.session_state['goodinfo_fetch_failed'] = False
-                        source = st.session_state.get('goodinfo_fetch_source', '週轉率排行')
-                        st.success(f"抓取成功：{source}，共 {len(result)} 筆；回到股票分析按執行即可。")
+                        st.success("抓取成功，已載入暫存；回到股票分析按執行即可。")
                     else:
                         st.session_state['goodinfo_fetch_failed'] = True
-                        st.error("Goodinfo、官方資料與最近成功暫存皆無法取得，請稍後再試。")
+                        st.error("抓取失敗或查無資料，請稍後再試。")
 
             if st.button(
-                "📥 抓取週轉率排行", help="優先讀取 Goodinfo；最多等待 14 秒並處理錯誤提示，失敗後自動改用證交所／櫃買中心官方資料，最後再使用最近成功暫存。",
+                "📥 抓取 Goodinfo 週轉率排行", help="需等待動態表格載入",
                 use_container_width=True, key='fetch_goodinfo_in_stock_room'
             ):
                 perform_goodinfo_fetch()
