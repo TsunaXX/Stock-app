@@ -5483,57 +5483,66 @@ def get_tw_stocker_data(direction):
 def _parse_goodinfo_turnover_table(page_html):
     """挑出 Goodinfo 週轉率排行表，並拒絕阻擋頁或尚未載入的空表。"""
     try:
-        tables = pd.read_html(io.StringIO(page_html))
-    except (ValueError, TypeError):
+        # 固定使用 requirements 已具備的 lxml；形成中的頁面若沒有完整 table，
+        # 不讓 pandas 退回未安裝的 html5lib 而中止整次重試。
+        tables = pd.read_html(io.StringIO(page_html), flavor='lxml')
+    except (ValueError, TypeError, ImportError):
         return None
 
     candidates = []
     for table in tables:
         if table.shape[0] < 10 or table.shape[1] < 5:
             continue
-        raw_columns = table.columns
-        column_text = "|".join(
-            str(item) for column in raw_columns
-            for item in (column if isinstance(column, tuple) else (column,))
-        )
-        score = sum(keyword in column_text for keyword in ("代號", "名稱", "週轉率", "成交"))
-        candidates.append((score, table.shape[0] * table.shape[1], table.copy()))
+        normalized = table.copy()
+        if isinstance(normalized.columns, pd.MultiIndex):
+            new_columns = []
+            for column in normalized.columns:
+                cleaned_parts = []
+                for item in column:
+                    item_text = re.sub(r"\s+", "", str(item)).strip()
+                    if item_text and not item_text.startswith("Unnamed"):
+                        if not cleaned_parts or cleaned_parts[-1] != item_text:
+                            cleaned_parts.append(item_text)
+                new_columns.append("_".join(cleaned_parts))
+            normalized.columns = new_columns
+        else:
+            normalized.columns = [re.sub(r"\s+", "", str(column)).strip() for column in normalized.columns]
+
+        column_text = "|".join(map(str, normalized.columns))
+        code_column = next((column for column in normalized.columns if "代號" in str(column)), None)
+        name_column = next((column for column in normalized.columns if "名稱" in str(column)), None)
+        if code_column is None or name_column is None:
+            continue
+        valid_codes = normalized[code_column].astype(str).str.extract(r"(\d{4,6})", expand=False).notna().sum()
+        if valid_codes < 10:
+            continue
+        score = sum(keyword in column_text for keyword in ("代號", "名稱", "週轉", "成交"))
+        candidates.append((score, int(valid_codes), normalized.shape[0] * normalized.shape[1], normalized))
     if not candidates:
         return None
 
-    # 欄名命中週轉率語意優先；版面異動時才退回最大資料表。
-    target_df = max(candidates, key=lambda item: (item[0], item[1]))[2]
-    if isinstance(target_df.columns, pd.MultiIndex):
-        new_columns = []
-        for column in target_df.columns:
-            cleaned_parts = []
-            for item in column:
-                item_text = re.sub(r"\s+", "", str(item)).strip()
-                if item_text and not item_text.startswith("Unnamed"):
-                    if not cleaned_parts or cleaned_parts[-1] != item_text:
-                        cleaned_parts.append(item_text)
-            new_columns.append("_".join(cleaned_parts))
-        target_df.columns = new_columns
-    else:
-        target_df.columns = [re.sub(r"\s+", "", str(column)).strip() for column in target_df.columns]
+    # Goodinfo 目前的完成表格不一定在 HTML 文字中保留「週轉率」字樣，
+    # 因此以代號／名稱欄與有效股票代號數量確認，而不是只比對單一關鍵字。
+    target_df = max(candidates, key=lambda item: (item[0], item[1], item[2]))[3]
     return target_df.dropna(how="all").reset_index(drop=True)
 
 
-def fetch_goodinfo_data(max_attempts=2, total_wait_seconds=14):
-    """以瀏覽器抓取 Goodinfo；載入完成立即回傳，重試共用 14 秒等待預算。"""
+def fetch_goodinfo_data(max_attempts=2, total_wait_seconds=22):
+    """以瀏覽器抓取 Goodinfo；通過 Cookie 初始化後等待完整排行，完成即回傳。"""
     url = "https://goodinfo.tw/tw/StockList.asp?RPT_TIME=&MARKET_CAT=%E7%86%B1%E9%96%80%E6%8E%92%E8%A1%8C&INDUSTRY_CAT=%E7%B4%AF%E8%A8%88%E6%88%90%E4%BA%A4%E9%87%8F%E9%80%B1%E8%BD%89%E7%8E%87%28%E7%95%B6%E6%97%A5%29%40%40%E7%B4%AF%E8%A8%88%E6%88%90%E4%BA%A4%E9%87%8F%E9%80%B1%E8%BD%89%E7%8E%87%40%40%E7%95%B6%E6%97%A5"
     chrome_options = Options()
-    chrome_options.page_load_strategy = "eager"
+    # Goodinfo 會先跳驗證頁，再由 JavaScript 重導向並載入大型排行；不等待瀏覽器
+    # 宣告整頁完成，改由下方 DOM 條件判定，避免廣告資源造成 renderer timeout。
+    chrome_options.page_load_strategy = "none"
     chrome_options.add_argument("--headless=new")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--disable-gpu")
     chrome_options.add_argument("--window-size=1920x1080")
-    # --- 新增：極致記憶體瘦身設定 ---
-    chrome_options.add_argument("--single-process") 
-    chrome_options.add_argument("--no-zygote")      
-    chrome_options.add_argument("--disable-software-rasterizer")
-    # -------------------------------
+    chrome_options.add_argument("--disable-extensions")
+    chrome_options.add_experimental_option(
+        "prefs", {"profile.managed_default_content_settings.images": 2}
+    )
     chrome_options.add_argument("--disable-blink-features=AutomationControlled")
     chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
     chrome_options.add_experimental_option('useAutomationExtension', False)
@@ -5547,7 +5556,7 @@ def fetch_goodinfo_data(max_attempts=2, total_wait_seconds=14):
     try:
         service = Service("/usr/bin/chromedriver") if os.path.exists("/usr/bin/chromedriver") else Service()
         driver = webdriver.Chrome(service=service, options=chrome_options)
-        driver.set_page_load_timeout(7)
+        driver.set_page_load_timeout(12)
         driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
             "source": """
             Object.defineProperty(navigator, 'webdriver', {
@@ -5558,25 +5567,39 @@ def fetch_goodinfo_data(max_attempts=2, total_wait_seconds=14):
         
         attempt_count = max(1, int(max_attempts))
         overall_deadline = time.monotonic() + max(3, float(total_wait_seconds))
+        best_result = None
         for attempt in range(attempt_count):
             try:
-                if attempt:
-                    driver.delete_all_cookies()
+                # Goodinfo 會先建立 CLIENT_KEY 再以 REINIT 重新導向；重試時必須沿用
+                # 同一組 Cookie，否則每次都會回到初始化頁而看不到排行表。
                 remaining = overall_deadline - time.monotonic()
                 if remaining <= 0.5:
                     break
                 attempts_left = attempt_count - attempt
-                attempt_budget = remaining if attempts_left == 1 else max(3.5, remaining * 0.62)
-                driver.set_page_load_timeout(max(2, min(7, attempt_budget)))
-                driver.get(url)
+                attempt_budget = remaining if attempts_left == 1 else max(8, remaining * 0.75)
+                driver.set_page_load_timeout(max(3, min(12, attempt_budget)))
+                request_url = url if attempt == 0 else f"{url}&RETRY_TS={int(time.time() * 1000)}"
+                try:
+                    driver.get(request_url)
+                except Exception as navigation_error:
+                    # Goodinfo 的廣告與大型排行可能讓 Chrome 先回報 renderer timeout，
+                    # 但頁面與 AJAX 仍在背景載入；保留該頁並繼續檢查 DOM。
+                    last_error = navigation_error
                 attempt_deadline = min(overall_deadline, time.monotonic() + attempt_budget)
-                # 每 0.4 秒檢查一次；表格一完整就回傳，不再固定空等 15 秒。
+                last_parsed_row_count = -1
+                # 動態表格通常先出現約 50 列骨架，之後才補齊完整排行；至少取得
+                # 100 筆就立即回傳，若來源當下不足 100 筆則在等待結束後保留最佳結果。
                 while time.monotonic() < attempt_deadline:
                     page_html = driver.page_source
-                    if "週轉率" in page_html and len(driver.find_elements(By.TAG_NAME, "tr")) >= 10:
+                    row_count = len(driver.find_elements(By.TAG_NAME, "tr"))
+                    if row_count >= 20 and row_count != last_parsed_row_count:
+                        last_parsed_row_count = row_count
                         result = _parse_goodinfo_turnover_table(page_html)
                         if result is not None and not result.empty:
-                            return result
+                            if best_result is None or len(result) > len(best_result):
+                                best_result = result
+                            if len(result) >= 100:
+                                return result
                     time.sleep(min(0.4, max(0.05, attempt_deadline - time.monotonic())))
                 raise ValueError("頁面已開啟，但週轉率排行表尚未完整載入")
             except Exception as exc:
@@ -5588,6 +5611,8 @@ def fetch_goodinfo_data(max_attempts=2, total_wait_seconds=14):
     finally:
         if driver is not None:
             driver.quit()
+    if best_result is not None and not best_result.empty:
+        return best_result
     if last_error is not None:
         st.error(f"Goodinfo 抓取失敗（已自動重試）：{last_error}")
     return None
@@ -6348,6 +6373,55 @@ def get_data_cache_sync_lock():
     return threading.RLock()
 
 
+def _decode_data_cache_payload(payload):
+    """相容 Apps Script 直接回傳 JSON、JSON 字串或包在 data 欄位中的格式。"""
+    value = payload
+    for _ in range(3):
+        if isinstance(value, bytes):
+            value = value.decode('utf-8-sig', errors='replace')
+            continue
+        if isinstance(value, str):
+            text = value.strip().lstrip('\ufeff')
+            if not text:
+                return {}
+            try:
+                value = json.loads(text)
+                continue
+            except (ValueError, TypeError):
+                return {}
+        if isinstance(value, dict):
+            if any(key in value for key in ('stock_data', 'fibo_tags', 'saved_notes', 'strategy_signal_log')):
+                return value
+            nested = value.get('data')
+            if isinstance(nested, (dict, str, bytes)):
+                value = nested
+                continue
+            return value
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _fetch_remote_data_cache(gsheet_api_url, timeout=5):
+    """讀取 Google Sheet 快取；只回傳解析結果，不把網址或內容寫入畫面。"""
+    if not gsheet_api_url:
+        return None, '未設定 Google Sheet 同步'
+    try:
+        response = requests.get(gsheet_api_url, timeout=timeout)
+        response.raise_for_status()
+        payload = _decode_data_cache_payload(response.text)
+        if not isinstance(payload, dict) or not payload:
+            return None, 'Google Sheet 回傳格式無法辨識'
+        return payload, None
+    except (requests.RequestException, ValueError, TypeError) as exc:
+        return None, f'{type(exc).__name__}'
+
+
+def _valid_fibo_tags(tags):
+    if not isinstance(tags, list) or len(tags) < 5:
+        return []
+    return [str(tag) for tag in tags[:5]]
+
+
 def save_fibo_config():
     config = load_config()
     fibo_tags = [
@@ -6372,7 +6446,15 @@ def save_fibo_config():
         )
     except Exception: pass
     # 標籤是明確儲存動作，傳入 fibo_tags 讓雲端同步不被視為一般股票快取寫入。
-    save_data_cache(st.session_state.stock_data, st.session_state.ignored_stocks, st.session_state.all_candidates, st.session_state.saved_notes, fibo_tags)
+    sync_saved = save_data_cache(
+        st.session_state.stock_data, st.session_state.ignored_stocks,
+        st.session_state.all_candidates, st.session_state.saved_notes, fibo_tags,
+    )
+    if sync_saved:
+        st.session_state['_fibo_tags_source'] = (
+            'google_sheet' if get_app_secret('gsheet_api_url') else 'local_tag_cache'
+        )
+    return sync_saved
 
 def save_data_cache(df, ignored_set, candidates=None, saved_notes=None, fibo_tags=None):
     if candidates is None:
@@ -6390,15 +6472,10 @@ def save_data_cache(df, ignored_set, candidates=None, saved_notes=None, fibo_tag
     fibo_tags = [str(tag) for tag in list(fibo_tags)[:5]]
     gsheet_api_url = get_app_secret('gsheet_api_url')
     if gsheet_api_url and not explicit_fibo_tag_save:
-        try:
-            remote_response = requests.get(gsheet_api_url, timeout=3)
-            if remote_response.status_code == 200 and remote_response.text.strip():
-                remote_payload = json.loads(remote_response.text)
-                remote_tags = remote_payload.get('fibo_tags', []) if isinstance(remote_payload, dict) else []
-                if isinstance(remote_tags, list) and len(remote_tags) >= 5:
-                    fibo_tags = [str(tag) for tag in remote_tags[:5]]
-        except (requests.RequestException, ValueError, TypeError):
-            pass
+        remote_payload, _ = _fetch_remote_data_cache(gsheet_api_url, timeout=3)
+        remote_tags = _valid_fibo_tags(remote_payload.get('fibo_tags', [])) if remote_payload else []
+        if remote_tags:
+            fibo_tags = remote_tags
     try:
         # 只在主執行緒做最輕量的複製，避免鎖死 UI
         df_save = df.fillna("").copy()
@@ -6434,15 +6511,10 @@ def save_data_cache(df, ignored_set, candidates=None, saved_notes=None, fibo_tag
                     with sync_lock:
                         # 取得鎖後再讀一次遠端標籤，確保排在快速標籤儲存之後的舊分頁
                         # 只更新股票資料，不會把剛同步的標籤覆寫掉。
-                        try:
-                            latest_response = requests.get(gsheet_api_url, timeout=3)
-                            if latest_response.status_code == 200 and latest_response.text.strip():
-                                latest_payload = json.loads(latest_response.text)
-                                latest_tags = latest_payload.get('fibo_tags', []) if isinstance(latest_payload, dict) else []
-                                if isinstance(latest_tags, list) and len(latest_tags) >= 5:
-                                    bg_tags = [str(tag) for tag in latest_tags[:5]]
-                        except (requests.RequestException, ValueError, TypeError):
-                            pass
+                        latest_payload, _ = _fetch_remote_data_cache(gsheet_api_url, timeout=3)
+                        latest_tags = _valid_fibo_tags(latest_payload.get('fibo_tags', [])) if latest_payload else []
+                        if latest_tags:
+                            bg_tags = latest_tags
                         data_to_save = {
                             "stock_data": bg_df.to_dict(orient='records'),
                             "ignored_stocks": bg_ignored,
@@ -6470,12 +6542,18 @@ def save_data_cache(df, ignored_set, candidates=None, saved_notes=None, fibo_tag
                     "cached_notes": cached_notes,
                     "strategy_signal_log": signal_records,
                 }
-                with get_data_cache_sync_lock():
-                    requests.post(
-                        gsheet_api_url,
-                        json={"action": "save", "data": json.dumps(data_to_save, ensure_ascii=False)},
-                        timeout=5,
-                    )
+                try:
+                    with get_data_cache_sync_lock():
+                        response = requests.post(
+                            gsheet_api_url,
+                            json={"action": "save", "data": json.dumps(data_to_save, ensure_ascii=False)},
+                            timeout=8,
+                        )
+                        response.raise_for_status()
+                    st.session_state['_fibo_cloud_save_status'] = 'ok'
+                except requests.RequestException as exc:
+                    st.session_state['_fibo_cloud_save_status'] = type(exc).__name__
+                    return False
             else:
                 threading.Thread(
                     target=bg_save,
@@ -6485,24 +6563,28 @@ def save_data_cache(df, ignored_set, candidates=None, saved_notes=None, fibo_tag
                     ),
                     daemon=True,
                 ).start()
-    except Exception: pass
+    except Exception:
+        if explicit_fibo_tag_save:
+            st.session_state['_fibo_cloud_save_status'] = 'local_only'
+            return False
+    return True if explicit_fibo_tag_save else None
 
 def load_data_cache():
     gsheet_api_url = get_app_secret('gsheet_api_url')
     if gsheet_api_url:
-        try:
-            r = requests.get(gsheet_api_url, timeout=5)
-            if r.status_code == 200 and r.text.strip():
-                data = json.loads(r.text)
-                df = pd.DataFrame(data.get('stock_data', []))
-                ignored = set(data.get('ignored_stocks', []))
-                candidates = data.get('all_candidates', [])
-                saved_notes = data.get('saved_notes', {}) 
-                fibo_tags = data.get('fibo_tags', [])
-                if isinstance(data.get('strategy_signal_log'), list):
-                    save_strategy_signal_log(data['strategy_signal_log'])
-                return df, ignored, candidates, saved_notes, fibo_tags, data.get('cached_notes', {})
-        except Exception: pass
+        data, remote_error = _fetch_remote_data_cache(gsheet_api_url, timeout=8)
+        if data:
+            st.session_state['_data_cache_source'] = 'google_sheet'
+            st.session_state['_data_cache_remote_error'] = ''
+            df = pd.DataFrame(data.get('stock_data', []))
+            ignored = set(data.get('ignored_stocks', []))
+            candidates = data.get('all_candidates', [])
+            saved_notes = data.get('saved_notes', {})
+            fibo_tags = _valid_fibo_tags(data.get('fibo_tags', []))
+            if isinstance(data.get('strategy_signal_log'), list):
+                save_strategy_signal_log(data['strategy_signal_log'])
+            return df, ignored, candidates, saved_notes, fibo_tags, data.get('cached_notes', {})
+        st.session_state['_data_cache_remote_error'] = remote_error or '讀取失敗'
 
     if os.path.exists(DATA_CACHE_FILE):
         try:
@@ -6514,9 +6596,38 @@ def load_data_cache():
             fibo_tags = data.get('fibo_tags', [])
             if isinstance(data.get('strategy_signal_log'), list):
                 save_strategy_signal_log(data['strategy_signal_log'])
+            st.session_state['_data_cache_source'] = 'local'
             return df, ignored, candidates, saved_notes, fibo_tags, data.get('cached_notes', {})
         except Exception: return pd.DataFrame(), set(), [], {}, [], {}
+    st.session_state['_data_cache_source'] = 'default'
     return pd.DataFrame(), set(), [], {}, [], {}
+
+
+def reload_fibo_tags_from_cloud():
+    """手動從 Google Sheet 還原標籤，供清除 Cookie 後的新手機工作階段使用。"""
+    payload, error = _fetch_remote_data_cache(get_app_secret('gsheet_api_url'), timeout=8)
+    tags = _valid_fibo_tags(payload.get('fibo_tags', [])) if payload else []
+    if not tags:
+        return False, error or '雲端尚無五組快速標籤'
+    st.session_state.fibo_tags = tags
+    for index, tag in enumerate(tags, start=1):
+        st.session_state[f'custom_tag_{index}'] = tag
+    st.session_state['_data_cache_source'] = 'google_sheet'
+    st.session_state['_fibo_cloud_save_status'] = 'loaded'
+    try:
+        updated_at = datetime.now(pytz.timezone('Asia/Taipei')).isoformat()
+        config = load_config()
+        config['fibo_tags'] = tags
+        config['fibo_tags_updated_at'] = updated_at
+        _write_json_atomic(CONFIG_FILE, config)
+        _write_json_atomic(
+            FIBO_TAG_CACHE_FILE,
+            {'version': 2, 'updated_at': updated_at, 'tags': tags},
+            indent=2,
+        )
+    except (OSError, TypeError, ValueError):
+        pass
+    return True, '已從 Google Sheet 還原快速標籤'
 
 def load_url_history():
     if os.path.exists(URL_CACHE_FILE):
@@ -6580,20 +6691,27 @@ if 'prefetch_cache' not in st.session_state: st.session_state.prefetch_cache = {
 if 'cached_notes' not in st.session_state: st.session_state.cached_notes = {}    
 
 
-# Fibo 標籤與狀態初始化。設定檔是標籤的最新來源；過去此處會先以雲端快取
-# （快取尚未同步時常是預設值）覆寫設定檔，導致瀏覽器重整後自訂標籤消失。
+# Fibo 標籤與狀態初始化。新工作階段若已成功讀到 Google Sheet，雲端標籤
+# 必須優先；否則手機清除 Cookie 後會被部署檔案內的預設標籤覆蓋。
 saved_config = load_config()
 configured_fibo_tags = saved_config.get('fibo_tags', [])
-cached_fibo_tags = st.session_state.get('fibo_tags', [])
+cached_fibo_tags = _valid_fibo_tags(st.session_state.get('fibo_tags', []))
 dedicated_fibo_tags = load_fibo_tag_cache()
-if len(dedicated_fibo_tags) >= 5:
+if st.session_state.get('_data_cache_source') == 'google_sheet' and cached_fibo_tags:
+    fibo_tags_source = cached_fibo_tags
+    st.session_state['_fibo_tags_source'] = 'google_sheet'
+elif len(dedicated_fibo_tags) >= 5:
     fibo_tags_source = dedicated_fibo_tags
+    st.session_state['_fibo_tags_source'] = 'local_tag_cache'
 elif isinstance(configured_fibo_tags, list) and len(configured_fibo_tags) >= 5:
     fibo_tags_source = configured_fibo_tags
-elif isinstance(cached_fibo_tags, list) and len(cached_fibo_tags) >= 5:
+    st.session_state['_fibo_tags_source'] = 'config'
+elif cached_fibo_tags:
     fibo_tags_source = cached_fibo_tags
+    st.session_state['_fibo_tags_source'] = 'data_cache'
 else:
     fibo_tags_source = list(DEFAULT_FIBO_TAGS)
+    st.session_state['_fibo_tags_source'] = 'default'
 st.session_state.fibo_tags = list(fibo_tags_source)
 
 if 'fibo_search_input' not in st.session_state: st.session_state.fibo_search_input = ""
@@ -6865,7 +6983,7 @@ def render_stock_strategy_controls():
             st.markdown("#### 外部資源")
 
             def perform_goodinfo_fetch():
-                with st.spinner("正在抓取最新資料；載入完成會立即回傳，14 秒內會自動重試..."):
+                with st.spinner("正在通過 Goodinfo 驗證並載入排行；完成會立即回傳，必要時約 20 秒..."):
                     result = fetch_goodinfo_data()
                     if result is not None and not result.empty:
                         st.session_state['goodinfo_df'] = result.astype(str)
@@ -6876,7 +6994,7 @@ def render_stock_strategy_controls():
                         st.error("抓取失敗或查無資料，請稍後再試。")
 
             if st.button(
-                "📥 抓取 Goodinfo 週轉率排行", help="共用最長 14 秒動態等待預算；表格載入完成立即回傳，遇阻擋或空表會自動重試一次。",
+                "📥 抓取 Goodinfo 週轉率排行", help="沿用同一組驗證 Cookie 並等待動態排行補齊；通常完成即回傳，最長約 22 秒並自動重試一次。",
                 use_container_width=True, key='fetch_goodinfo_in_stock_room'
             ):
                 perform_goodinfo_fetch()
@@ -13018,6 +13136,28 @@ with tab_fibo:
             st.info("💡 將圖表字體大小設定獨立：")
             st.session_state.fibo_font_size = st.slider("圖表標籤字體大小", min_value=8, max_value=24, value=st.session_state.fibo_font_size)
             st.write("---")
+            cloud_enabled = bool(get_app_secret('gsheet_api_url'))
+            fibo_source_labels = {
+                'google_sheet': 'Google Sheet', 'local_tag_cache': '伺服器標籤檔',
+                'config': '部署設定檔', 'data_cache': '本機資料快取', 'default': '預設標籤',
+            }
+            fibo_source = fibo_source_labels.get(
+                st.session_state.get('_fibo_tags_source', 'default'), '預設標籤'
+            )
+            if cloud_enabled:
+                st.caption(f"☁️ Google Sheet 同步已啟用｜本次標籤來源：{fibo_source}")
+                if st.button(
+                    "☁️ 從 Google Sheet 重新載入標籤",
+                    key="reload_fibo_quick_tags_from_cloud", use_container_width=True,
+                ):
+                    restored, message = reload_fibo_tags_from_cloud()
+                    if restored:
+                        st.toast(message, icon="☁️")
+                        st.rerun()
+                    else:
+                        st.error(f"雲端標籤讀取失敗：{message}")
+            else:
+                st.warning("尚未設定 Google Sheet 同步；目前快速標籤只保存在伺服器。")
             c1, c2, c3, c4, c5 = st.columns(5)
             c1.text_input("快速標籤 1", key="custom_tag_1", on_change=format_fibo_tag, args=("custom_tag_1",))
             c2.text_input("快速標籤 2", key="custom_tag_2", on_change=format_fibo_tag, args=("custom_tag_2",))
@@ -13025,8 +13165,12 @@ with tab_fibo:
             c4.text_input("快速標籤 4", key="custom_tag_4", on_change=format_fibo_tag, args=("custom_tag_4",))
             c5.text_input("快速標籤 5", key="custom_tag_5", on_change=format_fibo_tag, args=("custom_tag_5",))
             if st.button("💾 儲存快速標籤", key="save_fibo_quick_tags", use_container_width=True):
-                save_fibo_config()
-                st.toast("快速標籤已同步儲存", icon="✅")
+                sync_saved = save_fibo_config()
+                if sync_saved:
+                    message = "快速標籤已同步到 Google Sheet" if cloud_enabled else "快速標籤已儲存在伺服器"
+                    st.toast(message, icon="✅")
+                else:
+                    st.error("標籤已嘗試儲存，但 Google Sheet 同步失敗；請稍後再試。")
 
         st.write("📌 **快速查詢標籤** (點擊按鈕直接帶入)")
         btn_labels = [
