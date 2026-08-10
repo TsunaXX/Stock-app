@@ -5527,7 +5527,173 @@ def _parse_goodinfo_turnover_table(page_html):
     return target_df.dropna(how="all").reset_index(drop=True)
 
 
-def fetch_goodinfo_data(max_attempts=2, total_wait_seconds=22):
+GOODINFO_FALLBACK_CACHE_FILE = "goodinfo_turnover_cache.json"
+
+
+def _goodinfo_numeric_series(series):
+    """把官方行情中的逗號、符號與空值安全轉成數值。"""
+    return pd.to_numeric(
+        series.astype(str).str.replace(',', '', regex=False)
+        .str.replace(r'[^0-9+\-.]', '', regex=True),
+        errors='coerce'
+    )
+
+
+def _roc_market_date(value):
+    text = re.sub(r'\D', '', str(value or ''))
+    if len(text) == 7:
+        try:
+            return f"{int(text[:3]) + 1911}/{text[3:5]}/{text[5:7]}"
+        except ValueError:
+            pass
+    return str(value or '').strip()
+
+
+@st.cache_data(ttl=300, max_entries=1, show_spinner=False)
+def fetch_official_turnover_ranking():
+    """以 TWSE／TPEx 官方 OpenAPI 建立上市櫃股票週轉率排行。"""
+    endpoints = {
+        'twse_quote': 'https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL',
+        'twse_profile': 'https://openapi.twse.com.tw/v1/opendata/t187ap03_L',
+        'tpex_turnover': 'https://www.tpex.org.tw/openapi/v1/tpex_daily_turnover',
+        'tpex_quote': 'https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes',
+    }
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (compatible; StockStrategyRoom/1.0)',
+        'Accept': 'application/json',
+    }
+
+    def request_records(item):
+        name, endpoint = item
+        response = requests.get(endpoint, headers=headers, timeout=12)
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, list) or not payload:
+            raise ValueError(f'{name} 未回傳有效資料')
+        return name, payload
+
+    payloads = {}
+    errors = []
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [executor.submit(request_records, item) for item in endpoints.items()]
+        for future in as_completed(futures):
+            try:
+                name, payload = future.result()
+                payloads[name] = payload
+            except Exception as exc:
+                errors.append(str(exc))
+
+    market_frames = []
+    if {'twse_quote', 'twse_profile'}.issubset(payloads):
+        quote = pd.DataFrame(payloads['twse_quote']).copy()
+        profile = pd.DataFrame(payloads['twse_profile']).copy()
+        required_profile = {'公司代號', '公司簡稱', '已發行普通股數或TDR原股發行股數'}
+        if {'Code', 'TradeVolume', 'ClosingPrice', 'Change', 'Date'}.issubset(quote.columns) and required_profile.issubset(profile.columns):
+            profile = profile.rename(columns={
+                '公司代號': 'Code',
+                '公司簡稱': 'ProfileName',
+                '已發行普通股數或TDR原股發行股數': 'IssueShares',
+            })
+            listed = quote.merge(profile[['Code', 'ProfileName', 'IssueShares']], on='Code', how='inner')
+            listed['TradeVolumeNum'] = _goodinfo_numeric_series(listed['TradeVolume'])
+            listed['IssueSharesNum'] = _goodinfo_numeric_series(listed['IssueShares'])
+            listed['CloseNum'] = _goodinfo_numeric_series(listed['ClosingPrice'])
+            listed['ChangeNum'] = _goodinfo_numeric_series(listed['Change'])
+            listed['TurnoverNum'] = listed['TradeVolumeNum'] / listed['IssueSharesNum'] * 100
+            listed['PreviousClose'] = listed['CloseNum'] - listed['ChangeNum']
+            listed['ChangePctNum'] = listed['ChangeNum'] / listed['PreviousClose'].replace(0, np.nan) * 100
+            market_frames.append(pd.DataFrame({
+                '代號': listed['Code'].astype(str),
+                '名稱': listed['ProfileName'].astype(str).str.strip(),
+                '成交': listed['CloseNum'],
+                '漲跌價': listed['ChangeNum'],
+                '漲跌幅': listed['ChangePctNum'],
+                '更新日期': listed['Date'].map(_roc_market_date),
+                '當日成交量週轉率(%)': listed['TurnoverNum'],
+            }))
+        else:
+            errors.append('TWSE 官方欄位格式不完整')
+
+    if {'tpex_turnover', 'tpex_quote'}.issubset(payloads):
+        turnover = pd.DataFrame(payloads['tpex_turnover']).copy()
+        quote = pd.DataFrame(payloads['tpex_quote']).copy()
+        code_col = 'SecuritiesCompanyCode'
+        required_turnover = {code_col, 'CompanyName', 'TurnoverRatio', 'Date'}
+        if required_turnover.issubset(turnover.columns) and {code_col, 'Close', 'Change'}.issubset(quote.columns):
+            otc = turnover.merge(
+                quote[[code_col, 'Close', 'Change']], on=code_col, how='left'
+            )
+            otc['CloseNum'] = _goodinfo_numeric_series(otc['Close'])
+            otc['ChangeNum'] = _goodinfo_numeric_series(otc['Change'])
+            otc['PreviousClose'] = otc['CloseNum'] - otc['ChangeNum']
+            otc['ChangePctNum'] = otc['ChangeNum'] / otc['PreviousClose'].replace(0, np.nan) * 100
+            market_frames.append(pd.DataFrame({
+                '代號': otc[code_col].astype(str),
+                '名稱': otc['CompanyName'].astype(str).str.strip(),
+                '成交': otc['CloseNum'],
+                '漲跌價': otc['ChangeNum'],
+                '漲跌幅': otc['ChangePctNum'],
+                '更新日期': otc['Date'].map(_roc_market_date),
+                '當日成交量週轉率(%)': _goodinfo_numeric_series(otc['TurnoverRatio']),
+            }))
+        else:
+            errors.append('TPEx 官方欄位格式不完整')
+
+    if not market_frames:
+        raise ValueError('；'.join(errors) if errors else '官方週轉率資料皆為空白')
+
+    result = pd.concat(market_frames, ignore_index=True)
+    result['代號'] = result['代號'].str.extract(r'(\d{4})', expand=False)
+    result = result.dropna(subset=['代號', '當日成交量週轉率(%)'])
+    result = result[result['當日成交量週轉率(%)'] >= 0]
+    result = result.sort_values('當日成交量週轉率(%)', ascending=False).drop_duplicates('代號')
+    result.insert(0, '排名', np.arange(1, len(result) + 1))
+    for column in ('成交', '漲跌價', '漲跌幅', '當日成交量週轉率(%)'):
+        result[column] = result[column].round(2)
+    return result.head(500).reset_index(drop=True), errors
+
+
+def _save_goodinfo_fallback_cache(dataframe, source):
+    try:
+        payload = {
+            'saved_at': datetime.now(pytz.timezone('Asia/Taipei')).isoformat(),
+            'source': source,
+            'records': dataframe.to_dict(orient='records'),
+        }
+        temporary = f'{GOODINFO_FALLBACK_CACHE_FILE}.tmp'
+        with open(temporary, 'w', encoding='utf-8') as file:
+            json.dump(payload, file, ensure_ascii=False)
+        os.replace(temporary, GOODINFO_FALLBACK_CACHE_FILE)
+    except Exception:
+        pass
+
+
+def _load_goodinfo_fallback_cache(max_age_hours=36):
+    try:
+        with open(GOODINFO_FALLBACK_CACHE_FILE, 'r', encoding='utf-8') as file:
+            payload = json.load(file)
+        saved_at = datetime.fromisoformat(str(payload.get('saved_at', '')))
+        if saved_at.tzinfo is None:
+            saved_at = pytz.timezone('Asia/Taipei').localize(saved_at)
+        age = datetime.now(pytz.timezone('Asia/Taipei')) - saved_at.astimezone(pytz.timezone('Asia/Taipei'))
+        dataframe = pd.DataFrame(payload.get('records', []))
+        if age <= timedelta(hours=max_age_hours) and not dataframe.empty and {'代號', '名稱'}.issubset(dataframe.columns):
+            return dataframe, payload.get('source', '最近成功資料'), saved_at
+    except Exception:
+        pass
+    return None, None, None
+
+
+def _summarize_goodinfo_error(error):
+    text = str(error or '').strip()
+    if not text:
+        return '來源未回應'
+    text = text.split('Stacktrace:', 1)[0]
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text[:220] + ('…' if len(text) > 220 else '')
+
+
+def fetch_goodinfo_data(max_attempts=2, total_wait_seconds=14):
     """以瀏覽器抓取 Goodinfo；通過 Cookie 初始化後等待完整排行，完成即回傳。"""
     url = "https://goodinfo.tw/tw/StockList.asp?RPT_TIME=&MARKET_CAT=%E7%86%B1%E9%96%80%E6%8E%92%E8%A1%8C&INDUSTRY_CAT=%E7%B4%AF%E8%A8%88%E6%88%90%E4%BA%A4%E9%87%8F%E9%80%B1%E8%BD%89%E7%8E%87%28%E7%95%B6%E6%97%A5%29%40%40%E7%B4%AF%E8%A8%88%E6%88%90%E4%BA%A4%E9%87%8F%E9%80%B1%E8%BD%89%E7%8E%87%40%40%E7%95%B6%E6%97%A5"
     chrome_options = Options()
@@ -5553,6 +5719,17 @@ def fetch_goodinfo_data(max_attempts=2, total_wait_seconds=22):
 
     driver = None
     last_error = None
+    best_result = None
+
+    def consume_alert():
+        try:
+            alert = driver.switch_to.alert
+            alert_text = str(alert.text or '').strip()
+            alert.accept()
+            return alert_text
+        except Exception:
+            return ''
+
     try:
         service = Service("/usr/bin/chromedriver") if os.path.exists("/usr/bin/chromedriver") else Service()
         driver = webdriver.Chrome(service=service, options=chrome_options)
@@ -5567,7 +5744,6 @@ def fetch_goodinfo_data(max_attempts=2, total_wait_seconds=22):
         
         attempt_count = max(1, int(max_attempts))
         overall_deadline = time.monotonic() + max(3, float(total_wait_seconds))
-        best_result = None
         for attempt in range(attempt_count):
             try:
                 # Goodinfo 會先建立 CLIENT_KEY 再以 REINIT 重新導向；重試時必須沿用
@@ -5585,13 +5761,25 @@ def fetch_goodinfo_data(max_attempts=2, total_wait_seconds=22):
                     # Goodinfo 的廣告與大型排行可能讓 Chrome 先回報 renderer timeout，
                     # 但頁面與 AJAX 仍在背景載入；保留該頁並繼續檢查 DOM。
                     last_error = navigation_error
+                    alert_text = consume_alert()
+                    if alert_text:
+                        raise RuntimeError(f'Goodinfo 提示：{alert_text}')
                 attempt_deadline = min(overall_deadline, time.monotonic() + attempt_budget)
                 last_parsed_row_count = -1
                 # 動態表格通常先出現約 50 列骨架，之後才補齊完整排行；至少取得
                 # 100 筆就立即回傳，若來源當下不足 100 筆則在等待結束後保留最佳結果。
                 while time.monotonic() < attempt_deadline:
-                    page_html = driver.page_source
-                    row_count = len(driver.find_elements(By.TAG_NAME, "tr"))
+                    alert_text = consume_alert()
+                    if alert_text:
+                        raise RuntimeError(f'Goodinfo 提示：{alert_text}')
+                    try:
+                        page_html = driver.page_source
+                        row_count = len(driver.find_elements(By.TAG_NAME, "tr"))
+                    except Exception as dom_error:
+                        alert_text = consume_alert()
+                        if alert_text:
+                            raise RuntimeError(f'Goodinfo 提示：{alert_text}') from dom_error
+                        raise
                     if row_count >= 20 and row_count != last_parsed_row_count:
                         last_parsed_row_count = row_count
                         result = _parse_goodinfo_turnover_table(page_html)
@@ -5599,6 +5787,8 @@ def fetch_goodinfo_data(max_attempts=2, total_wait_seconds=22):
                             if best_result is None or len(result) > len(best_result):
                                 best_result = result
                             if len(result) >= 100:
+                                st.session_state['goodinfo_fetch_source'] = 'Goodinfo 動態排行'
+                                _save_goodinfo_fallback_cache(result, 'Goodinfo 動態排行')
                                 return result
                     time.sleep(min(0.4, max(0.05, attempt_deadline - time.monotonic())))
                 raise ValueError("頁面已開啟，但週轉率排行表尚未完整載入")
@@ -5612,9 +5802,38 @@ def fetch_goodinfo_data(max_attempts=2, total_wait_seconds=22):
         if driver is not None:
             driver.quit()
     if best_result is not None and not best_result.empty:
+        st.session_state['goodinfo_fetch_source'] = 'Goodinfo 動態排行（部分完成）'
+        _save_goodinfo_fallback_cache(best_result, 'Goodinfo 動態排行（部分完成）')
         return best_result
+
+    official_error = None
+    try:
+        official_result, official_warnings = fetch_official_turnover_ranking()
+        if official_result is not None and not official_result.empty:
+            source = '證交所／櫃買中心官方週轉率排行'
+            st.session_state['goodinfo_fetch_source'] = source
+            _save_goodinfo_fallback_cache(official_result, source)
+            reason = f'（Goodinfo：{_summarize_goodinfo_error(last_error)}）' if last_error is not None else ''
+            st.warning(f'Goodinfo 動態頁暫時無法使用，已自動改用官方資料{reason}')
+            if official_warnings:
+                st.caption('部分官方來源未回應，已使用可取得的市場資料：' + '；'.join(official_warnings))
+            return official_result
+    except Exception as exc:
+        official_error = exc
+
+    cached_result, cached_source, cached_at = _load_goodinfo_fallback_cache()
+    if cached_result is not None and not cached_result.empty:
+        st.session_state['goodinfo_fetch_source'] = f'{cached_source}（暫存）'
+        st.warning(f"即時來源暫時無法使用，已載入 {cached_at.strftime('%Y/%m/%d %H:%M')} 的最近成功資料。")
+        return cached_result
+
+    error_parts = []
     if last_error is not None:
-        st.error(f"Goodinfo 抓取失敗（已自動重試）：{last_error}")
+        error_parts.append(f'Goodinfo：{_summarize_goodinfo_error(last_error)}')
+    if official_error is not None:
+        error_parts.append(f'官方備援：{_summarize_goodinfo_error(official_error)}')
+    if error_parts:
+        st.error('抓取失敗（已依序嘗試 Goodinfo、官方資料與最近成功暫存）：' + '；'.join(error_parts))
     return None
 
 # ==========================================
@@ -6983,18 +7202,19 @@ def render_stock_strategy_controls():
             st.markdown("#### 外部資源")
 
             def perform_goodinfo_fetch():
-                with st.spinner("正在通過 Goodinfo 驗證並載入排行；完成會立即回傳，必要時約 20 秒..."):
+                with st.spinner("正在載入週轉率排行；Goodinfo 最多等待 14 秒，失敗會自動切換官方資料..."):
                     result = fetch_goodinfo_data()
                     if result is not None and not result.empty:
                         st.session_state['goodinfo_df'] = result.astype(str)
                         st.session_state['goodinfo_fetch_failed'] = False
-                        st.success("抓取成功，已載入暫存；回到股票分析按執行即可。")
+                        source = st.session_state.get('goodinfo_fetch_source', '週轉率排行')
+                        st.success(f"抓取成功：{source}，共 {len(result)} 筆；回到股票分析按執行即可。")
                     else:
                         st.session_state['goodinfo_fetch_failed'] = True
-                        st.error("抓取失敗或查無資料，請稍後再試。")
+                        st.error("Goodinfo、官方資料與最近成功暫存皆無法取得，請稍後再試。")
 
             if st.button(
-                "📥 抓取 Goodinfo 週轉率排行", help="沿用同一組驗證 Cookie 並等待動態排行補齊；通常完成即回傳，最長約 22 秒並自動重試一次。",
+                "📥 抓取週轉率排行", help="優先讀取 Goodinfo；最多等待 14 秒並處理錯誤提示，失敗後自動改用證交所／櫃買中心官方資料，最後再使用最近成功暫存。",
                 use_container_width=True, key='fetch_goodinfo_in_stock_room'
             ):
                 perform_goodinfo_fetch()
@@ -7033,6 +7253,7 @@ def render_stock_strategy_explanation():
 - **ATR**衡量正常波動幅度，不判斷多空；乖離越大，越不適合追價或追空。
 - **VWAP**是盤中成交量加權平均成本。當沖時，價格在 VWAP 上方偏多、下方偏空，並搭配 09:00–09:15 開盤區間及量能確認。
 - **開盤首 15 分鐘**按「更新盤中資料與當沖條件」後，會以 Shioaji 即時串流＋1 分 K 顯示形成中的高低點與動能；09:15 後自動改用 5 分 K 與完整開盤區間。
+- **系統自動方向**會逐檔判斷，不會把整張表固定成同一方向：當沖優先比較分 K 的 VWAP、開盤區間支撐／壓力、量能與開盤價；隔日／波段比較日 K 的 5／20 日線、均線斜率、前高前低與 K 棒位置。表格會顯示「建議方向」及「方向依據」，也可手動改選多或空。
 - **進／停／目**分別為條件成立後的觀察進場、策略失效離場與第一目標。信心分是條件一致度，不是勝率。
 - **表格「處置／注意」訊號**：`🟡 注意 1` 代表官方名單目前累計 1 次注意，仍可觀察但風險分會降低；`🔴 注意 2`（或更高）代表累計至少 2 次注意，預設「封鎖注意累計 ≥ 2」會排除；櫃買的「注意累計異常」也會至少標為注意 2。
 - `🚫 處置中` 代表已列入處置名單，直接排除；`🟢 官方名單未列示` 代表本次查核未列名；`⚪ 未查核` 代表官方來源尚未完整讀取，不會被誤當成安全。
@@ -8380,6 +8601,139 @@ def _as_float(value, default=None):
         return default if math.isnan(number) else number
     except (TypeError, ValueError):
         return default
+
+
+def determine_stock_direction(row, is_daytrade_mode=False, direction_choice='系統自動'):
+    """逐檔以分 K／日 K、VWAP 與支撐壓力判斷策略方向。"""
+    manual_map = {'多': '多頭', '多頭': '多頭', '空': '空頭', '空頭': '空頭'}
+    if direction_choice in manual_map:
+        direction = manual_map[direction_choice]
+        return {
+            'direction': direction,
+            'label': '🔴 多（手動）' if direction == '多頭' else '🟢 空（手動）',
+            'basis': '依使用者指定方向計算；系統仍會檢查趨勢、支撐壓力與風險門檻。',
+            'long_score': None,
+            'short_score': None,
+            'source': '手動',
+        }
+
+    long_score = 0
+    short_score = 0
+    long_reasons = []
+    short_reasons = []
+
+    def add_signal(condition, long_points, short_points, long_text, short_text):
+        nonlocal long_score, short_score
+        if condition is True:
+            long_score += long_points
+            long_reasons.append(long_text)
+        elif condition is False:
+            short_score += short_points
+            short_reasons.append(short_text)
+
+    daily_close = _as_float(row.get('收盤價'))
+    ma5 = _as_float(row.get('_ma5'))
+    ma20 = _as_float(row.get('_risk_ma20'))
+    ma20_slope = _as_float(row.get('_risk_ma20_slope'))
+    previous_high = _as_float(row.get('_risk_prev_high'))
+    previous_low = _as_float(row.get('_risk_prev_low'))
+    close_position = _as_float(row.get('_risk_close_position'))
+    change_pct = _as_float(row.get('漲跌幅'))
+
+    if daily_close is not None and ma5 is not None:
+        add_signal(daily_close >= ma5, 2, 2, '日 K 站上 5 日線', '日 K 跌破 5 日線')
+    if daily_close is not None and ma20 is not None:
+        add_signal(daily_close >= ma20, 2, 2, '日 K 站上 20 日線', '日 K 跌破 20 日線')
+    if ma20_slope is not None and ma20_slope != 0:
+        add_signal(ma20_slope > 0, 1, 1, '20 日線向上', '20 日線向下')
+    if daily_close is not None and previous_high is not None and daily_close > previous_high:
+        long_score += 2
+        long_reasons.append('突破日 K 前高壓力')
+    if daily_close is not None and previous_low is not None and daily_close < previous_low:
+        short_score += 2
+        short_reasons.append('跌破日 K 前低支撐')
+    if close_position is not None:
+        if close_position >= 60:
+            long_score += 1
+            long_reasons.append('日 K 收近高位')
+        elif close_position <= 40:
+            short_score += 1
+            short_reasons.append('日 K 收近低位')
+    if change_pct is not None and change_pct != 0:
+        add_signal(change_pct > 0, 1, 1, '價格動能偏多', '價格動能偏空')
+
+    source = '日 K（波段）'
+    intraday_close = _as_float(row.get('_daytrade_close'))
+    vwap = _as_float(row.get('_daytrade_vwap'))
+    opening_high = _as_float(row.get('_daytrade_or_high'))
+    opening_low = _as_float(row.get('_daytrade_or_low'))
+    intraday_open = _as_float(row.get('_daytrade_open'))
+    volume_ratio = _as_float(row.get('_daytrade_volume_ratio'))
+    has_intraday = is_daytrade_mode and None not in (intraday_close, vwap, opening_high, opening_low)
+    if has_intraday:
+        daily_long_reason_count = len(long_reasons)
+        daily_short_reason_count = len(short_reasons)
+        source = f"{row.get('_daytrade_source', '分 K')}（當沖）＋日 K"
+        add_signal(intraday_close >= vwap, 4, 4, '分 K 站上 VWAP', '分 K 跌破 VWAP')
+        if intraday_close > opening_high:
+            long_score += 4
+            long_reasons.append('突破開盤區間壓力')
+        elif intraday_close < opening_low:
+            short_score += 4
+            short_reasons.append('跌破開盤區間支撐')
+        elif opening_high > opening_low:
+            range_position = (intraday_close - opening_low) / (opening_high - opening_low)
+            if range_position >= 0.65:
+                long_score += 2
+                long_reasons.append('位於開盤區間上緣')
+            elif range_position <= 0.35:
+                short_score += 2
+                short_reasons.append('位於開盤區間下緣')
+        if intraday_open is not None:
+            add_signal(intraday_close >= intraday_open, 1, 1, '分 K 高於開盤價', '分 K 低於開盤價')
+        if volume_ratio is not None and volume_ratio >= 1:
+            if intraday_close >= vwap:
+                long_score += 1
+                long_reasons.append('量能放大支持多方')
+            else:
+                short_score += 1
+                short_reasons.append('量能放大支持空方')
+        # 當沖說明先顯示分 K／VWAP／開盤區間，再補充日 K 方向。
+        long_reasons = long_reasons[daily_long_reason_count:] + long_reasons[:daily_long_reason_count]
+        short_reasons = short_reasons[daily_short_reason_count:] + short_reasons[:daily_short_reason_count]
+    elif is_daytrade_mode:
+        source = '日 K 備援（尚未更新分 K）'
+
+    if long_score == short_score:
+        note = str(row.get('戰略備註', ''))
+        if '空' in note and '多' not in note:
+            short_score += 1
+            short_reasons.append('原戰略備註偏空')
+        elif '多' in note and '空' not in note:
+            long_score += 1
+            long_reasons.append('原戰略備註偏多')
+        elif change_pct is not None and change_pct < 0:
+            short_score += 1
+            short_reasons.append('同分時依價格動能偏空')
+        else:
+            long_score += 1
+            long_reasons.append('同分時依價格動能偏多')
+
+    is_long = long_score > short_score
+    chosen_reasons = long_reasons if is_long else short_reasons
+    direction = '多頭' if is_long else '空頭'
+    label = '🔴 建議多' if is_long else '🟢 建議空'
+    evidence = '、'.join(chosen_reasons[:4]) if chosen_reasons else '可用指標有限'
+    basis = f'{source}：{evidence}（多 {long_score}／空 {short_score}）'
+    return {
+        'direction': direction,
+        'label': label,
+        'basis': basis,
+        'long_score': long_score,
+        'short_score': short_score,
+        'source': source,
+    }
+
 
 def calculate_risk_filter_result(row, direction, max_extension_atr, attention_counts=None, disposition_codes=None, market_lists_updated=False, block_attention=True):
     """建立風險篩選預覽資料；不會改寫原本的選股資料或下單行為。"""
@@ -10422,9 +10776,15 @@ with stock_strategy_container:
                     help="隔日／波段維持原有規則；09:00–09:15 採即時串流＋1 分 K，之後採 5 分 K、VWAP 與完整開盤區間，不會自動下單。"
                 )
                 is_daytrade_mode = strategy_mode == "當沖"
+                if st.session_state.get('risk_filter_direction') in ('多頭', '空頭'):
+                    st.session_state['risk_filter_direction'] = '多' if st.session_state['risk_filter_direction'] == '多頭' else '空'
                 risk_col1, risk_col2, risk_col3 = st.columns(3)
                 with risk_col1:
-                    risk_direction = st.radio("判斷方向", ["多頭", "空頭"], horizontal=True, key="risk_filter_direction")
+                    risk_direction = st.radio(
+                        "判斷方向", ["系統自動", "多", "空"], horizontal=True,
+                        key="risk_filter_direction",
+                        help="系統自動會逐檔判斷：當沖以分 K、VWAP、開盤區間及量能為主；隔日／波段以日 K 均線、前高前低與支撐壓力為主。選多或空可強制整表使用指定方向。"
+                    )
                     risk_min_score = st.slider("最低進場信心", min_value=60, max_value=90, value=75, key="risk_filter_min_score")
                 with risk_col2:
                     risk_max_extension = st.slider("最大乖離（ATR）", min_value=1.0, max_value=3.0, value=2.0, step=0.1, key="risk_filter_max_extension")
@@ -10530,17 +10890,19 @@ with stock_strategy_container:
             st.caption(f"市場環境：{market_bias}｜依據 {market_source}{market_change_text}；只提供順逆勢標示，不改動原選股順位。")
 
             for i, row in df_display.iterrows():
+                direction_info = determine_stock_direction(row, is_daytrade_mode, risk_direction)
+                row_direction = direction_info['direction']
                 result = calculate_daytrade_filter_result(
-                    row, risk_direction, attention_counts, disposition_codes,
+                    row, row_direction, attention_counts, disposition_codes,
                     market_lists_updated, risk_block_attention
                 ) if is_daytrade_mode else calculate_risk_filter_result(
-                    row, risk_direction, risk_max_extension, attention_counts, disposition_codes,
+                    row, row_direction, risk_max_extension, attention_counts, disposition_codes,
                     market_lists_updated, risk_block_attention
                 )
                 code = str(row.get('代號', ''))
                 if is_daytrade_mode:
                     daily_risk = calculate_risk_filter_result(
-                        row, risk_direction, risk_max_extension, attention_counts, disposition_codes,
+                        row, row_direction, risk_max_extension, attention_counts, disposition_codes,
                         market_lists_updated, risk_block_attention
                     )
                     # 日 ATR 乖離與官方風險是當沖的盤前門檻；盤中訊號成立也不放行過度延伸標的。
@@ -10560,9 +10922,13 @@ with stock_strategy_container:
                     df_display.at[i, '評分'] = result['score']
                     df_display.at[i, '乖離'] = f"{_format_compact_number(result['extension'], 1, signed=True)} ATR" if result['extension'] is not None else "—"
                     df_display.at[i, '隔日規則'] = result['rule']
-                trade_plan = build_trade_plan(row, risk_direction, is_daytrade_mode, result)
+                trade_plan = build_trade_plan(row, row_direction, is_daytrade_mode, result)
                 result['trade_plan'] = trade_plan
+                result['direction_info'] = direction_info
                 risk_details[code] = result
+                df_display.at[i, '建議方向'] = direction_info['label']
+                df_display.at[i, '方向依據'] = direction_info['basis']
+                df_display.at[i, '_系統方向'] = row_direction
                 df_display.at[i, '進出場預判'] = trade_plan['summary']
                 signal_state = classify_signal_state(result['rule'], result['eligible'], result['score'], risk_min_score)
                 quote_time = row.get('_quote_time') or (row.get('_daytrade_data_time') if is_daytrade_mode else None)
@@ -10576,12 +10942,12 @@ with stock_strategy_container:
                 reference_price = _safe_number(row.get('收盤價'))
                 tick = get_tick_size(reference_price) if reference_price is not None else 0.01
                 spread_ticks = (ask - bid) / tick if bid is not None and ask is not None and ask >= bid and tick > 0 else None
-                market_alignment = calculate_market_alignment(risk_direction, market_bias)
+                market_alignment = calculate_market_alignment(row_direction, market_bias)
                 current_price = (
                     _safe_number(row.get('_daytrade_close')) if is_daytrade_mode else None
                 ) or reference_price
                 confidence = calculate_entry_confidence(
-                    result['score'], signal_state, current_price, trade_plan['summary'], risk_direction,
+                    result['score'], signal_state, current_price, trade_plan['summary'], row_direction,
                     data_health, market_alignment, result.get('detail', '')
                 )
                 result['confidence'] = confidence
@@ -10610,13 +10976,13 @@ with stock_strategy_container:
             if stock_compact_table:
                 input_cols = [
                     "移除", "代號", "名稱", "戰略備註", "收盤價", "漲跌幅",
-                    "支撐壓力", "進出場預判", "5日線價差", "信心分", "信心判讀",
+                    "建議方向", "方向依據", "支撐壓力", "進出場預判", "5日線價差", "信心分", "信心判讀",
                     "訊號狀態", "市場一致", "風險", "資料狀態"
                 ]
             elif is_daytrade_mode:
-                input_cols = ["移除", "代號", "名稱", "戰略備註", "收盤價", "漲跌幅", "狀態", "成交價價差", "5日線價差", "風險", "VWAP 狀態", "開盤區間", "量能", "信心分", "信心判讀", "支撐壓力", "盤中觸發", "進出場預判", "訊號狀態", "市場一致", "當日漲停價", "當日跌停價", "期貨", "資料狀態", "買賣價差"]
+                input_cols = ["移除", "代號", "名稱", "戰略備註", "收盤價", "漲跌幅", "建議方向", "方向依據", "狀態", "成交價價差", "5日線價差", "風險", "VWAP 狀態", "開盤區間", "量能", "信心分", "信心判讀", "支撐壓力", "盤中觸發", "進出場預判", "訊號狀態", "市場一致", "當日漲停價", "當日跌停價", "期貨", "資料狀態", "買賣價差"]
             else:
-                input_cols = ["移除", "代號", "名稱", "戰略備註", "收盤價", "漲跌幅", "狀態", "成交價價差", "5日線價差", "風險", "信心分", "信心判讀", "乖離", "支撐壓力", "隔日規則", "進出場預判", "訊號狀態", "市場一致", "當日漲停價", "當日跌停價", "期貨", "資料狀態", "買賣價差"]
+                input_cols = ["移除", "代號", "名稱", "戰略備註", "收盤價", "漲跌幅", "建議方向", "方向依據", "狀態", "成交價價差", "5日線價差", "風險", "信心分", "信心判讀", "乖離", "支撐壓力", "隔日規則", "進出場預判", "訊號狀態", "市場一致", "當日漲停價", "當日跌停價", "期貨", "資料狀態", "買賣價差"]
         else:
             input_cols = ["移除", "代號", "名稱", "戰略備註", "收盤價", "漲跌幅", "狀態", "成交價價差", "5日線價差", "當日漲停價", "當日跌停價", "期貨"]
         for col in input_cols:
@@ -10687,6 +11053,12 @@ with stock_strategy_container:
                 if col == "名稱": styles[idx] = name_c
                 elif col in ["收盤價", "漲跌幅"]: styles[idx] = price_c
                 elif col == "狀態": styles[idx] = status_c
+                elif col == "建議方向":
+                    direction_text = str(row.get('建議方向', ''))
+                    if '多' in direction_text:
+                        styles[idx] = 'color:#ff4b4b;font-weight:bold;'
+                    elif '空' in direction_text:
+                        styles[idx] = 'color:#00e676;font-weight:bold;'
                 elif col in ["成交價價差", "5日線價差"]:
                     val = row[col]
                     try:
@@ -10741,6 +11113,8 @@ with stock_strategy_container:
         risk_column_config = {}
         if risk_preview_enabled:
             risk_column_config = {
+                "建議方向": st.column_config.TextColumn(width=90, disabled=True, help="系統自動時逐檔判斷；紅色為建議多、綠色為建議空。選擇手動多／空時會標示為手動。"),
+                "方向依據": st.column_config.TextColumn(width=190, disabled=True, help="當沖優先列出分 K、VWAP、開盤區間與量能；隔日／波段列出日 K 均線、前高前低及 K 棒位置。括號為多空條件分數。"),
                 "風險": st.column_config.TextColumn("處置／注意", width=95, disabled=True, help="官方注意與處置查核結果；不預測漲跌方向。"),
                 "訊號狀態": st.column_config.TextColumn(width=88, disabled=True, help="將原條件濃縮為等待、接近、觸發或暫停；原規則仍在明細。"),
                 "市場一致": st.column_config.TextColumn(width=90, disabled=True, help="目前方向是否與近月臺指期環境一致；不改變原排序。"),
@@ -10812,7 +11186,9 @@ with stock_strategy_container:
                 data_time_text = f"｜盤中資料更新：{selected_risk['data_time']}" if is_daytrade_mode and selected_risk.get('data_time') else ""
                 plan_text = selected_risk.get('trade_plan', {}).get('detail', '尚未預判點位。')
                 confidence_detail = selected_risk.get('confidence', {})
+                direction_detail = selected_risk.get('direction_info', {})
                 st.caption(
+                    f"{direction_detail.get('label', '方向未判定')}｜{direction_detail.get('basis', '方向依據不足')}｜"
                     f"進場信心 {confidence_detail.get('score', '—')} 分（{confidence_detail.get('label', '—')}）｜"
                     f"{selected_risk['detail']}｜{rule_label}：{selected_risk['rule']}｜進出場預判：{plan_text}{data_time_text}。"
                     "信心分代表條件一致度，不是勝率；僅供策略觀察與回測。"
@@ -10837,7 +11213,7 @@ with stock_strategy_container:
                     score = row.get('信心分')
                     records.append({
                         '市場': '股票', '商品鍵': str(row['代號']), '代碼': str(row['代號']),
-                        '名稱': str(row['名稱']), '策略': strategy_mode, '方向': risk_direction,
+                        '名稱': str(row['名稱']), '策略': strategy_mode, '方向': str(row.get('_系統方向', '')),
                         '訊號狀態': str(row.get('訊號狀態', '')), '評分': _safe_number(score),
                         '信心判讀': str(row.get('信心判讀', '')),
                         '進場價': plan['entry'], '停損價': plan['stop'], '目標價': plan['target'],
@@ -11051,7 +11427,13 @@ with stock_strategy_container:
                     key="indep_strategy_mode",
                     help="09:00–09:15 會取得即時串流＋1 分 K；09:15 後改用 5 分 K，計算 VWAP、開盤區間與量能。"
                 )
-                indep_direction = st.radio("判斷方向", ["多頭", "空頭"], horizontal=True, key="indep_risk_direction")
+                if st.session_state.get('indep_risk_direction') in ('多頭', '空頭'):
+                    st.session_state['indep_risk_direction'] = '多' if st.session_state['indep_risk_direction'] == '多頭' else '空'
+                indep_direction = st.radio(
+                    "判斷方向", ["系統自動", "多", "空"], horizontal=True,
+                    key="indep_risk_direction",
+                    help="系統自動會依每檔股票可用的分 K／日 K、VWAP 與支撐壓力分別判斷多空。"
+                )
             with indep_ctrl2:
                 indep_min_score = st.slider("最低進場信心", 60, 90, 75, key="indep_risk_min_score")
                 indep_max_extension = st.slider("最大乖離（ATR）", 1.0, 3.0, 2.0, 0.1, key="indep_risk_max_extension")
@@ -11188,17 +11570,19 @@ with stock_strategy_container:
 
                 if risk_preview_enabled:
                     for i, row in df_indep.iterrows():
+                        direction_info = determine_stock_direction(row, indep_is_daytrade, indep_direction)
+                        row_direction = direction_info['direction']
                         result = calculate_daytrade_filter_result(
-                            row, indep_direction, indep_attention_counts, indep_disposition_codes,
+                            row, row_direction, indep_attention_counts, indep_disposition_codes,
                             indep_market_lists_updated, indep_block_attention
                         ) if indep_is_daytrade else calculate_risk_filter_result(
-                            row, indep_direction, indep_max_extension, indep_attention_counts, indep_disposition_codes,
+                            row, row_direction, indep_max_extension, indep_attention_counts, indep_disposition_codes,
                             indep_market_lists_updated, indep_block_attention
                         )
                         code = str(row.get('代號', ''))
                         if indep_is_daytrade:
                             daily_risk = calculate_risk_filter_result(
-                                row, indep_direction, indep_max_extension, indep_attention_counts, indep_disposition_codes,
+                                row, row_direction, indep_max_extension, indep_attention_counts, indep_disposition_codes,
                                 indep_market_lists_updated, indep_block_attention
                             )
                             if not daily_risk['eligible']:
@@ -11215,8 +11599,9 @@ with stock_strategy_container:
                             df_indep.at[i, '風險'] = result['risk']
                             df_indep.at[i, '乖離'] = f"{_format_compact_number(result['extension'], 1, signed=True)} ATR" if result['extension'] is not None else "—"
                             df_indep.at[i, '隔日規則'] = result['rule']
-                        trade_plan = build_trade_plan(row, indep_direction, indep_is_daytrade, result)
+                        trade_plan = build_trade_plan(row, row_direction, indep_is_daytrade, result)
                         result['trade_plan'] = trade_plan
+                        result['direction_info'] = direction_info
                         signal_state = classify_signal_state(
                             result['rule'], result['eligible'], result['score'], indep_min_score
                         )
@@ -11235,16 +11620,18 @@ with stock_strategy_container:
                             (ask - bid) / tick
                             if bid is not None and ask is not None and ask >= bid and tick > 0 else None
                         )
-                        market_alignment = calculate_market_alignment(indep_direction, market_bias)
+                        market_alignment = calculate_market_alignment(row_direction, market_bias)
                         current_price = (
                             _safe_number(row.get('_daytrade_close')) if indep_is_daytrade else None
                         ) or _safe_number(row.get('收盤價'))
                         confidence = calculate_entry_confidence(
-                            result['score'], signal_state, current_price, trade_plan['summary'], indep_direction,
+                            result['score'], signal_state, current_price, trade_plan['summary'], row_direction,
                             data_health, market_alignment, result.get('detail', '')
                         )
                         result['confidence'] = confidence
                         indep_risk_details[code] = result
+                        df_indep.at[i, '建議方向'] = direction_info['label']
+                        df_indep.at[i, '方向依據'] = direction_info['basis']
                         df_indep.at[i, '進出場預判'] = trade_plan['summary']
                         df_indep.at[i, '支撐壓力'] = build_stock_support_resistance(row, indep_is_daytrade)
                         df_indep.at[i, '訊號狀態'] = signal_state
@@ -11261,9 +11648,9 @@ with stock_strategy_container:
                             st.warning("目前沒有符合門檻的候選；可降低最低評分、放寬最大乖離，或改看完整結果。")
 
                     if indep_is_daytrade:
-                        input_cols = ["代號", "名稱", "戰略備註", "收盤價", "漲跌幅", "成交價價差", "5日線價差", "風險", "VWAP 狀態", "開盤區間", "量能", "訊號狀態", "信心分", "信心判讀", "支撐壓力", "盤中觸發", "進出場預判", "市場一致", "當日漲停價", "當日跌停價", "期貨", "資料狀態", "買賣價差"]
+                        input_cols = ["代號", "名稱", "戰略備註", "收盤價", "漲跌幅", "建議方向", "方向依據", "成交價價差", "5日線價差", "風險", "VWAP 狀態", "開盤區間", "量能", "訊號狀態", "信心分", "信心判讀", "支撐壓力", "盤中觸發", "進出場預判", "市場一致", "當日漲停價", "當日跌停價", "期貨", "資料狀態", "買賣價差"]
                     else:
-                        input_cols = ["代號", "名稱", "戰略備註", "收盤價", "漲跌幅", "成交價價差", "5日線價差", "風險", "訊號狀態", "信心分", "信心判讀", "乖離", "支撐壓力", "隔日規則", "進出場預判", "市場一致", "當日漲停價", "當日跌停價", "期貨", "資料狀態", "買賣價差"]
+                        input_cols = ["代號", "名稱", "戰略備註", "收盤價", "漲跌幅", "建議方向", "方向依據", "成交價價差", "5日線價差", "風險", "訊號狀態", "信心分", "信心判讀", "乖離", "支撐壓力", "隔日規則", "進出場預判", "市場一致", "當日漲停價", "當日跌停價", "期貨", "資料狀態", "買賣價差"]
                 else:
                     input_cols = ["代號", "名稱", "戰略備註", "收盤價", "漲跌幅", "成交價價差", "5日線價差", "當日漲停價", "當日跌停價", "期貨"]
                 for col in input_cols:
@@ -11298,6 +11685,8 @@ with stock_strategy_container:
                 indep_column_config = {}
                 if risk_preview_enabled:
                     indep_column_config.update({
+                        "建議方向": st.column_config.TextColumn(width=90, disabled=True, help="紅色為建議多、綠色為建議空；手動指定時會顯示手動。"),
+                        "方向依據": st.column_config.TextColumn(width=190, disabled=True, help="列出本檔採用的分 K／日 K、VWAP 與支撐壓力判斷。"),
                         "風險": st.column_config.TextColumn("處置／注意", width=95, disabled=True, help="官方注意與處置查核結果；不預測漲跌方向。"),
                         "訊號狀態": st.column_config.TextColumn(width=88, disabled=True),
                         "信心分": st.column_config.ProgressColumn("進場信心", min_value=0, max_value=100, format="%d", width=100, help="條件一致度，不是勝率。"),
@@ -11361,7 +11750,9 @@ with stock_strategy_container:
                     data_time_text = f"｜盤中資料更新：{selected_result['data_time']}" if indep_is_daytrade and selected_result.get('data_time') else ""
                     plan_text = selected_result.get('trade_plan', {}).get('detail', '尚未預判點位。')
                     confidence_detail = selected_result.get('confidence', {})
+                    direction_detail = selected_result.get('direction_info', {})
                     st.caption(
+                        f"{direction_detail.get('label', '方向未判定')}｜{direction_detail.get('basis', '方向依據不足')}｜"
                         f"進場信心 {confidence_detail.get('score', '—')} 分（{confidence_detail.get('label', '—')}）｜"
                         f"{selected_result['detail']}｜{rule_label}：{selected_result['rule']}｜"
                         f"進出場預判：{plan_text}{data_time_text}。信心分代表條件一致度，不是勝率。"
