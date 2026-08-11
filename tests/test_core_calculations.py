@@ -262,6 +262,17 @@ def test_public_revenue_report_date_prefers_earliest_matching_release():
     ], "2408", 2026, 7) == "2026-08-04"
 
 
+def test_cnyes_current_items_data_envelope_is_parsed():
+    extract = load_app_symbols("extract_cnyes_search_items")["extract_cnyes_search_items"]
+    rows = [{
+        "title": "DRAM漲不停！南亞科7月營收再創高",
+        "content": "南亞科 (2408-TW) 今 (4) 日公告 7 月營收",
+        "publishAt": 1785800804,
+    }]
+    assert extract({"items": {"data": rows, "total": 1}}) == rows
+    assert extract({"data": {"items": rows}}) == rows
+
+
 def test_google_news_revenue_date_uses_earliest_matching_company_report():
     symbols = load_app_symbols("select_google_news_revenue_announcement_date")
     rss = """<?xml version='1.0' encoding='UTF-8'?><rss><channel>
