@@ -2274,33 +2274,43 @@ def fetch_taiwan_monthly_revenue_events(inputs):
     for code, item in input_by_code.items():
         row = rows_by_code.get(code)
         row_month = str(row.get("資料年月", "")).strip() if row else ""
+        finmind_records = fetch_finmind_monthly_revenue_rows(
+            code, target_roc_year + 1911 - 1
+        )
+        finmind_row = build_finmind_monthly_revenue_row(
+            finmind_records,
+            code,
+            target_roc_year + 1911,
+            target_month,
+            item["display_name"],
+        )
+        direct_row = None
         if not row or row_month < target_month_text:
-            direct_row = fetch_mops_company_monthly_revenue(
-                code, target_roc_year, target_month, "all"
-            )
-            if not direct_row:
-                finmind_records = fetch_finmind_monthly_revenue_rows(
-                    code, target_roc_year + 1911 - 1
+            for market_type in ("sii", "otc", "all"):
+                direct_row = fetch_mops_company_monthly_revenue(
+                    code, target_roc_year, target_month, market_type
                 )
-                direct_row = build_finmind_monthly_revenue_row(
-                    finmind_records,
-                    code,
-                    target_roc_year + 1911,
-                    target_month,
-                    item["display_name"],
-                )
+                if direct_row:
+                    break
             if direct_row:
                 previous_row = None
-                if direct_row.get("_source"):
-                    # FinMind conversion already includes previous-month comparisons.
-                    previous_row = None
+                finmind_month = str(finmind_row.get("資料年月", "")) if finmind_row else ""
+                if finmind_row and finmind_month == str(direct_row.get("資料年月", "")):
+                    direct_row["營業收入-上月營收"] = finmind_row.get("營業收入-上月營收")
+                    direct_row["營業收入-上月比較增減(%)"] = finmind_row.get(
+                        "營業收入-上月比較增減(%)"
+                    )
                 elif row and str(row.get("資料年月", "")).strip() == previous_month_text:
                     previous_row = row
                 else:
-                    previous_row = fetch_mops_company_monthly_revenue(
-                        code, previous_roc_year, previous_month, "all"
-                    )
-                if not direct_row.get("_source"):
+                    previous_row = None
+                    for market_type in ("sii", "otc", "all"):
+                        previous_row = fetch_mops_company_monthly_revenue(
+                            code, previous_roc_year, previous_month, market_type
+                        )
+                        if previous_row:
+                            break
+                if not direct_row.get("營業收入-上月營收"):
                     previous_revenue = previous_row.get("營業收入-當月營收") if previous_row else None
                     direct_row["營業收入-上月營收"] = previous_revenue
                     current_number = _to_number(direct_row["營業收入-當月營收"])
@@ -2309,7 +2319,27 @@ def fetch_taiwan_monthly_revenue_events(inputs):
                         direct_row["營業收入-上月比較增減(%)"] = (
                             (current_number - previous_number) / previous_number * 100
                         )
-                row = direct_row
+
+        # 數值優先採 MOPS；若 MOPS 彙總尚未更新則採最新 FinMind。相同月份時，
+        # 用 FinMind create_time 補上公司實際公布日，避免把同步日誤當公告日。
+        candidates = [candidate for candidate in (row, direct_row, finmind_row) if candidate]
+        if candidates:
+            row = max(
+                candidates,
+                key=lambda candidate: (
+                    str(candidate.get("資料年月", "")),
+                    2 if candidate.get("_mops_direct") else (1 if not candidate.get("_source") else 0),
+                ),
+            )
+        selected_month = str(row.get("資料年月", "")) if row else ""
+        if (
+            row and finmind_row
+            and selected_month == str(finmind_row.get("資料年月", ""))
+            and finmind_row.get("_report_date")
+        ):
+            row = dict(row)
+            row["_report_date"] = finmind_row["_report_date"]
+            row["_report_date_source"] = "FinMind create_time"
         if not row:
             missing.append(f"{item['display_name']}（目前官方月營收彙總表未提供）")
             continue
@@ -2352,8 +2382,13 @@ def fetch_taiwan_monthly_revenue_events(inputs):
             "detail": (
                 fallback_note
                 + f"{revenue_month} 月營收：{_thousand_currency(revenue_data['current_month'])}；"
-                + ("MOPS 單一公司資料（公告日未提供，顯示系統偵測日）；" if row.get("_mops_direct") else "")
-                 + "點擊事件名稱查看月營收明細。"
+                + (
+                    "MOPS 單一公司資料，公告日依 FinMind 收錄時間；"
+                    if row.get("_mops_direct") and row.get("_report_date_source") else
+                    "MOPS 單一公司資料（公告日未提供，顯示系統偵測日）；"
+                    if row.get("_mops_direct") else ""
+                )
+                + "點擊事件名稱查看月營收明細。"
             ),
             "closed": False,
             "temporary": False,
@@ -5712,10 +5747,35 @@ def parse_sinopac_report_list(page_html, page_url):
     return reports
 
 
+def parse_sinopac_report_markdown(page_text):
+    """Parse the read-only text proxy used only when the official page blocks Cloud."""
+    reports, seen = [], set()
+    pattern = re.compile(
+        r'\[\s*台指期籌碼快訊\s*\]\((https://www\.spf\.com\.tw/[^)]+\.pdf)\)'
+        r'\s*(202\d)[/-](0?[1-9]|1[0-2])[/-](0?[1-9]|[12]\d|3[01])(?!\d)',
+        re.I,
+    )
+    for match in pattern.finditer(page_text or ''):
+        report_url = match.group(1).strip()
+        if report_url in seen:
+            continue
+        reports.append({
+            '日期': f'{match.group(2)}-{int(match.group(3)):02d}-{int(match.group(4)):02d}',
+            'title': '台指期籌碼快訊',
+            'url': report_url,
+        })
+        seen.add(report_url)
+    reports.sort(key=lambda item: item['日期'], reverse=True)
+    return reports
+
+
 @st.cache_data(ttl=600, max_entries=1, show_spinner=False)
 def get_report_list():
     """讀取永豐期貨盤後快訊，畫面維持原本的最新報告與歷史清單樣式。"""
-    url = "https://www.spf.com.tw/sinopacSPF/research/list.do?id=1709f20d3ff00000d8e2039e8984ed51"
+    official_urls = (
+        "https://www.spf.com.tw/sinopacSPF/research/list_1709f20d3ff00000d8e2039e8984ed51.do",
+        "https://www.spf.com.tw/sinopacSPF/research/list.do?id=1709f20d3ff00000d8e2039e8984ed51",
+    )
     headers = {
         'User-Agent': (
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
@@ -5724,13 +5784,29 @@ def get_report_list():
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Accept-Language': 'zh-TW,zh;q=0.9,en;q=0.7',
     }
+    for url in official_urls:
+        try:
+            response = requests.get(url, headers=headers, timeout=15)
+            response.raise_for_status()
+            response.encoding = response.apparent_encoding or 'utf-8'
+            reports = parse_sinopac_report_list(response.text, url)
+            if reports:
+                return reports
+        except requests.RequestException:
+            continue
+
+    # Streamlit Cloud 的出口 IP 偶爾會被官網清單頁擋下。只有直連兩個官方網址
+    # 都失敗時，才以唯讀文字代理解析相同官網頁面；PDF 仍連回永豐官方網址。
+    proxy_url = f"https://r.jina.ai/{official_urls[0]}"
     try:
-        response = requests.get(url, headers=headers, timeout=15)
+        response = requests.get(proxy_url, headers=headers, timeout=30)
         response.raise_for_status()
-        response.encoding = 'utf-8'
-        return parse_sinopac_report_list(response.text, url)
+        reports = parse_sinopac_report_markdown(response.text)
+        if reports:
+            return reports
     except requests.RequestException:
-        return []
+        pass
+    return []
 
 @st.cache_data(ttl=600, max_entries=1, show_spinner=False)
 def fetch_and_parse_pdf(pdf_url):
@@ -7750,11 +7826,20 @@ TAIFEX_NIGHT_SESSION_ROOTS = {
 }
 
 
+def is_futures_night_session_product(root):
+    """Match both TAIFEX display roots (QF) and OpenAPI contract roots (QFF)."""
+    normalized_root = str(root or '').strip().upper()
+    root_aliases = {normalized_root}
+    if len(normalized_root) > 2 and normalized_root.endswith('F'):
+        root_aliases.add(normalized_root[:-1])
+    return bool(root_aliases & TAIFEX_NIGHT_SESSION_ROOTS)
+
+
 def get_futures_session_label(session_names, fallback='未知', root=''):
     """Normalize TAIFEX day/night session labels for the table cell."""
     normalized_names = {str(name).strip() for name in session_names if str(name).strip()}
     has_day_session = any('一般' in name or '日盤' in name for name in normalized_names)
-    has_night_session = str(root).strip().upper() in TAIFEX_NIGHT_SESSION_ROOTS or any(
+    has_night_session = is_futures_night_session_product(root) or any(
         ('盤後' in name or '夜盤' in name) and not ('一般' in name or '日盤' in name)
         for name in normalized_names
     )
@@ -10458,6 +10543,16 @@ def render_futures_strategy_room():
         }
         st.info("期交所資料暫時無法取得，已還原上次成功保存的期貨表格。")
 
+    # 舊快照可能仍保存「日盤」；依目前商品代碼資格重新正規化，避免 QFF 等
+    # OpenAPI 三碼代碼未被舊版 QF 商品代碼表辨識。
+    if '交易時段' in universe.columns and '期貨代碼' in universe.columns:
+        universe['交易時段'] = universe.apply(
+            lambda row: get_futures_session_label(
+                [row.get('交易時段', '')], row.get('交易時段', '未知'), row.get('期貨代碼', '')
+            ),
+            axis=1,
+        )
+
     # 契約到期或從官方清單移除後，同步清掉快速新增與行情快取，避免舊列黏在表尾。
     valid_contract_keys = set(universe.get('契約鍵', pd.Series(dtype=str)).astype(str))
     expired_manual_keys = {
@@ -10637,6 +10732,8 @@ def render_futures_strategy_room():
         cached = cache.get(contract_key)
         if cached:
             for column, value in cached.items():
+                if column == '交易時段':
+                    continue
                 if column in display_rows.columns or column in ('支撐壓力', '進出場點位', '方向', '觸發條件', '實際契約'):
                     display_rows.at[index, column] = value
         if not cached or cached.get('_策略週期') != strategy_mode or cached.get('_分析方向') != direction_choice:
@@ -10682,7 +10779,8 @@ def render_futures_strategy_room():
             futures_display_columns = [
                 '忽略', '期貨代碼', '契約月份', '名稱', '方向', '收盤價', '漲跌幅',
                 '訊號狀態', '信心分', '信心判讀', '支撐壓力', '進出場點位', '市場一致',
-                '資料狀態', '可交易性', '當日成交口數', '未平倉量', '量倉比', '到期提醒', '所需保證金'
+                '資料狀態', '可交易性', '交易時段', '當日成交口數', '未平倉量', '量倉比',
+                '到期提醒', '所需保證金'
             ]
         else:
             futures_display_columns = [
@@ -15141,7 +15239,7 @@ with tab3:
                     color = "#FF9800"
                 if "財報" in event.get("title", ""):
                     color = "#FFD700"
-                if "MOPS" in event.get("source", ""):
+                if event.get("market") == "台股" and isinstance(event.get("revenue"), dict):
                     revenue = event.get("revenue", {})
                     mom, yoy = str(revenue.get("mom", "--")), str(revenue.get("yoy", "--"))
                     content_html.append(
