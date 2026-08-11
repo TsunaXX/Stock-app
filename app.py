@@ -6795,8 +6795,6 @@ def save_fibo_config():
         st.session_state.get('custom_tag_4', "和椿(6215)"), 
         st.session_state.get('custom_tag_5', "晶彩科(3535)")
     ]]
-    for index, tag in enumerate(fibo_tags, start=1):
-        st.session_state[f'custom_tag_{index}'] = tag
     config['fibo_tags'] = fibo_tags
     st.session_state.fibo_tags = fibo_tags
     if 'ma_w' in st.session_state:
@@ -14472,7 +14470,10 @@ with tab3:
             migrated_widget_groups = normalize_calendar_preferences({
                 'groups': st.session_state.calendar_event_groups,
             })['groups']
-            st.session_state.calendar_event_groups = migrated_widget_groups
+            # Widget state may only be migrated before the widget is created.
+            # Reset stale legacy values so the normalized saved preference becomes its default.
+            if migrated_widget_groups != st.session_state.calendar_event_groups:
+                del st.session_state.calendar_event_groups
         selected_event_groups = st.multiselect(
             "追蹤類別",
             options=CALENDAR_GROUP_OPTIONS,
