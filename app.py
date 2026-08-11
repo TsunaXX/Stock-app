@@ -25,6 +25,7 @@ import logging
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import numpy as np
+import streamlit.components.v1 as components
 import pdfplumber
 import fitz  # PyMuPDF 用於將 PDF 轉為圖片
 from PIL import Image
@@ -2145,6 +2146,110 @@ def select_latest_monthly_revenue_rows(rows):
     return latest_rows
 
 
+@st.cache_data(ttl=60 * 60 * 4, max_entries=100, show_spinner=False)
+def fetch_finmind_monthly_revenue_rows(code, start_year):
+    """Fetch one company's monthly revenue from FinMind as a secondary public source."""
+    try:
+        response = requests.get(
+            "https://api.finmindtrade.com/api/v4/data",
+            params={
+                "dataset": "TaiwanStockMonthRevenue",
+                "data_id": str(code),
+                "start_date": f"{int(start_year):04d}-01-01",
+            },
+            headers={"User-Agent": "Mozilla/5.0 (compatible; StockApp/1.0)"},
+            timeout=12,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        rows = payload.get("data", []) if isinstance(payload, dict) else []
+        return rows if isinstance(rows, list) else []
+    except (requests.RequestException, ValueError, TypeError):
+        return []
+
+
+def build_finmind_monthly_revenue_row(records, code, target_year, target_month, company_name):
+    """Convert FinMind's TWD records to the MOPS thousand-TWD row used by the calendar."""
+    valid_records = [record for record in records or [] if isinstance(record, dict)]
+
+    def find_record(year, month):
+        return next((
+            record for record in reversed(valid_records)
+            if int(_to_number(record.get("revenue_year")) or 0) == int(year)
+            and int(_to_number(record.get("revenue_month")) or 0) == int(month)
+        ), None)
+
+    current = find_record(target_year, target_month)
+    if not current:
+        eligible = [
+            record for record in valid_records
+            if (
+                int(_to_number(record.get("revenue_year")) or 0),
+                int(_to_number(record.get("revenue_month")) or 0),
+            ) <= (int(target_year), int(target_month))
+        ]
+        current = max(
+            eligible,
+            key=lambda record: (
+                int(_to_number(record.get("revenue_year")) or 0),
+                int(_to_number(record.get("revenue_month")) or 0),
+            ),
+            default=None,
+        )
+    if not current:
+        return None
+    selected_year = int(_to_number(current.get("revenue_year")) or 0)
+    selected_month = int(_to_number(current.get("revenue_month")) or 0)
+    previous_year, previous_month = (
+        (selected_year - 1, 12) if selected_month == 1 else (selected_year, selected_month - 1)
+    )
+    previous = find_record(previous_year, previous_month)
+    last_year = find_record(selected_year - 1, selected_month)
+
+    def revenue_thousands(record):
+        value = _to_number(record.get("revenue")) if record else None
+        return value / 1000 if value is not None else None
+
+    current_revenue = revenue_thousands(current)
+    previous_revenue = revenue_thousands(previous)
+    last_year_revenue = revenue_thousands(last_year)
+
+    def change_percent(value, comparison):
+        if value is None or comparison in (None, 0):
+            return None
+        return (value - comparison) / comparison * 100
+
+    current_ytd = sum(
+        revenue_thousands(record) or 0
+        for record in valid_records
+        if int(_to_number(record.get("revenue_year")) or 0) == selected_year
+        and 1 <= int(_to_number(record.get("revenue_month")) or 0) <= selected_month
+    )
+    last_year_ytd = sum(
+        revenue_thousands(record) or 0
+        for record in valid_records
+        if int(_to_number(record.get("revenue_year")) or 0) == selected_year - 1
+        and 1 <= int(_to_number(record.get("revenue_month")) or 0) <= selected_month
+    )
+    report_date = str(current.get("create_time") or current.get("date") or "")[:10]
+    return {
+        "公司代號": str(code),
+        "公司名稱": str(company_name),
+        "資料年月": _roc_month_text(selected_year - 1911, selected_month),
+        "營業收入-當月營收": current_revenue,
+        "營業收入-上月營收": previous_revenue,
+        "營業收入-去年當月營收": last_year_revenue,
+        "營業收入-上月比較增減(%)": change_percent(current_revenue, previous_revenue),
+        "營業收入-去年同月增減(%)": change_percent(current_revenue, last_year_revenue),
+        "累計營業收入-當月累計營收": current_ytd,
+        "累計營業收入-去年累計營收": last_year_ytd,
+        "累計營業收入-前期比較增減(%)": change_percent(current_ytd, last_year_ytd),
+        "備註": "FinMind 月營收 API 備援",
+        "_report_date": report_date,
+        "_source": "FinMind TaiwanStockMonthRevenue",
+    }
+
+
 @st.cache_data(ttl=60 * 60 * 4, show_spinner=False)
 def fetch_taiwan_monthly_revenue_events(inputs):
     """依追蹤清單產生台股最新月營收事件，必要時由 MOPS 單一公司資料補齊。"""
@@ -2161,45 +2266,50 @@ def fetch_taiwan_monthly_revenue_events(inputs):
 
     revenue_rows = fetch_twse_monthly_revenue_rows()
     rows_by_code = select_latest_monthly_revenue_rows(revenue_rows)
-    bulk_months = [
-        str(row.get("資料年月", "")).strip()
-        for row in revenue_rows
-        if re.fullmatch(r"\d{5}", str(row.get("資料年月", "")).strip())
-    ]
-    latest_bulk_month = max(bulk_months) if bulk_months else ""
     target_roc_year, target_month = _latest_completed_roc_month()
     target_month_text = _roc_month_text(target_roc_year, target_month)
     previous_roc_year, previous_month = _previous_roc_month(target_roc_year, target_month)
     previous_month_text = _roc_month_text(previous_roc_year, previous_month)
-    should_check_mops = not latest_bulk_month or latest_bulk_month < target_month_text
     events, missing = [], []
     for code, item in input_by_code.items():
         row = rows_by_code.get(code)
-        if should_check_mops or row is None:
+        row_month = str(row.get("資料年月", "")).strip() if row else ""
+        if not row or row_month < target_month_text:
             direct_row = fetch_mops_company_monthly_revenue(
                 code, target_roc_year, target_month, "all"
             )
+            if not direct_row:
+                finmind_records = fetch_finmind_monthly_revenue_rows(
+                    code, target_roc_year + 1911 - 1
+                )
+                direct_row = build_finmind_monthly_revenue_row(
+                    finmind_records,
+                    code,
+                    target_roc_year + 1911,
+                    target_month,
+                    item["display_name"],
+                )
             if direct_row:
                 previous_row = None
-                if row and str(row.get("資料年月", "")).strip() == previous_month_text:
+                if direct_row.get("_source"):
+                    # FinMind conversion already includes previous-month comparisons.
+                    previous_row = None
+                elif row and str(row.get("資料年月", "")).strip() == previous_month_text:
                     previous_row = row
                 else:
                     previous_row = fetch_mops_company_monthly_revenue(
                         code, previous_roc_year, previous_month, "all"
                     )
-                previous_revenue = previous_row.get("營業收入-當月營收") if previous_row else None
-                direct_row["營業收入-上月營收"] = previous_revenue
-                current_number, previous_number = _to_number(direct_row["營業收入-當月營收"]), _to_number(previous_revenue)
-                if current_number is not None and previous_number not in (None, 0):
-                    direct_row["營業收入-上月比較增減(%)"] = (current_number - previous_number) / previous_number * 100
+                if not direct_row.get("_source"):
+                    previous_revenue = previous_row.get("營業收入-當月營收") if previous_row else None
+                    direct_row["營業收入-上月營收"] = previous_revenue
+                    current_number = _to_number(direct_row["營業收入-當月營收"])
+                    previous_number = _to_number(previous_revenue)
+                    if current_number is not None and previous_number not in (None, 0):
+                        direct_row["營業收入-上月比較增減(%)"] = (
+                            (current_number - previous_number) / previous_number * 100
+                        )
                 row = direct_row
-        if (
-            row
-            and str(row.get("資料年月", "")).strip() < target_month_text
-        ):
-            # 在應公告月已過期時不可把舊月營收當作最新資料顯示。
-            missing.append(f"{item['display_name']}（尚未取得 {target_month_text} 最新月營收）")
-            continue
         if not row:
             missing.append(f"{item['display_name']}（目前官方月營收彙總表未提供）")
             continue
@@ -2216,6 +2326,11 @@ def fetch_taiwan_monthly_revenue_events(inputs):
         company = str(row.get("公司名稱", item["display_name"])).strip()
         mom = _signed_percent(row.get("營業收入-上月比較增減(%)"))
         yoy = _signed_percent(row.get("營業收入-去年同月增減(%)"))
+        revenue_month_number = int(revenue_month[-2:])
+        fallback_note = (
+            f"最新 {int(target_month_text[-2:])} 月尚無資料，遞補顯示 {revenue_month_number} 月；"
+            if revenue_month < target_month_text else ""
+        )
         revenue_data = {
             "company": company,
             "code": code,
@@ -2233,15 +2348,19 @@ def fetch_taiwan_monthly_revenue_events(inputs):
         }
         events.append({
             "date": report_date.isoformat(),
-            "title": f"{company} 月營收 MOM{mom}／YOY{yoy}",
+            "title": f"{company} {revenue_month_number}月營收 MOM{mom}／YOY{yoy}",
             "detail": (
-                f"{revenue_month} 月營收：{_thousand_currency(revenue_data['current_month'])}；"
+                fallback_note
+                + f"{revenue_month} 月營收：{_thousand_currency(revenue_data['current_month'])}；"
                 + ("MOPS 單一公司資料（公告日未提供，顯示系統偵測日）；" if row.get("_mops_direct") else "")
-                + "點擊事件名稱查看 MOPS 格式明細。"
+                 + "點擊事件名稱查看月營收明細。"
             ),
             "closed": False,
             "temporary": False,
-            "source": "MOPS 單一公司月營收" if row.get("_mops_direct") else "TWSE OpenAPI（MOPS 每月營收）",
+            "source": row.get("_source") or (
+                "MOPS 單一公司月營收"
+                if row.get("_mops_direct") else "TWSE OpenAPI（MOPS 每月營收）"
+            ),
             "ticker": code,
             "market": "台股",
             "revenue": revenue_data,
@@ -5535,7 +5654,7 @@ def plot_fibonacci_chart(
 # ==========================================
 # 網路爬蟲加入快取，避免切換分頁時卡死
 # ==========================================
-@st.cache_data(ttl=300, max_entries=3, show_spinner=False)
+@st.cache_data(ttl=3600, max_entries=2, show_spinner=False)
 def fetch_fubon_html(url):
     """解決富邦 DJ 拒絕 iframe 連線的問題、處理亂碼與排版"""
     try:
@@ -7622,11 +7741,20 @@ def _safe_number(value, default=None):
         return default
 
 
-def get_futures_session_label(session_names, fallback='未知'):
+TAIFEX_NIGHT_SESSION_ROOTS = {
+    # 期交所盤後交易商品；用商品資格補足每日行情僅回傳日盤列的情況。
+    'TX', 'MTX', 'TMF', 'TE', 'ZEF', 'SOF',
+    'CD', 'QF', 'CC', 'NY', 'SR', 'RZ',
+    'RHF', 'RTF', 'XJF', 'XEF', 'UDF', 'SPF', 'UNF', 'SXF', 'F1F', 'XBF', 'XAF',
+    'GDF', 'TGF', 'BRF',
+}
+
+
+def get_futures_session_label(session_names, fallback='未知', root=''):
     """Normalize TAIFEX day/night session labels for the table cell."""
     normalized_names = {str(name).strip() for name in session_names if str(name).strip()}
     has_day_session = any('一般' in name or '日盤' in name for name in normalized_names)
-    has_night_session = any(
+    has_night_session = str(root).strip().upper() in TAIFEX_NIGHT_SESSION_ROOTS or any(
         ('盤後' in name or '夜盤' in name) and not ('一般' in name or '日盤' in name)
         for name in normalized_names
     )
@@ -7858,7 +7986,7 @@ def fetch_futures_strategy_universe():
             for row in rows if str(row.get('TradingSession', '')).strip()
         }
         session_label = get_futures_session_label(
-            session_names, quote_row.get('TradingSession', '未知')
+            session_names, quote_row.get('TradingSession', '未知'), root
         )
         valid_highs = [_safe_number(row.get('High')) for row in session_rows]
         valid_lows = [_safe_number(row.get('Low')) for row in session_rows]
@@ -14181,11 +14309,20 @@ with tab_db:
         st.markdown("#### 📈 法人當日買賣超個股")
         inst_tabs = st.tabs(["外資當日買賣超", "投信當日買賣超", "自營商當日買賣超"])
         with inst_tabs[0]:
-            st.html(fetch_fubon_html("https://fubon-ebrokerdj.fbs.com.tw/Z/ZG/ZGK_D.djhtm"), width=800)
+            components.html(
+                fetch_fubon_html("https://fubon-ebrokerdj.fbs.com.tw/Z/ZG/ZGK_D.djhtm"),
+                height=1185, width=800, scrolling=True,
+            )
         with inst_tabs[1]:
-            st.html(fetch_fubon_html("https://fubon-ebrokerdj.fbs.com.tw/Z/ZG/ZGK_DD.djhtm"), width=800)
+            components.html(
+                fetch_fubon_html("https://fubon-ebrokerdj.fbs.com.tw/Z/ZG/ZGK_DD.djhtm"),
+                height=1185, width=800, scrolling=True,
+            )
         with inst_tabs[2]:
-            st.html(fetch_fubon_html("https://fubon-ebrokerdj.fbs.com.tw/Z/ZG/ZGK_DB.djhtm"), width=800)
+            components.html(
+                fetch_fubon_html("https://fubon-ebrokerdj.fbs.com.tw/Z/ZG/ZGK_DB.djhtm"),
+                height=1185, width=800, scrolling=True,
+            )
         
     with sub_tab2:
         st.markdown("#### 📑 永豐期貨盤後籌碼自動化工具")
@@ -15122,6 +15259,7 @@ with tab_company:
             fetch_earnings_events.clear()
             fetch_twse_monthly_revenue_rows.clear()
             fetch_mops_company_monthly_revenue.clear()
+            fetch_finmind_monthly_revenue_rows.clear()
             fetch_taiwan_monthly_revenue_events.clear()
             fetch_us_revenue_events.clear()
             with st.spinner("正在同步財報日期與營收資料；完成後行事曆會直接讀取快照……"):

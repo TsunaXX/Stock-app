@@ -103,10 +103,11 @@ def test_futures_ticks_follow_product_specification():
 
 
 def test_futures_day_and_night_sessions_display_in_the_table_cell():
-    symbols = load_app_symbols("get_futures_session_label")
+    symbols = load_app_symbols("TAIFEX_NIGHT_SESSION_ROOTS", "get_futures_session_label")
     label = symbols["get_futures_session_label"]
     assert label(["一般交易時段", "盤後交易時段"]) == "日+夜"
     assert label(["一般交易時段"]) == "日盤"
+    assert label(["一般交易時段"], root="QF") == "日+夜"
 
 
 def test_monthly_revenue_prefers_latest_official_month_for_each_company():
@@ -118,6 +119,31 @@ def test_monthly_revenue_prefers_latest_official_month_for_each_company():
     ])
     assert rows["2408"]["資料年月"] == "11507"
     assert rows["2408"]["營業收入-當月營收"] == "110"
+
+
+def test_finmind_monthly_revenue_fallback_converts_july_data():
+    symbols = load_app_symbols(
+        "_to_number", "_roc_month_text", "build_finmind_monthly_revenue_row",
+    )
+    row = symbols["build_finmind_monthly_revenue_row"]([
+        {"date": "2025-08-01", "stock_id": "2408", "revenue": 100_000_000,
+         "revenue_month": 7, "revenue_year": 2025, "create_time": "2025-08-05"},
+        {"date": "2026-07-01", "stock_id": "2408", "revenue": 120_000_000,
+         "revenue_month": 6, "revenue_year": 2026, "create_time": "2026-07-03"},
+        {"date": "2026-08-01", "stock_id": "2408", "revenue": 150_000_000,
+         "revenue_month": 7, "revenue_year": 2026, "create_time": "2026-08-05"},
+    ], "2408", 2026, 7, "南亞科")
+    assert row["資料年月"] == "11507"
+    assert row["營業收入-當月營收"] == 150_000
+    assert row["營業收入-上月比較增減(%)"] == 25
+    assert row["營業收入-去年同月增減(%)"] == 50
+    assert row["_report_date"] == "2026-08-05"
+
+    fallback = symbols["build_finmind_monthly_revenue_row"]([
+        {"date": "2026-07-01", "stock_id": "2408", "revenue": 120_000_000,
+         "revenue_month": 6, "revenue_year": 2026, "create_time": "2026-07-03"},
+    ], "2408", 2026, 7, "南亞科")
+    assert fallback["資料年月"] == "11506"
 
 
 def test_goodinfo_table_requires_real_turnover_rows():
