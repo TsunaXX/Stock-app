@@ -14,17 +14,17 @@ import html
 from types import SimpleNamespace
 from datetime import datetime, time as dt_time, timedelta, date
 import pytz
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP
 import io
 import twstock
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import calendar
 import gc
+import logging
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import numpy as np
 import streamlit.components.v1 as components
-import urllib3
 import pdfplumber
 import fitz  # PyMuPDF 用於將 PDF 轉為圖片
 from PIL import Image
@@ -32,9 +32,12 @@ from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
+from selenium.common.exceptions import (
+    NoAlertPresentException, TimeoutException, UnexpectedAlertPresentException,
+    WebDriverException,
+)
 
-# 關閉 SSL 驗證警告
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+logger = logging.getLogger(__name__)
 
 # 引入 yahoo_fin 與 shioaji
 try:
@@ -218,6 +221,8 @@ def _install_stream_callbacks(api):
     ) else getattr(api, 'quote', None)
     if callback_target is None:
         _remember_stream_error(state, '此 Shioaji 版本沒有 Quote v1 callback')
+        with state['lock']:
+            state['callbacks_installed'] = False
         return False
 
     installed = 0
@@ -246,6 +251,8 @@ def _install_stream_callbacks(api):
     register('set_on_quote_idx_v1_callback', 'IND')
     if installed == 0:
         _remember_stream_error(state, '無法註冊任何 Quote v1 callback')
+        with state['lock']:
+            state['callbacks_installed'] = False
         return False
     return True
 
@@ -263,15 +270,20 @@ def _unsubscribe_market_stream(api, state, subscription_key, metadata):
         return
     target = api if callable(getattr(api, 'unsubscribe', None)) else getattr(api, 'quote', None)
     method = getattr(target, 'unsubscribe', None)
+    unsubscribed = False
     if callable(method):
         try:
             method(contract, quote_type=_shioaji_quote_type())
+            unsubscribed = True
         except BaseException as exc:
             if isinstance(exc, (KeyboardInterrupt, SystemExit)):
                 raise
-            pass
-    with state['lock']:
-        state['subscriptions'].pop(subscription_key, None)
+            _remember_stream_error(state, f'unsubscribe {subscription_key}: {exc}')
+    else:
+        _remember_stream_error(state, f'unsubscribe {subscription_key}: 此版本無取消訂閱方法')
+    if unsubscribed:
+        with state['lock']:
+            state['subscriptions'].pop(subscription_key, None)
 
 
 def ensure_market_stream_subscription(api, contract):
@@ -426,14 +438,14 @@ def get_stream_quotes(api, contracts, snapshot_fallback=True):
                 codes = _stream_contract_codes(contract)
                 key = codes[0] if codes else str(index)
                 is_missing = quote is None
-                is_stale_seed = False
-                if quote is not None and getattr(quote, 'source', '') == 'snapshot_seed':
+                is_stale_quote = False
+                if quote is not None:
                     updated_at = _stream_datetime(getattr(quote, 'updated_at', None))
-                    is_stale_seed = (
+                    is_stale_quote = (
                         (now_tw - updated_at).total_seconds() >= 30
                         and _is_contract_stream_session(contract, now_tw)
                     )
-                if (is_missing or is_stale_seed) and now_mono >= state['snapshot_retry_after'].get(key, 0):
+                if (is_missing or is_stale_quote) and now_mono >= state['snapshot_retry_after'].get(key, 0):
                     state['snapshot_retry_after'][key] = now_mono + 30
                     fallback_indices.append(index)
 
@@ -506,10 +518,17 @@ def get_market_stream_status(api):
 
 
 def clear_market_stream(api):
-    """Forget one disconnected API object's quote cache."""
+    """Unsubscribe and forget one disconnected API object's quote cache."""
     if api is None:
         return
     registry, registry_lock = get_market_stream_registry()
+    with registry_lock:
+        state = registry.get(id(api))
+    if state is not None:
+        with state['lock']:
+            subscriptions = list(state['subscriptions'].items())
+        for subscription_key, metadata in subscriptions:
+            _unsubscribe_market_stream(api, state, subscription_key, metadata)
     with registry_lock:
         registry.pop(id(api), None)
 # ==========================================
@@ -542,6 +561,14 @@ def is_market_closed_func(d_date):
     name = h_dict.get((d_date.month, d_date.day), "")
     if name and name != "封關日": return True
     return False
+
+
+def adjust_to_next_market_day(value):
+    """Return the next exchange business day, including the supplied date."""
+    adjusted = pd.Timestamp(value).date()
+    while is_market_closed_func(adjusted):
+        adjusted += timedelta(days=1)
+    return adjusted
 
 def get_futures_trading_date(now_dt):
     """Map Taiwan local time to the active futures trading date."""
@@ -604,7 +631,6 @@ def fetch_twse_taiex_daily_history(lookback_days=180):
                 params={'response': 'json', 'date': month.start_time.strftime('%Y%m%d')},
                 headers=headers,
                 timeout=10,
-                verify=False,
             )
             payload = response.json()
             rows = payload.get('data', [])
@@ -630,38 +656,49 @@ def fetch_twse_taiex_daily_history(lookback_days=180):
     return pd.DataFrame(records).drop_duplicates(subset=['ts'], keep='last').set_index('ts').sort_index()
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=60 * 60 * 24 * 30, max_entries=400, show_spinner=False)
+def fetch_twse_market_turnover(trade_date):
+    """Return one official TWSE total-market turnover value in hundred-million TWD."""
+    headers = {'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json'}
+    try:
+        response = requests.get(
+            'https://www.twse.com.tw/exchangeReport/MI_INDEX',
+            params={'response': 'json', 'date': trade_date, 'type': 'MS'},
+            headers=headers,
+            timeout=8,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if payload.get('stat') not in (None, 'OK'):
+            return np.nan
+        for table in [payload] + list(payload.get('tables', [])):
+            fields = table.get('fields', [])
+            data = table.get('data', [])
+            amount_idx = next(
+                (index for index, field in enumerate(fields) if '成交金額' in str(field)),
+                None,
+            )
+            if amount_idx is None:
+                continue
+            for row in data:
+                if len(row) <= amount_idx:
+                    continue
+                label = ''.join(str(value).strip() for value in row[:amount_idx])
+                if not any(keyword in label for keyword in ('證券合計', '市場總計', '總計')):
+                    continue
+                raw_amount = str(row[amount_idx]).replace(',', '').replace('元', '').strip()
+                amount = float(raw_amount)
+                if amount > 0:
+                    return amount / 100_000_000
+    except (requests.RequestException, ValueError, TypeError, KeyError):
+        pass
+    return np.nan
+
+
 def fetch_twse_market_turnovers(trading_dates):
     """Return official daily TWSE market turnover in hundred-million TWD."""
-    headers = {'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json'}
-
     def parse_turnover(trade_date):
-        try:
-            response = requests.get(
-                'https://www.twse.com.tw/exchangeReport/MI_INDEX',
-                params={'response': 'json', 'date': trade_date, 'type': 'MS'},
-                headers=headers,
-                timeout=8,
-                verify=False,
-            )
-            payload = response.json()
-            tables = [payload] + list(payload.get('tables', []))
-            for table in tables:
-                fields = table.get('fields', [])
-                data = table.get('data', [])
-                amount_idx = next((i for i, field in enumerate(fields) if '成交金額' in str(field)), None)
-                if amount_idx is None:
-                    continue
-                for row in data:
-                    if len(row) <= amount_idx:
-                        continue
-                    raw_amount = str(row[amount_idx]).replace(',', '').replace('元', '').strip()
-                    amount = float(raw_amount)
-                    if amount > 0:
-                        return trade_date, amount / 100_000_000
-        except (requests.RequestException, ValueError, TypeError, KeyError):
-            pass
-        return trade_date, np.nan
+        return trade_date, fetch_twse_market_turnover(trade_date)
 
     date_list = list(trading_dates)
     if not date_list:
@@ -706,7 +743,9 @@ def get_near_month_futures_settlement(reference_dt=None):
         ]
         return date(year, month, wednesdays[2])
 
-    settlement_date = third_wednesday(now_tw.year, now_tw.month)
+    settlement_date = adjust_to_next_market_day(
+        third_wednesday(now_tw.year, now_tw.month)
+    )
     # 到期日一般交易於 13:30 結束；之後提醒下一個近月契約。
     if now_tw.date() > settlement_date or (
         now_tw.date() == settlement_date and now_tw.time() >= dt_time(13, 30)
@@ -715,7 +754,9 @@ def get_near_month_futures_settlement(reference_dt=None):
         next_year = now_tw.year
         if next_month == 13:
             next_month, next_year = 1, next_year + 1
-        settlement_date = third_wednesday(next_year, next_month)
+        settlement_date = adjust_to_next_market_day(
+            third_wednesday(next_year, next_month)
+        )
 
     return settlement_date
 
@@ -1721,6 +1762,7 @@ def fetch_earnings_events(inputs):
 
 
 TWSE_MONTHLY_REVENUE_URL = "https://openapi.twse.com.tw/v1/opendata/t187ap05_L"
+TPEX_MONTHLY_REVENUE_URL = "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap05_O"
 MOPS_MONTHLY_REVENUE_PAGE_URL = "https://mopsov.twse.com.tw/mops/web/t05st10_ifrs"
 MOPS_MONTHLY_REVENUE_QUERY_URL = "https://mopsov.twse.com.tw/mops/web/ajax_t05st10_ifrs"
 
@@ -2035,15 +2077,19 @@ def _usd_currency(value):
 
 @st.cache_data(ttl=60 * 60 * 4, show_spinner=False)
 def fetch_twse_monthly_revenue_rows():
-    """取得證交所公開、來源為 MOPS 的最新上市公司月營收彙總表。"""
-    response = _calendar_get(TWSE_MONTHLY_REVENUE_URL)
-    if not response:
-        return []
-    try:
-        data = response.json()
-        return data if isinstance(data, list) else []
-    except ValueError:
-        return []
+    """取得 MOPS 最新上市與上櫃公司月營收彙總表。"""
+    rows = []
+    for url in (TWSE_MONTHLY_REVENUE_URL, TPEX_MONTHLY_REVENUE_URL):
+        response = _calendar_get(url)
+        if not response:
+            continue
+        try:
+            data = response.json()
+            if isinstance(data, list):
+                rows.extend(data)
+        except ValueError:
+            continue
+    return rows
 
 
 @st.cache_data(ttl=60 * 60 * 4, show_spinner=False)
@@ -2076,7 +2122,7 @@ def fetch_taiwan_monthly_revenue_events(inputs):
     events, missing = [], []
     for code, item in input_by_code.items():
         row = rows_by_code.get(code)
-        if should_check_mops:
+        if should_check_mops or row is None:
             direct_row = None
             for market_type in ("sii", "otc"):
                 direct_row = fetch_mops_company_monthly_revenue(
@@ -2189,7 +2235,13 @@ def fetch_us_revenue_events(inputs):
                 continue
             period_end, quarter_revenue = quarter_values[0]
             previous_quarter = quarter_values[1][1] if len(quarter_values) > 1 else None
-            year_ago_quarter = quarter_values[4][1] if len(quarter_values) > 4 else None
+            expected_year_ago = period_end - pd.DateOffset(years=1)
+            year_ago_candidates = [
+                (abs((candidate_date - expected_year_ago).days), candidate_value)
+                for candidate_date, candidate_value in quarter_values[1:]
+                if abs((candidate_date - expected_year_ago).days) <= 45
+            ]
+            year_ago_quarter = min(year_ago_candidates, default=(None, None))[1]
             qoq_value = _growth_percent(quarter_revenue, previous_quarter)
             yoy_value = _growth_percent(quarter_revenue, year_ago_quarter)
             annual_values = []
@@ -2376,12 +2428,9 @@ def fetch_shioaji_data(api, code, interval='1d', lookback_days=10):
         elif code in ["TWF=F", "台指期貨", "TXF", "台指期貨(TWF=F)", "台指(全)", "台指期(全)", "台指期貨(全)"]:
             is_future = True
             try:
-                contract = min(
-                    [c for c in api.Contracts.Futures.TXF if c.code[-2:] not in ["R1", "R2"] and '/' not in c.code],
-                    key=lambda c: c.delivery_date
-                )
-            except (ValueError, AttributeError):
                 contract = api.Contracts.Futures.TXF.TXFR1
+            except AttributeError:
+                contract = None
 
         elif code in ["TMF=F", "微型台指期貨", "TMF", "微型台指", "微型台指期貨(TMF=F)", "微台(全)", "微台期(全)", "微型台指(全)", "微型台指期貨(全)"]:
             is_future = True
@@ -2547,7 +2596,7 @@ def fetch_shioaji_data(api, code, interval='1d', lookback_days=10):
                 df.index = date_series.map(date_mapping) + (df.index - date_series)
 
             if interval == '1d': df = df.resample('D').agg(agg_dict).dropna()
-            elif interval == '1wk': df = df.resample('W-MON').agg(agg_dict).dropna()
+            elif interval == '1wk': df = df.resample('W-FRI').agg(agg_dict).dropna()
             else: df = df.resample('M').agg(agg_dict).dropna()
             
             if is_future:
@@ -2832,8 +2881,17 @@ def calculate_market_temperature(df):
     change = close.diff()
     gains = change.clip(lower=0).rolling(14, min_periods=10).mean()
     losses = (-change.clip(upper=0)).rolling(14, min_periods=10).mean()
-    relative_strength = gains / losses.replace(0, np.nan)
-    rsi = float((100 - 100 / (1 + relative_strength)).iloc[-1])
+    latest_gain = float(gains.iloc[-1])
+    latest_loss = float(losses.iloc[-1])
+    if latest_loss == 0 and latest_gain > 0:
+        rsi = 100.0
+    elif latest_gain == 0 and latest_loss > 0:
+        rsi = 0.0
+    elif latest_gain == 0 and latest_loss == 0:
+        rsi = 50.0
+    else:
+        relative_strength = latest_gain / latest_loss
+        rsi = 100 - 100 / (1 + relative_strength)
     if not np.isfinite(rsi):
         rsi = 50.0
 
@@ -3217,7 +3275,6 @@ def fetch_taifex_index_margin_map():
             'https://openapi.taifex.com.tw/v1/IndexFuturesAndOptionsMargining',
             headers={'accept': 'application/json', 'If-Modified-Since': 'Mon, 26 Jul 1997 05:00:00 GMT'},
             timeout=8,
-            verify=False,
         )
         for item in response.json() if response.status_code == 200 else []:
             raw_name = str(item.get('Contract', '')).replace(' ', '')
@@ -3343,31 +3400,45 @@ def get_txo_target_contract_specs(expiry_choice, today=None):
         return (value.day - 1) // 7 + 1
 
     def wednesday_spec():
-        expiry = next_weekday(2)
-        week = week_of_month(expiry)
+        nominal_expiry = next_weekday(2)
+        week = week_of_month(nominal_expiry)
         root_map = {1: 'TX1', 2: 'TX2', 4: 'TX4', 5: 'TX5'}
         # 第三個星期三是月選，不是週選。
         if week == 3:
-            expiry += timedelta(days=7)
-            week = week_of_month(expiry)
-        return {'root': root_map[week], 'delivery_month': f"{expiry:%Y%m}W{week}", 'expiry': expiry}
+            nominal_expiry += timedelta(days=7)
+            week = week_of_month(nominal_expiry)
+        return {
+            'root': root_map[week],
+            'delivery_month': f"{nominal_expiry:%Y%m}W{week}",
+            'expiry': adjust_to_next_market_day(nominal_expiry),
+        }
 
     def friday_spec():
-        expiry = next_weekday(4)
-        week = week_of_month(expiry)
+        nominal_expiry = next_weekday(4)
+        week = week_of_month(nominal_expiry)
         root_map = {1: 'TXU', 2: 'TXV', 3: 'TXX', 4: 'TXY', 5: 'TXZ'}
-        return {'root': root_map[week], 'delivery_month': f"{expiry:%Y%m}F{week}", 'expiry': expiry}
+        return {
+            'root': root_map[week],
+            'delivery_month': f"{nominal_expiry:%Y%m}F{week}",
+            'expiry': adjust_to_next_market_day(nominal_expiry),
+        }
 
     def monthly_spec():
         year, month = today.year, today.month
         first_day = date(year, month, 1)
         first_wednesday = first_day + timedelta(days=(2 - first_day.weekday()) % 7)
-        expiry = first_wednesday + timedelta(days=14)
+        nominal_expiry = first_wednesday + timedelta(days=14)
+        expiry = adjust_to_next_market_day(nominal_expiry)
         if expiry < today or (expiry == today and passed_expiry_cutoff):
             next_month = date(year + (month == 12), 1 if month == 12 else month + 1, 1)
             first_wednesday = next_month + timedelta(days=(2 - next_month.weekday()) % 7)
-            expiry = first_wednesday + timedelta(days=14)
-        return {'root': 'TXO', 'delivery_month': f"{expiry:%Y%m}", 'expiry': expiry}
+            nominal_expiry = first_wednesday + timedelta(days=14)
+            expiry = adjust_to_next_market_day(nominal_expiry)
+        return {
+            'root': 'TXO',
+            'delivery_month': f"{nominal_expiry:%Y%m}",
+            'expiry': expiry,
+        }
 
     if expiry_choice == '週三選':
         return [wednesday_spec()]
@@ -3513,8 +3584,18 @@ def select_txo_expiry(api, expiry_choice):
             )
         ]
         if exact_contracts:
-            save_diagnostic(f"{batch_source}｜已取得 {len(exact_contracts)} 筆 {spec['delivery_month']} 契約")
-            return exact_contracts, spec['expiry'], batch_source
+            actual_expiries = [expiry_date(contract) for contract in exact_contracts]
+            actual_expiries = [value for value in actual_expiries if value is not None]
+            selected_expiry = min(actual_expiries) if actual_expiries else spec['expiry']
+            selected_contracts = [
+                contract for contract in exact_contracts
+                if expiry_date(contract) in (None, selected_expiry)
+            ]
+            save_diagnostic(
+                f"{batch_source}｜已取得 {len(selected_contracts)} 筆 "
+                f"{selected_expiry:%Y/%m/%d} 到期契約"
+            )
+            return selected_contracts, selected_expiry, batch_source
         for contract in batch_options:
             contract_key = str(
                 getattr(contract, 'code', '')
@@ -3732,12 +3813,14 @@ def rank_txo_directional_candidates(
         target_pnl = (target_option_price - premium) * 50
         stop_pnl = (stop_option_price - premium) * 50
         target_return_pct = (target_option_price - premium) / premium * 100 if premium > 0 else None
-        expected_pnl = (
-            probability * max(target_pnl, 0.0) + (1 - probability) * min(stop_pnl, 0.0)
-            if probability is not None else None
+        # 使用相同到期時間與同一模型衡量理論價差，避免把到期機率與
+        # 到期前目標／停損損益混成一個不一致的「期望值」。
+        theoretical_now = black_scholes_index_option_price(
+            spot, strike, years, model_vol, is_buy_call,
         )
+        expected_pnl = (theoretical_now - premium) * 50
         distance_points = abs(strike - spot)
-        target_reachable = strike <= target if is_buy_call else strike >= target
+        target_reachable = target >= breakeven if is_buy_call else target <= breakeven
         liquidity_score = {'高': 1.0, '中': 0.65, '低': 0.25, '報價不足': 0.0}.get(quote['liquidity'], 0.0)
         volume_score = math.sqrt(max(float(quote.get('volume', 0) or 0), 0.0) / max_volume)
         flow_score = float(np.clip((float(quote.get('book_balance', 0) or 0) + 1) / 2, 0, 1))
@@ -3858,8 +3941,16 @@ def get_txo_spread_quote(api, plan, expiry_choice, preferred_width=100):
         model_probability = option_profit_probability(
             float(spot), breakeven, years, model_vol, is_call=is_bull_put,
         )
-        if model_probability is not None:
-            expected_pnl = model_probability * credit + (1 - model_probability) * (-max_loss)
+        short_strike = float(short_contract.strike_price)
+        long_strike = float(long_contract.strike_price)
+        short_model_value = black_scholes_index_option_price(
+            float(spot), short_strike, years, model_vol, is_call=not is_bull_put,
+        )
+        long_model_value = black_scholes_index_option_price(
+            float(spot), long_strike, years, model_vol, is_call=not is_bull_put,
+        )
+        theoretical_spread_value = max(0.0, short_model_value - long_model_value)
+        expected_pnl = credit - theoretical_spread_value * 50
     return {
         'name': '賣權多頭價差（Bull Put Credit Spread）' if is_bull_put else '買權空頭價差（Bear Call Credit Spread）',
         'right': 'Put' if is_bull_put else 'Call', 'short_contract': short_contract,
@@ -4286,6 +4377,8 @@ def calculate_index_trade_plan(index_df, index_result, futures_df, futures_resul
         entry_level = support
         invalidation = levels[max(0, support_idx - 1)] if support_idx > 0 else support - max(zone_points, atr * 0.5)
         target = resistance if resistance > entry_level else levels[min(len(levels) - 1, support_idx + 1)]
+        if target <= entry_level:
+            target = swing_high + swing_range * 0.272
         action = "多方觀察"
         action_color = "#ff4b4b"
         trigger = f"價格回到 {entry_level:,.0f} ± {zone_points:,.0f} 點支撐區，且 15 分 K 止跌上收。"
@@ -4296,6 +4389,8 @@ def calculate_index_trade_plan(index_df, index_result, futures_df, futures_resul
         entry_level = resistance
         invalidation = levels[min(len(levels) - 1, resistance_idx + 1)] if resistance_idx < len(levels) - 1 else resistance + max(zone_points, atr * 0.5)
         target = support if support < entry_level else levels[max(0, resistance_idx - 1)]
+        if target >= entry_level:
+            target = max(0.0, swing_low - swing_range * 0.272)
         action = "空方觀察"
         action_color = "#00c853"
         trigger = f"價格反彈到 {entry_level:,.0f} ± {zone_points:,.0f} 點壓力區，且 15 分 K 受壓下收。"
@@ -4312,8 +4407,20 @@ def calculate_index_trade_plan(index_df, index_result, futures_df, futures_resul
         option_name = "不建立價差部位"
         short_strike = long_strike = None
 
+    valid_directional_plan = (
+        direction == '偏多' and invalidation < entry_level < target
+    ) or (
+        direction == '偏空' and target < entry_level < invalidation
+    )
+    if direction in ('偏多', '偏空') and not valid_directional_plan:
+        direction = '觀望'
+        action = '等待'
+        action_color = '#ffc107'
+        trigger = '目前沒有符合價格順序的有效停損與目標，等待區間重新形成。'
+        option_name = '不建立價差部位'
+        short_strike = long_strike = None
     risk_points = max(0.0, abs(entry_level - invalidation))
-    reward_points = max(0.0, abs(target - entry_level))
+    reward_points = max(0.0, abs(target - entry_level)) if direction != '觀望' else 0.0
     return {
         'market_label': market_label, 'alignment_note': alignment_note,
         'direction': direction, 'action': action, 'action_color': action_color,
@@ -4983,14 +5090,32 @@ def plot_fibonacci_chart(
                             df.at[df.index[-1], 'Volume'] = max(float(df['Volume'].iloc[-1]), rt_vol)
                     elif interval in ["1m", "5m", "15m", "60m"]:
                         now_dt_naive = now_tw.replace(tzinfo=None)
-                        # 判斷最後一根K棒時間，若落後即時時間則追加一根最新的，否則直接更新最後一根
-                        if df.index[-1] < now_dt_naive and rt_price > 0 and not is_market_closed_func(now_tw.date()) and not is_temporary_closed:
-                            new_row = pd.DataFrame([{'Open': rt_open, 'High': rt_high, 'Low': rt_low, 'Close': rt_price, 'Volume': rt_vol}], index=[now_dt_naive])
+                        bucket_minutes = {'1m': 1, '5m': 5, '15m': 15, '60m': 60}[interval]
+                        bucket_start = now_dt_naive.replace(
+                            minute=(now_dt_naive.minute // bucket_minutes) * bucket_minutes,
+                            second=0, microsecond=0,
+                        )
+                        last_bucket = pd.Timestamp(df.index[-1]).to_pydatetime().replace(
+                            minute=(pd.Timestamp(df.index[-1]).minute // bucket_minutes) * bucket_minutes,
+                            second=0, microsecond=0,
+                        )
+                        same_day_mask = df.index.date == now_tw.date()
+                        known_volume = float(df.loc[same_day_mask, 'Volume'].sum())
+                        if bucket_start > last_bucket and rt_price > 0 and not is_market_closed_func(now_tw.date()) and not is_temporary_closed:
+                            bar_volume = max(0.0, rt_vol - known_volume)
+                            new_row = pd.DataFrame(
+                                [{'Open': rt_price, 'High': rt_price, 'Low': rt_price, 'Close': rt_price, 'Volume': bar_volume}],
+                                index=[bucket_start],
+                            )
                             df = pd.concat([df, new_row])
                         else:
                             df.at[df.index[-1], 'Close'] = rt_price
-                            df.at[df.index[-1], 'High'] = max(float(df['High'].iloc[-1]), rt_high)
-                            df.at[df.index[-1], 'Low'] = min(float(df['Low'].iloc[-1]), rt_low)
+                            df.at[df.index[-1], 'High'] = max(float(df['High'].iloc[-1]), rt_price)
+                            df.at[df.index[-1], 'Low'] = min(float(df['Low'].iloc[-1]), rt_price)
+                            previous_bar_volume = known_volume - float(df['Volume'].iloc[-1])
+                            df.at[df.index[-1], 'Volume'] = max(
+                                float(df['Volume'].iloc[-1]), rt_vol - previous_bar_volume,
+                            )
                     else:
                         df.at[df.index[-1], 'Close'] = rt_price
                         df.at[df.index[-1], 'High'] = max(float(df['High'].iloc[-1]), rt_high)
@@ -5041,6 +5166,10 @@ def plot_fibonacci_chart(
 
     diff = high_60 - low_60
     ratios = [-2.618, -2.0, -1.618, -1.0, 0.0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0, 1.618, 2.0, 2.618]
+    asset_type = (
+        'futures' if ticker_code in ('TWF=F', 'TMF=F')
+        else ('index' if str(ticker_code).startswith('^') else 'stock')
+    )
     
     # 費波顏色映射表
     color_map = {
@@ -5104,8 +5233,8 @@ def plot_fibonacci_chart(
 
     high_idx_str = df_subset['High'].idxmax().strftime(fmt)
     low_idx_str = df_subset['Low'].idxmin().strftime(fmt)
-    disp_high = round_to_tick(high_60)
-    disp_low = round_to_tick(low_60)
+    disp_high = _round_fibo_asset_price(high_60, asset_type)
+    disp_low = _round_fibo_asset_price(low_60, asset_type)
     
     target_row = 1 if (show_vol and 'Volume' in df_subset.columns) else None
     target_col = 1 if (show_vol and 'Volume' in df_subset.columns) else None
@@ -5118,7 +5247,7 @@ def plot_fibonacci_chart(
     
     for r in ratios:
         price = low_60 + r * diff
-        rounded_price = round_to_tick(price)
+        rounded_price = _round_fibo_asset_price(price, asset_type)
         line_col = color_map.get(r, "rgba(150, 150, 150, 0.5)")
         
         fig.add_shape(type="line", x0=first_date_str, y0=price, x1=last_date_str, y1=price,
@@ -5128,8 +5257,10 @@ def plot_fibonacci_chart(
         fig.add_annotation(x=last_date_str, y=price, text=f"{r_label} ({rounded_price:g})",
             showarrow=False, xanchor="left", xshift=10, font=dict(size=font_size, color=line_col), row=target_row, col=target_col)
 
-    y_min_view = low_60 - diff * 1.05
-    y_max_view = high_60 + diff * 0.05
+    plotted_prices = [low_60 + ratio * diff for ratio in ratios]
+    y_padding = diff * 0.05
+    y_min_view = min(plotted_prices) - y_padding
+    y_max_view = max(plotted_prices) + y_padding
     if pd.isna(y_min_view) or pd.isna(y_max_view): y_min_view, y_max_view = None, None
 
     interval_display_map = {"1m": "1分K", "5m": "5分K", "15m": "15分K", "60m": "60分K", "1d": "日K", "1wk": "週K", "1mo": "月K"}
@@ -5282,7 +5413,7 @@ def fetch_fubon_html(url):
     """解決富邦 DJ 拒絕 iframe 連線的問題、處理亂碼與排版"""
     try:
         headers = {'User-Agent': 'Mozilla/5.0'}
-        r = requests.get(url, headers=headers, timeout=10, verify=False)
+        r = requests.get(url, headers=headers, timeout=10)
         r.encoding = 'cp950' 
         html = r.text
         
@@ -5313,7 +5444,7 @@ def get_report_list():
     base_url = "https://www.spf.com.tw"
     headers = {'User-Agent': 'Mozilla/5.0'}
     try:
-        response = requests.get(url, headers=headers, timeout=10, verify=False)
+        response = requests.get(url, headers=headers, timeout=10)
         response.encoding = 'utf-8'
         soup = BeautifulSoup(response.text, 'html.parser')
         
@@ -5382,7 +5513,7 @@ def fetch_and_parse_pdf(pdf_url):
     headers = {'User-Agent': 'Mozilla/5.0'}
     try:
         if not pdf_url.lower().endswith('.pdf'):
-            r_inner = requests.get(pdf_url, headers=headers, timeout=10, verify=False)
+            r_inner = requests.get(pdf_url, headers=headers, timeout=10)
             soup_inner = BeautifulSoup(r_inner.text, 'html.parser')
             for tag in soup_inner.find_all(['a', 'iframe']):
                 link = tag.get('href') or tag.get('src')
@@ -5392,7 +5523,7 @@ def fetch_and_parse_pdf(pdf_url):
                         pdf_url = "https://www.spf.com.tw" + pdf_url
                     break
 
-        response = requests.get(pdf_url, headers=headers, timeout=15, verify=False)
+        response = requests.get(pdf_url, headers=headers, timeout=15)
         pdf_bytes = response.content
         
         text = ""
@@ -5433,7 +5564,7 @@ def get_major_institutional_data(date_str):
     """從證交所 API 抓取三大法人買賣金額統計 (套用正確 API 結構)"""
     url = f"https://www.twse.com.tw/rwd/zh/fund/BFI82U?dayDate={date_str}&response=json"
     try:
-        response = requests.get(url, timeout=5, verify=False)
+        response = requests.get(url, timeout=5)
         data = response.json()
         
         if data.get("stat") != "OK":
@@ -5463,7 +5594,7 @@ def color_negative_positive(val):
 def get_tw_stocker_data(direction):
     url = f"https://voidful.github.io/tw-institutional-stocker/data/top_three_inst_change_20_{direction}.json"
     try:
-        r = requests.get(url, timeout=3, verify=False)
+        r = requests.get(url, timeout=3)
         if r.status_code == 200:
             data = r.json()
             if data:
@@ -5480,8 +5611,34 @@ def get_tw_stocker_data(direction):
         pass
     return pd.DataFrame()
 
+_GOODINFO_BROWSER_SEMAPHORE = threading.BoundedSemaphore(1)
+
+
+def _clean_goodinfo_table(dataframe):
+    cleaned = dataframe.copy()
+    if isinstance(cleaned.columns, pd.MultiIndex):
+        new_columns = []
+        for column in cleaned.columns:
+            parts = []
+            for item in column:
+                text = str(item).replace(' ', '').strip()
+                if text and not text.startswith('Unnamed') and text not in parts:
+                    parts.append(text)
+            new_columns.append('_'.join(parts))
+        cleaned.columns = new_columns
+    else:
+        cleaned.columns = [str(column).replace(' ', '').strip() for column in cleaned.columns]
+    header_text = '|'.join(map(str, cleaned.columns))
+    has_code = any(keyword in header_text for keyword in ('代號', '股票代號'))
+    has_name = '名稱' in header_text
+    has_turnover = '週轉率' in header_text
+    if len(cleaned) < 10 or not (has_code and has_name and has_turnover):
+        return None
+    return cleaned
+
+
 def fetch_goodinfo_data():
-    """使用原始流程：開啟 Goodinfo 後固定等待 15 秒，再解析完整排行表。"""
+    """在 15 秒期限內等待並驗證 Goodinfo 上市／上櫃綜合週轉率表。"""
     url = "https://goodinfo.tw/tw/StockList.asp?RPT_TIME=&MARKET_CAT=%E7%86%B1%E9%96%80%E6%8E%92%E8%A1%8C&INDUSTRY_CAT=%E7%B4%AF%E8%A8%88%E6%88%90%E4%BA%A4%E9%87%8F%E9%80%B1%E8%BD%89%E7%8E%87%28%E7%95%B6%E6%97%A5%29%40%40%E7%B4%AF%E8%A8%88%E6%88%90%E4%BA%A4%E9%87%8F%E9%80%B1%E8%BD%89%E7%8E%87%40%40%E7%95%B6%E6%97%A5"
     chrome_options = Options()
     chrome_options.add_argument("--headless=new")
@@ -5489,61 +5646,64 @@ def fetch_goodinfo_data():
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--disable-gpu")
     chrome_options.add_argument("--window-size=1920x1080")
-    chrome_options.add_argument("--single-process")
-    chrome_options.add_argument("--no-zygote")
     chrome_options.add_argument("--disable-software-rasterizer")
     chrome_options.add_argument("--disable-blink-features=AutomationControlled")
     chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
     chrome_options.add_experimental_option('useAutomationExtension', False)
-    chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36")
 
     chrome_options.binary_location = "/usr/bin/chromium"
+    acquired = _GOODINFO_BROWSER_SEMAPHORE.acquire(timeout=16)
+    if not acquired:
+        return None
+    driver = None
+    started_at = time.monotonic()
+    deadline = started_at + 15
+    refreshed_after_alert = False
     try:
         service = Service("/usr/bin/chromedriver")
         driver = webdriver.Chrome(service=service, options=chrome_options)
+        driver.set_page_load_timeout(8)
         driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
-            "source": """
-            Object.defineProperty(navigator, 'webdriver', {
-                get: () => undefined
-            })
-            """
+            "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
         })
-        driver.get(url)
-        time.sleep(15)
-
-        page_html = driver.page_source
-        tables = pd.read_html(io.StringIO(page_html))
-
-        target_df = None
-        for dataframe in tables:
-            if dataframe.shape[0] > 10 and dataframe.shape[1] > 5:
-                if target_df is None or (
-                    dataframe.shape[0] * dataframe.shape[1]
-                    > target_df.shape[0] * target_df.shape[1]
-                ):
-                    target_df = dataframe
-
-        if target_df is not None:
-            if isinstance(target_df.columns, pd.MultiIndex):
-                new_columns = []
-                for column in target_df.columns:
-                    cleaned_parts = []
-                    for item in column:
-                        item_text = str(item).replace(' ', '').strip()
-                        if item_text and not item_text.startswith('Unnamed'):
-                            if not cleaned_parts or cleaned_parts[-1] != item_text:
-                                cleaned_parts.append(item_text)
-                    new_columns.append('_'.join(cleaned_parts))
-                target_df.columns = new_columns
-            else:
-                target_df.columns = [str(column).replace(' ', '').strip() for column in target_df.columns]
-            return target_df
-    except Exception as exc:
-        st.error(f"系統發生異常: {exc}")
-        return None
+        try:
+            driver.get(url)
+        except TimeoutException:
+            pass
+        while time.monotonic() < deadline:
+            try:
+                alert = driver.switch_to.alert
+                alert_text = alert.text
+                alert.accept()
+                logger.warning('Goodinfo alert: %s', alert_text)
+                if not refreshed_after_alert and time.monotonic() + 3 < deadline:
+                    refreshed_after_alert = True
+                    try:
+                        driver.refresh()
+                    except (TimeoutException, UnexpectedAlertPresentException):
+                        pass
+            except NoAlertPresentException:
+                pass
+            try:
+                tables = pd.read_html(io.StringIO(driver.page_source))
+            except (ValueError, TypeError):
+                tables = []
+            candidates = [
+                cleaned for cleaned in (_clean_goodinfo_table(table) for table in tables)
+                if cleaned is not None
+            ]
+            if candidates:
+                return max(candidates, key=lambda table: table.shape[0] * table.shape[1])
+            time.sleep(min(0.5, max(0, deadline - time.monotonic())))
+    except (WebDriverException, OSError, ValueError) as exc:
+        logger.exception('Goodinfo fetch failed: %s', type(exc).__name__)
     finally:
-        if 'driver' in locals():
-            driver.quit()
+        if driver is not None:
+            try:
+                driver.quit()
+            except WebDriverException:
+                pass
+        _GOODINFO_BROWSER_SEMAPHORE.release()
     return None
 
 # ==========================================
@@ -5607,28 +5767,37 @@ DEFAULT_FIBO_TAGS = ["台積電(2330)", "鴻海(2317)", "聯發科(2454)", "和�
 ANALYSIS_MAX_WORKERS = 2
 API_REQUEST_GAP_SECONDS = 0.1
 
+_RUNTIME_FILE_LOCK = threading.RLock()
+
+
 def load_config():
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f: return json.load(f)
-        except Exception: return {}
-    return {}
+    with _RUNTIME_FILE_LOCK:
+        if os.path.exists(CONFIG_FILE):
+            try:
+                with open(CONFIG_FILE, "r", encoding="utf-8") as file:
+                    payload = json.load(file)
+                return payload if isinstance(payload, dict) else {}
+            except (OSError, ValueError, TypeError):
+                return {}
+        return {}
 
 def save_config(font_size, limit_rows, sj_key="", sj_secret="", remember_sj=False):
     try:
-        config = load_config()
-        config.pop('auto_update', None)
-        config.pop('delay_sec', None)
-        config.update({
-            "font_size": font_size, 
-            "limit_rows": limit_rows, 
-            "sj_key": sj_key if remember_sj else "",
-            "sj_secret": sj_secret if remember_sj else "",
-            "remember_sj": remember_sj
-        })
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f: json.dump(config, f)
+        with _RUNTIME_FILE_LOCK:
+            config = load_config()
+            config.pop('auto_update', None)
+            config.pop('delay_sec', None)
+            config.update({
+                "font_size": font_size,
+                "limit_rows": limit_rows,
+                "sj_key": sj_key if remember_sj else "",
+                "sj_secret": sj_secret if remember_sj else "",
+                "remember_sj": remember_sj,
+            })
+            _write_json_atomic(CONFIG_FILE, config)
         return True
-    except Exception: return False
+    except (OSError, TypeError, ValueError):
+        return False
 
 def _json_safe(value):
     """將期貨快取轉為可寫入設定檔的基本型別。"""
@@ -5660,24 +5829,24 @@ def save_futures_strategy_state(
 ):
     """持久化期貨表格快照，重整後仍能還原最後成功資料。"""
     try:
-        config = load_config()
-        config.pop('futures_strategy_custom_prices', None)
-        existing = config.get('futures_strategy_state', {})
-        records = existing.get('universe', []) if isinstance(existing, dict) else []
-        if isinstance(universe, pd.DataFrame) and not universe.empty:
-            records = json.loads(universe.to_json(orient='records', force_ascii=False))
-        config['futures_strategy_state'] = _json_safe({
-            'universe': records,
-            'metadata': metadata or (existing.get('metadata', {}) if isinstance(existing, dict) else {}),
-            'rank_cache': rank_cache if rank_cache is not None else (existing.get('rank_cache', {}) if isinstance(existing, dict) else {}),
-            'live_cache': live_cache if live_cache is not None else (existing.get('live_cache', {}) if isinstance(existing, dict) else {}),
-            'manual': list(manual if manual is not None else (existing.get('manual', []) if isinstance(existing, dict) else [])),
-            'ignored': list(ignored if ignored is not None else (existing.get('ignored', []) if isinstance(existing, dict) else [])),
-            'rank_time': rank_time if rank_time is not None else (existing.get('rank_time') if isinstance(existing, dict) else None),
-            'live_time': live_time if live_time is not None else (existing.get('live_time') if isinstance(existing, dict) else None),
-        })
-        with open(CONFIG_FILE, 'w', encoding='utf-8') as file:
-            json.dump(config, file, ensure_ascii=False)
+        with _RUNTIME_FILE_LOCK:
+            config = load_config()
+            config.pop('futures_strategy_custom_prices', None)
+            existing = config.get('futures_strategy_state', {})
+            records = existing.get('universe', []) if isinstance(existing, dict) else []
+            if isinstance(universe, pd.DataFrame) and not universe.empty:
+                records = json.loads(universe.to_json(orient='records', force_ascii=False))
+            config['futures_strategy_state'] = _json_safe({
+                'universe': records,
+                'metadata': metadata or (existing.get('metadata', {}) if isinstance(existing, dict) else {}),
+                'rank_cache': rank_cache if rank_cache is not None else (existing.get('rank_cache', {}) if isinstance(existing, dict) else {}),
+                'live_cache': live_cache if live_cache is not None else (existing.get('live_cache', {}) if isinstance(existing, dict) else {}),
+                'manual': list(manual if manual is not None else (existing.get('manual', []) if isinstance(existing, dict) else [])),
+                'ignored': list(ignored if ignored is not None else (existing.get('ignored', []) if isinstance(existing, dict) else [])),
+                'rank_time': rank_time if rank_time is not None else (existing.get('rank_time') if isinstance(existing, dict) else None),
+                'live_time': live_time if live_time is not None else (existing.get('live_time') if isinstance(existing, dict) else None),
+            })
+            _write_json_atomic(CONFIG_FILE, config)
         return True
     except (OSError, TypeError, ValueError):
         return False
@@ -5701,8 +5870,10 @@ def load_strategy_signal_log():
 def save_strategy_signal_log(records):
     """最多保留最近 2,000 筆策略訊號，避免長期使用造成檔案膨脹。"""
     try:
-        with open(STRATEGY_SIGNAL_LOG_FILE, "w", encoding="utf-8") as file:
-            json.dump(list(records)[-2000:], file, ensure_ascii=False, indent=2)
+        with _RUNTIME_FILE_LOCK:
+            _write_json_atomic(
+                STRATEGY_SIGNAL_LOG_FILE, list(records)[-2000:], indent=2,
+            )
         return True
     except (OSError, TypeError, ValueError):
         return False
@@ -5752,7 +5923,11 @@ def build_data_health(data_time=None, required_ready=True, live_expected=False):
     timestamp = parse_strategy_data_time(data_time)
     if timestamp is None:
         return '🔵 官方日行情' if not live_expected else '⚪ 尚未即時更新'
-    age_seconds = max(0, (datetime.now() - timestamp.to_pydatetime()).total_seconds())
+    now_tw_naive = datetime.now(pytz.timezone('Asia/Taipei')).replace(tzinfo=None)
+    age_seconds = (now_tw_naive - timestamp.to_pydatetime()).total_seconds()
+    if age_seconds < -60:
+        return '🟠 報價時間異常'
+    age_seconds = max(0, age_seconds)
     if age_seconds <= 90:
         return '🟢 即時'
     if age_seconds <= 600:
@@ -5767,7 +5942,7 @@ def calculate_market_alignment(direction, market_bias):
     return '🟢 同向' if normalized_direction == market_bias else '🟡 逆勢'
 
 def futures_expiry_date(contract_month):
-    """以月契約第三個星期三估算到期日；休市時往前調整至交易日。"""
+    """以月契約第三個星期三估算到期日；休市時順延至次一交易日。"""
     match = re.fullmatch(r'(\d{4})(\d{2})', str(contract_month or ''))
     if not match:
         return None
@@ -5776,10 +5951,7 @@ def futures_expiry_date(contract_month):
     wednesdays = [week[calendar.WEDNESDAY] for week in month_calendar if week[calendar.WEDNESDAY]]
     if len(wednesdays) < 3:
         return None
-    expiry = date(year, month, wednesdays[2])
-    while is_market_closed_func(expiry):
-        expiry -= timedelta(days=1)
-    return expiry
+    return adjust_to_next_market_day(date(year, month, wednesdays[2]))
 
 def calculate_entry_confidence(
     base_score, state, current_price, plan_text, direction,
@@ -5858,10 +6030,15 @@ def register_strategy_signals(records):
     existing = load_strategy_signal_log()
     existing_keys = {str(record.get('dedupe_key', '')) for record in existing}
     added = 0
-    now_text = datetime.now(pytz.timezone('Asia/Taipei')).strftime('%Y/%m/%d %H:%M:%S')
-    trade_day = datetime.now(pytz.timezone('Asia/Taipei')).strftime('%Y%m%d')
+    now_tw = datetime.now(pytz.timezone('Asia/Taipei'))
+    now_text = now_tw.strftime('%Y/%m/%d %H:%M:%S')
     for raw_record in records:
         record = dict(raw_record)
+        trade_day = (
+            get_futures_trading_date(now_tw).strftime('%Y%m%d')
+            if str(record.get('市場', '')) == '期貨'
+            else now_tw.strftime('%Y%m%d')
+        )
         dedupe_key = '|'.join([
             trade_day, str(record.get('市場', '')), str(record.get('商品鍵', '')),
             str(record.get('策略', '')), str(record.get('方向', '')), str(record.get('進場價', '')),
@@ -5880,7 +6057,7 @@ def register_strategy_signals(records):
     return added, save_strategy_signal_log(existing)
 
 def update_strategy_signal_outcomes(price_map):
-    """以每次手動更新取得的最新價更新追蹤中訊號，不額外發出行情請求。"""
+    """Update tracked signals from timestamped snapshots without fabricating history."""
     records = load_strategy_signal_log()
     if not records:
         return 0
@@ -5888,6 +6065,8 @@ def update_strategy_signal_outcomes(price_map):
     now_tw = datetime.now(pytz.timezone('Asia/Taipei'))
     now_text = now_tw.strftime('%Y/%m/%d %H:%M:%S')
     for record in records:
+        if str(record.get('結果')) != '追蹤中':
+            continue
         key = str(record.get('商品鍵', ''))
         current_price = _safe_number(price_map.get(key))
         # 使用者有填實際成交點位時，以實際進場價計算所有後續 R 與結果；否則沿用計畫價。
@@ -5902,29 +6081,60 @@ def update_strategy_signal_outcomes(price_map):
         if risk_distance <= 0:
             continue
         is_long = str(record.get('方向')) in ('多頭', '偏多')
-        favorable = (current_price - entry) if is_long else (entry - current_price)
-        adverse = (entry - current_price) if is_long else (current_price - entry)
-        current_r = favorable / risk_distance
-        record['MFE(R)'] = round(max(_safe_number(record.get('MFE(R)'), 0) or 0, favorable / risk_distance), 2)
-        record['MAE(R)'] = round(max(_safe_number(record.get('MAE(R)'), 0) or 0, adverse / risk_distance), 2)
+        valid_order = stop < entry < target if is_long else target < entry < stop
+        if not valid_order:
+            record['資料警示'] = '進場／停損／目標價格順序無效'
+            continue
+        snapshots = record.get('價格快照', [])
+        if not isinstance(snapshots, list):
+            snapshots = []
+        snapshots.append({'時間': now_text, '價格': current_price})
+        record['價格快照'] = snapshots[-500:]
+
+        snapshot_values = [
+            _safe_number(item.get('價格')) for item in record['價格快照']
+            if isinstance(item, dict)
+        ]
+        snapshot_values = [value for value in snapshot_values if value is not None]
+        favorable_values = [
+            (value - entry) if is_long else (entry - value)
+            for value in snapshot_values
+        ]
+        adverse_values = [
+            (entry - value) if is_long else (value - entry)
+            for value in snapshot_values
+        ]
+        current_r = ((current_price - entry) if is_long else (entry - current_price)) / risk_distance
+        record['MFE(R)'] = round(max([0.0] + favorable_values) / risk_distance, 2)
+        record['MAE(R)'] = round(max([0.0] + adverse_values) / risk_distance, 2)
         record['最新價'] = current_price
         record['最後更新'] = now_text
         created_at = parse_strategy_data_time(record.get('建立時間'))
         if created_at is not None:
-            elapsed_minutes = (now_tw.replace(tzinfo=None) - created_at.to_pydatetime()).total_seconds() / 60
             for minutes, column in ((15, '15分(R)'), (30, '30分(R)'), (60, '60分(R)')):
-                if elapsed_minutes >= minutes and _safe_number(record.get(column)) is None:
+                target_time = created_at.to_pydatetime() + timedelta(minutes=minutes)
+                age_from_target = abs(
+                    (now_tw.replace(tzinfo=None) - target_time).total_seconds()
+                )
+                if age_from_target <= 5 * 60 and _safe_number(record.get(column)) is None:
                     record[column] = round(current_r, 2)
-        if str(record.get('市場')) == '股票' and now_tw.time() >= dt_time(13, 30) and _safe_number(record.get('收盤(R)')) is None:
+        if (
+            str(record.get('市場')) == '股票'
+            and created_at is not None
+            and created_at.date() == now_tw.date()
+            and now_tw.time() >= dt_time(13, 30)
+            and _safe_number(record.get('收盤(R)')) is None
+        ):
             record['收盤(R)'] = round(current_r, 2)
-        if str(record.get('結果')) == '追蹤中':
-            stopped = current_price <= stop if is_long else current_price >= stop
-            targeted = current_price >= target if is_long else current_price <= target
-            if stopped:
-                record['結果'], record['結果(R)'] = '停損', -1.0
-            elif targeted:
-                reward_r = abs(target - entry) / risk_distance
-                record['結果'], record['結果(R)'] = '達標', round(reward_r, 2)
+        stopped = current_price <= stop if is_long else current_price >= stop
+        targeted = current_price >= target if is_long else current_price <= target
+        if stopped:
+            record['結果'], record['結果(R)'] = '停損', -1.0
+            record['結案時間'] = now_text
+        elif targeted:
+            reward_r = abs(target - entry) / risk_distance
+            record['結果'], record['結果(R)'] = '達標', round(reward_r, 2)
+            record['結案時間'] = now_text
         updated_count += 1
     save_strategy_signal_log(records)
     return updated_count
@@ -6240,33 +6450,58 @@ def render_strategy_validation_room():
     for position, edited_value in enumerate(edited_validation['實際進場價'].tolist()):
         record_id = int(validation_display.iloc[position]['_紀錄ID'])
         new_value = _safe_number(edited_value)
+        raw_value = str(edited_value or '').strip()
+        if raw_value and (new_value is None or new_value <= 0):
+            st.error(f"實際進場價「{raw_value}」不是有效正數，該筆未儲存。")
+            continue
         old_value = _safe_number(records[record_id].get('實際進場價'))
         if new_value != old_value:
             record = records[record_id]
-            record['實際進場價'] = new_value
-            record['最後更新'] = datetime.now(
-                pytz.timezone('Asia/Taipei')
-            ).strftime('%Y/%m/%d %H:%M:%S')
             effective_entry = new_value if new_value is not None else _safe_number(record.get('進場價'))
             latest = _safe_number(record.get('最新價'))
             stop = _safe_number(record.get('停損價'))
             target = _safe_number(record.get('目標價'))
-            if None not in (effective_entry, latest, stop, target) and abs(effective_entry - stop) > 0:
+            is_long = str(record.get('方向')) in ('多頭', '偏多')
+            valid_order = (
+                None not in (effective_entry, stop, target)
+                and (stop < effective_entry < target if is_long else target < effective_entry < stop)
+            )
+            if not valid_order:
+                st.error(
+                    f"{record.get('代碼', '')} 實際進場價不在停損與目標之間，該筆未儲存。"
+                )
+                continue
+            record['實際進場價'] = new_value
+            record['最後更新'] = datetime.now(
+                pytz.timezone('Asia/Taipei')
+            ).strftime('%Y/%m/%d %H:%M:%S')
+            terminal_result = str(record.get('結果')) in ('停損', '達標')
+            for derived_column in ('15分(R)', '30分(R)', '60分(R)', '收盤(R)'):
+                record[derived_column] = None
+            record['價格快照'] = []
+            record['MFE(R)'] = 0.0
+            record['MAE(R)'] = 0.0
+            if None not in (effective_entry, latest, stop, target):
                 risk_distance = abs(effective_entry - stop)
-                is_long = str(record.get('方向')) in ('多頭', '偏多')
                 favorable = (latest - effective_entry) if is_long else (effective_entry - latest)
                 adverse = (effective_entry - latest) if is_long else (latest - effective_entry)
                 record['MFE(R)'] = round(max(0, favorable / risk_distance), 2)
                 record['MAE(R)'] = round(max(0, adverse / risk_distance), 2)
-                stopped = latest <= stop if is_long else latest >= stop
-                targeted = latest >= target if is_long else latest <= target
-                if stopped:
-                    record['結果'], record['結果(R)'] = '停損', -1.0
-                elif targeted:
-                    record['結果'] = '達標'
-                    record['結果(R)'] = round(abs(target - effective_entry) / risk_distance, 2)
+                if terminal_result:
+                    if str(record.get('結果')) == '停損':
+                        record['結果(R)'] = -1.0
+                    else:
+                        record['結果(R)'] = round(abs(target - effective_entry) / risk_distance, 2)
                 else:
-                    record['結果'], record['結果(R)'] = '追蹤中', None
+                    stopped = latest <= stop if is_long else latest >= stop
+                    targeted = latest >= target if is_long else latest <= target
+                    if stopped:
+                        record['結果'], record['結果(R)'] = '停損', -1.0
+                    elif targeted:
+                        record['結果'] = '達標'
+                        record['結果(R)'] = round(abs(target - effective_entry) / risk_distance, 2)
+                    else:
+                        record['結果'], record['結果(R)'] = '追蹤中', None
             actual_entry_changed = True
     if actual_entry_changed:
         if save_strategy_signal_log(records):
@@ -6315,15 +6550,43 @@ def load_fibo_tag_cache():
 def _write_json_atomic(path, payload, *, indent=None):
     """完整寫入後再替換原檔，避免兩個 Streamlit 工作階段留下半份 JSON。"""
     temp_path = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
-    with open(temp_path, 'w', encoding='utf-8') as file:
-        json.dump(payload, file, ensure_ascii=False, indent=indent)
-    os.replace(temp_path, path)
+    with _RUNTIME_FILE_LOCK:
+        try:
+            with open(temp_path, 'w', encoding='utf-8') as file:
+                json.dump(payload, file, ensure_ascii=False, indent=indent)
+                file.flush()
+                os.fsync(file.fileno())
+            os.replace(temp_path, path)
+        finally:
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
 
 
 @st.cache_resource(show_spinner=False)
 def get_data_cache_sync_lock():
     """同一個 Streamlit 服務內，序列化不同裝置的遠端快取讀寫。"""
     return threading.RLock()
+
+
+def _is_valid_data_cache_payload(value):
+    if not isinstance(value, dict):
+        return False
+    expected_types = {
+        'stock_data': list,
+        'ignored_stocks': list,
+        'all_candidates': list,
+        'saved_notes': dict,
+        'fibo_tags': list,
+        'cached_notes': dict,
+        'strategy_signal_log': list,
+    }
+    present = [key for key in expected_types if key in value]
+    return bool(present) and all(
+        isinstance(value[key], expected_types[key]) for key in present
+    )
 
 
 def _decode_data_cache_payload(payload):
@@ -6343,15 +6606,17 @@ def _decode_data_cache_payload(payload):
             except (ValueError, TypeError):
                 return {}
         if isinstance(value, dict):
-            if any(key in value for key in ('stock_data', 'fibo_tags', 'saved_notes', 'strategy_signal_log')):
+            if _is_valid_data_cache_payload(value):
                 return value
             nested = value.get('data')
             if isinstance(nested, (dict, str, bytes)):
                 value = nested
                 continue
-            return value
+            return {}
         return {}
-    return value if isinstance(value, dict) else {}
+    return (
+        value if _is_valid_data_cache_payload(value) else {}
+    )
 
 
 def _fetch_remote_data_cache(gsheet_api_url, timeout=5):
@@ -6409,14 +6674,101 @@ def save_fibo_config():
         )
     return sync_saved
 
-def save_data_cache(df, ignored_set, candidates=None, saved_notes=None, fibo_tags=None):
-    if candidates is None:
-        candidates = []
-    if saved_notes is None:
-        saved_notes = {}
+
+def _merge_unique_records(remote_records, local_records, key_name):
+    merged = {}
+    unkeyed = []
+    for record in list(remote_records or []) + list(local_records or []):
+        if not isinstance(record, dict):
+            continue
+        key = str(record.get(key_name, '')).strip()
+        if key:
+            merged[key] = record
+        else:
+            unkeyed.append(record)
+    return list(merged.values()) + unkeyed
+
+
+def _merge_unique_values(remote_values, local_values):
+    merged = []
+    seen = set()
+    for value in list(remote_values or []) + list(local_values or []):
+        marker = json.dumps(_json_safe(value), ensure_ascii=False, sort_keys=True)
+        if marker not in seen:
+            merged.append(value)
+            seen.add(marker)
+    return merged
+
+
+def _merge_data_cache_payload(
+    remote, local, *, explicit_fibo_tag_save=False,
+    clear_stock_data=False, replace_ignored=False,
+):
+    remote = remote if isinstance(remote, dict) else {}
+    local = local if isinstance(local, dict) else {}
+    if explicit_fibo_tag_save and remote:
+        merged = dict(remote)
+        merged['fibo_tags'] = list(local.get('fibo_tags', []))
+    elif clear_stock_data:
+        merged = dict(remote)
+        for key, empty_value in (
+            ('stock_data', []), ('ignored_stocks', []), ('all_candidates', []),
+            ('saved_notes', {}), ('cached_notes', {}),
+        ):
+            merged[key] = empty_value
+        merged['fibo_tags'] = (
+            _valid_fibo_tags(remote.get('fibo_tags', []))
+            or list(local.get('fibo_tags', []))
+        )
+        merged['strategy_signal_log'] = remote.get(
+            'strategy_signal_log', local.get('strategy_signal_log', []),
+        )
+    else:
+        remote_ignored = set(remote.get('ignored_stocks', []))
+        local_ignored = set(local.get('ignored_stocks', []))
+        ignored = local_ignored if replace_ignored else remote_ignored | local_ignored
+        stock_rows = _merge_unique_records(
+            remote.get('stock_data', []), local.get('stock_data', []), '代號',
+        )
+        stock_rows = [
+            row for row in stock_rows
+            if str(row.get('代號', '')).strip() not in ignored
+        ]
+        saved_notes = dict(remote.get('saved_notes', {}))
+        saved_notes.update(local.get('saved_notes', {}))
+        cached_notes = dict(remote.get('cached_notes', {}))
+        cached_notes.update(local.get('cached_notes', {}))
+        merged = {
+            'stock_data': stock_rows,
+            'ignored_stocks': sorted(ignored),
+            'all_candidates': _merge_unique_values(
+                remote.get('all_candidates', []), local.get('all_candidates', []),
+            ),
+            'saved_notes': saved_notes,
+            'cached_notes': cached_notes,
+            'fibo_tags': (
+                _valid_fibo_tags(remote.get('fibo_tags', []))
+                or list(local.get('fibo_tags', []))
+            ),
+            'strategy_signal_log': _merge_unique_records(
+                remote.get('strategy_signal_log', []),
+                local.get('strategy_signal_log', []),
+                'dedupe_key',
+            )[-2000:],
+        }
+    merged['version'] = 3
+    merged['updated_at'] = datetime.now(pytz.timezone('Asia/Taipei')).isoformat()
+    return _json_safe(merged)
+
+
+def save_data_cache(
+    df, ignored_set, candidates=None, saved_notes=None, fibo_tags=None,
+    *, clear_stock_data=False, replace_ignored=False,
+):
+    candidates = list(candidates or [])
+    saved_notes = dict(saved_notes or {})
     explicit_fibo_tag_save = fibo_tags is not None
     if fibo_tags is None:
-        # 一般股票／期貨儲存不得拿目前瀏覽器的舊 session 覆寫其他裝置剛存的標籤。
         dedicated_tags = load_fibo_tag_cache()
         fibo_tags = (
             dedicated_tags if len(dedicated_tags) >= 5
@@ -6424,16 +6776,9 @@ def save_data_cache(df, ignored_set, candidates=None, saved_notes=None, fibo_tag
         )
     fibo_tags = [str(tag) for tag in list(fibo_tags)[:5]]
     gsheet_api_url = get_app_secret('gsheet_api_url')
-    if gsheet_api_url and not explicit_fibo_tag_save:
-        remote_payload, _ = _fetch_remote_data_cache(gsheet_api_url, timeout=3)
-        remote_tags = _valid_fibo_tags(remote_payload.get('fibo_tags', [])) if remote_payload else []
-        if remote_tags:
-            fibo_tags = remote_tags
     try:
-        # 只在主執行緒做最輕量的複製，避免鎖死 UI
-        df_save = df.fillna("").copy()
-        ignored_list = list(ignored_set)
-        # 快取完整備註供重整後還原（須在 drop 內部欄位前執行）
+        df_save = df.fillna("").copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
+        ignored_list = list(ignored_set or [])
         empty_col = pd.Series("", index=df_save.index, dtype=str)
         codes = df_save.get('代號', empty_col).astype(str).str.strip()
         notes = df_save.get('戰略備註', empty_col).astype(str).str.strip()
@@ -6443,84 +6788,59 @@ def save_data_cache(df, ignored_set, candidates=None, saved_notes=None, fibo_tag
             for code, note, auto in zip(codes, notes, auto_notes)
             if code
         }
-
-        # 移除只供執行期間使用的欄位，避免重新載入時污染資料。
         df_save.drop(columns=['_auto_note'], errors='ignore', inplace=True)
-        
-        # 本地存檔維持在主執行緒 (若不想寫入本地也可將此段一併移入背景)
-        signal_records = load_strategy_signal_log()
-        data_to_save_local = {
-            "stock_data": df_save.to_dict(orient='records'), "ignored_stocks": ignored_list,
-            "all_candidates": candidates, "saved_notes": saved_notes, "fibo_tags": fibo_tags,
-            "cached_notes": cached_notes, "strategy_signal_log": signal_records,
-        }
-        with open(DATA_CACHE_FILE, "w", encoding='utf-8') as f: 
-            json.dump(data_to_save_local, f, ensure_ascii=False, indent=4)
-        
-        # 記憶體與速度終極優化：將「轉換 Dict」與「轉 JSON 字串」等高耗 RAM 動作全部移入背景執行緒
+        local_payload = _json_safe({
+            'version': 3,
+            'stock_data': df_save.to_dict(orient='records'),
+            'ignored_stocks': ignored_list,
+            'all_candidates': candidates,
+            'saved_notes': saved_notes,
+            'fibo_tags': fibo_tags,
+            'cached_notes': cached_notes,
+            'strategy_signal_log': load_strategy_signal_log(),
+        })
+        merged_payload = local_payload
+        sync_ok = True
         if gsheet_api_url:
-            def bg_save(bg_df, bg_ignored, bg_cands, bg_notes, bg_tags, bg_cn, bg_signals, sync_lock):
-                try:
-                    with sync_lock:
-                        # 取得鎖後再讀一次遠端標籤，確保排在快速標籤儲存之後的舊分頁
-                        # 只更新股票資料，不會把剛同步的標籤覆寫掉。
-                        latest_payload, _ = _fetch_remote_data_cache(gsheet_api_url, timeout=3)
-                        latest_tags = _valid_fibo_tags(latest_payload.get('fibo_tags', [])) if latest_payload else []
-                        if latest_tags:
-                            bg_tags = latest_tags
-                        data_to_save = {
-                            "stock_data": bg_df.to_dict(orient='records'),
-                            "ignored_stocks": bg_ignored,
-                            "all_candidates": bg_cands,
-                            "saved_notes": bg_notes,
-                            "fibo_tags": bg_tags,
-                            "cached_notes": bg_cn,
-                            "strategy_signal_log": bg_signals,
-                        }
-                        json_str = json.dumps(data_to_save, ensure_ascii=False)
-                        requests.post(gsheet_api_url, json={"action": "save", "data": json_str}, timeout=5)
-                except Exception: pass
-                finally:
-                    # 強制回收背景執行緒產生的巨大 JSON 與 Dict 記憶體
-                    gc.collect()
-
-            if explicit_fibo_tag_save:
-                # 快速標籤按下儲存後先完成遠端寫入，避免另一個裝置緊接著以舊值覆蓋。
-                data_to_save = {
-                    "stock_data": df_save.to_dict(orient='records'),
-                    "ignored_stocks": ignored_list,
-                    "all_candidates": candidates,
-                    "saved_notes": saved_notes,
-                    "fibo_tags": fibo_tags,
-                    "cached_notes": cached_notes,
-                    "strategy_signal_log": signal_records,
-                }
-                try:
-                    with get_data_cache_sync_lock():
+            with get_data_cache_sync_lock():
+                remote_payload, _ = _fetch_remote_data_cache(gsheet_api_url, timeout=5)
+                merged_payload = _merge_data_cache_payload(
+                    remote_payload, local_payload,
+                    explicit_fibo_tag_save=explicit_fibo_tag_save,
+                    clear_stock_data=clear_stock_data,
+                    replace_ignored=replace_ignored,
+                )
+                last_error = None
+                for attempt in range(2):
+                    try:
                         response = requests.post(
                             gsheet_api_url,
-                            json={"action": "save", "data": json.dumps(data_to_save, ensure_ascii=False)},
+                            json={
+                                'action': 'save',
+                                'data': json.dumps(merged_payload, ensure_ascii=False),
+                            },
                             timeout=8,
                         )
                         response.raise_for_status()
-                    st.session_state['_fibo_cloud_save_status'] = 'ok'
-                except requests.RequestException as exc:
-                    st.session_state['_fibo_cloud_save_status'] = type(exc).__name__
-                    return False
-            else:
-                threading.Thread(
-                    target=bg_save,
-                    args=(
-                        df_save, ignored_list, candidates, saved_notes, fibo_tags,
-                        cached_notes, signal_records, get_data_cache_sync_lock(),
-                    ),
-                    daemon=True,
-                ).start()
-    except Exception:
+                        last_error = None
+                        break
+                    except requests.RequestException as exc:
+                        last_error = exc
+                        if attempt == 0:
+                            time.sleep(0.4)
+                if last_error is not None:
+                    sync_ok = False
+                    st.session_state['_data_cache_remote_error'] = type(last_error).__name__
+        _write_json_atomic(DATA_CACHE_FILE, merged_payload, indent=2)
+        st.session_state['_data_cache_sync_status'] = 'ok' if sync_ok else 'local_only'
+        if explicit_fibo_tag_save:
+            st.session_state['_fibo_cloud_save_status'] = 'ok' if sync_ok else 'local_only'
+        return sync_ok
+    except (OSError, TypeError, ValueError) as exc:
+        st.session_state['_data_cache_sync_status'] = type(exc).__name__
         if explicit_fibo_tag_save:
             st.session_state['_fibo_cloud_save_status'] = 'local_only'
-            return False
-    return True if explicit_fibo_tag_save else None
+        return False
 
 def load_data_cache():
     gsheet_api_url = get_app_secret('gsheet_api_url')
@@ -6741,7 +7061,7 @@ def load_local_stock_names():
             pass
     return {}, {}
 
-@st.cache_data(ttl=86400)
+@st.cache_data(ttl=300)
 def get_stock_name_online(code):
     code = str(code).strip()
     code_map, _ = load_local_stock_names()
@@ -6902,7 +7222,8 @@ def render_stock_strategy_controls():
                         st.session_state.pending_unignore = restored
                     save_data_cache(
                         st.session_state.stock_data, st.session_state.ignored_stocks,
-                        st.session_state.all_candidates, st.session_state.saved_notes
+                        st.session_state.all_candidates, st.session_state.saved_notes,
+                        replace_ignored=True,
                     )
                     st.rerun()
             else:
@@ -6915,7 +7236,8 @@ def render_stock_strategy_controls():
                     st.session_state.ignored_stocks.clear()
                     save_data_cache(
                         st.session_state.stock_data, st.session_state.ignored_stocks,
-                        st.session_state.all_candidates, st.session_state.saved_notes
+                        st.session_state.all_candidates, st.session_state.saved_notes,
+                        replace_ignored=True,
                     )
                     st.rerun()
             with clear_col:
@@ -6925,10 +7247,13 @@ def render_stock_strategy_controls():
                     st.session_state.all_candidates = []
                     st.session_state.search_multiselect = []
                     st.session_state.saved_notes = {}
+                    st.session_state.cached_notes = {}
                     st.session_state.pop('stock_independent_raw_results', None)
                     save_search_cache([])
-                    if os.path.exists(DATA_CACHE_FILE):
-                        os.remove(DATA_CACHE_FILE)
+                    save_data_cache(
+                        pd.DataFrame(), set(), [], {},
+                        clear_stock_data=True, replace_ignored=True,
+                    )
                     st.rerun()
             st.info("在股票表格左側勾選「刪除」，會立即隱藏並自動遞補下一檔。")
 
@@ -7010,9 +7335,10 @@ def render_futures_strategy_explanation():
 
 @st.cache_data(ttl=86400)
 def fetch_futures_list():
+    errors = []
     try:
         url = "https://openapi.taifex.com.tw/v1/SingleStockFuturesMargining"
-        r = requests.get(url, headers={'accept': 'application/json'}, timeout=5, verify=False)
+        r = requests.get(url, headers={'accept': 'application/json'}, timeout=5)
         if r.status_code == 200:
             data = r.json()
             stock_contracts = {}
@@ -7029,11 +7355,14 @@ def fetch_futures_list():
                 futures_dict[code] = "✅(有小型)" if len(contracts) > 1 else "✅"
             if futures_dict:
                 return futures_dict
-    except: pass
+    except (requests.RequestException, ValueError, TypeError) as exc:
+        errors.append(type(exc).__name__)
 
     try:
         url = "https://www.taifex.com.tw/cht/2/stockLists"
-        dfs = pd.read_html(url)
+        response = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=8)
+        response.raise_for_status()
+        dfs = pd.read_html(io.StringIO(response.text))
         futures_dict = {}
         if dfs:
             for df in dfs:
@@ -7057,7 +7386,9 @@ def fetch_futures_list():
                         elif code not in futures_dict:
                             futures_dict[code] = "✅"
             return futures_dict
-    except: pass
+    except (requests.RequestException, ValueError, TypeError) as exc:
+        errors.append(type(exc).__name__)
+    logger.warning("期貨名單暫時無法取得：%s", '/'.join(errors) or 'empty')
     return {}
 
 def _decode_taifex_legacy_text(value):
@@ -7105,6 +7436,46 @@ def price_change_amount(price, change_rate):
     return current_price - current_price / denominator
 
 
+FUTURES_FIXED_TICK_SIZES = {
+    'TX': 1.0, 'MTX': 1.0, 'TMF': 1.0,
+    'TE': 0.05, 'TF': 0.2, 'GTF': 0.05,
+}
+
+
+def get_futures_tick_size(root, price, product_type='未知'):
+    """Return an orderable TAIFEX tick; unsupported products return None."""
+    normalized_root = str(root or '').strip().upper()
+    if normalized_root in FUTURES_FIXED_TICK_SIZES:
+        return FUTURES_FIXED_TICK_SIZES[normalized_root]
+    numeric_price = _safe_number(price)
+    if numeric_price is None or numeric_price <= 0:
+        return None
+    if product_type == 'ETF':
+        return 0.01 if numeric_price < 50 else 0.05
+    if product_type == '股票':
+        if numeric_price < 10:
+            return 0.01
+        if numeric_price < 50:
+            return 0.05
+        if numeric_price < 100:
+            return 0.1
+        if numeric_price < 500:
+            return 0.5
+        if numeric_price < 2500:
+            return 1.0
+        return 5.0
+    return None
+
+
+def round_futures_price(value, tick, rounding=ROUND_HALF_UP):
+    if tick is None or tick <= 0:
+        return None
+    decimal_tick = Decimal(str(tick))
+    decimal_value = Decimal(str(value))
+    rounded = (decimal_value / decimal_tick).to_integral_value(rounding=rounding) * decimal_tick
+    return float(rounded)
+
+
 @st.cache_data(ttl=300, max_entries=1, show_spinner=False)
 def fetch_futures_strategy_universe():
     """整併期交所成交量、近月契約名稱與保證金，供期貨戰略室排序。"""
@@ -7122,14 +7493,13 @@ def fetch_futures_strategy_universe():
     def fetch_endpoint(endpoint):
         url = f'https://openapi.taifex.com.tw/v1/{endpoint}'
         last_error = None
-        for attempt in range(3):
+        for attempt in range(2):
             try:
                 response = requests.get(
                     url,
                     headers=headers,
                     params={'_': int(time.time())} if attempt else None,
-                    timeout=(8, 25),
-                    verify=False,
+                    timeout=(5, 12),
                 )
                 response.raise_for_status()
                 response.encoding = 'utf-8-sig'
@@ -7139,9 +7509,9 @@ def fetch_futures_strategy_universe():
                 return payload
             except (requests.RequestException, ValueError, json.JSONDecodeError) as exc:
                 last_error = exc
-                if attempt < 2:
+                if attempt < 1:
                     time.sleep(0.6 * (attempt + 1))
-        raise RuntimeError(f'{endpoint} 連線失敗（已重試 3 次）：{last_error}')
+        raise RuntimeError(f'{endpoint} 連線失敗（已重試 2 次）：{last_error}')
 
     product_meta = {}
     errors = []
@@ -7157,9 +7527,10 @@ def fetch_futures_strategy_universe():
             is_small = '小型' in name
             product_meta[root] = {
                 '名稱': name, '標的代號': underlying_code, 'ETF期貨': False, '指數期貨': False,
+                '商品類型': '股票',
                 '小型期貨': is_small, '乘數': 100 if is_small else 2000,
-                '原始保證金率': _safe_number(item.get('InitialMarginRate'), 0) or 0,
-                '維持保證金率': _safe_number(item.get('MaintenanceMarginRate'), 0) or 0,
+                '原始保證金率': _safe_number(item.get('InitialMarginRate')),
+                '維持保證金率': _safe_number(item.get('MaintenanceMarginRate')),
                 '原始保證金固定': None, '維持保證金固定': None,
             }
             if item.get('Date'):
@@ -7178,6 +7549,7 @@ def fetch_futures_strategy_universe():
             product_meta[root] = {
                 '名稱': name or f'{underlying_code} ETF期貨', '標的代號': underlying_code,
                 'ETF期貨': True, '指數期貨': False, '小型期貨': is_small,
+                '商品類型': 'ETF',
                 '乘數': 100 if is_small else 1000,
                 '原始保證金率': 0, '維持保證金率': 0,
                 '原始保證金固定': _safe_number(item.get('InitialMargin')),
@@ -7205,6 +7577,7 @@ def fetch_futures_strategy_universe():
             root, is_small = match
             product_meta[root] = {
                 '名稱': raw_name, '標的代號': root, 'ETF期貨': False, '指數期貨': True,
+                '商品類型': '指數',
                 '小型期貨': is_small, '乘數': 1,
                 '原始保證金率': 0, '維持保證金率': 0,
                 '原始保證金固定': _safe_number(item.get('InitialMargin')),
@@ -7230,8 +7603,9 @@ def fetch_futures_strategy_universe():
             product_meta[root] = {
                 '名稱': f'{root} 期貨', '標的代號': root,
                 'ETF期貨': False, '指數期貨': root in index_futures_roots,
+                '商品類型': '未知',
                 '小型期貨': root in {'MTX', 'TMF'},
-                '乘數': 1, '原始保證金率': 0, '維持保證金率': 0,
+                '乘數': None, '原始保證金率': None, '維持保證金率': None,
                 '原始保證金固定': None, '維持保證金固定': None,
             }
         key = (root, month)
@@ -7250,29 +7624,34 @@ def fetch_futures_strategy_universe():
     for (root, month), rows in grouped.items():
         meta = product_meta[root]
         general_rows = [row for row in rows if str(row.get('TradingSession', '')).strip() == '一般']
-        quote_row = general_rows[0] if general_rows else rows[0]
-        valid_highs = [_safe_number(row.get('High')) for row in rows]
-        valid_lows = [_safe_number(row.get('Low')) for row in rows]
+        session_rows = general_rows or [rows[0]]
+        quote_row = session_rows[0]
+        valid_highs = [_safe_number(row.get('High')) for row in session_rows]
+        valid_lows = [_safe_number(row.get('Low')) for row in session_rows]
         high = max((value for value in valid_highs if value is not None), default=None)
         low = min((value for value in valid_lows if value is not None), default=None)
         close = _safe_number(quote_row.get('Last')) or _safe_number(quote_row.get('SettlementPrice'))
         open_price = _safe_number(quote_row.get('Open'))
         change = _safe_number(quote_row.get('Change'), 0) or 0
         change_pct = _safe_number(quote_row.get('%'), 0) or 0
-        volume = int(sum(_safe_number(row.get('Volume'), 0) or 0 for row in rows))
+        volume = int(sum(_safe_number(row.get('Volume'), 0) or 0 for row in session_rows))
         open_interest = int(_safe_number(quote_row.get('OpenInterest'), 0) or 0)
         reference = close - change if close is not None else None
-        if reference and reference > 0:
-            if root in {'TX', 'MTX', 'TMF', 'TE', 'TF'}:
-                limit_up, limit_down = round(reference * 1.10), round(reference * 0.90)
-            else:
-                limit_up, limit_down = round_to_tick(reference * 1.10), round_to_tick(reference * 0.90)
+        futures_tick = get_futures_tick_size(root, reference, meta.get('商品類型', '未知'))
+        if reference and reference > 0 and futures_tick is not None:
+            limit_up = round_futures_price(reference * 1.10, futures_tick, ROUND_FLOOR)
+            limit_down = round_futures_price(reference * 0.90, futures_tick, ROUND_CEILING)
         else:
             limit_up = limit_down = None
         if meta['原始保證金固定'] is not None:
             initial_margin = meta['原始保證金固定']
             maintenance_margin = meta['維持保證金固定']
-        elif close is not None:
+        elif (
+            close is not None
+            and meta.get('乘數') is not None
+            and (_safe_number(meta.get('原始保證金率')) or 0) > 0
+            and (_safe_number(meta.get('維持保證金率')) or 0) > 0
+        ):
             initial_margin = round(close * meta['乘數'] * meta['原始保證金率'] / 100)
             maintenance_margin = round(close * meta['乘數'] * meta['維持保證金率'] / 100)
         else:
@@ -7287,11 +7666,11 @@ def fetch_futures_strategy_universe():
             '當日漲停價': limit_up, '當日跌停價': limit_down,
             '所需保證金': initial_margin, '維持保證金': maintenance_margin,
             '原始保證金率': meta['原始保證金率'], '維持保證金率': meta['維持保證金率'],
-            '乘數': meta['乘數'], 'ETF期貨': meta['ETF期貨'],
+            '乘數': meta['乘數'], 'ETF期貨': meta['ETF期貨'], '商品類型': meta.get('商品類型', '未知'),
             '指數期貨': meta.get('指數期貨', root in index_futures_roots), '小型期貨': meta['小型期貨'],
             '次月期貨': month_rank[(root, month)] > 0,
             '月份順位': month_rank[(root, month)],
-            '交易時段': '日＋夜' if any(str(row.get('TradingSession', '')).strip() == '盤後' and (_safe_number(row.get('Volume'), 0) or 0) > 0 for row in rows) else '日盤',
+            '交易時段': '日盤' if general_rows else str(quote_row.get('TradingSession', '未知')),
             '資料日期': str(quote_row.get('Date', '')),
         })
 
@@ -7347,7 +7726,29 @@ def calculate_futures_strategy_levels(row, strategy_mode='當沖', direction_cho
                 (data['Low'] - previous_close).abs(),
             ], axis=1).max(axis=1)
             if strategy_mode == '當沖':
-                recent = data.tail(min(36, len(data)))
+                session_kind = 'night' if (
+                    datetime.now(pytz.timezone('Asia/Taipei')).time() >= dt_time(15, 0)
+                    or datetime.now(pytz.timezone('Asia/Taipei')).time() < dt_time(5, 0)
+                ) else 'day'
+                session_labels = pd.Series(
+                    [
+                        (
+                            get_futures_trading_date(
+                                ts.to_pydatetime().replace(
+                                    tzinfo=pytz.timezone('Asia/Taipei')
+                                ) if ts.tzinfo is None else ts.to_pydatetime()
+                            ).date(),
+                            'night' if ts.time() >= dt_time(15, 0) or ts.time() < dt_time(5, 0) else 'day',
+                        )
+                        for ts in data.index
+                    ],
+                    index=data.index,
+                )
+                matching_sessions = session_labels[session_labels.map(lambda value: value[1] == session_kind)]
+                selected_session = matching_sessions.iloc[-1] if not matching_sessions.empty else session_labels.iloc[-1]
+                recent = data.loc[
+                    session_labels.map(lambda value: value == selected_session)
+                ].tail(36)
                 reference_bars = recent.iloc[:-1] if len(recent) >= 4 else recent
                 support = float(reference_bars['Low'].min())
                 resistance = float(reference_bars['High'].max())
@@ -7356,9 +7757,17 @@ def calculate_futures_strategy_levels(row, strategy_mode='當沖', direction_cho
                     typical = (recent['High'] + recent['Low'] + recent['Close']) / 3
                     vwap = float((typical * recent['Volume']).sum() / recent['Volume'].sum())
             else:
-                trade_date = pd.Series(data.index.normalize(), index=data.index)
-                after_hours = data.index.time >= dt_time(15, 0)
-                trade_date.loc[after_hours] = trade_date.loc[after_hours] + pd.Timedelta(days=1)
+                trade_date = pd.Series(
+                    [
+                        get_futures_trading_date(
+                            ts.to_pydatetime().replace(
+                                tzinfo=pytz.timezone('Asia/Taipei')
+                            ) if ts.tzinfo is None else ts.to_pydatetime()
+                        ).date()
+                        for ts in data.index
+                    ],
+                    index=data.index,
+                )
                 daily = data.assign(_trade_date=trade_date.values).groupby('_trade_date').agg({
                     'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last',
                     **({'Volume': 'sum'} if 'Volume' in data.columns else {})
@@ -7389,8 +7798,13 @@ def calculate_futures_strategy_levels(row, strategy_mode='當沖', direction_cho
     if direction == '自動':
         comparison = vwap if strategy_mode == '當沖' and vwap is not None else (open_price if open_price is not None else close)
         direction = '偏多' if close >= comparison else '偏空'
-    tick = 1.0 if root in {'TX', 'MTX', 'TMF', 'TE', 'TF'} else get_tick_size(close)
-    round_future = (lambda value: float(round(value))) if root in {'TX', 'MTX', 'TMF', 'TE', 'TF'} else round_to_tick
+    tick = get_futures_tick_size(root, close, str(row.get('商品類型', '未知')))
+    if tick is None:
+        return {
+            '支撐壓力': f'支 {fmt_price(support)}｜壓 {fmt_price(resistance)}',
+            '進出場點位': '商品跳動點未設定', '方向': direction,
+        }
+    round_future = lambda value: round_futures_price(value, tick)
     observed_range = max(float(resistance) - float(support), tick * 2)
     risk_distance = max((atr or observed_range) * (0.55 if strategy_mode == '當沖' else 1.0), tick * 2)
     if direction == '偏多':
@@ -7423,8 +7837,14 @@ def enrich_futures_strategy_rows(rows, strategy_mode, market_bias='盤整'):
         bid = _safe_number(row.get('買價'))
         ask = _safe_number(row.get('賣價'))
         price = _safe_number(row.get('收盤價'))
-        tick = get_tick_size(price) if price is not None else 1.0
-        spread_ticks = (ask - bid) / tick if bid is not None and ask is not None and ask >= bid and tick > 0 else None
+        tick = get_futures_tick_size(
+            row.get('期貨代碼'), price, str(row.get('商品類型', '未知')),
+        )
+        spread_ticks = (
+            (ask - bid) / tick
+            if tick is not None and bid is not None and ask is not None and ask >= bid and tick > 0
+            else None
+        )
         quote_time = row.get('報價時間')
         if quote_time:
             data_health = build_data_health(quote_time, required_ready=price is not None, live_expected=True)
@@ -7567,12 +7987,18 @@ def update_futures_live_rows(rows, api, strategy_mode, direction_choice, include
                 updated.at[index, '賣價'] = _safe_number(getattr(snapshot, 'sell_price', None))
                 updated.at[index, '報價時間'] = datetime.now(pytz.timezone('Asia/Taipei')).strftime('%Y/%m/%d %H:%M:%S')
                 if reference > 0:
-                    if str(updated.at[index, '期貨代碼']) in {'TX', 'MTX', 'TMF', 'TE', 'TF'}:
-                        updated.at[index, '當日漲停價'] = round(reference * 1.10)
-                        updated.at[index, '當日跌停價'] = round(reference * 0.90)
-                    else:
-                        updated.at[index, '當日漲停價'] = round_to_tick(reference * 1.10)
-                        updated.at[index, '當日跌停價'] = round_to_tick(reference * 0.90)
+                    tick = get_futures_tick_size(
+                        updated.at[index, '期貨代碼'], reference,
+                        str(updated.at[index, '商品類型']) if '商品類型' in updated.columns else '未知',
+                    )
+                    updated.at[index, '當日漲停價'] = (
+                        round_futures_price(reference * 1.10, tick, ROUND_FLOOR)
+                        if tick is not None else None
+                    )
+                    updated.at[index, '當日跌停價'] = (
+                        round_futures_price(reference * 0.90, tick, ROUND_CEILING)
+                        if tick is not None else None
+                    )
                 initial_rate = _safe_number(updated.at[index, '原始保證金率'], 0) or 0
                 maintenance_rate = _safe_number(updated.at[index, '維持保證金率'], 0) or 0
                 multiplier = _safe_number(updated.at[index, '乘數'], 0) or 0
@@ -8280,7 +8706,7 @@ def fetch_market_risk_lists():
                     time.sleep(0.8 * (attempt + 1))
         raise RuntimeError(f"{name} 已重試 3 次仍失敗：{last_error}")
 
-    def parse_twse_rows(payload, target, is_attention=False):
+    def parse_twse_rows(payload, target, is_attention=False, minimum_attention=1):
         fields = payload.get('fields', [])
         for values in payload.get('data', []):
             record = dict(zip(fields, values))
@@ -8292,7 +8718,8 @@ def fetch_market_risk_lists():
             if is_attention:
                 raw_count = str(record.get('累計次數', record.get('累計', '1')))
                 count_match = re.search(r'\d+', raw_count)
-                target[code] = max(target.get(code, 0), int(count_match.group()) if count_match else 1)
+                parsed_count = int(count_match.group()) if count_match else minimum_attention
+                target[code] = max(target.get(code, 0), minimum_attention, parsed_count)
             else:
                 target.add(code)
 
@@ -8304,6 +8731,20 @@ def fetch_market_risk_lists():
             parse_twse_rows(fetch_json(name, url, dict), target, is_attention)
         except Exception as exc:
             errors.append(f'{name}: {exc}')
+
+    try:
+        parse_twse_rows(
+            fetch_json(
+                '上市注意累計異常',
+                'https://www.twse.com.tw/announcement/notetrans?response=json',
+                dict,
+            ),
+            attention_counts,
+            True,
+            minimum_attention=2,
+        )
+    except Exception as exc:
+        errors.append(f'上市注意累計異常: {exc}')
 
     for name, url, is_attention, is_accumulated_note in [
         ('上櫃注意', 'https://www.tpex.org.tw/openapi/v1/tpex_trading_warning_information', True, False),
@@ -8554,7 +8995,8 @@ def calculate_risk_filter_result(row, direction, max_extension_atr, attention_co
 
 RISK_METRIC_COLUMNS = [
     '_risk_atr14', '_risk_ma20', '_risk_ma20_slope',
-    '_risk_close_position', '_risk_prev_high', '_risk_prev_low'
+    '_risk_close_position', '_risk_prev_high', '_risk_prev_low',
+    '_plan_prev_high', '_plan_prev_low',
 ]
 
 # 當沖資料只在使用者手動更新時回填，避免影響原本選股載入速度。
@@ -8801,10 +9243,10 @@ def build_trade_plan(row, direction, is_daytrade_mode, filter_result):
             return {'summary': '—', 'detail': '缺少 VWAP 或開盤區間，不預判點位。'}
 
         if is_long:
-            entry = _round(opening_high + get_tick_size(opening_high))
+            entry = _round(move_tick(opening_high, 1))
             stop = _round(max(vwap, opening_low))
             if stop >= entry:
-                stop = _round(entry - get_tick_size(entry) * 2)
+                stop = _round(move_tick(entry, -2))
             target = _round(entry + (entry - stop) * 1.5)
             limit_up = _as_float(row.get('當日漲停價'))
             if limit_up is not None and limit_up > entry:
@@ -8815,10 +9257,10 @@ def build_trade_plan(row, direction, is_daytrade_mode, filter_result):
             )
             return _format_plan(entry, stop, target, trigger)
 
-        entry = _round(opening_low - get_tick_size(opening_low))
+        entry = _round(move_tick(opening_low, -1))
         stop = _round(min(vwap, opening_high))
         if stop <= entry:
-            stop = _round(entry + get_tick_size(entry) * 2)
+            stop = _round(move_tick(entry, 2))
         target = _round(entry - (stop - entry) * 1.5)
         limit_down = _as_float(row.get('當日跌停價'))
         if limit_down is not None and 0 < limit_down < entry:
@@ -8830,18 +9272,18 @@ def build_trade_plan(row, direction, is_daytrade_mode, filter_result):
         return _format_plan(entry, stop, target, trigger)
 
     atr14 = _as_float(row.get('_risk_atr14'))
-    previous_high = _as_float(row.get('_risk_prev_high'))
-    previous_low = _as_float(row.get('_risk_prev_low'))
+    previous_high = _as_float(row.get('_plan_prev_high', row.get('_risk_prev_high')))
+    previous_low = _as_float(row.get('_plan_prev_low', row.get('_risk_prev_low')))
     if atr14 is None or atr14 <= 0 or previous_high is None or previous_low is None:
         return {'summary': '—', 'detail': '缺少 ATR 或昨高／昨低，不預判次日開盤點位。'}
 
     if is_long:
-        entry = _round(previous_high + get_tick_size(previous_high))
+        entry = _round(move_tick(previous_high, 1))
         stop = _round(entry - atr14)
         target = _round(entry + (entry - stop) * 1.5)
         return _format_plan(entry, stop, target, '次日開盤站穩昨高後再觀察進場')
 
-    entry = _round(previous_low - get_tick_size(previous_low))
+    entry = _round(move_tick(previous_low, -1))
     stop = _round(entry + atr14)
     target = _round(entry - (stop - entry) * 1.5)
     return _format_plan(entry, stop, target, '次日開盤跌破昨低後再觀察進場')
@@ -8909,16 +9351,18 @@ def calculate_stop_loss_price(base_price, stop_loss_percent, is_long=True):
 
 def calculate_limits(price):
     try:
-        p = float(price)
-        if math.isnan(p) or p <= 0: return 0, 0
-        raw_up = p * 1.10
-        tick_up = get_tick_size(raw_up) 
-        limit_up = math.floor(raw_up / tick_up) * tick_up
-        raw_down = p * 0.90
-        tick_down = get_tick_size(raw_down) 
-        limit_down = math.ceil(raw_down / tick_down) * tick_down
-        return float(f"{limit_up:.2f}"), float(f"{limit_down:.2f}")
-    except: return 0, 0
+        base = Decimal(str(price))
+        if not base.is_finite() or base <= 0:
+            return 0, 0
+        raw_up = base * Decimal('1.10')
+        tick_up = Decimal(str(get_tick_size(raw_up)))
+        limit_up = (raw_up / tick_up).to_integral_value(rounding=ROUND_FLOOR) * tick_up
+        raw_down = base * Decimal('0.90')
+        tick_down = Decimal(str(get_tick_size(raw_down)))
+        limit_down = (raw_down / tick_down).to_integral_value(rounding=ROUND_CEILING) * tick_down
+        return float(limit_up), float(limit_down)
+    except (ArithmeticError, TypeError, ValueError):
+        return 0, 0
 
 def move_tick(price, steps):
     try:
@@ -9131,10 +9575,10 @@ def fetch_stock_data_raw(code, name_hint="", extra_data=None, futures_set=None, 
     if hist.empty:
         try:
             ticker_obj = yf.Ticker(f"{code}.TW")
-            hist_yf = ticker_obj.history(period="3mo")
+            hist_yf = ticker_obj.history(period="3mo", auto_adjust=False)
             if hist_yf.empty:
                 ticker_obj = yf.Ticker(f"{code}.TWO")
-                hist_yf = ticker_obj.history(period="3mo")
+                hist_yf = ticker_obj.history(period="3mo", auto_adjust=False)
             if not hist_yf.empty:
                 hist = hist_yf
                 source_used = "yfinance"
@@ -9233,6 +9677,7 @@ def fetch_stock_data_raw(code, name_hint="", extra_data=None, futures_set=None, 
     # 風險篩選預覽所需指標：只沿用已取得的日 K，不增加任何資料請求。
     risk_atr14 = risk_ma20 = risk_ma20_slope = risk_close_position = None
     risk_prev_high = risk_prev_low = None
+    plan_prev_high = plan_prev_low = None
     if len(hist_strat) >= 2:
         prev_close_series = hist_strat['Close'].shift(1)
         true_range = pd.concat([
@@ -9243,6 +9688,8 @@ def fetch_stock_data_raw(code, name_hint="", extra_data=None, futures_set=None, 
         risk_atr14 = float(true_range.tail(min(14, len(true_range))).mean())
         risk_prev_high = float(hist_strat['High'].iloc[-2])
         risk_prev_low = float(hist_strat['Low'].iloc[-2])
+        plan_prev_high = float(hist_strat['High'].iloc[-1])
+        plan_prev_low = float(hist_strat['Low'].iloc[-1])
         latest_range = float(hist_strat['High'].iloc[-1] - hist_strat['Low'].iloc[-1])
         if latest_range > 0:
             risk_close_position = float((hist_strat['Close'].iloc[-1] - hist_strat['Low'].iloc[-1]) / latest_range * 100)
@@ -9257,7 +9704,8 @@ def fetch_stock_data_raw(code, name_hint="", extra_data=None, futures_set=None, 
     if len(hist_strat) >= 2: prev_of_base = hist_strat.iloc[-2]['Close']
     else: prev_of_base = strategy_base_price 
 
-    base_price_for_limit = strategy_base_price
+    # 最新一根 K 的當日漲跌停必須以前一交易日收盤價為基準。
+    base_price_for_limit = prev_of_base
     limit_up_show, limit_down_show = calculate_limits(base_price_for_limit)
 
     limit_up_T = None
@@ -9364,6 +9812,7 @@ def fetch_stock_data_raw(code, name_hint="", extra_data=None, futures_set=None, 
         "戰略備註": strategy_note, "_points": full_calc_points, "狀態": "", "_auto_note": auto_note, "_ma5": ma5 if 'ma5' in locals() else None,
         "_risk_atr14": risk_atr14, "_risk_ma20": risk_ma20, "_risk_ma20_slope": risk_ma20_slope,
         "_risk_close_position": risk_close_position, "_risk_prev_high": risk_prev_high, "_risk_prev_low": risk_prev_low,
+        "_plan_prev_high": plan_prev_high, "_plan_prev_low": plan_prev_low,
         "_quote_bid": live_quote_bid, "_quote_ask": live_quote_ask, "_quote_time": live_quote_time
     }
 
@@ -10380,6 +10829,25 @@ with stock_strategy_container:
         
         bar.empty()
         status_text.empty()
+
+        failed_codes = {
+            str(task[0]) for task in tasks_to_run
+            if str(task[0]) not in existing_data
+        }
+        if failed_codes and not previous_stock_data.empty and '代號' in previous_stock_data.columns:
+            previous_failed = previous_stock_data[
+                previous_stock_data['代號'].astype(str).isin(failed_codes)
+            ]
+            for _, previous_row in previous_failed.iterrows():
+                previous_code = str(previous_row.get('代號', ''))
+                if previous_code:
+                    preserved = previous_row.to_dict()
+                    preserved['_data_stale'] = True
+                    existing_data[previous_code] = preserved
+            if not previous_failed.empty:
+                st.warning(
+                    f"{len(previous_failed)} 檔本次更新失敗，已保留上次資料並標記為過期。"
+                )
         
         if existing_data:
             df_temp = pd.DataFrame(list(existing_data.values()))
@@ -10957,7 +11425,7 @@ with stock_strategy_container:
                 if saved:
                     save_data_cache(
                         st.session_state.stock_data, st.session_state.ignored_stocks,
-                        st.session_state.all_candidates, st.session_state.saved_notes
+                        st.session_state.all_candidates, st.session_state.saved_notes,
                     )
                     st.toast(f'已新增 {added} 筆股票訊號；重複訊號不另建。', icon='📝')
                 else:
@@ -11032,10 +11500,15 @@ with stock_strategy_container:
                             
                         # 🚀 2. 若快取不足(例如剛開啟網頁還沒預載完)，才即時抓取剩下的
                         if remaining_to_fetch:
+                            worker_sj_logged_in = st.session_state.get('sj_logged_in', False)
+                            worker_sj_api = st.session_state.get('sj_api')
                             def _replenish_worker(cand):
                                 time.sleep(API_REQUEST_GAP_SECONDS)
                                 t_code, t_name, t_src, t_extra = cand
-                                res = fetch_stock_data_raw(t_code, t_name, t_extra, futures_copy, notes_copy, code_map_copy, st.session_state.get('sj_logged_in', False), st.session_state.get('sj_api', None))
+                                res = fetch_stock_data_raw(
+                                    t_code, t_name, t_extra, futures_copy, notes_copy,
+                                    code_map_copy, worker_sj_logged_in, worker_sj_api,
+                                )
                                 if res: res.update({'_source': t_src, '_order': t_extra, '_source_rank': 1})
                                 return res
 
@@ -11976,7 +12449,7 @@ with tab2:
                     'Cache-Control': 'no-cache',
                     'Pragma': 'no-cache'
                 }
-                r = requests.get(url, headers=headers, timeout=5, verify=False)
+                r = requests.get(url, headers=headers, timeout=5)
                 if r.status_code == 200:
                     data = r.json()
                     res = {}
@@ -12025,7 +12498,7 @@ with tab2:
             maint_map = {}         # 新增
             try:
                 url_pct = "https://openapi.taifex.com.tw/v1/SingleStockFuturesMargining"
-                r_pct = requests.get(url_pct, headers={'accept': 'application/json', 'If-Modified-Since': 'Mon, 26 Jul 1997 05:00:00 GMT'}, timeout=5, verify=False)
+                r_pct = requests.get(url_pct, headers={'accept': 'application/json', 'If-Modified-Since': 'Mon, 26 Jul 1997 05:00:00 GMT'}, timeout=5)
                 if r_pct.status_code == 200:
                     data = r_pct.json()
                     stock_contracts = {}
@@ -12173,7 +12646,7 @@ with tab2:
                             if len(d_date) == 8:
                                 if d_date < today_str:
                                     return False
-                                if d_date == today_str and now_time >= dt_time(13, 45):
+                                if d_date == today_str and now_time >= dt_time(13, 30):
                                     return False
                             # 若僅有 6 碼年月 (YYYYMM)
                             elif len(d_date) == 6:
@@ -12181,14 +12654,11 @@ with tab2:
                                 if d_date < today_ym:
                                     return False
                                 if d_date == today_ym:
-                                    # 判斷今天是否為結算日(第三個星期三)
-                                    cal = calendar.monthcalendar(tz_now.year, tz_now.month)
-                                    wednesdays = [week[calendar.WEDNESDAY] for week in cal if week[calendar.WEDNESDAY] != 0]
-                                    if len(wednesdays) >= 3:
-                                        settle_day = wednesdays[2]
-                                        if tz_now.day > settle_day:
+                                    settle_date = futures_expiry_date(d_date)
+                                    if settle_date is not None:
+                                        if tz_now.date() > settle_date:
                                             return False
-                                        if tz_now.day == settle_day and now_time >= dt_time(13, 45):
+                                        if tz_now.date() == settle_date and now_time >= dt_time(13, 30):
                                             return False
                             return True
 
@@ -13394,7 +13864,7 @@ with tab_fibo:
                 fibo_low = st.number_input("輸入波段低點：", value=None, step=1.0, format="%.12g")
                 
             if fibo_high is not None and fibo_low is not None:
-                if fibo_high > 0 and fibo_low > 0 and fibo_high >= fibo_low:
+                if fibo_high > 0 and fibo_low > 0 and fibo_high > fibo_low:
                     diff = fibo_high - fibo_low
                     ratios_manual = [-2.618, -2.0, -1.618, -1.0, 0.0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0, 1.618, 2.0, 2.618]
                     
