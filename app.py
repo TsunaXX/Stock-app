@@ -2394,15 +2394,36 @@ def select_google_news_revenue_announcement_date(
     return min(matched_dates).isoformat() if matched_dates else None
 
 
-def choose_revenue_announcement_date(cnyes_date=None, google_news_date=None):
-    """Prefer the direct structured revenue report when public sources disagree."""
+def choose_revenue_announcement_date(
+    finmind_date=None, cnyes_date=None, google_news_date=None,
+    revenue_year=None, revenue_month=None,
+):
+    """Choose a release date with FinMind primary and news only as fallback."""
+    release_window = None
+    try:
+        report_year, report_month = int(revenue_year), int(revenue_month)
+        next_year, next_month = (
+            (report_year + 1, 1) if report_month == 12 else (report_year, report_month + 1)
+        )
+        release_window = (
+            date(next_year, next_month, 1), date(next_year, next_month, 15),
+        )
+    except (TypeError, ValueError):
+        pass
     for source, value in (
+        ('FinMind 收錄日', finmind_date),
         ('鉅亨網直接營收報導', cnyes_date),
         ('Google News 營收報導', google_news_date),
     ):
         text = str(value or '').strip()
         if re.fullmatch(r'\d{4}-\d{2}-\d{2}', text):
-            return text, source
+            try:
+                parsed = date.fromisoformat(text)
+            except ValueError:
+                continue
+            if release_window and not release_window[0] <= parsed <= release_window[1]:
+                continue
+            return parsed.isoformat(), source
     return None, ''
 
 
@@ -2536,26 +2557,35 @@ def fetch_taiwan_monthly_revenue_events(inputs):
         revenue_roc_year = int(revenue_month[:3])
         revenue_month_number = int(revenue_month[-2:])
         company = str(row.get("公司名稱", item["display_name"])).strip()
-        cnyes_report_date = fetch_cnyes_revenue_announcement_date(
-            code, revenue_roc_year + 1911, revenue_month_number
+        finmind_month = str(finmind_row.get("資料年月", "")) if finmind_row else ""
+        finmind_date_candidate = (
+            finmind_report_date if finmind_month == revenue_month else None
         )
-        google_report_date = fetch_google_news_revenue_announcement_date(
-            code, company, revenue_roc_year + 1911, revenue_month_number
-        )
+        cnyes_report_date = None
+        google_report_date = None
         public_report_date, public_report_source = choose_revenue_announcement_date(
-            cnyes_report_date, google_report_date,
+            finmind_date_candidate, revenue_year=revenue_roc_year + 1911,
+            revenue_month=revenue_month_number,
         )
-        used_finmind_report_date = False
+        if not public_report_date:
+            cnyes_report_date = fetch_cnyes_revenue_announcement_date(
+                code, revenue_roc_year + 1911, revenue_month_number
+            )
+            public_report_date, public_report_source = choose_revenue_announcement_date(
+                cnyes_date=cnyes_report_date, revenue_year=revenue_roc_year + 1911,
+                revenue_month=revenue_month_number,
+            )
+        if not public_report_date:
+            google_report_date = fetch_google_news_revenue_announcement_date(
+                code, company, revenue_roc_year + 1911, revenue_month_number
+            )
+            public_report_date, public_report_source = choose_revenue_announcement_date(
+                google_news_date=google_report_date,
+                revenue_year=revenue_roc_year + 1911,
+                revenue_month=revenue_month_number,
+            )
         if public_report_date:
             report_date = date.fromisoformat(public_report_date)
-        elif finmind_report_date:
-            try:
-                finmind_date = date.fromisoformat(str(finmind_report_date)[:10])
-                if finmind_date < report_date:
-                    report_date = finmind_date
-                    used_finmind_report_date = True
-            except ValueError:
-                pass
         mom = _signed_percent(row.get("營業收入-上月比較增減(%)"))
         yoy = _signed_percent(row.get("營業收入-去年同月增減(%)"))
         fallback_note = (
@@ -2577,8 +2607,7 @@ def fetch_taiwan_monthly_revenue_events(inputs):
             "ytd_yoy": _signed_percent(row.get("累計營業收入-前期比較增減(%)")),
             "note": str(row.get("備註", "-")).strip(),
             "date_source": (
-                f"多來源公開營收報導日期（採 {public_report_source}）" if public_report_date
-                else "FinMind 收錄日（公告來源暫時無法讀取）" if used_finmind_report_date
+                f"公告日期來源（採 {public_report_source}）" if public_report_date
                 else "系統偵測日（MOPS 未提供單一公司公告時間）" if row.get("_mops_direct")
                 else "MOPS 彙總資料日期"
             ),
@@ -2590,9 +2619,7 @@ def fetch_taiwan_monthly_revenue_events(inputs):
                 fallback_note
                 + f"{revenue_month} 月營收：{_thousand_currency(revenue_data['current_month'])}；"
                 + (
-                    f"公開營收報導比對日期：{public_report_date}（採 {public_report_source}）；" if public_report_date else
-                    f"公告來源暫時無法讀取，暫用 FinMind 收錄日：{report_date.isoformat()}；"
-                    if used_finmind_report_date else
+                    f"公告日期：{public_report_date}（採 {public_report_source}）；" if public_report_date else
                     "MOPS 單一公司資料（公告日未提供，顯示系統偵測日）；" if row.get("_mops_direct") else ""
                 )
                 + "點擊事件名稱查看月營收明細。"
@@ -2799,12 +2826,10 @@ def apply_revenue_announcement_date_overrides(snapshot, overrides=None):
     """Apply exact user-confirmed monthly-revenue dates and keep them across syncs."""
     normalized = normalize_company_event_snapshot(snapshot)
     merged_overrides = dict(normalized.get('revenue_date_overrides', {}))
-    explicit_override_keys = set()
     for key, value in (overrides or {}).items():
         key_text, value_text = str(key), str(value)
         if re.fullmatch(r'\d{4,6}:\d{5}', key_text) and re.fullmatch(r'\d{4}-\d{2}-\d{2}', value_text):
             merged_overrides[key_text] = value_text
-            explicit_override_keys.add(key_text)
 
     revenue_events = []
     for event in normalized.get('taiwan_revenue', {}).get('events', []):
@@ -2812,19 +2837,6 @@ def apply_revenue_announcement_date_overrides(snapshot, overrides=None):
         revenue = dict(updated_event.get('revenue', {}))
         override_key = f"{str(updated_event.get('ticker', ''))}:{str(revenue.get('revenue_month', ''))}"
         exact_date = merged_overrides.get(override_key)
-        discovered_date = str(updated_event.get('date', ''))
-        discovered_source = str(revenue.get('date_source', ''))
-        # A corroborated public release date is authoritative. Retire any older or
-        # later stale browser/manual value (including the former UTC off-by-one).
-        if (
-            exact_date
-            and override_key not in explicit_override_keys
-            and discovered_source.startswith('多來源公開營收報導日期')
-            and re.fullmatch(r'\d{4}-\d{2}-\d{2}', discovered_date)
-            and exact_date != discovered_date
-        ):
-            merged_overrides.pop(override_key, None)
-            exact_date = None
         if exact_date:
             updated_event['date'] = exact_date
             revenue['report_date'] = exact_date
