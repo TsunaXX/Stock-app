@@ -106,6 +106,14 @@ def test_futures_ticks_follow_product_specification():
     assert get_tick("0050", 50, "ETF") == 0.05
 
 
+def test_futures_limit_color_requires_actual_equality():
+    symbols = load_app_symbols("_safe_number", "futures_limit_state")
+    state = symbols["futures_limit_state"]
+    assert state("101", 100, 90) == ""
+    assert state("100", 100, 90) == "up"
+    assert state("90", 100, 90) == "down"
+
+
 def test_futures_day_and_night_sessions_display_in_the_table_cell():
     symbols = load_app_symbols(
         "TAIFEX_NIGHT_SESSION_ROOTS", "is_futures_night_session_product",
@@ -287,6 +295,55 @@ def test_public_report_date_removes_later_stale_sync_date_override():
     corrected = symbols["apply_revenue_announcement_date_overrides"](snapshot)
     assert corrected["taiwan_revenue"]["events"][0]["date"] == "2026-08-04"
     assert "2408:11507" not in corrected["revenue_date_overrides"]
+
+
+def test_public_report_date_removes_older_timezone_shift_override():
+    symbols = load_app_symbols(
+        "empty_company_event_snapshot", "normalize_company_event_snapshot",
+        "apply_revenue_announcement_date_overrides",
+    )
+    snapshot = {
+        "revenue_date_overrides": {"2408:11507": "2026-08-03"},
+        "taiwan_revenue": {"events": [{
+            "date": "2026-08-04", "title": "南亞科 7月營收", "ticker": "2408",
+            "revenue": {
+                "company": "南亞科", "revenue_month": "11507",
+                "date_source": "多來源公開營收報導日期（鉅亨網／Google News）",
+            },
+        }]},
+    }
+    corrected = symbols["apply_revenue_announcement_date_overrides"](snapshot)
+    assert corrected["taiwan_revenue"]["events"][0]["date"] == "2026-08-04"
+    assert "2408:11507" not in corrected["revenue_date_overrides"]
+
+
+def test_calendar_date_only_value_does_not_shift_to_previous_day():
+    parse_date = load_app_symbols("parse_calendar_event_date")["parse_calendar_event_date"]
+    assert parse_date("2026-08-04") == date(2026, 8, 4)
+    assert parse_date("2026-08-03T17:00:00Z") == date(2026, 8, 4)
+
+
+def test_fibonacci_initial_view_is_core_zero_to_one_range():
+    view = load_app_symbols("fibonacci_initial_y_range")["fibonacci_initial_y_range"]
+    assert view(100, 200) == (95, 205)
+    assert view(100, 100) == (None, None)
+
+
+def test_nested_google_sheet_payload_restores_fibo_tags():
+    symbols = load_app_symbols(
+        "_is_valid_data_cache_payload", "_decode_data_cache_payload",
+        "_valid_fibo_tags", "_extract_fibo_tags",
+    )
+    tags = ["南亞科(2408)", "台積電(2330)", "鴻海(2317)", "聯發科(2454)", "和椿(6215)"]
+    payload = {
+        "success": True,
+        "stock_data": [],
+        "data": json.dumps({"fibo_tags": tags}, ensure_ascii=False),
+    }
+    decoded = symbols["_decode_data_cache_payload"](payload)
+    assert symbols["_extract_fibo_tags"](decoded) == tags
+    legacy = symbols["_decode_data_cache_payload"]({"tags": tags})
+    assert symbols["_extract_fibo_tags"](legacy) == tags
 
 
 def test_cache_merge_preserves_remote_device_sections():

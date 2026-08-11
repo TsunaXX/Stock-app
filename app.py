@@ -23,6 +23,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import calendar
 import gc
 import logging
+import tempfile
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import numpy as np
@@ -40,6 +41,22 @@ from selenium.common.exceptions import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _configure_yfinance_runtime_cache():
+    """Keep yfinance's SQLite caches writable and isolated per app process."""
+    try:
+        cache_dir = os.path.join(
+            tempfile.gettempdir(), f"stock_app_yfinance_{os.getpid()}"
+        )
+        os.makedirs(cache_dir, exist_ok=True)
+        yf.set_tz_cache_location(cache_dir)
+        return cache_dir
+    except (AttributeError, OSError):
+        return ""
+
+
+_YFINANCE_CACHE_DIR = _configure_yfinance_runtime_cache()
 
 # 引入 yahoo_fin 與 shioaji
 try:
@@ -536,7 +553,7 @@ def clear_market_stream(api):
 # ==========================================
 # 新增: 全域行事曆與權證判斷函數
 # ==========================================
-@st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
+@st.cache_data(ttl=60 * 60 * 12, max_entries=12, show_spinner=False)
 def fetch_official_market_holidays(year):
     """Fetch future TWSE closure dates so expiry logic is not frozen at 2026."""
     try:
@@ -644,7 +661,7 @@ def get_taiex_contract(api):
     return None
 
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=600, max_entries=4, show_spinner=False)
 def fetch_twse_taiex_daily_history(lookback_days=180):
     """Fetch official TWSE monthly TAIEX OHLC history (no Yahoo fallback)."""
     tz_tw = pytz.timezone('Asia/Taipei')
@@ -733,7 +750,7 @@ def fetch_twse_market_turnovers(trading_dates):
     date_list = list(trading_dates)
     if not date_list:
         return {}
-    with ThreadPoolExecutor(max_workers=4) as executor:
+    with ThreadPoolExecutor(max_workers=ANALYSIS_MAX_WORKERS if 'ANALYSIS_MAX_WORKERS' in globals() else 2) as executor:
         pairs = list(executor.map(parse_turnover, date_list))
     return dict(pairs)
 
@@ -858,7 +875,7 @@ def _taiwan_time_from_eastern(year, month, day, hour, minute=0):
     return eastern.localize(datetime(year, month, day, hour, minute)).astimezone(taipei)
 
 
-@st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
+@st.cache_data(ttl=60 * 60 * 6, max_entries=12, show_spinner=False)
 def fetch_tradingview_us_calendar(year):
     """免 API Key 的美國經濟日曆備援；保留原始資料來源欄位供畫面標示。"""
     headers = {
@@ -892,7 +909,7 @@ def fetch_tradingview_us_calendar(year):
         return []
 
     combined = {}
-    with ThreadPoolExecutor(max_workers=4) as executor:
+    with ThreadPoolExecutor(max_workers=2) as executor:
         for quarter_rows in executor.map(fetch_quarter, quarter_ranges):
             for row in quarter_rows:
                 row_key = str(row.get("id") or f"{row.get('title')}|{row.get('date')}")
@@ -967,7 +984,7 @@ def _merge_macro_events(fallback_events, official_events):
     return sorted(merged.values(), key=lambda event: (str(event.get("date", "")), str(event.get("title", ""))))
 
 
-@st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
+@st.cache_data(ttl=60 * 60 * 6, max_entries=1, show_spinner=False)
 def fetch_bea_release_schedule_html():
     """集中快取 BEA 發布排程，避免 GDP 與核心 PCE 各下載一次。"""
     response = _calendar_get(BEA_RELEASE_SCHEDULE_URL)
@@ -1035,7 +1052,7 @@ def _parse_bea_release_schedule(page_html, year, release_type):
     return events
 
 
-@st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
+@st.cache_data(ttl=60 * 60 * 12, max_entries=12, show_spinner=False)
 def fetch_bea_gdp_events(year):
     """GDP 以 BEA 官方排程為準，TradingView 補足官方頁未保留的歷史發布日期。"""
     fallback_events = _tradingview_macro_events(year, "gdp")
@@ -1043,7 +1060,7 @@ def fetch_bea_gdp_events(year):
     return _merge_macro_events(fallback_events, official_events)
 
 
-@st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
+@st.cache_data(ttl=60 * 60 * 12, max_entries=12, show_spinner=False)
 def fetch_bea_core_pce_events(year):
     """核心 PCE 隨 BEA Personal Income and Outlays 發布，並以 TradingView 補歷史日期。"""
     fallback_events = _tradingview_macro_events(year, "core_pce")
@@ -1051,7 +1068,7 @@ def fetch_bea_core_pce_events(year):
     return _merge_macro_events(fallback_events, official_events)
 
 
-@st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
+@st.cache_data(ttl=60 * 60 * 12, max_entries=12, show_spinner=False)
 def fetch_ism_manufacturing_events(year):
     """擷取 ISM 製造業 PMI；僅接受明確的 ISM Manufacturing PMI 主指標。"""
     fallback_events = _tradingview_macro_events(year, "ism_manufacturing")
@@ -1111,7 +1128,7 @@ def fetch_ism_manufacturing_events(year):
     return _merge_macro_events(fallback_events, official_events)
 
 
-@st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
+@st.cache_data(ttl=60 * 60 * 6, max_entries=12, show_spinner=False)
 def fetch_twse_holiday_events(year):
     """同步臺灣證券交易所的年度開休市日，保留官方名稱與說明。"""
     response = _calendar_get(TWSE_HOLIDAY_URL.format(roc_year=year - 1911))
@@ -1145,7 +1162,7 @@ def fetch_twse_holiday_events(year):
         return []
 
 
-@st.cache_data(ttl=60 * 15, show_spinner=False)
+@st.cache_data(ttl=60 * 15, max_entries=1, show_spinner=False)
 def fetch_twse_temporary_closure_events():
     """從證交所最新公告辨識已宣布的突發休市（颱風、天災等）。"""
     response = _calendar_get(TWSE_NEWS_URL)
@@ -1205,7 +1222,7 @@ def fetch_twse_temporary_closure_events():
     return events
 
 
-@st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
+@st.cache_data(ttl=60 * 60 * 12, max_entries=12, show_spinner=False)
 def fetch_fomc_events(year):
     """由 Fed 官方會議日程轉成台灣時間的利率決議時間。"""
     response = _calendar_get(FOMC_CALENDAR_URL)
@@ -1246,7 +1263,7 @@ def fetch_fomc_events(year):
     return events
 
 
-@st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
+@st.cache_data(ttl=60 * 60 * 12, max_entries=12, show_spinner=False)
 def fetch_bls_cpi_events(year):
     """CPI 以免金鑰經濟日曆為主，BLS 官方來源作交叉備援。"""
     fallback_events = _tradingview_macro_events(year, "cpi")
@@ -1451,7 +1468,7 @@ def _parse_bls_cps_employment_calendar(response, year):
     return events
 
 
-@st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
+@st.cache_data(ttl=60 * 60 * 12, max_entries=12, show_spinner=False)
 def fetch_bls_employment_events(year):
     """BLS Employment Situation：市場俗稱大非農，同時公布失業率。"""
     fallback_events = _tradingview_macro_events(year, "nfp")
@@ -1474,7 +1491,7 @@ def fetch_bls_employment_events(year):
     return _merge_macro_events(fallback_events, official_events)
 
 
-@st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
+@st.cache_data(ttl=60 * 60 * 12, max_entries=12, show_spinner=False)
 def fetch_adp_employment_events(year):
     """由 ADP 官方資料端點取得每月小非農日期，固定 08:15 ET 發布。"""
     response = _calendar_get(ADP_EMPLOYMENT_DATA_URL)
@@ -1555,7 +1572,7 @@ def _us_weekly_claims_release_date(year, month, day):
     return release_date - timedelta(days=1) if release_date in thursday_holidays else release_date
 
 
-@st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
+@st.cache_data(ttl=60 * 60 * 12, max_entries=12, show_spinner=False)
 def build_us_initial_claims_events(year):
     """建立美國勞工部每週四 08:30 ET 的初領失業金預定發布時間。"""
     events = []
@@ -1749,7 +1766,7 @@ def _get_earnings_dates(ticker_object):
         return []
 
 
-@st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
+@st.cache_data(ttl=60 * 60 * 6, max_entries=24, show_spinner=False)
 def fetch_earnings_events(inputs):
     """查詢指定公司財報日，回傳事件與未找到日期的輸入，避免靜默漏顯示。"""
     events, resolved, missing = [], [], []
@@ -1944,7 +1961,7 @@ def _roc_month_text(roc_year, month):
     return f"{int(roc_year):03d}{int(month):02d}"
 
 
-@st.cache_data(ttl=60 * 60 * 4, show_spinner=False)
+@st.cache_data(ttl=60 * 60 * 4, max_entries=128, show_spinner=False)
 def fetch_mops_company_monthly_revenue(code, roc_year, month, market_type):
     """補查 MOPS 單一公司月營收，處理 TWSE 彙總 OpenAPI 更新落後的公告空窗。"""
     payload = {
@@ -2114,7 +2131,7 @@ def _usd_currency(value):
     return f"US${number:,.0f}"
 
 
-@st.cache_data(ttl=60 * 60 * 4, show_spinner=False)
+@st.cache_data(ttl=60 * 60 * 4, max_entries=1, show_spinner=False)
 def fetch_twse_monthly_revenue_rows():
     """取得 MOPS 最新上市與上櫃公司月營收彙總表。"""
     rows = []
@@ -2393,7 +2410,7 @@ def fetch_google_news_revenue_announcement_date(
     )
 
 
-@st.cache_data(ttl=60 * 60 * 4, show_spinner=False)
+@st.cache_data(ttl=60 * 60 * 4, max_entries=24, show_spinner=False)
 def fetch_taiwan_monthly_revenue_events(inputs):
     """依追蹤清單產生台股最新月營收事件，必要時由 MOPS 單一公司資料補齊。"""
     input_by_code = {}
@@ -2588,7 +2605,7 @@ def _growth_percent(current, comparison):
     return (current_number - comparison_number) / abs(comparison_number) * 100
 
 
-@st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
+@st.cache_data(ttl=60 * 60 * 6, max_entries=24, show_spinner=False)
 def fetch_us_revenue_events(inputs):
     """取得美股最新已公告季度與年度營收；美股沒有統一月營收，改以 QoQ／YoY 呈現。"""
     events, missing = [], []
@@ -2772,13 +2789,13 @@ def apply_revenue_announcement_date_overrides(snapshot, overrides=None):
         exact_date = merged_overrides.get(override_key)
         discovered_date = str(updated_event.get('date', ''))
         discovered_source = str(revenue.get('date_source', ''))
-        # Retire a stale correction when a newly corroborated public report proves
-        # an earlier date. This also cleans up dates accidentally saved as sync day.
+        # A corroborated public release date is authoritative. Retire any older or
+        # later stale browser/manual value (including the former UTC off-by-one).
         if (
             exact_date
             and discovered_source.startswith('多來源公開營收報導日期')
             and re.fullmatch(r'\d{4}-\d{2}-\d{2}', discovered_date)
-            and exact_date > discovered_date
+            and exact_date != discovered_date
         ):
             merged_overrides.pop(override_key, None)
             exact_date = None
@@ -2802,6 +2819,27 @@ def apply_revenue_announcement_date_overrides(snapshot, overrides=None):
         + list(normalized.get('us_revenue', {}).get('events', []))
     )
     return normalize_company_event_snapshot(normalized)
+
+
+def parse_calendar_event_date(value):
+    """Parse calendar dates without letting browser/UTC conversion move the day."""
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return value
+    text = str(value or '').strip()
+    if re.fullmatch(r'\d{4}-\d{2}-\d{2}', text):
+        try:
+            return date.fromisoformat(text)
+        except ValueError:
+            return None
+    try:
+        parsed = pd.Timestamp(value)
+        if pd.isna(parsed):
+            return None
+        if parsed.tzinfo is not None:
+            parsed = parsed.tz_convert('Asia/Taipei')
+        return parsed.date()
+    except (TypeError, ValueError, AttributeError):
+        return None
 
 
 def load_company_event_snapshot():
@@ -3769,7 +3807,7 @@ def get_live_futures_snapshot(api, product='TMF'):
         return None
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=300, max_entries=1, show_spinner=False)
 def fetch_taifex_index_margin_map():
     """Read current initial margin requirements from the TAIFEX OpenAPI."""
     margin_map = {}
@@ -4691,7 +4729,7 @@ def _taifex_number(value):
         return None
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=60, max_entries=1, show_spinner=False)
 def fetch_taifex_txo_daily_quotes():
     """Fetch official TXO daily rows as a fallback when Shioaji contracts are unavailable."""
     try:
@@ -5247,6 +5285,17 @@ def render_fibonacci_trade_suggestion(suggestion):
         )
 
 
+def fibonacci_initial_y_range(low_price, high_price, padding_ratio=0.05):
+    """Start at the core 0–1 range while keeping extension traces zoomable."""
+    low_value = float(low_price)
+    high_value = float(high_price)
+    price_range = high_value - low_value
+    if not np.isfinite(price_range) or price_range <= 0:
+        return None, None
+    padding = price_range * max(0.0, float(padding_ratio))
+    return low_value - padding, high_value + padding
+
+
 def plot_fibonacci_chart(
     symbol, interval, lookback=60, font_size=15, ma_flags=None,
     ma_width=1.5, show_vol=True, advice_container=None,
@@ -5765,10 +5814,7 @@ def plot_fibonacci_chart(
         fig.add_annotation(x=last_date_str, y=price, text=f"{r_label} ({rounded_price:g})",
             showarrow=False, xanchor="left", xshift=10, font=dict(size=font_size, color=line_col), row=target_row, col=target_col)
 
-    plotted_prices = [low_60 + ratio * diff for ratio in ratios]
-    y_padding = diff * 0.05
-    y_min_view = min(plotted_prices) - y_padding
-    y_max_view = max(plotted_prices) + y_padding
+    y_min_view, y_max_view = fibonacci_initial_y_range(low_60, high_60)
     if pd.isna(y_min_view) or pd.isna(y_max_view): y_min_view, y_max_view = None, None
 
     interval_display_map = {"1m": "1分K", "5m": "5分K", "15m": "15分K", "60m": "60分K", "1d": "日K", "1wk": "週K", "1mo": "月K"}
@@ -7203,32 +7249,31 @@ def _is_valid_data_cache_payload(value):
 
 def _decode_data_cache_payload(payload):
     """相容 Apps Script 直接回傳 JSON、JSON 字串或包在 data 欄位中的格式。"""
-    value = payload
-    for _ in range(3):
+    def decode(value, depth=0):
+        if depth > 5:
+            return {}
         if isinstance(value, bytes):
-            value = value.decode('utf-8-sig', errors='replace')
-            continue
+            return decode(value.decode('utf-8-sig', errors='replace'), depth + 1)
         if isinstance(value, str):
             text = value.strip().lstrip('\ufeff')
             if not text:
                 return {}
             try:
-                value = json.loads(text)
-                continue
+                return decode(json.loads(text), depth + 1)
             except (ValueError, TypeError):
                 return {}
         if isinstance(value, dict):
-            if _is_valid_data_cache_payload(value):
-                return value
+            candidate = {key: item for key, item in value.items() if key != 'data'}
             nested = value.get('data')
             if isinstance(nested, (dict, str, bytes)):
-                value = nested
-                continue
-            return {}
+                decoded_nested = decode(nested, depth + 1)
+                if decoded_nested:
+                    candidate.update(decoded_nested)
+            if 'fibo_tags' not in candidate and isinstance(candidate.get('tags'), list):
+                candidate['fibo_tags'] = candidate['tags']
+            return candidate if _is_valid_data_cache_payload(candidate) else {}
         return {}
-    return (
-        value if _is_valid_data_cache_payload(value) else {}
-    )
+    return decode(payload)
 
 
 def _fetch_remote_data_cache(gsheet_api_url, timeout=5):
@@ -7250,6 +7295,40 @@ def _valid_fibo_tags(tags):
     if not isinstance(tags, list) or len(tags) < 5:
         return []
     return [str(tag) for tag in tags[:5]]
+
+
+def _extract_fibo_tags(payload):
+    """Read tags from current and legacy Apps Script response envelopes."""
+    queue = [payload]
+    visited = set()
+    for _ in range(12):
+        if not queue:
+            break
+        value = queue.pop(0)
+        marker = id(value)
+        if marker in visited:
+            continue
+        visited.add(marker)
+        if isinstance(value, bytes):
+            value = value.decode('utf-8-sig', errors='replace')
+        if isinstance(value, str):
+            try:
+                queue.append(json.loads(value.strip().lstrip('\ufeff')))
+            except (ValueError, TypeError):
+                pass
+            continue
+        if isinstance(value, dict):
+            for key in ('fibo_tags', 'tags'):
+                tags = _valid_fibo_tags(value.get(key))
+                if tags:
+                    return tags
+            queue.extend(value.get(key) for key in ('data', 'payload', 'result') if key in value)
+        elif isinstance(value, list):
+            tags = _valid_fibo_tags(value)
+            if tags:
+                return tags
+            queue.extend(value[:10])
+    return []
 
 
 def save_fibo_config():
@@ -7464,10 +7543,23 @@ def save_data_cache(
                                 json={
                                     'action': 'save',
                                     'data': json.dumps(merged_payload, ensure_ascii=False),
+                                    # Legacy Apps Script deployments can persist
+                                    # these direct fields even when they ignore data.
+                                    'fibo_tags': merged_payload.get('fibo_tags', []),
+                                    'updated_at': merged_payload.get('updated_at', ''),
                                 },
                                 timeout=8,
                             )
                             response.raise_for_status()
+                            try:
+                                acknowledgement = response.json()
+                            except (ValueError, TypeError):
+                                acknowledgement = None
+                            if isinstance(acknowledgement, dict) and (
+                                acknowledgement.get('success') is False
+                                or str(acknowledgement.get('status', '')).lower() in {'error', 'failed'}
+                            ):
+                                raise requests.RequestException('Google Sheet rejected save')
                             last_error = None
                             break
                         except requests.RequestException as exc:
@@ -7477,6 +7569,23 @@ def save_data_cache(
                     if last_error is not None:
                         sync_ok = False
                         st.session_state['_data_cache_remote_error'] = type(last_error).__name__
+                    elif explicit_fibo_tag_save:
+                        expected_tags = _valid_fibo_tags(merged_payload.get('fibo_tags', []))
+                        verified = False
+                        verification_error = ''
+                        for delay in (0.15, 0.5, 1.0):
+                            time.sleep(delay)
+                            saved_payload, verification_error = _fetch_remote_data_cache(
+                                gsheet_api_url, timeout=8,
+                            )
+                            if _extract_fibo_tags(saved_payload) == expected_tags:
+                                verified = True
+                                break
+                        if not verified:
+                            sync_ok = False
+                            st.session_state['_data_cache_remote_error'] = (
+                                verification_error or 'Google Sheet 寫入後回讀不一致'
+                            )
         _write_json_atomic(DATA_CACHE_FILE, merged_payload, indent=2)
         st.session_state['_data_cache_sync_status'] = 'ok' if sync_ok else 'local_only'
         if explicit_fibo_tag_save:
@@ -7534,7 +7643,7 @@ def load_data_cache():
 def reload_fibo_tags_from_cloud():
     """手動從 Google Sheet 還原標籤，供清除 Cookie 後的新手機工作階段使用。"""
     payload, error = _fetch_remote_data_cache(get_app_secret('gsheet_api_url'), timeout=8)
-    tags = _valid_fibo_tags(payload.get('fibo_tags', [])) if payload else []
+    tags = _extract_fibo_tags(payload)
     tags = [normalize_fibo_quick_tag(tag) for tag in tags]
     if not tags:
         return False, error or '雲端尚無五組快速標籤'
@@ -7710,14 +7819,14 @@ if sj and st.session_state.remember_sj and st.session_state.sj_key and not st.se
         st.session_state.sj_logged_in = False
         st.session_state.sj_connection_error = type(exc).__name__
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=300, max_entries=512)
 def get_stock_name_online(code):
     code = str(code).strip()
     code_map, _ = load_local_stock_names()
     if code in code_map: return code_map[code]
     return code
 
-@st.cache_data(ttl=86400)
+@st.cache_data(ttl=86400, max_entries=512)
 def search_code_online(query):
     query = query.strip()
     if query.isdigit(): return query
@@ -7982,7 +8091,7 @@ def render_futures_strategy_explanation():
 - 「即時更新報價與分析」更新目前表格；「即時更新成交量排行」批次更新可解析契約後重新排序。夜盤商品會採夜盤快照的最新價、漲跌幅與累計量。
         """)
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=300, max_entries=1)
 def fetch_futures_list():
     errors = []
     try:
@@ -8063,6 +8172,24 @@ def _safe_number(value, default=None):
         return default if not math.isfinite(number) else number
     except (TypeError, ValueError):
         return default
+
+
+def futures_limit_state(price, limit_up, limit_down):
+    """Return a limit state only when the traded price actually equals the limit."""
+    price_value = _safe_number(price)
+    up_value = _safe_number(limit_up)
+    down_value = _safe_number(limit_down)
+    if price_value is None:
+        return ''
+    if up_value is not None and math.isclose(
+        price_value, up_value, rel_tol=1e-10, abs_tol=1e-9,
+    ):
+        return 'up'
+    if down_value is not None and math.isclose(
+        price_value, down_value, rel_tol=1e-10, abs_tol=1e-9,
+    ):
+        return 'down'
+    return ''
 
 
 TAIFEX_NIGHT_SESSION_ROOTS = {
@@ -8935,7 +9062,7 @@ def fetch_yahoo_us_index_close_signals(trading_day, expected_date, requested_key
         except Exception as exc:
             return None, f'{label}：{exc}'
 
-    with ThreadPoolExecutor(max_workers=4) as executor:
+    with ThreadPoolExecutor(max_workers=2) as executor:
         results = list(executor.map(fetch_one, instruments.items()))
     rows = []
     for row, error in results:
@@ -9003,7 +9130,7 @@ def fetch_nasdaq_us_close_signals(trading_day, requested_keys=None):
         except Exception as exc:
             return None, f'{label}：{exc}'
 
-    with ThreadPoolExecutor(max_workers=4) as executor:
+    with ThreadPoolExecutor(max_workers=2) as executor:
         results = list(executor.map(fetch_one, instruments.items()))
     rows = []
     for row, error in results:
@@ -9126,7 +9253,7 @@ def fetch_opening_overseas_signals(trading_date_text, cutoff_text):
         downloaded = yf.download(
             [item[1] for item in intraday_symbols.values()] + ['TWF=F'],
             period='5d', interval='5m', group_by='ticker', auto_adjust=False,
-            prepost=True, progress=False, threads=True,
+            prepost=True, progress=False, threads=False,
         )
         for key, (label, ticker, group, start_time) in intraday_symbols.items():
             start_at = tz_tw.localize(datetime.combine(trading_day, start_time))
@@ -11051,12 +11178,12 @@ def render_futures_strategy_room():
         signal_state = str(row.get('訊號狀態', ''))
         liquidity = str(row.get('可交易性', ''))
         data_health = str(row.get('資料狀態', ''))
-        price = _safe_number(row.get('收盤價'))
-        limit_up = _safe_number(row.get('當日漲停價'))
-        limit_down = _safe_number(row.get('當日跌停價'))
-        if price is not None and limit_up is not None and price >= limit_up:
+        limit_state = futures_limit_state(
+            row.get('收盤價'), row.get('當日漲停價'), row.get('當日跌停價'),
+        )
+        if limit_state == 'up':
             name_style = 'background-color: #ff4b4b; color: #ffffff; font-weight: bold;'
-        elif price is not None and limit_down is not None and price <= limit_down:
+        elif limit_state == 'down':
             name_style = 'background-color: #00e676; color: #ffffff; font-weight: bold;'
         else:
             name_style = 'color:#ff4b4b;font-weight:bold;' if direction == '偏多' else ('color:#00c853;font-weight:bold;' if direction == '偏空' else '')
@@ -15363,8 +15490,8 @@ with tab3:
     network_event_dict = {}
     for event in network_events:
         try:
-            event_date = pd.Timestamp(event["date"]).date()
-            if event_date.year == sel_year and event_date.month == sel_month:
+            event_date = parse_calendar_event_date(event.get("date"))
+            if event_date and event_date.year == sel_year and event_date.month == sel_month:
                 network_event_dict.setdefault(event_date, []).append(event)
         except (KeyError, TypeError, ValueError):
             continue
