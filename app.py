@@ -11,6 +11,7 @@ import itertools
 import json
 import re
 import html
+from urllib.parse import urljoin
 from types import SimpleNamespace
 from datetime import datetime, time as dt_time, timedelta, date
 import pytz
@@ -5435,7 +5436,7 @@ def plot_fibonacci_chart(
 # ==========================================
 # 網路爬蟲加入快取，避免切換分頁時卡死
 # ==========================================
-@st.cache_data(ttl=3600, max_entries=2, show_spinner=False)
+@st.cache_data(ttl=300, max_entries=3, show_spinner=False)
 def fetch_fubon_html(url):
     """解決富邦 DJ 拒絕 iframe 連線的問題、處理亂碼與排版"""
     try:
@@ -5464,6 +5465,52 @@ def fetch_fubon_html(url):
     except Exception as e:
         return f"<html><body><h3>無法載入資料: {e}</h3></body></html>"
 
+
+@st.cache_data(ttl=300, max_entries=3, show_spinner=False)
+def fetch_fubon_institutional_rankings(url):
+    """Parse Fubon's paired buy/sell ranking page into native Streamlit tables."""
+    page_html = fetch_fubon_html(url)
+    if not page_html or '無法載入資料:' in page_html:
+        return pd.DataFrame(), pd.DataFrame(), ''
+    source_date_match = re.search(r'日期[：:]\s*(\d{1,2}/\d{1,2})', page_html)
+    source_date = source_date_match.group(1) if source_date_match else ''
+    buy_rows, sell_rows = [], []
+
+    def parse_number(value):
+        value = str(value).replace(',', '').replace('+', '').strip()
+        try:
+            return float(value)
+        except ValueError:
+            return None
+
+    def parse_half(cells):
+        if len(cells) < 5 or not str(cells[0]).strip().isdigit():
+            return None
+        stock_match = re.match(r'^(\d{4,6}[A-Za-z]*)\s*(.+)$', str(cells[1]).strip())
+        quantity, close, change = (parse_number(cells[index]) for index in (2, 3, 4))
+        if not stock_match or quantity is None or close is None or change is None:
+            return None
+        return {
+            '排名': int(cells[0]), '代號': stock_match.group(1), '名稱': stock_match.group(2).strip(),
+            '超張數': quantity, '收盤價': close, '漲跌': change,
+        }
+
+    try:
+        soup = BeautifulSoup(page_html, 'html.parser')
+        for row in soup.find_all('tr'):
+            cells = [cell.get_text(' ', strip=True) for cell in row.find_all(['th', 'td'])]
+            if len(cells) < 10:
+                continue
+            buy = parse_half(cells[:5])
+            sell = parse_half(cells[5:10])
+            if buy:
+                buy_rows.append(buy)
+            if sell:
+                sell_rows.append(sell)
+    except (TypeError, ValueError, AttributeError):
+        return pd.DataFrame(), pd.DataFrame(), source_date
+    return pd.DataFrame(buy_rows), pd.DataFrame(sell_rows), source_date
+
 @st.cache_data(ttl=600, max_entries=1, show_spinner=False)
 def get_report_list():
     """爬取永豐期貨盤後快訊列表，嚴格過濾台指期籌碼快訊"""
@@ -5489,7 +5536,7 @@ def get_report_list():
                         continue
                         
                     href = link_tag['href']
-                    pdf_url = f"{base_url}{href}" if href.startswith('/') else f"{base_url}/sinopacSPF/research/{href}"
+                    pdf_url = urljoin(url, href)
                     
                     date_str = ""
                     date_match = re.search(r'(202\d)(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])', title)
@@ -5509,7 +5556,7 @@ def get_report_list():
                     continue
                     
                 href = a_tag['href']
-                pdf_url = f"{base_url}{href}" if href.startswith('/') else href
+                pdf_url = urljoin(url, href)
                 
                 date_match = re.search(r'(202\d)(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])', title)
                 if date_match:
@@ -5521,6 +5568,24 @@ def get_report_list():
 
                 reports.append({"日期": date_str, "title": title, "url": pdf_url})
                 
+        # 網站近期的清單 class 會變動；只要是台指期籌碼快訊就不依 DOM class 漏抓。
+        if not reports:
+            for link_tag in soup.find_all('a', href=True):
+                title = link_tag.get_text(' ', strip=True) or link_tag.get('title', '')
+                if '台指期' not in title or '籌碼快訊' not in title:
+                    continue
+                context = link_tag.find_parent(['li', 'tr', 'div'])
+                context_text = context.get_text(' ', strip=True) if context else title
+                date_match = re.search(r'(202\d)[/-]?(0[1-9]|1[0-2])[/-]?(0[1-9]|[12]\d|3[01])', context_text)
+                date_str = (
+                    f"{date_match.group(1)}-{date_match.group(2)}-{date_match.group(3)}"
+                    if date_match else '近期發布'
+                )
+                reports.append({
+                    '日期': date_str, 'title': title,
+                    'url': urljoin(url, link_tag['href']),
+                })
+
         # 過濾重複連結並依照日期降冪排列 (確保第一筆一定是最新的)
         unique_reports = []
         seen = set()
@@ -5541,17 +5606,27 @@ def fetch_and_parse_pdf(pdf_url):
     try:
         if not pdf_url.lower().endswith('.pdf'):
             r_inner = requests.get(pdf_url, headers=headers, timeout=10)
+            r_inner.raise_for_status()
+            if r_inner.content.startswith(b'%PDF'):
+                pdf_bytes = r_inner.content
+            else:
+                pdf_bytes = None
             soup_inner = BeautifulSoup(r_inner.text, 'html.parser')
-            for tag in soup_inner.find_all(['a', 'iframe']):
-                link = tag.get('href') or tag.get('src')
-                if link and link.lower().endswith('.pdf'):
-                    pdf_url = link
-                    if not pdf_url.startswith('http'):
-                        pdf_url = "https://www.spf.com.tw" + pdf_url
-                    break
+            if pdf_bytes is None:
+                for tag in soup_inner.find_all(['a', 'iframe']):
+                    link = tag.get('href') or tag.get('src')
+                    if link and ('.pdf' in link.lower() or 'download' in link.lower()):
+                        pdf_url = urljoin(pdf_url, link)
+                        break
+        else:
+            pdf_bytes = None
 
-        response = requests.get(pdf_url, headers=headers, timeout=15)
-        pdf_bytes = response.content
+        if pdf_bytes is None:
+            response = requests.get(pdf_url, headers=headers, timeout=15)
+            response.raise_for_status()
+            pdf_bytes = response.content
+        if not pdf_bytes.startswith(b'%PDF'):
+            raise ValueError('永豐來源未回傳 PDF')
         
         text = ""
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
@@ -6620,6 +6695,7 @@ def _is_valid_data_cache_payload(value):
         'fibo_tags': list,
         'cached_notes': dict,
         'strategy_signal_log': list,
+        'company_event_snapshot': dict,
     }
     present = [key for key in expected_types if key in value]
     return bool(present) and all(
@@ -6738,6 +6814,26 @@ def _merge_unique_values(remote_values, local_values):
     return merged
 
 
+def _newer_company_event_snapshot(remote_snapshot, local_snapshot):
+    """Keep the newest non-empty company snapshot when computer and phone both save."""
+    remote_snapshot = remote_snapshot if isinstance(remote_snapshot, dict) else {}
+    local_snapshot = local_snapshot if isinstance(local_snapshot, dict) else {}
+    remote_has_events = bool(remote_snapshot.get('events'))
+    local_has_events = bool(local_snapshot.get('events'))
+    if not local_has_events:
+        return remote_snapshot
+    if not remote_has_events:
+        return local_snapshot
+    try:
+        remote_time = pd.Timestamp(remote_snapshot.get('updated_at'))
+        local_time = pd.Timestamp(local_snapshot.get('updated_at'))
+        if pd.notna(remote_time) and pd.notna(local_time):
+            return local_snapshot if local_time >= remote_time else remote_snapshot
+    except (TypeError, ValueError):
+        pass
+    return local_snapshot
+
+
 def _merge_data_cache_payload(
     remote, local, *, explicit_fibo_tag_save=False,
     clear_stock_data=False, replace_ignored=False,
@@ -6760,6 +6856,9 @@ def _merge_data_cache_payload(
         )
         merged['strategy_signal_log'] = remote.get(
             'strategy_signal_log', local.get('strategy_signal_log', []),
+        )
+        merged['company_event_snapshot'] = _newer_company_event_snapshot(
+            remote.get('company_event_snapshot'), local.get('company_event_snapshot'),
         )
     else:
         remote_ignored = set(remote.get('ignored_stocks', []))
@@ -6793,6 +6892,9 @@ def _merge_data_cache_payload(
                 local.get('strategy_signal_log', []),
                 'dedupe_key',
             )[-2000:],
+            'company_event_snapshot': _newer_company_event_snapshot(
+                remote.get('company_event_snapshot'), local.get('company_event_snapshot'),
+            ),
         }
     merged['version'] = 3
     merged['updated_at'] = datetime.now(pytz.timezone('Asia/Taipei')).isoformat()
@@ -6827,6 +6929,9 @@ def save_data_cache(
             if code
         }
         df_save.drop(columns=['_auto_note'], errors='ignore', inplace=True)
+        company_snapshot = st.session_state.get('company_event_snapshot')
+        if not isinstance(company_snapshot, dict):
+            company_snapshot = load_company_event_snapshot()
         local_payload = _json_safe({
             'version': 3,
             'stock_data': df_save.to_dict(orient='records'),
@@ -6836,6 +6941,7 @@ def save_data_cache(
             'fibo_tags': fibo_tags,
             'cached_notes': cached_notes,
             'strategy_signal_log': load_strategy_signal_log(),
+            'company_event_snapshot': company_snapshot,
         })
         merged_payload = local_payload
         sync_ok = True
@@ -6896,6 +7002,8 @@ def load_data_cache():
             candidates = data.get('all_candidates', [])
             saved_notes = data.get('saved_notes', {})
             fibo_tags = _valid_fibo_tags(data.get('fibo_tags', []))
+            if isinstance(data.get('company_event_snapshot'), dict):
+                st.session_state['_cached_company_event_snapshot'] = data['company_event_snapshot']
             if isinstance(data.get('strategy_signal_log'), list):
                 save_strategy_signal_log(data['strategy_signal_log'])
             return df, ignored, candidates, saved_notes, fibo_tags, data.get('cached_notes', {})
@@ -6913,6 +7021,8 @@ def load_data_cache():
             candidates = data.get('all_candidates', [])
             saved_notes = data.get('saved_notes', {}) 
             fibo_tags = _valid_fibo_tags(data.get('fibo_tags', []))
+            if isinstance(data.get('company_event_snapshot'), dict):
+                st.session_state['_cached_company_event_snapshot'] = data['company_event_snapshot']
             if isinstance(data.get('strategy_signal_log'), list):
                 save_strategy_signal_log(data['strategy_signal_log'])
             st.session_state['_data_cache_source'] = 'local'
@@ -7677,6 +7787,18 @@ def fetch_futures_strategy_universe():
         general_rows = [row for row in rows if str(row.get('TradingSession', '')).strip() == '一般']
         session_rows = general_rows or [rows[0]]
         quote_row = session_rows[0]
+        session_names = {
+            str(row.get('TradingSession', '')).strip()
+            for row in rows if str(row.get('TradingSession', '')).strip()
+        }
+        has_day_session = '一般' in session_names
+        has_night_session = any(name != '一般' for name in session_names)
+        if has_day_session and has_night_session:
+            session_label = '日＋夜（計算採日盤）'
+        elif has_day_session:
+            session_label = '日盤'
+        else:
+            session_label = str(quote_row.get('TradingSession', '未知'))
         valid_highs = [_safe_number(row.get('High')) for row in session_rows]
         valid_lows = [_safe_number(row.get('Low')) for row in session_rows]
         high = max((value for value in valid_highs if value is not None), default=None)
@@ -7721,7 +7843,7 @@ def fetch_futures_strategy_universe():
             '指數期貨': meta.get('指數期貨', root in index_futures_roots), '小型期貨': meta['小型期貨'],
             '次月期貨': month_rank[(root, month)] > 0,
             '月份順位': month_rank[(root, month)],
-            '交易時段': '日盤' if general_rows else str(quote_row.get('TradingSession', '未知')),
+            '交易時段': session_label,
             '資料日期': str(quote_row.get('Date', '')),
         })
 
@@ -10443,7 +10565,10 @@ def render_futures_strategy_room():
             '期貨代碼': st.column_config.TextColumn(width=48, disabled=True),
             '契約月份': st.column_config.TextColumn(width=58, disabled=True),
             '名稱': st.column_config.TextColumn(width=88, disabled=True),
-            '交易時段': st.column_config.TextColumn(width=55, disabled=True),
+            '交易時段': st.column_config.TextColumn(
+                width=150, disabled=True,
+                help='「日＋夜」代表期交所同時提供兩時段資料；為避免混用兩個時段的 OHLC 與成交量，策略計算固定採日盤欄位。',
+            ),
             '當日成交口數': st.column_config.NumberColumn(format='%d', width=72, disabled=True),
             '未平倉量': st.column_config.NumberColumn(format='%d', width=70, disabled=True),
             '方向': st.column_config.TextColumn(width=48, disabled=True),
@@ -13067,33 +13192,38 @@ with tab2:
 with tab_fibo:
     
     def format_fibo_tag(key):
-        val = st.session_state[key].strip()
-        if not val: 
+        val = str(st.session_state[key] or '').strip()
+        if not val:
             save_fibo_config()
             return
-        if "(" in val and val.endswith(")"): 
-            save_fibo_config()
-            return
-        
-        code_map, name_map = load_local_stock_names()
-        if val.isdigit():
-            name = code_map.get(val, "")
-            if name: st.session_state[key] = f"{name}({val})"
-        else:
-            matched_stocks = []
-            for name, code in name_map.items():
-                if val in name:
-                    matched_stocks.append((name, code))
-            if matched_stocks:
-                def sort_key(item):
-                    c = item[1]
-                    if c.isdigit() and len(c) <= 4: return 0
-                    elif c.isdigit(): return 1
-                    return 2
-                matched_stocks.sort(key=sort_key)
-                best_match = matched_stocks[0]
-                st.session_state[key] = f"{best_match[0]}({best_match[1]})"
+
+        st.session_state[key] = normalize_fibo_tag(val)
         save_fibo_config()
+
+    def normalize_fibo_tag(value):
+        """Convert a saved quick-tag into the same 名稱(代號) form as the selector."""
+        raw = str(value or '').strip().replace('（', '(').replace('）', ')')
+        if not raw:
+            return ''
+        code_map, name_map = load_local_stock_names()
+        code_match = re.search(r'(?<!\d)(\d{4,6}[A-Za-z]?)(?!\d)', raw)
+        if code_match:
+            code = code_match.group(1).upper()
+            name = code_map.get(code)
+            if name:
+                return f"{name}({code})"
+        normalized_name = re.sub(r'\s+', '', raw.split('(', 1)[0])
+        if normalized_name in name_map:
+            return f"{normalized_name}({name_map[normalized_name]})"
+        matched_stocks = [
+            (name, code) for name, code in name_map.items()
+            if normalized_name and normalized_name in re.sub(r'\s+', '', name)
+        ]
+        if matched_stocks:
+            matched_stocks.sort(key=lambda item: (not item[1].isdigit(), len(item[1]), item[1]))
+            name, code = matched_stocks[0]
+            return f"{name}({code})"
+        return raw
     
     tab_trade_plan, tab_option_plan, tab_fibo_thermometer, tab_fibo_chart, tab_fibo_manual = st.tabs(
         ["🧭 指數操作計畫", "📅 選擇權操作計畫", "🌡️ 市場溫度計", "📊 費波圖表", "🧮 手動費波"],
@@ -13775,7 +13905,10 @@ with tab_fibo:
         search_list = ["加權股價指數(TAIEX)", "臺股期貨(TX)", "微型臺指期貨(TMF)"] + fibo_stock_options
 
         def set_fibo_search(val):
-            st.session_state.fibo_search_input = val
+            canonical_value = normalize_fibo_tag(val)
+            st.session_state.fibo_search_input = canonical_value
+            if canonical_value in search_list:
+                st.session_state.fibo_selectbox = canonical_value
             st.session_state.fibo_trigger_search = True
             st.session_state.fibo_interval = "1d"
 
@@ -13847,7 +13980,7 @@ with tab_fibo:
         def selectbox_changed():
             val = st.session_state.fibo_selectbox
             if val:
-                st.session_state.fibo_search_input = val
+                st.session_state.fibo_search_input = normalize_fibo_tag(val)
                 st.session_state.fibo_interval = "1d"
             else:
                 st.session_state.fibo_search_input = ""
@@ -13861,7 +13994,7 @@ with tab_fibo:
             on_change=selectbox_changed
         )
         
-        final_target = st.session_state.fibo_search_input
+        final_target = normalize_fibo_tag(st.session_state.fibo_search_input)
         
         st.write("---")
         st.write("⚙️ **圖表顯示設定**")
@@ -14011,12 +14144,53 @@ with tab_db:
         st.markdown("---")
         st.markdown("#### 📈 法人當日買賣超個股")
         inst_tabs = st.tabs(["外資當日買賣超", "投信當日買賣超", "自營商當日買賣超"])
+        def render_fubon_ranking(url):
+            buy_table, sell_table, source_date = fetch_fubon_institutional_rankings(url)
+            if buy_table.empty and sell_table.empty:
+                st.warning("法人個股排行暫時無法表格化，以下保留原始來源內容。")
+                st.html(fetch_fubon_html(url), width=800)
+                return
+
+            def style_price_change(value):
+                try:
+                    value = float(value)
+                except (TypeError, ValueError):
+                    return ''
+                if value > 0:
+                    return 'color:#ff4b4b;font-weight:700;'
+                if value < 0:
+                    return 'color:#00c853;font-weight:700;'
+                return 'color:#B0BEC5;'
+
+            buy_col, sell_col = st.columns(2)
+            table_config = {
+                '排名': st.column_config.NumberColumn(width=48, format='%d'),
+                '代號': st.column_config.TextColumn(width=66),
+                '名稱': st.column_config.TextColumn(width=92),
+                '超張數': st.column_config.NumberColumn(width=80, format='%,.0f'),
+                '收盤價': st.column_config.NumberColumn(width=72, format='%.4g'),
+                '漲跌': st.column_config.NumberColumn(width=64, format='%+.4g'),
+            }
+            with buy_col:
+                st.caption("🔴 買超排行")
+                st.dataframe(
+                    buy_table.style.map(style_price_change, subset=['漲跌']),
+                    hide_index=True, width='stretch', height=420, column_config=table_config,
+                )
+            with sell_col:
+                st.caption("🟢 賣超排行")
+                st.dataframe(
+                    sell_table.style.map(style_price_change, subset=['漲跌']),
+                    hide_index=True, width='stretch', height=420, column_config=table_config,
+                )
+            st.caption(f"資料來源：富邦 DJ 法人排行{f'｜資料日期 {source_date}' if source_date else ''}")
+
         with inst_tabs[0]:
-            st.html(fetch_fubon_html("https://fubon-ebrokerdj.fbs.com.tw/Z/ZG/ZGK_D.djhtm"), width=800)
+            render_fubon_ranking("https://fubon-ebrokerdj.fbs.com.tw/Z/ZG/ZGK_D.djhtm")
         with inst_tabs[1]:
-            st.html(fetch_fubon_html("https://fubon-ebrokerdj.fbs.com.tw/Z/ZG/ZGK_DD.djhtm"), width=800)
+            render_fubon_ranking("https://fubon-ebrokerdj.fbs.com.tw/Z/ZG/ZGK_DD.djhtm")
         with inst_tabs[2]:
-            st.html(fetch_fubon_html("https://fubon-ebrokerdj.fbs.com.tw/Z/ZG/ZGK_DB.djhtm"), width=800)
+            render_fubon_ranking("https://fubon-ebrokerdj.fbs.com.tw/Z/ZG/ZGK_DB.djhtm")
         
     with sub_tab2:
         st.markdown("#### 📑 永豐期貨盤後籌碼自動化工具")
@@ -14299,7 +14473,11 @@ with tab3:
             st.session_state.calendar_preferences
         )
     if "company_event_snapshot" not in st.session_state:
-        st.session_state.company_event_snapshot = load_company_event_snapshot()
+        cached_snapshot = st.session_state.get('_cached_company_event_snapshot')
+        st.session_state.company_event_snapshot = (
+            cached_snapshot if isinstance(cached_snapshot, dict) and cached_snapshot.get('events')
+            else load_company_event_snapshot()
+        )
 
     with st.expander("🛠️ 自訂與校正行事曆事件"):
         st.info("若發現系統預設日期或時間有誤，可在此手動新增或覆寫事件（例如：提前休市、自訂總經數據時間）。")
@@ -14555,8 +14733,20 @@ with tab3:
         return matched
 
     if TAIWAN_COMPANY_GROUP in selected_event_groups:
-        network_events.extend(company_earnings_for_market("台股"))
-        network_events.extend(company_snapshot.get("taiwan_revenue", {}).get("events", []))
+        taiwan_earnings_events = company_earnings_for_market("台股")
+        taiwan_revenue_events = list(company_snapshot.get("taiwan_revenue", {}).get("events", []))
+        network_events.extend(taiwan_earnings_events)
+        network_events.extend(taiwan_revenue_events)
+        visible_company_events = [
+            event for event in taiwan_earnings_events + taiwan_revenue_events
+            if str(event.get('date', '')).startswith(f'{sel_year}-{sel_month:02d}-')
+        ]
+        st.caption(
+            f"台股公司事件快照：財報 {len(taiwan_earnings_events)} 筆、月營收 {len(taiwan_revenue_events)} 筆；"
+            f"本月顯示 {len(visible_company_events)} 筆。"
+        )
+        if not taiwan_earnings_events and not taiwan_revenue_events:
+            st.info("目前快照沒有可顯示的台股財報／月營收；請到「公司財報與營收」按「同步公司資料」。")
     if US_COMPANY_GROUP in selected_event_groups:
         network_events.extend(company_earnings_for_market("美股"))
         network_events.extend(company_snapshot.get("us_revenue", {}).get("events", []))
@@ -14945,6 +15135,10 @@ with tab_company:
             }
             st.session_state.company_event_snapshot = new_snapshot
             save_company_event_snapshot(new_snapshot)
+            company_sync_ok = save_data_cache(
+                st.session_state.stock_data, st.session_state.ignored_stocks,
+                st.session_state.all_candidates, st.session_state.saved_notes,
+            )
             st.session_state.calendar_preferences["tickers"] = company_ticker_input
             save_calendar_preferences(
                 st.session_state.calendar_preferences.get("groups", CALENDAR_GROUP_OPTIONS),
@@ -14952,7 +15146,11 @@ with tab_company:
                 company_ticker_input,
                 selected_event_types,
             )
-            st.toast("公司資料已同步，行事曆摘要快照已更新。", icon="✅")
+            st.toast(
+                "公司資料已同步，行事曆摘要快照已更新。"
+                + ("已同步 Google Sheet。" if company_sync_ok and get_app_secret('gsheet_api_url') else ""),
+                icon="✅",
+            )
             st.rerun()
 
     st.markdown("""
