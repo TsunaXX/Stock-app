@@ -2250,6 +2250,78 @@ def build_finmind_monthly_revenue_row(records, code, target_year, target_month, 
     }
 
 
+def select_cnyes_revenue_announcement_date(items, code, revenue_year, revenue_month):
+    """Return the earliest matching public revenue-report date in the release window.
+
+    MOPS is the value source.  This only supplies a date when a public report names
+    both the company code and the reported month; it never replaces MOPS revenue.
+    """
+    try:
+        report_year, report_month = int(revenue_year), int(revenue_month)
+        window_year, window_month = (
+            (report_year + 1, 1) if report_month == 12 else (report_year, report_month + 1)
+        )
+        window_start = date(window_year, window_month, 1)
+        window_end = date(window_year, window_month, 15)
+    except (TypeError, ValueError):
+        return None
+
+    matched_dates = []
+    code_pattern = re.compile(rf"(?<!\d){re.escape(str(code))}(?!\d)")
+    month_pattern = re.compile(rf"{report_month}\s*月")
+    taipei = pytz.timezone("Asia/Taipei")
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        text = " ".join(
+            html.unescape(str(item.get(field, "")))
+            for field in ("title", "content", "summary", "keyword")
+        )
+        if "營收" not in text or not code_pattern.search(text) or not month_pattern.search(text):
+            continue
+        timestamp = _to_number(item.get("publishAt") or item.get("publish_at"))
+        if timestamp is None:
+            continue
+        try:
+            published_date = datetime.fromtimestamp(float(timestamp), taipei).date()
+        except (OSError, OverflowError, TypeError, ValueError):
+            continue
+        if window_start <= published_date <= window_end:
+            matched_dates.append(published_date)
+    return min(matched_dates).isoformat() if matched_dates else None
+
+
+@st.cache_data(ttl=60 * 60 * 4, max_entries=300, show_spinner=False)
+def fetch_cnyes_revenue_announcement_date(code, revenue_year, revenue_month):
+    """Find a corroborating public release date without using its revenue value."""
+    items = []
+    try:
+        for page in range(1, 4):
+            response = requests.get(
+                "https://api.cnyes.com/media/api/v1/search/news",
+                params={"q": str(code), "page": page},
+                headers={"User-Agent": "Mozilla/5.0 (compatible; StockApp/1.0)"},
+                timeout=10,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, dict):
+                return None
+            # The public endpoint has used both ``data.items`` and the current
+            # Laravel-style ``items.data`` response envelopes.
+            data = payload.get("data", {})
+            page_items = data.get("items", []) if isinstance(data, dict) else []
+            if not isinstance(page_items, list):
+                top_items = payload.get("items", {})
+                page_items = top_items.get("data", []) if isinstance(top_items, dict) else []
+            if not isinstance(page_items, list) or not page_items:
+                break
+            items.extend(page_items)
+    except (requests.RequestException, ValueError, TypeError):
+        return None
+    return select_cnyes_revenue_announcement_date(items, code, revenue_year, revenue_month)
+
+
 @st.cache_data(ttl=60 * 60 * 4, show_spinner=False)
 def fetch_taiwan_monthly_revenue_events(inputs):
     """依追蹤清單產生台股最新月營收事件，必要時由 MOPS 單一公司資料補齊。"""
@@ -2345,10 +2417,16 @@ def fetch_taiwan_monthly_revenue_events(inputs):
         if not report_date or not revenue_month:
             missing.append(f"{item['display_name']}（官方資料日期格式異常）")
             continue
+        revenue_roc_year = int(revenue_month[:3])
+        revenue_month_number = int(revenue_month[-2:])
+        public_report_date = fetch_cnyes_revenue_announcement_date(
+            code, revenue_roc_year + 1911, revenue_month_number
+        )
+        if public_report_date:
+            report_date = date.fromisoformat(public_report_date)
         company = str(row.get("公司名稱", item["display_name"])).strip()
         mom = _signed_percent(row.get("營業收入-上月比較增減(%)"))
         yoy = _signed_percent(row.get("營業收入-去年同月增減(%)"))
-        revenue_month_number = int(revenue_month[-2:])
         fallback_note = (
             f"最新 {int(target_month_text[-2:])} 月尚無資料，遞補顯示 {revenue_month_number} 月；"
             if revenue_month < target_month_text else ""
@@ -2367,6 +2445,11 @@ def fetch_taiwan_monthly_revenue_events(inputs):
             "last_year_ytd": row.get("累計營業收入-去年累計營收"),
             "ytd_yoy": _signed_percent(row.get("累計營業收入-前期比較增減(%)")),
             "note": str(row.get("備註", "-")).strip(),
+            "date_source": (
+                "公開營收報導日期（鉅亨網比對）" if public_report_date
+                else "系統偵測日（MOPS 未提供單一公司公告時間）" if row.get("_mops_direct")
+                else "MOPS 彙總資料日期"
+            ),
         }
         events.append({
             "date": report_date.isoformat(),
@@ -2374,7 +2457,10 @@ def fetch_taiwan_monthly_revenue_events(inputs):
             "detail": (
                 fallback_note
                 + f"{revenue_month} 月營收：{_thousand_currency(revenue_data['current_month'])}；"
-                + ("MOPS 單一公司資料（公告日未提供，顯示系統偵測日）；" if row.get("_mops_direct") else "")
+                + (
+                    f"公開營收報導比對日期：{public_report_date}；" if public_report_date else
+                    "MOPS 單一公司資料（公告日未提供，顯示系統偵測日）；" if row.get("_mops_direct") else ""
+                )
                 + "點擊事件名稱查看月營收明細。"
             ),
             "closed": False,
@@ -2488,6 +2574,9 @@ def empty_company_event_snapshot():
         "earnings": {"events": [], "resolved": [], "missing": []},
         "taiwan_revenue": {"events": [], "missing": []},
         "us_revenue": {"events": [], "missing": []},
+        # MOPS 單一公司月營收沒有可供程式驗證的公告時間；使用者校正後保留於
+        # 快照，後續重新同步也會套回相同的公司／營收月份。
+        "revenue_date_overrides": {},
     }
 
 
@@ -2498,6 +2587,14 @@ def normalize_company_event_snapshot(saved):
         return normalized
     normalized['updated_at'] = str(saved.get('updated_at', '') or '')
     normalized['tickers'] = str(saved.get('tickers', '') or '')
+    saved_overrides = saved.get('revenue_date_overrides', {})
+    if isinstance(saved_overrides, dict):
+        normalized['revenue_date_overrides'] = {
+            str(key): str(value)
+            for key, value in saved_overrides.items()
+            if re.fullmatch(r'\d{4,6}:\d{5}', str(key))
+            and re.fullmatch(r'\d{4}-\d{2}-\d{2}', str(value))
+        }
     for section in ('earnings', 'taiwan_revenue', 'us_revenue'):
         section_value = saved.get(section, {})
         if isinstance(section_value, dict):
@@ -2562,6 +2659,43 @@ def normalize_company_event_snapshot(saved):
             all_keys.add(key)
     normalized['events'] = all_events
     return normalized
+
+
+def apply_revenue_announcement_date_overrides(snapshot, overrides=None):
+    """Apply exact user-confirmed monthly-revenue dates and keep them across syncs."""
+    normalized = normalize_company_event_snapshot(snapshot)
+    merged_overrides = dict(normalized.get('revenue_date_overrides', {}))
+    for key, value in (overrides or {}).items():
+        key_text, value_text = str(key), str(value)
+        if re.fullmatch(r'\d{4,6}:\d{5}', key_text) and re.fullmatch(r'\d{4}-\d{2}-\d{2}', value_text):
+            merged_overrides[key_text] = value_text
+
+    revenue_events = []
+    for event in normalized.get('taiwan_revenue', {}).get('events', []):
+        updated_event = dict(event)
+        revenue = dict(updated_event.get('revenue', {}))
+        override_key = f"{str(updated_event.get('ticker', ''))}:{str(revenue.get('revenue_month', ''))}"
+        exact_date = merged_overrides.get(override_key)
+        if exact_date:
+            updated_event['date'] = exact_date
+            revenue['report_date'] = exact_date
+            revenue['date_source'] = '使用者校正的實際公告日'
+            updated_event['revenue'] = revenue
+            base_detail = str(updated_event.get('detail', '')).split('；實際公告日校正：', 1)[0]
+            updated_event['detail'] = f"{base_detail}；實際公告日校正：{exact_date}。"
+        revenue_events.append(updated_event)
+
+    normalized['taiwan_revenue'] = {
+        **normalized.get('taiwan_revenue', {}),
+        'events': revenue_events,
+    }
+    normalized['revenue_date_overrides'] = merged_overrides
+    normalized['events'] = (
+        list(normalized.get('earnings', {}).get('events', []))
+        + revenue_events
+        + list(normalized.get('us_revenue', {}).get('events', []))
+    )
+    return normalize_company_event_snapshot(normalized)
 
 
 def load_company_event_snapshot():
@@ -15332,7 +15466,18 @@ with tab3:
 
 
 with tab_company:
-    st.header("🏢 公司財報與營收")
+    st.markdown("""
+    <style>
+    .company-room-title {
+        margin: 0.1rem 0 0.25rem;
+        color: #f5f7fa;
+        font-size: 1.35rem;
+        line-height: 1.35;
+        font-weight: 700;
+    }
+    </style>
+    <div class='company-room-title'>🏢 公司財報與營收</div>
+    """, unsafe_allow_html=True)
     st.caption("這個分頁採手動同步；只有按下按鈕時才查詢 MOPS／TWSE／Yahoo。行事曆只讀取完成後的摘要快照。")
 
     company_ticker_input = st.text_input(
@@ -15366,6 +15511,7 @@ with tab_company:
             fetch_twse_monthly_revenue_rows.clear()
             fetch_mops_company_monthly_revenue.clear()
             fetch_finmind_monthly_revenue_rows.clear()
+            fetch_cnyes_revenue_announcement_date.clear()
             fetch_taiwan_monthly_revenue_events.clear()
             fetch_us_revenue_events.clear()
             with st.spinner("正在同步財報日期與營收資料；完成後行事曆會直接讀取快照……"):
@@ -15385,6 +15531,10 @@ with tab_company:
                 "taiwan_revenue": taiwan_revenue_result,
                 "us_revenue": us_revenue_result,
             }
+            new_snapshot = apply_revenue_announcement_date_overrides(
+                new_snapshot,
+                st.session_state.company_event_snapshot.get('revenue_date_overrides', {}),
+            )
             st.session_state.company_event_snapshot = new_snapshot
             save_company_event_snapshot(new_snapshot)
             company_sync_ok = save_data_cache(
@@ -15414,6 +15564,54 @@ with tab_company:
     </style>
     """, unsafe_allow_html=True)
     snapshot = st.session_state.company_event_snapshot
+    revenue_events = list(snapshot.get('taiwan_revenue', {}).get('events', []))
+    if revenue_events:
+        with st.expander("🗓️ 校正台股月營收實際公告日", expanded=False):
+            st.caption(
+                "MOPS 單一公司頁未提供可驗證的公告日；此處填入公司官網／公告確認的日期後，"
+                "行事曆與下次同步都會沿用校正值。"
+            )
+            correction_rows = []
+            for event in revenue_events:
+                revenue = event.get('revenue', {}) if isinstance(event.get('revenue'), dict) else {}
+                correction_rows.append({
+                    '校正鍵': f"{event.get('ticker', '')}:{revenue.get('revenue_month', '')}",
+                    '代號': str(event.get('ticker', '')),
+                    '公司': str(revenue.get('company', event.get('title', ''))),
+                    '營收月份': str(revenue.get('revenue_month', '')),
+                    '目前日期': str(event.get('date', '')),
+                    '實際公告日': pd.to_datetime(event.get('date', ''), errors='coerce').date(),
+                })
+            correction_frame = pd.DataFrame(correction_rows)
+            edited_corrections = st.data_editor(
+                correction_frame,
+                hide_index=True,
+                width='stretch',
+                disabled=['校正鍵', '代號', '公司', '營收月份', '目前日期'],
+                column_config={
+                    '實際公告日': st.column_config.DateColumn('實際公告日', required=True),
+                },
+                key='revenue_announcement_date_corrections',
+            )
+            if st.button('套用實際公告日到行事曆', key='apply_revenue_announcement_dates'):
+                corrections = {}
+                for _, correction in edited_corrections.iterrows():
+                    corrected_date = pd.to_datetime(correction.get('實際公告日'), errors='coerce')
+                    current_date = pd.to_datetime(correction.get('目前日期'), errors='coerce')
+                    if (
+                        pd.notna(corrected_date)
+                        and (pd.isna(current_date) or corrected_date.date() != current_date.date())
+                    ):
+                        corrections[str(correction['校正鍵'])] = corrected_date.date().isoformat()
+                corrected_snapshot = apply_revenue_announcement_date_overrides(snapshot, corrections)
+                st.session_state.company_event_snapshot = corrected_snapshot
+                save_company_event_snapshot(corrected_snapshot)
+                save_data_cache(
+                    st.session_state.stock_data, st.session_state.ignored_stocks,
+                    st.session_state.all_candidates, st.session_state.saved_notes,
+                )
+                st.success('已套用實際公告日，行事曆會依校正日期顯示。')
+                st.rerun()
     summary_cols = st.columns(3)
     summary_cols[0].metric("財報事件", len(snapshot.get("earnings", {}).get("events", [])))
     summary_cols[1].metric("台股月營收", len(snapshot.get("taiwan_revenue", {}).get("events", [])))
