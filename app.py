@@ -14,6 +14,7 @@ import html
 from urllib.parse import urljoin
 from types import SimpleNamespace
 from datetime import datetime, time as dt_time, timedelta, date
+from email.utils import parsedate_to_datetime
 import pytz
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP
 import io
@@ -2295,31 +2296,101 @@ def select_cnyes_revenue_announcement_date(items, code, revenue_year, revenue_mo
 def fetch_cnyes_revenue_announcement_date(code, revenue_year, revenue_month):
     """Find a corroborating public release date without using its revenue value."""
     items = []
+    for page in range(1, 4):
+        page_items = None
+        for _attempt in range(2):
+            try:
+                response = requests.get(
+                    "https://api.cnyes.com/media/api/v1/search/news",
+                    params={"q": str(code), "page": page},
+                    headers={"User-Agent": "Mozilla/5.0 (compatible; StockApp/1.0)"},
+                    timeout=10,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                if not isinstance(payload, dict):
+                    continue
+                data = payload.get("data", {})
+                page_items = data.get("items", []) if isinstance(data, dict) else []
+                if not isinstance(page_items, list):
+                    top_items = payload.get("items", {})
+                    page_items = top_items.get("data", []) if isinstance(top_items, dict) else []
+                break
+            except (requests.RequestException, ValueError, TypeError):
+                continue
+        if not page_items:
+            break
+        items.extend(page_items)
+    return select_cnyes_revenue_announcement_date(items, code, revenue_year, revenue_month)
+
+
+def select_google_news_revenue_announcement_date(
+    rss_content, code, company_name, revenue_year, revenue_month
+):
+    """Select the earliest matching monthly-revenue date from Google News RSS."""
     try:
-        for page in range(1, 4):
+        report_year, report_month = int(revenue_year), int(revenue_month)
+        window_year, window_month = (
+            (report_year + 1, 1) if report_month == 12 else (report_year, report_month + 1)
+        )
+        window_start = date(window_year, window_month, 1)
+        window_end = date(window_year, window_month, 15)
+    except (TypeError, ValueError):
+        return None
+
+    soup = BeautifulSoup(rss_content or b"", "xml")
+    month_pattern = re.compile(rf"{report_month}\s*月")
+    code_pattern = re.compile(rf"(?<!\d){re.escape(str(code))}(?!\d)")
+    company_text = str(company_name or "").strip()
+    taipei = pytz.timezone("Asia/Taipei")
+    matched_dates = []
+    for item in soup.find_all("item"):
+        title_node, date_node = item.find("title"), item.find("pubDate")
+        title = html.unescape(title_node.get_text(" ", strip=True)) if title_node else ""
+        if "營收" not in title or not month_pattern.search(title):
+            continue
+        if not code_pattern.search(title) and (not company_text or company_text not in title):
+            continue
+        try:
+            published_date = parsedate_to_datetime(
+                date_node.get_text(strip=True)
+            ).astimezone(taipei).date()
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if window_start <= published_date <= window_end:
+            matched_dates.append(published_date)
+    return min(matched_dates).isoformat() if matched_dates else None
+
+
+@st.cache_data(ttl=60 * 60 * 4, max_entries=300, show_spinner=False)
+def fetch_google_news_revenue_announcement_date(
+    code, company_name, revenue_year, revenue_month
+):
+    """Use an independent public-news feed as a second date source."""
+    response_content = None
+    for _attempt in range(2):
+        try:
             response = requests.get(
-                "https://api.cnyes.com/media/api/v1/search/news",
-                params={"q": str(code), "page": page},
+                "https://news.google.com/rss/search",
+                params={
+                    "q": f"{code} {int(revenue_month)}月營收",
+                    "hl": "zh-TW",
+                    "gl": "TW",
+                    "ceid": "TW:zh-Hant",
+                },
                 headers={"User-Agent": "Mozilla/5.0 (compatible; StockApp/1.0)"},
                 timeout=10,
             )
             response.raise_for_status()
-            payload = response.json()
-            if not isinstance(payload, dict):
-                return None
-            # The public endpoint has used both ``data.items`` and the current
-            # Laravel-style ``items.data`` response envelopes.
-            data = payload.get("data", {})
-            page_items = data.get("items", []) if isinstance(data, dict) else []
-            if not isinstance(page_items, list):
-                top_items = payload.get("items", {})
-                page_items = top_items.get("data", []) if isinstance(top_items, dict) else []
-            if not isinstance(page_items, list) or not page_items:
-                break
-            items.extend(page_items)
-    except (requests.RequestException, ValueError, TypeError):
+            response_content = response.content
+            break
+        except (requests.RequestException, TypeError, ValueError):
+            continue
+    if not response_content:
         return None
-    return select_cnyes_revenue_announcement_date(items, code, revenue_year, revenue_month)
+    return select_google_news_revenue_announcement_date(
+        response_content, code, company_name, revenue_year, revenue_month
+    )
 
 
 @st.cache_data(ttl=60 * 60 * 4, show_spinner=False)
@@ -2356,6 +2427,7 @@ def fetch_taiwan_monthly_revenue_events(inputs):
             target_month,
             item["display_name"],
         )
+        finmind_report_date = finmind_row.get("_report_date") if finmind_row else None
         direct_row = None
         if not row or row_month < target_month_text:
             for market_type in ("sii", "otc", "all"):
@@ -2419,12 +2491,31 @@ def fetch_taiwan_monthly_revenue_events(inputs):
             continue
         revenue_roc_year = int(revenue_month[:3])
         revenue_month_number = int(revenue_month[-2:])
-        public_report_date = fetch_cnyes_revenue_announcement_date(
-            code, revenue_roc_year + 1911, revenue_month_number
-        )
+        company = str(row.get("公司名稱", item["display_name"])).strip()
+        public_date_candidates = [
+            candidate
+            for candidate in (
+                fetch_cnyes_revenue_announcement_date(
+                    code, revenue_roc_year + 1911, revenue_month_number
+                ),
+                fetch_google_news_revenue_announcement_date(
+                    code, company, revenue_roc_year + 1911, revenue_month_number
+                ),
+            )
+            if candidate
+        ]
+        public_report_date = min(public_date_candidates, default=None)
+        used_finmind_report_date = False
         if public_report_date:
             report_date = date.fromisoformat(public_report_date)
-        company = str(row.get("公司名稱", item["display_name"])).strip()
+        elif finmind_report_date:
+            try:
+                finmind_date = date.fromisoformat(str(finmind_report_date)[:10])
+                if finmind_date < report_date:
+                    report_date = finmind_date
+                    used_finmind_report_date = True
+            except ValueError:
+                pass
         mom = _signed_percent(row.get("營業收入-上月比較增減(%)"))
         yoy = _signed_percent(row.get("營業收入-去年同月增減(%)"))
         fallback_note = (
@@ -2446,7 +2537,8 @@ def fetch_taiwan_monthly_revenue_events(inputs):
             "ytd_yoy": _signed_percent(row.get("累計營業收入-前期比較增減(%)")),
             "note": str(row.get("備註", "-")).strip(),
             "date_source": (
-                "公開營收報導日期（鉅亨網比對）" if public_report_date
+                "多來源公開營收報導日期（鉅亨網／Google News）" if public_report_date
+                else "FinMind 收錄日（公告來源暫時無法讀取）" if used_finmind_report_date
                 else "系統偵測日（MOPS 未提供單一公司公告時間）" if row.get("_mops_direct")
                 else "MOPS 彙總資料日期"
             ),
@@ -2458,7 +2550,9 @@ def fetch_taiwan_monthly_revenue_events(inputs):
                 fallback_note
                 + f"{revenue_month} 月營收：{_thousand_currency(revenue_data['current_month'])}；"
                 + (
-                    f"公開營收報導比對日期：{public_report_date}；" if public_report_date else
+                    f"多來源公開營收報導比對日期：{public_report_date}；" if public_report_date else
+                    f"公告來源暫時無法讀取，暫用 FinMind 收錄日：{report_date.isoformat()}；"
+                    if used_finmind_report_date else
                     "MOPS 單一公司資料（公告日未提供，顯示系統偵測日）；" if row.get("_mops_direct") else ""
                 )
                 + "點擊事件名稱查看月營收明細。"
@@ -2676,6 +2770,18 @@ def apply_revenue_announcement_date_overrides(snapshot, overrides=None):
         revenue = dict(updated_event.get('revenue', {}))
         override_key = f"{str(updated_event.get('ticker', ''))}:{str(revenue.get('revenue_month', ''))}"
         exact_date = merged_overrides.get(override_key)
+        discovered_date = str(updated_event.get('date', ''))
+        discovered_source = str(revenue.get('date_source', ''))
+        # Retire a stale correction when a newly corroborated public report proves
+        # an earlier date. This also cleans up dates accidentally saved as sync day.
+        if (
+            exact_date
+            and discovered_source.startswith('多來源公開營收報導日期')
+            and re.fullmatch(r'\d{4}-\d{2}-\d{2}', discovered_date)
+            and exact_date > discovered_date
+        ):
+            merged_overrides.pop(override_key, None)
+            exact_date = None
         if exact_date:
             updated_event['date'] = exact_date
             revenue['report_date'] = exact_date
@@ -15512,6 +15618,7 @@ with tab_company:
             fetch_mops_company_monthly_revenue.clear()
             fetch_finmind_monthly_revenue_rows.clear()
             fetch_cnyes_revenue_announcement_date.clear()
+            fetch_google_news_revenue_announcement_date.clear()
             fetch_taiwan_monthly_revenue_events.clear()
             fetch_us_revenue_events.clear()
             with st.spinner("正在同步財報日期與營收資料；完成後行事曆會直接讀取快照……"):
