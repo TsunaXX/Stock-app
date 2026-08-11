@@ -15820,6 +15820,11 @@ with tab_company:
             )
             new_snapshot = apply_revenue_announcement_date_overrides(new_snapshot)
             st.session_state.company_event_snapshot = new_snapshot
+            # The date-input widgets are created later in this rerun. Clear their
+            # previous values so a newly fetched 8/4 cannot keep displaying 8/3.
+            for state_key in list(st.session_state.keys()):
+                if str(state_key).startswith('revenue_date_'):
+                    del st.session_state[state_key]
             save_company_event_snapshot(new_snapshot)
             company_sync_ok = save_data_cache(
                 st.session_state.stock_data, st.session_state.ignored_stocks,
