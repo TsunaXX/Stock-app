@@ -10,6 +10,9 @@ search_cache.json
 cal_preferences.json
 company_event_snapshot.json
 strategy_signal_log.json
+fibo_tags.json
+cal_override.json
+.pytest_cache/
 
 # Local Streamlit secrets
 .streamlit/secrets.toml

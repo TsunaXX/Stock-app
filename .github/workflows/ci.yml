@@ -10,10 +10,10 @@ jobs:
   build-and-test:
     runs-on: ubuntu-latest
     
-    # 測試多個 Python 版本，確保相容性
+    # Streamlit Cloud 目前使用 Python 3.14；同時保留一個穩定版執行回歸測試。
     strategy:
       matrix:
-        python-version: ["3.10", "3.11", "3.12"]
+        python-version: ["3.12", "3.14"]
 
     steps:
     - name: 檢出原始碼
@@ -29,21 +29,16 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         # 安裝檢查與測試工具
-        pip install ruff pytest 
+        python -m pip install ruff pytest
         # 如果專案有 requirements.txt 則安裝，沒有就跳過
         if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
     - name: 執行阻斷性程式碼檢查 (Ruff)
       run: |
         # 停止建構：如果程式碼有語法錯誤或未定義的變數
-        ruff check . --select=E9,F63,F7,F82
+        python -m ruff check app.py tests --select=E9,F63,F7,F82
 
     - name: 執行單元測試 (Pytest)
       run: |
-        # 專案目前未提供測試檔時，至少驗證主程式可編譯；有測試時才執行 pytest。
         python -m py_compile app.py
-        if find . -path './.git' -prune -o \( -name 'test_*.py' -o -name '*_test.py' \) -print -quit | grep -q .; then
-          pytest
-        else
-          echo '尚無 pytest 測試檔，已完成 app.py 編譯檢查。'
-        fi
+        python -m pytest -q

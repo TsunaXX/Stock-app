@@ -24,7 +24,6 @@ import logging
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import numpy as np
-import streamlit.components.v1 as components
 import pdfplumber
 import fitz  # PyMuPDF 用於將 PDF 轉為圖片
 from PIL import Image
@@ -534,6 +533,32 @@ def clear_market_stream(api):
 # ==========================================
 # 新增: 全域行事曆與權證判斷函數
 # ==========================================
+@st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
+def fetch_official_market_holidays(year):
+    """Fetch future TWSE closure dates so expiry logic is not frozen at 2026."""
+    try:
+        response = requests.get(
+            f"https://www.twse.com.tw/holidaySchedule/holidaySchedule?response=json&queryYear={year - 1911}",
+            timeout=5,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if payload.get("stat") != "ok":
+            return {}
+        holidays = {}
+        for row in payload.get("data", []):
+            if len(row) < 2:
+                continue
+            parsed = pd.to_datetime(row[0], errors="coerce")
+            title = str(row[1]).strip()
+            if pd.isna(parsed) or any(word in title for word in ("開始交易", "最後交易日", "封關日")):
+                continue
+            holidays[(parsed.month, parsed.day)] = title or "市場無交易"
+        return holidays
+    except (requests.RequestException, ValueError, TypeError, KeyError):
+        return {}
+
+
 def get_holidays(year):
     h = {}
     if year == 2025:
@@ -553,6 +578,8 @@ def get_holidays(year):
             (10, 9): "國慶日(補)", (10, 10): "國慶日", (10, 25): "光復節", (10, 26): "光復節(補)",
             (12, 25): "行憲紀念日"
         })
+    if not h:
+        h.update(fetch_official_market_holidays(year))
     return h
 
 def is_market_closed_func(d_date):
@@ -731,6 +758,8 @@ def get_near_month_futures_settlement(reference_dt=None):
     """回傳台指與股票期貨近月契約的第三個星期三結算日。"""
     tz_tw = pytz.timezone('Asia/Taipei')
     now_tw = reference_dt or datetime.now(tz_tw)
+    if isinstance(now_tw, date) and not isinstance(now_tw, datetime):
+        now_tw = datetime.combine(now_tw, dt_time.min)
     if now_tw.tzinfo is None:
         now_tw = tz_tw.localize(now_tw)
     else:
@@ -2315,14 +2344,7 @@ def load_company_event_snapshot():
 
 def save_company_event_snapshot(snapshot):
     try:
-        with open(COMPANY_EVENT_SNAPSHOT_FILE, "w", encoding="utf-8") as file:
-            json.dump(
-                snapshot,
-                file,
-                ensure_ascii=False,
-                indent=2,
-                default=lambda value: value.item() if hasattr(value, "item") else str(value),
-            )
+        _write_json_atomic(COMPANY_EVENT_SNAPSHOT_FILE, _json_safe(snapshot), indent=2)
     except (OSError, TypeError, ValueError):
         pass
 
@@ -2345,7 +2367,7 @@ def render_company_event_snapshot(snapshot):
             earnings_frame = pd.DataFrame(rows)
             st.dataframe(
                 earnings_frame, column_config=compact_table_column_config(earnings_frame),
-                hide_index=True, use_container_width=True,
+                hide_index=True, width='stretch',
             )
         else:
             st.info("目前快照沒有可用的財報日期。")
@@ -2378,7 +2400,7 @@ def render_company_event_snapshot(snapshot):
                 }])
                 st.dataframe(
                     revenue_frame, column_config=compact_table_column_config(revenue_frame),
-                    hide_index=True, use_container_width=True,
+                    hide_index=True, width='stretch',
                 )
         if taiwan_result.get("missing"):
             st.info("未取得台股月營收：" + "； ".join(taiwan_result["missing"]))
@@ -2405,7 +2427,7 @@ def render_company_event_snapshot(snapshot):
                 }])
                 st.dataframe(
                     us_revenue_frame, column_config=compact_table_column_config(us_revenue_frame),
-                    hide_index=True, use_container_width=True,
+                    hide_index=True, width='stretch',
                 )
         if us_result.get("missing"):
             st.info("未取得美股營收：" + "； ".join(us_result["missing"]))
@@ -3266,7 +3288,7 @@ def get_live_futures_snapshot(api, product='TMF'):
         return None
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False)
 def fetch_taifex_index_margin_map():
     """Read current initial margin requirements from the TAIFEX OpenAPI."""
     margin_map = {}
@@ -4226,11 +4248,16 @@ def get_taifex_txo_records(expiry_choice):
     """Return the requested expiry from official TAIFEX daily TXO rows."""
     records = fetch_taifex_txo_daily_quotes()
     target_specs = get_txo_target_contract_specs(expiry_choice)
-    if target_specs:
-        target = target_specs[0]
-        matches = [record for record in records if record['delivery_month'] == target['delivery_month']]
+    for target in target_specs:
+        matches = [
+            record for record in records
+            if record['delivery_month'] == target['delivery_month']
+            or record['expiry'] == target['expiry']
+        ]
         if matches:
-            return matches, target['expiry']
+            actual_expiry = min(record['expiry'] for record in matches)
+            return [record for record in matches if record['expiry'] == actual_expiry], actual_expiry
+    if target_specs:
         return [], None
     today = datetime.now(pytz.timezone('Asia/Taipei')).date()
     active = [record for record in records if record['expiry'] >= today]
@@ -5634,6 +5661,15 @@ def _clean_goodinfo_table(dataframe):
     has_turnover = '週轉率' in header_text
     if len(cleaned) < 10 or not (has_code and has_name and has_turnover):
         return None
+    code_column = next((column for column in cleaned.columns if '代號' in str(column)), None)
+    turnover_column = next((column for column in cleaned.columns if '週轉率' in str(column)), None)
+    valid_codes = cleaned[code_column].astype(str).str.extract(r'(\d{4,6})', expand=False).notna()
+    turnover_values = pd.to_numeric(
+        cleaned[turnover_column].astype(str).str.replace('%', '', regex=False).str.replace(',', '', regex=False),
+        errors='coerce',
+    )
+    if int((valid_codes & turnover_values.notna()).sum()) < 10:
+        return None
     return cleaned
 
 
@@ -5652,17 +5688,19 @@ def fetch_goodinfo_data():
     chrome_options.add_experimental_option('useAutomationExtension', False)
 
     chrome_options.binary_location = "/usr/bin/chromium"
-    acquired = _GOODINFO_BROWSER_SEMAPHORE.acquire(timeout=16)
+    request_started_at = time.monotonic()
+    deadline = request_started_at + 15
+    acquired = _GOODINFO_BROWSER_SEMAPHORE.acquire(timeout=15)
     if not acquired:
         return None
     driver = None
-    started_at = time.monotonic()
-    deadline = started_at + 15
     refreshed_after_alert = False
     try:
+        if time.monotonic() >= deadline:
+            return None
         service = Service("/usr/bin/chromedriver")
         driver = webdriver.Chrome(service=service, options=chrome_options)
-        driver.set_page_load_timeout(8)
+        driver.set_page_load_timeout(max(1, min(8, deadline - time.monotonic())))
         driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
             "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
         })
@@ -6161,7 +6199,7 @@ def render_strategy_validation_room():
         st.markdown("""
         1. **先記錄**：在股票或期貨戰略室按「記錄目前表格的已觸發訊號」。它會一次保存表內符合門檻的標的，不是只保存目前查看的那一檔；同一交易日、商品、策略、方向與進場價只會保存一筆。
         2. **再更新**：回到原戰略室按即時更新報價／分析時，該次取得的最新價會更新已記錄訊號的追蹤結果；策略驗證頁本身**不會額外抓行情**。
-        3. **怎麼看表格**：建立時間、策略、方向、進場／停損／目標是建立訊號當下的計畫；可在「實際進場價」填入真實成交點位，後續 R、MFE、MAE 與結果會優先以它計算，留白則沿用計畫進場價。最新價與 15／30／60 分(R)、收盤(R)是後續表現。
+        3. **怎麼看表格**：建立時間、策略、方向、進場／停損／目標是建立訊號當下的計畫；可在「實際進場價」填入真實成交點位，後續 R、快照 MFE／MAE 與結果會優先以它計算，留白則沿用計畫進場價。15／30／60 分與收盤欄只在更新時間貼近該節點時記錄，不會用較晚價格回填。
         4. **R、MFE、MAE**：1R 是進場到失效點的距離，不是金額；例如多方進場 100、停損 95，1R = 5。MFE 是建立訊號後最有利曾走到多少 R，MAE 是最不利曾回撤多少 R，可用來檢查進場是否太晚、停損是否太近，不等於實際損益。
         5. **刪除與匯出**：可在下方明細勾選多筆「刪除」，再按刪除按鈕移除勾選紀錄；匯出按鈕會下載目前篩選後的 CSV。
         """)
@@ -6174,17 +6212,17 @@ def render_strategy_validation_room():
         clear_stock_col, clear_futures_col, clear_all_col = st.columns(3)
         with clear_stock_col:
             clear_stock_signals = st.button(
-                "清除股票紀錄", use_container_width=True,
+                "清除股票紀錄", width='stretch',
                 disabled=not confirm_clear, key='clear_stock_strategy_signals'
             )
         with clear_futures_col:
             clear_futures_signals = st.button(
-                "清除期貨紀錄", use_container_width=True,
+                "清除期貨紀錄", width='stretch',
                 disabled=not confirm_clear, key='clear_futures_strategy_signals'
             )
         with clear_all_col:
             clear_all_signals = st.button(
-                "全部清除", use_container_width=True, type='primary',
+                "全部清除", width='stretch', type='primary',
                 disabled=not confirm_clear, key='clear_all_strategy_signals'
             )
         market_to_clear = '股票' if clear_stock_signals else ('期貨' if clear_futures_signals else None)
@@ -6250,7 +6288,7 @@ def render_strategy_validation_room():
         st.download_button(
             '⬇️ 匯出目前紀錄', csv_data,
             file_name=f"strategy-signals-{datetime.now().strftime('%Y%m%d')}.csv",
-            mime='text/csv', use_container_width=True,
+            mime='text/csv', width='stretch',
         )
 
     if filtered.empty:
@@ -6439,8 +6477,8 @@ def render_strategy_validation_room():
             '30分(R)': st.column_config.TextColumn(help='建立訊號滿 30 分鐘時的表現。'),
             '60分(R)': st.column_config.TextColumn(help='建立訊號滿 60 分鐘時的表現。'),
             '收盤(R)': st.column_config.TextColumn(help='股票訊號在收盤後的表現快照。'),
-            'MFE(R)': st.column_config.TextColumn('MFE', help='Maximum Favorable Excursion：訊號後最大有利變動，單位為 R。'),
-            'MAE(R)': st.column_config.TextColumn('MAE', help='Maximum Adverse Excursion：訊號後最大不利變動，單位為 R。'),
+            'MFE(R)': st.column_config.TextColumn('快照 MFE', help='已記錄更新快照中的最大有利變動；不是兩次更新之間完整行情路徑，單位為 R。'),
+            'MAE(R)': st.column_config.TextColumn('快照 MAE', help='已記錄更新快照中的最大不利變動；不是兩次更新之間完整行情路徑，單位為 R。'),
             '結果(R)': st.column_config.TextColumn(help='達標或策略失效時的結果；以 R 表示。'),
         },
         disabled=['市場', '代碼', '名稱'],
@@ -6517,7 +6555,7 @@ def render_strategy_validation_room():
     delete_col, hint_col = st.columns([2, 4])
     with delete_col:
         delete_selected = st.button(
-            f'🗑️ 刪除勾選訊號（{len(selected_ids)}）', type='primary', use_container_width=True,
+            f'🗑️ 刪除勾選訊號（{len(selected_ids)}）', type='primary', width='stretch',
             disabled=not selected_ids, key=f'{table_key}_delete_selected'
         )
     with hint_col:
@@ -6803,34 +6841,38 @@ def save_data_cache(
         sync_ok = True
         if gsheet_api_url:
             with get_data_cache_sync_lock():
-                remote_payload, _ = _fetch_remote_data_cache(gsheet_api_url, timeout=5)
-                merged_payload = _merge_data_cache_payload(
-                    remote_payload, local_payload,
-                    explicit_fibo_tag_save=explicit_fibo_tag_save,
-                    clear_stock_data=clear_stock_data,
-                    replace_ignored=replace_ignored,
-                )
-                last_error = None
-                for attempt in range(2):
-                    try:
-                        response = requests.post(
-                            gsheet_api_url,
-                            json={
-                                'action': 'save',
-                                'data': json.dumps(merged_payload, ensure_ascii=False),
-                            },
-                            timeout=8,
-                        )
-                        response.raise_for_status()
-                        last_error = None
-                        break
-                    except requests.RequestException as exc:
-                        last_error = exc
-                        if attempt == 0:
-                            time.sleep(0.4)
-                if last_error is not None:
+                remote_payload, remote_error = _fetch_remote_data_cache(gsheet_api_url, timeout=5)
+                if remote_payload is None:
                     sync_ok = False
-                    st.session_state['_data_cache_remote_error'] = type(last_error).__name__
+                    st.session_state['_data_cache_remote_error'] = remote_error or '讀取失敗'
+                else:
+                    merged_payload = _merge_data_cache_payload(
+                        remote_payload, local_payload,
+                        explicit_fibo_tag_save=explicit_fibo_tag_save,
+                        clear_stock_data=clear_stock_data,
+                        replace_ignored=replace_ignored,
+                    )
+                    last_error = None
+                    for attempt in range(2):
+                        try:
+                            response = requests.post(
+                                gsheet_api_url,
+                                json={
+                                    'action': 'save',
+                                    'data': json.dumps(merged_payload, ensure_ascii=False),
+                                },
+                                timeout=8,
+                            )
+                            response.raise_for_status()
+                            last_error = None
+                            break
+                        except requests.RequestException as exc:
+                            last_error = exc
+                            if attempt == 0:
+                                time.sleep(0.4)
+                    if last_error is not None:
+                        sync_ok = False
+                        st.session_state['_data_cache_remote_error'] = type(last_error).__name__
         _write_json_atomic(DATA_CACHE_FILE, merged_payload, indent=2)
         st.session_state['_data_cache_sync_status'] = 'ok' if sync_ok else 'local_only'
         if explicit_fibo_tag_save:
@@ -6861,17 +6903,22 @@ def load_data_cache():
 
     if os.path.exists(DATA_CACHE_FILE):
         try:
-            with open(DATA_CACHE_FILE, "r", encoding='utf-8') as f: data = json.load(f)
+            with _RUNTIME_FILE_LOCK:
+                with open(DATA_CACHE_FILE, "r", encoding='utf-8') as file:
+                    data = json.load(file)
+            if not _is_valid_data_cache_payload(data):
+                raise ValueError('invalid local data cache schema')
             df = pd.DataFrame(data.get('stock_data', []))
             ignored = set(data.get('ignored_stocks', []))
             candidates = data.get('all_candidates', [])
             saved_notes = data.get('saved_notes', {}) 
-            fibo_tags = data.get('fibo_tags', [])
+            fibo_tags = _valid_fibo_tags(data.get('fibo_tags', []))
             if isinstance(data.get('strategy_signal_log'), list):
                 save_strategy_signal_log(data['strategy_signal_log'])
             st.session_state['_data_cache_source'] = 'local'
             return df, ignored, candidates, saved_notes, fibo_tags, data.get('cached_notes', {})
-        except Exception: return pd.DataFrame(), set(), [], {}, [], {}
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return pd.DataFrame(), set(), [], {}, [], {}
     st.session_state['_data_cache_source'] = 'default'
     return pd.DataFrame(), set(), [], {}, [], {}
 
@@ -6909,7 +6956,8 @@ def load_url_history():
                 data = json.load(f)
                 if "url" in data and isinstance(data["url"], str) and data["url"]: return [data["url"]]
                 return data.get("urls", [])
-        except Exception: return []
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return []
     return []
 
 def save_url_history(urls):
@@ -6921,22 +6969,25 @@ def save_url_history(urls):
             if u_clean and u_clean not in seen:
                 unique_urls.append(u_clean)
                 seen.add(u_clean)
-        with open(URL_CACHE_FILE, "w", encoding='utf-8') as f: json.dump({"urls": unique_urls}, f)
+        _write_json_atomic(URL_CACHE_FILE, {"urls": unique_urls})
         return True
-    except Exception: return False
+    except (OSError, TypeError, ValueError):
+        return False
 
 def load_search_cache():
     if os.path.exists(SEARCH_CACHE_FILE):
         try:
             with open(SEARCH_CACHE_FILE, "r", encoding='utf-8') as f: data = json.load(f)
             return data.get("selected", [])
-        except Exception: return []
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return []
     return []
 
 def save_search_cache(selected_items):
     try:
-        with open(SEARCH_CACHE_FILE, "w", encoding='utf-8') as f: json.dump({"selected": selected_items}, f, ensure_ascii=False)
-    except Exception: pass
+        _write_json_atomic(SEARCH_CACHE_FILE, {"selected": selected_items})
+    except (OSError, TypeError, ValueError):
+        pass
 
 if 'stock_data' not in st.session_state:
     cached_df, cached_ignored, cached_candidates, cached_saved_notes, cached_fibo_tags, cached_note_dict = load_data_cache()
@@ -7104,7 +7155,7 @@ with st.sidebar:
 
             col_logout, col_relogin = st.columns(2)
             with col_logout:
-                if st.button("登出", key="btn_logout_sj", use_container_width=True):
+                if st.button("登出", key="btn_logout_sj", width='stretch'):
                     st.session_state.sj_logged_in = False
                     st.session_state.manual_logout = True # 標記為手動登出，阻擋重整時自動登入
                     
@@ -7124,7 +7175,7 @@ with st.sidebar:
                     )
                     st.rerun()
             with col_relogin:
-                relogin_clicked = st.button("快速重新登入", key="btn_relogin_sj", use_container_width=True)
+                relogin_clicked = st.button("快速重新登入", key="btn_relogin_sj", width='stretch')
                 
             msg_placeholder = st.empty()
             
@@ -7196,7 +7247,7 @@ def render_stock_strategy_controls():
                 value=st.session_state.limit_rows, key='limit_rows_input'
             )
             st.session_state.limit_rows = current_limit_rows
-            if st.button("💾 儲存股票設定", use_container_width=True, key='save_stock_room_settings'):
+            if st.button("💾 儲存股票設定", width='stretch', key='save_stock_room_settings'):
                 if save_config(
                     st.session_state.get('font_size', 15), current_limit_rows,
                     st.session_state.sj_key, st.session_state.sj_secret,
@@ -7231,7 +7282,7 @@ def render_stock_strategy_controls():
 
             restore_col, clear_col = st.columns(2)
             with restore_col:
-                if st.button("♻️ 全部復原", use_container_width=True, key='restore_all_stocks'):
+                if st.button("♻️ 全部復原", width='stretch', key='restore_all_stocks'):
                     st.session_state.pending_unignore = set(st.session_state.ignored_stocks)
                     st.session_state.ignored_stocks.clear()
                     save_data_cache(
@@ -7241,7 +7292,7 @@ def render_stock_strategy_controls():
                     )
                     st.rerun()
             with clear_col:
-                if st.button("🗑️ 全部清空", type="primary", use_container_width=True, key='clear_all_stock_data'):
+                if st.button("🗑️ 全部清空", type="primary", width='stretch', key='clear_all_stock_data'):
                     st.session_state.stock_data = pd.DataFrame()
                     st.session_state.ignored_stocks = set()
                     st.session_state.all_candidates = []
@@ -7273,30 +7324,30 @@ def render_stock_strategy_controls():
 
             if st.button(
                 "📥 抓取 Goodinfo 週轉率排行", help="需等待動態表格載入",
-                use_container_width=True, key='fetch_goodinfo_in_stock_room'
+                width='stretch', key='fetch_goodinfo_in_stock_room'
             ):
                 perform_goodinfo_fetch()
             if st.session_state.get('goodinfo_fetch_failed', False):
-                if st.button("🔄 重新抓取", use_container_width=True, key='retry_goodinfo_btn'):
+                if st.button("🔄 重新抓取", width='stretch', key='retry_goodinfo_btn'):
                     perform_goodinfo_fetch()
             if 'goodinfo_df' in st.session_state:
                 st.download_button(
                     "💾 下載 Report.csv",
                     data=st.session_state['goodinfo_df'].to_csv(index=False).encode('utf-8-sig'),
-                    file_name="Report.csv", mime="text/csv", use_container_width=True
+                    file_name="Report.csv", mime="text/csv", width='stretch'
                 )
             st.link_button(
                 "🌐 Goodinfo 週轉率排行",
                 "https://goodinfo.tw/tw/StockList.asp?RPT_TIME=&MARKET_CAT=%E7%86%B1%E9%96%80%E6%8E%92%E8%A1%8C&INDUSTRY_CAT=%E7%B4%AF%E8%A8%88%E6%88%90%E4%BA%A4%E9%87%8F%E9%80%B1%E8%BD%89%E7%8E%87%28%E7%95%B6%E6%97%A5%29%40%40%E7%B4%AF%E8%A8%88%E6%88%90%E4%BA%A4%E9%87%8F%E9%80%B1%E8%BD%89%E7%8E%87%40%40%E7%95%B6%E6%97%A5",
-                use_container_width=True
+                width='stretch'
             )
             st.link_button(
                 "🚨 上市處置公告", "https://www.twse.com.tw/zh/announcement/punish.html",
-                use_container_width=True
+                width='stretch'
             )
             st.link_button(
                 "🚨 上櫃處置公告", "https://www.tpex.org.tw/zh-tw/announce/market/disposal.html",
-                use_container_width=True
+                width='stretch'
             )
     return hide_non_stock, show_3d_hilo
 
@@ -7333,7 +7384,7 @@ def render_futures_strategy_explanation():
 - 「即時更新報價與分析」更新目前表格；「即時更新成交量排行」批次更新可解析契約後重新排序。夜盤商品會採夜盤快照的最新價、漲跌幅與累計量。
         """)
 
-@st.cache_data(ttl=86400)
+@st.cache_data(ttl=300)
 def fetch_futures_list():
     errors = []
     try:
@@ -10057,15 +10108,15 @@ def render_futures_strategy_room():
 
     action_col1, action_col2, action_col3 = st.columns(3)
     with action_col1:
-        refresh_official = st.button("🔄 更新成交量／保證金", use_container_width=True, key="refresh_futures_official")
+        refresh_official = st.button("🔄 更新成交量／保證金", width='stretch', key="refresh_futures_official")
     with action_col2:
         refresh_rank = st.button(
-            "📊 即時更新成交量排行", use_container_width=True, key="refresh_futures_rank",
+            "📊 即時更新成交量排行", width='stretch', key="refresh_futures_rank",
             help="登入 Shioaji 後批次取得盤中／夜盤累計成交量並重新排序；不會背景輪詢。"
         )
     with action_col3:
         refresh_live = st.button(
-            "⏱️ 即時更新報價與分析", use_container_width=True, type="primary", key="refresh_futures_live",
+            "⏱️ 即時更新報價與分析", width='stretch', type="primary", key="refresh_futures_live",
             help='登入 Shioaji 後更新目前表格的成交價、夜盤資料與支撐壓力。'
         )
 
@@ -10488,7 +10539,7 @@ def render_futures_strategy_room():
         with record_col:
             st.markdown("<div style='margin-top:28px'></div>", unsafe_allow_html=True)
             record_futures_signals = st.button(
-                '📝 記錄目前表格的已觸發期貨訊號', use_container_width=True, key='record_futures_strategy_signals',
+                '📝 記錄目前表格的已觸發期貨訊號', width='stretch', key='record_futures_strategy_signals',
                 help='一次記錄目前期貨表格中所有已觸發、且流動性未亮紅燈的契約；不是只記錄正在查看的單一契約。'
             )
         if record_futures_signals:
@@ -11668,7 +11719,7 @@ with stock_strategy_container:
             )
         with col_q2:
             st.markdown("<div style='margin-top: 28px;'></div>", unsafe_allow_html=True)
-            btn_indep_run = st.button("🚀 執行分析", key="btn_indep_run", use_container_width=True)
+            btn_indep_run = st.button("🚀 執行分析", key="btn_indep_run", width='stretch')
             
         cached_indep_data = st.session_state.get('stock_independent_raw_results', [])
         if btn_indep_run and not indep_selection:
@@ -11970,13 +12021,13 @@ with tab2:
     with tab2_1:
         c1, c2, c3, c4, c5 = st.columns(5)
         with c1:
-            calc_price = st.number_input("基準價格", value=float(st.session_state.calc_base_price), step=0.01, format="%.12g", key="input_base_price")
+            calc_price = st.number_input("基準價格", min_value=0.01, value=max(0.01, float(st.session_state.calc_base_price)), step=0.01, format="%.12g", key="input_base_price")
             if calc_price != st.session_state.calc_base_price:
                 st.session_state.calc_base_price = calc_price
                 st.session_state.calc_view_price = apply_tick_rules(calc_price)
-        with c2: shares = st.number_input("股數", value=1000, step=1000)
+        with c2: shares = st.number_input("股數", min_value=1, value=1000, step=1000)
         with c3: discount = st.number_input("手續費折扣 (折)", value=2.8, step=0.1, min_value=0.1, max_value=10.0)
-        with c4: min_fee = st.number_input("最低手續費 (元)", value=20, step=1)
+        with c4: min_fee = st.number_input("最低手續費 (元)", min_value=0, value=20, step=1)
         with c5: tick_count = st.number_input("顯示檔數 (檔)", value=10, min_value=1, max_value=50, step=1)
         direction = st.radio("交易方向", ["當沖多 (先買後賣)", "當沖空 (先賣後買)"], horizontal=True)
 
@@ -11997,7 +12048,7 @@ with tab2:
         col_t1, col_t2 = st.columns([1, 4])
         with col_t1:
             # 將 value 設為 None 並加入 placeholder，實現預設為空值
-            target_p = st.number_input("輸入目標價", value=None, step=0.5, format="%.12g", key="input_target_price", placeholder="請輸入...")
+            target_p = st.number_input("輸入目標價", min_value=0.01, value=None, step=0.5, format="%.12g", key="input_target_price", placeholder="請輸入...")
         with col_t2:
             fee_rate = 0.001425; tax_rate = 0.0015
             base_p = st.session_state.calc_base_price
@@ -12134,19 +12185,19 @@ with tab2:
     with tab2_2:
         c2_1, c2_2, c2_3, c2_4, c2_5 = st.columns(5)
         with c2_1:
-            swing_calc_price = st.number_input("基準價格", value=None, step=0.5, format="%.12g", key="input_swing_base_price", placeholder="請輸入...")
-        with c2_2: swing_shares = st.number_input("股數", value=1000, step=1000, key="swing_shares")
+            swing_calc_price = st.number_input("基準價格", min_value=0.01, value=None, step=0.5, format="%.12g", key="input_swing_base_price", placeholder="請輸入...")
+        with c2_2: swing_shares = st.number_input("股數", min_value=1, value=1000, step=1000, key="swing_shares")
         with c2_3: swing_discount = st.number_input("手續費折扣 (折)", value=2.8, step=0.1, min_value=0.1, max_value=10.0, key="swing_discount")
-        with c2_4: swing_min_fee = st.number_input("最低手續費 (元)", value=20, step=1, key="swing_min_fee")
+        with c2_4: swing_min_fee = st.number_input("最低手續費 (元)", min_value=0, value=20, step=1, key="swing_min_fee")
         with c2_5: swing_tick_count = st.number_input("顯示檔數 (檔)", value=10, min_value=1, max_value=50, step=1, key="swing_tick_count")
         
         c2_type, c2_margin, c2_rate, c2_days, c2_fee_rate = st.columns(5)
         with c2_type:
             swing_type = st.selectbox("交易選項", ["個股", "融資(多)", "融券(空)"], key="swing_type")
         with c2_margin:
-            margin_ratio = st.number_input("融資/券成數(%)", value=60.0 if swing_type == "融資(多)" else (90.0 if swing_type == "融券(空)" else 0.0), step=10.0, key="margin_ratio")
+            margin_ratio = st.number_input("融資/券成數(%)", min_value=0.0, max_value=100.0, value=60.0 if swing_type == "融資(多)" else (90.0 if swing_type == "融券(空)" else 0.0), step=10.0, key="margin_ratio")
         with c2_rate:
-            annual_rate = st.number_input("年利率(%)", value=6.25 if swing_type == "融資(多)" else (0.2 if swing_type == "融券(空)" else 0.0), step=0.1, key="annual_rate")
+            annual_rate = st.number_input("年利率(%)", min_value=0.0, value=6.25 if swing_type == "融資(多)" else (0.2 if swing_type == "融券(空)" else 0.0), step=0.1, key="annual_rate")
         with c2_days:
             swing_date_range = st.date_input("選擇區間", value=(datetime.now(tz_tw).date(), datetime.now(tz_tw).date() + timedelta(days=1)), key="swing_date_range")
             if isinstance(swing_date_range, tuple) and len(swing_date_range) == 2:
@@ -12156,7 +12207,7 @@ with tab2:
                 swing_days = 1
             st.caption(f"總天數: {swing_days} 天")
         with c2_fee_rate:
-            short_fee_rate = st.number_input("借券費率(‱)", value=8.0 if swing_type == "融券(空)" else 0.0, step=1.0, key="short_fee_rate")
+            short_fee_rate = st.number_input("借券費率(‱)", min_value=0.0, value=8.0 if swing_type == "融券(空)" else 0.0, step=1.0, key="short_fee_rate")
 
         swing_stop_col1, swing_stop_col2, _ = st.columns([1, 1, 3])
         with swing_stop_col1:
@@ -12180,7 +12231,7 @@ with tab2:
         st.markdown("##### 🎯 目標價快速試算")
         col_st1, col_st2 = st.columns([1, 4])
         with col_st1:
-            swing_target_p = st.number_input("輸入目標價", value=None, step=0.5, format="%.12g", key="swing_target_price", placeholder="請輸入...")
+            swing_target_p = st.number_input("輸入目標價", min_value=0.01, value=None, step=0.5, format="%.12g", key="swing_target_price", placeholder="請輸入...")
         with col_st2:
             if swing_calc_price is not None and swing_target_p is not None:
                 s_base_p = swing_calc_price
@@ -12488,7 +12539,7 @@ with tab2:
             except Exception as e:
                 st.toast(f"取得期交所保證金失敗: {e}", icon="⚠️")
 
-        @st.cache_data(ttl=3600, show_spinner=False)
+        @st.cache_data(ttl=300, show_spinner=False)
         def fetch_ssf_margin_info():
             """透過期交所 OpenAPI 獲取個股期貨保證金比例與小型合約資訊"""
             margin_map = {}
@@ -12530,7 +12581,8 @@ with tab2:
                     for code, contracts in stock_contracts.items():
                         if len(contracts) > 1:
                             has_small_set.add(code)
-            except: pass
+            except (requests.RequestException, ValueError, TypeError, KeyError) as exc:
+                logger.warning("個股期貨保證金暫時無法取得：%s", type(exc).__name__)
             return margin_map, maint_map, group_level_map, has_small_set, sync_date
 
         def do_clear_opt():
@@ -12757,7 +12809,7 @@ with tab2:
 
             c_p1, c_p2 = st.columns(2)
             with c_p1:
-                entry_p = st.number_input("進場價 (點)", value=None, format="%.12g", placeholder="輸入進場價", key="opt_entry_p")
+                entry_p = st.number_input("進場價 (點)", min_value=0.0, value=None, format="%.12g", placeholder="輸入進場價", key="opt_entry_p")
                 
                 # --- 顯示最新成交價及重新整理按鈕 ---
                 if opt_main_tab in ["台指期", "個股期貨"]:
@@ -12790,29 +12842,30 @@ with tab2:
                         else:
                             st.markdown("<div style='font-size:20px; margin:0px; color:#aaa;'>最新成交價: 尚未更新</div>", unsafe_allow_html=True)
                     with c_rt2:
-                        if st.button("🔄", key="btn_refresh_opt_rt", help="更新最新價格", use_container_width=True):
+                        if st.button("🔄", key="btn_refresh_opt_rt", help="更新最新價格", width='stretch'):
                             st.session_state.opt_rt_trigger = True
                             st.rerun()
                 # ------------------------------------
 
             with c_p2:
-                exit_p = st.number_input("出場/目標價 (點)", value=None, format="%.12g", placeholder="輸入目標價", key="opt_exit_p")
+                exit_p = st.number_input("出場/目標價 (點)", min_value=0.0, value=None, format="%.12g", placeholder="輸入目標價", key="opt_exit_p")
 
             st.markdown("###### ⇆ 停損及保證金設定")
-            sl_p = st.number_input("停損價 (點) - 用於風報比", value=None, format="%.12g", placeholder="輸入停損價", key="opt_sl_p")
+            sl_p = st.number_input("停損價 (點) - 用於風報比", min_value=0.0, value=None, format="%.12g", placeholder="輸入停損價", key="opt_sl_p")
             
             # 手續費記憶
             config = load_config()
             if 'saved_opt_fee' not in st.session_state:
                 st.session_state.saved_opt_fee = config.get('saved_opt_fee', None)
                 
-            opt_fee = st.number_input("單邊手續費 (元/口)", value=st.session_state.saved_opt_fee, step=1, placeholder="輸入手續費 (必填)")
+            opt_fee = st.number_input("單邊手續費 (元/口)", min_value=0.0, value=st.session_state.saved_opt_fee, step=1.0, placeholder="輸入手續費 (必填)")
             if opt_fee is not None and opt_fee != st.session_state.saved_opt_fee:
                 st.session_state.saved_opt_fee = opt_fee
                 config['saved_opt_fee'] = opt_fee
                 try:
-                    with open(CONFIG_FILE, "w") as f: json.dump(config, f)
-                except: pass
+                    _write_json_atomic(CONFIG_FILE, config)
+                except (OSError, TypeError, ValueError):
+                    st.warning("手續費設定暫時無法儲存，請稍後再試。")
 
             actual_margin_req = 0
             margin_display_val = "尚未同步或無資料"
@@ -12844,7 +12897,7 @@ with tab2:
                     except ValueError:
                         actual_margin_req = fetched_margin
                 with c_m2:
-                    st.button("↺ 重新整理", key="refresh_tx_margin", use_container_width=True, on_click=sync_taifex_margin)
+                    st.button("↺ 重新整理", key="refresh_tx_margin", width='stretch', on_click=sync_taifex_margin)
                 if sync_text != "尚未同步":
                     st.markdown(f"<div style='font-size:13px; margin-top: -10px; margin-bottom: 10px;'><span style='color:#00e676;'>✔️</span> <span style='color:#ff4b4b;'>已同步</span> <span style='color:#aaa;'>期交所資料：{sync_text}</span></div>", unsafe_allow_html=True)
                     
@@ -12894,7 +12947,7 @@ with tab2:
                     except ValueError:
                         actual_margin_req = calc_margin
                 with c_m2:
-                    if st.button("↺ 重新整理", key="refresh_ssf_margin", use_container_width=True):
+                    if st.button("↺ 重新整理", key="refresh_ssf_margin", width='stretch'):
                         fetch_ssf_margin_info.clear()
                         st.rerun()
                 if sync_text != "尚未同步":
@@ -13742,7 +13795,7 @@ with tab_fibo:
                 st.caption(f"☁️ Google Sheet 同步已啟用｜本次標籤來源：{fibo_source}")
                 if st.button(
                     "☁️ 從 Google Sheet 重新載入標籤",
-                    key="reload_fibo_quick_tags_from_cloud", use_container_width=True,
+                    key="reload_fibo_quick_tags_from_cloud", width='stretch',
                 ):
                     restored, message = reload_fibo_tags_from_cloud()
                     if restored:
@@ -13758,7 +13811,7 @@ with tab_fibo:
             c3.text_input("快速標籤 3", key="custom_tag_3", on_change=format_fibo_tag, args=("custom_tag_3",))
             c4.text_input("快速標籤 4", key="custom_tag_4", on_change=format_fibo_tag, args=("custom_tag_4",))
             c5.text_input("快速標籤 5", key="custom_tag_5", on_change=format_fibo_tag, args=("custom_tag_5",))
-            if st.button("💾 儲存快速標籤", key="save_fibo_quick_tags", use_container_width=True):
+            if st.button("💾 儲存快速標籤", key="save_fibo_quick_tags", width='stretch'):
                 sync_saved = save_fibo_config()
                 if sync_saved:
                     message = "快速標籤已同步到 Google Sheet" if cloud_enabled else "快速標籤已儲存在伺服器"
@@ -13959,11 +14012,11 @@ with tab_db:
         st.markdown("#### 📈 法人當日買賣超個股")
         inst_tabs = st.tabs(["外資當日買賣超", "投信當日買賣超", "自營商當日買賣超"])
         with inst_tabs[0]:
-            components.html(fetch_fubon_html("https://fubon-ebrokerdj.fbs.com.tw/Z/ZG/ZGK_D.djhtm"), height=1185, width=800, scrolling=True)
+            st.html(fetch_fubon_html("https://fubon-ebrokerdj.fbs.com.tw/Z/ZG/ZGK_D.djhtm"), width=800)
         with inst_tabs[1]:
-            components.html(fetch_fubon_html("https://fubon-ebrokerdj.fbs.com.tw/Z/ZG/ZGK_DD.djhtm"), height=1185, width=800, scrolling=True)
+            st.html(fetch_fubon_html("https://fubon-ebrokerdj.fbs.com.tw/Z/ZG/ZGK_DD.djhtm"), width=800)
         with inst_tabs[2]:
-            components.html(fetch_fubon_html("https://fubon-ebrokerdj.fbs.com.tw/Z/ZG/ZGK_DB.djhtm"), height=1185, width=800, scrolling=True)
+            st.html(fetch_fubon_html("https://fubon-ebrokerdj.fbs.com.tw/Z/ZG/ZGK_DB.djhtm"), width=800)
         
     with sub_tab2:
         st.markdown("#### 📑 永豐期貨盤後籌碼自動化工具")
@@ -14040,10 +14093,10 @@ with tab_db:
         # 將計數器加入網址參數，藉由改變網址強制 iframe 重新載入
         refresh_url = f"https://cmfaren.github.io/dispositionforecast/?t={st.session_state.disposal_refresh_idx}"
         
-        components.iframe(
+        st.iframe(
             refresh_url, 
-            height=800, 
-            scrolling=True
+            height=800,
+            width='stretch',
         )
 
 with tab3:
@@ -14119,6 +14172,7 @@ with tab3:
         if not isinstance(saved, dict):
             return default_preferences
 
+        groups_were_saved = "groups" in saved
         raw_groups = saved.get("groups", [])
         if isinstance(raw_groups, str):
             raw_groups = [raw_groups]
@@ -14139,7 +14193,7 @@ with tab3:
             item for item in raw_groups
             if isinstance(item, str) and item in CALENDAR_GROUP_OPTIONS
         )) if isinstance(raw_groups, (list, tuple, set)) else []
-        if not groups:
+        if not groups and not groups_were_saved:
             legacy_events = saved.get("events", [])
             if isinstance(legacy_events, str):
                 legacy_events = [legacy_events]
@@ -14151,6 +14205,7 @@ with tab3:
                 if legacy_events.intersection(events)
             ] or CALENDAR_GROUP_OPTIONS.copy()
 
+        macro_events_were_saved = "macro_events" in saved
         raw_macro_events = saved.get("macro_events", saved.get("events", []))
         if isinstance(raw_macro_events, str):
             raw_macro_events = [raw_macro_events]
@@ -14161,15 +14216,16 @@ with tab3:
         macro_events = [
             item for item in US_HIGH_IMPACT_EVENTS if item in raw_macro_event_set
         ]
-        if not macro_events:
+        if not macro_events and not macro_events_were_saved:
             macro_events = US_HIGH_IMPACT_EVENTS.copy()
+        settlement_events_were_saved = "settlement_events" in saved
         raw_settlement_events = saved.get("settlement_events", saved.get("events", []))
         if isinstance(raw_settlement_events, str):
             raw_settlement_events = [raw_settlement_events]
         settlement_events = [
             item for item in SETTLEMENT_REBALANCE_EVENTS if item in set(raw_settlement_events or [])
         ]
-        if not settlement_events:
+        if not settlement_events and not settlement_events_were_saved:
             settlement_events = SETTLEMENT_REBALANCE_EVENTS.copy()
         tickers = saved.get("tickers", default_preferences["tickers"])
         if tickers is None:
@@ -14197,15 +14253,14 @@ with tab3:
                 "settlement_events", SETTLEMENT_REBALANCE_EVENTS
             )
         try:
-            with open(CAL_PREFERENCES_FILE, "w", encoding="utf-8") as file:
-                json.dump({
-                    "groups": groups,
-                    "macro_events": macro_events,
-                    "settlement_events": settlement_events,
-                    "events": events,
-                    "tickers": tickers,
-                    "calendar_events_version": 6,
-                }, file, ensure_ascii=False, indent=2)
+            _write_json_atomic(CAL_PREFERENCES_FILE, {
+                "groups": groups,
+                "macro_events": macro_events,
+                "settlement_events": settlement_events,
+                "events": events,
+                "tickers": tickers,
+                "calendar_events_version": 6,
+            }, indent=2)
         except OSError:
             pass
     
@@ -14217,7 +14272,8 @@ with tab3:
                     if not df.empty and "日期" in df.columns:
                         df["日期"] = pd.to_datetime(df["日期"], errors='coerce').dt.date
                         return df
-            except: pass
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                pass
         
         # 預設給予一列空白資料，並確保日期欄位擁有正確的空值型別 (NaT)
         df = pd.DataFrame([{"日期": pd.NaT, "事件名稱": "", "文字顏色": "白色"}])
@@ -14229,8 +14285,9 @@ with tab3:
             # 確保日期格式為字串以利 JSON 儲存
             df_save = df.copy()
             df_save['日期'] = df_save['日期'].astype(str)
-            df_save.to_json(CAL_OVERRIDE_FILE, orient="records", force_ascii=False)
-        except: pass
+            _write_json_atomic(CAL_OVERRIDE_FILE, _json_safe(df_save.to_dict(orient="records")), indent=2)
+        except (OSError, TypeError, ValueError):
+            pass
 
     if 'cal_overrides' not in st.session_state:
         st.session_state.cal_overrides = load_cal_overrides()
@@ -14259,7 +14316,7 @@ with tab3:
                 )
             },
             key="cal_override_editor",
-            use_container_width=True
+            width='stretch'
         )
         
         if st.button("💾 儲存行事曆設定", key="btn_save_cal_override"):
@@ -14385,8 +14442,12 @@ with tab3:
 
     col_sel_y, col_sel_m = st.columns(2)
     with col_sel_y:
-        current_year_idx = range(2024, 2031).index(st.session_state.cal_year)
-        new_year = st.selectbox("年份", range(2024, 2031), index=current_year_idx, key='sel_year_box')
+        current_calendar_year = now_tw.year
+        year_start = min(2024, st.session_state.cal_year, current_calendar_year - 2)
+        year_end = max(current_calendar_year + 8, st.session_state.cal_year)
+        year_options = list(range(year_start, year_end + 1))
+        current_year_idx = year_options.index(st.session_state.cal_year)
+        new_year = st.selectbox("年份", year_options, index=current_year_idx, key='sel_year_box')
         if new_year != st.session_state.cal_year:
             st.session_state.cal_year = new_year
             st.rerun()
@@ -14697,9 +14758,12 @@ with tab3:
                         color_map = {"白色": "#FFFFFF", "紅色": "#FF4B4B", "綠色": "#00E676", "黃色": "#FFD700", "藍色": "#00E5FF", "橘色": "#FF9800", "紫紅色": "#FF00FF"}
                         raw_col = str(r["文字顏色"]).strip() if pd.notna(r["文字顏色"]) else "白色"
                         col = color_map.get(raw_col, "#FFFFFF")
-                        override_dict[d_obj].append(f"<div style='color:{col}; font-size:0.8em; margin-top:2px; font-weight:bold;'>{r['事件名稱']}</div>")
-            except:
-                pass
+                        event_name = html.escape(str(r["事件名稱"]))
+                        override_dict[d_obj].append(
+                            f"<div style='color:{col}; font-size:0.8em; margin-top:2px; font-weight:bold;'>{event_name}</div>"
+                        )
+            except (KeyError, TypeError, ValueError):
+                continue
     def calendar_day_content(curr_date):
         """建立單日事件內容，桌機月曆與手機清單共用，避免兩種版面日期不一致。"""
         holiday_name = current_holidays.get((curr_date.month, curr_date.day), "")
@@ -14788,11 +14852,17 @@ with tab3:
     )
     mobile_cells = []
     weekday_names = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"]
+    def calendar_display_week(curr_date):
+        """Sunday-start calendar rows use the following Monday's ISO week consistently."""
+        if curr_date.weekday() == 6:
+            curr_date += timedelta(days=1)
+        return curr_date.isocalendar().week
+
     for week in month_days:
         first_valid_day = next((day for day in week if day), None)
         # 月曆從週日開始，但週次從週一開始；優先取該列週一作為週次基準。
         iso_anchor_day = week[1] if len(week) > 1 and week[1] else first_valid_day
-        iso_week = date(sel_year, sel_month, iso_anchor_day).isocalendar().week
+        iso_week = calendar_display_week(date(sel_year, sel_month, iso_anchor_day))
         desktop_cells.append(f"<div class='cal-box cal-week'>W{iso_week}</div>")
         for day in week:
             if not day:
@@ -14808,7 +14878,7 @@ with tab3:
             mobile_cells.append(
                 f"<div class='calendar-mobile-day {bg_class} {today_class}'>"
                 f"<div class='calendar-mobile-date'><span>{sel_month}/{day} {weekday_names[curr_date.weekday()]}</span>"
-                f"<span class='calendar-mobile-week'>W{curr_date.isocalendar().week}</span></div>"
+                f"<span class='calendar-mobile-week'>W{calendar_display_week(curr_date)}</span></div>"
                 f"{day_content}</div>"
             )
 
