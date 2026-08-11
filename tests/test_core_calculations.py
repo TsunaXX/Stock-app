@@ -8,6 +8,7 @@ import math
 import re
 from datetime import date, datetime, time as dt_time, timedelta
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import urljoin
 
@@ -47,6 +48,7 @@ def load_app_symbols(*names):
         "math": math,
         "np": np,
         "pd": pd,
+        "parsedate_to_datetime": parsedate_to_datetime,
         "pytz": pytz,
         "re": re,
         "urljoin": urljoin,
@@ -250,6 +252,41 @@ def test_public_revenue_report_date_prefers_earliest_matching_release():
         {"title": "南亞科(2408)6月營收", "publishAt": 1785802800},
         {"title": "其他公司(1234)7月營收", "publishAt": 1785802800},
     ], "2408", 2026, 7) == "2026-08-04"
+
+
+def test_google_news_revenue_date_uses_earliest_matching_company_report():
+    symbols = load_app_symbols("select_google_news_revenue_announcement_date")
+    rss = """<?xml version='1.0' encoding='UTF-8'?><rss><channel>
+      <item><title>南亞科(2408)市場新聞</title>
+        <pubDate>Mon, 03 Aug 2026 07:00:00 GMT</pubDate></item>
+      <item><title>南亞科(2408)7月營收公告</title>
+        <pubDate>Tue, 04 Aug 2026 07:40:03 GMT</pubDate></item>
+      <item><title>南亞科(2408)7月營收後續</title>
+        <pubDate>Wed, 05 Aug 2026 08:20:00 GMT</pubDate></item>
+    </channel></rss>""".encode()
+    assert symbols["select_google_news_revenue_announcement_date"](
+        rss, "2408", "南亞科", 2026, 7
+    ) == "2026-08-04"
+
+
+def test_public_report_date_removes_later_stale_sync_date_override():
+    symbols = load_app_symbols(
+        "empty_company_event_snapshot", "normalize_company_event_snapshot",
+        "apply_revenue_announcement_date_overrides",
+    )
+    snapshot = {
+        "revenue_date_overrides": {"2408:11507": "2026-08-12"},
+        "taiwan_revenue": {"events": [{
+            "date": "2026-08-04", "title": "南亞科 7月營收", "ticker": "2408",
+            "revenue": {
+                "company": "南亞科", "revenue_month": "11507",
+                "date_source": "多來源公開營收報導日期（鉅亨網／Google News）",
+            },
+        }]},
+    }
+    corrected = symbols["apply_revenue_announcement_date_overrides"](snapshot)
+    assert corrected["taiwan_revenue"]["events"][0]["date"] == "2026-08-04"
+    assert "2408:11507" not in corrected["revenue_date_overrides"]
 
 
 def test_cache_merge_preserves_remote_device_sections():
