@@ -2,6 +2,7 @@
 
 import ast
 import calendar
+import html
 import json
 import math
 import re
@@ -32,6 +33,7 @@ def load_app_symbols(*names):
                 selected.append(node)
     namespace = {
         "calendar": calendar,
+        "html": html,
         "date": date,
         "datetime": datetime,
         "dt_time": dt_time,
@@ -215,6 +217,39 @@ def test_legacy_company_events_are_restored_to_calendar_sections():
     assert len(snapshot["taiwan_revenue"]["events"]) == 1
     assert snapshot["taiwan_revenue"]["events"][0]["market"] == "台股"
     assert len(snapshot["events"]) == 1
+
+
+def test_revenue_announcement_date_override_persists_in_snapshot():
+    symbols = load_app_symbols(
+        "empty_company_event_snapshot", "normalize_company_event_snapshot",
+        "apply_revenue_announcement_date_overrides",
+    )
+    snapshot = {
+        "taiwan_revenue": {"events": [{
+            "date": "2026-08-05", "title": "南亞科 7月營收",
+            "ticker": "2408", "market": "台股", "source": "MOPS 單一公司月營收",
+            "detail": "MOPS 單一公司資料（公告日未提供，顯示系統偵測日）；",
+            "revenue": {"company": "南亞科", "revenue_month": "11507"},
+        }]},
+    }
+    corrected = symbols["apply_revenue_announcement_date_overrides"](
+        snapshot, {"2408:11507": "2026-08-04"}
+    )
+    event = corrected["taiwan_revenue"]["events"][0]
+    assert event["date"] == "2026-08-04"
+    assert event["revenue"]["report_date"] == "2026-08-04"
+    assert corrected["revenue_date_overrides"] == {"2408:11507": "2026-08-04"}
+
+
+def test_public_revenue_report_date_prefers_earliest_matching_release():
+    symbols = load_app_symbols("_to_number", "select_cnyes_revenue_announcement_date")
+    select_date = symbols["select_cnyes_revenue_announcement_date"]
+    assert select_date([
+        {"title": "營收速報 - 南亞科(2408)7月營收", "publishAt": 1785802800},  # 2026-08-04 18:20 Taipei
+        {"title": "南亞科(2408) 7月營收續強", "publishAt": 1785859200},
+        {"title": "南亞科(2408)6月營收", "publishAt": 1785802800},
+        {"title": "其他公司(1234)7月營收", "publishAt": 1785802800},
+    ], "2408", 2026, 7) == "2026-08-04"
 
 
 def test_cache_merge_preserves_remote_device_sections():
