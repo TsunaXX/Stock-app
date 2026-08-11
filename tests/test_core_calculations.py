@@ -103,11 +103,15 @@ def test_futures_ticks_follow_product_specification():
 
 
 def test_futures_day_and_night_sessions_display_in_the_table_cell():
-    symbols = load_app_symbols("TAIFEX_NIGHT_SESSION_ROOTS", "get_futures_session_label")
+    symbols = load_app_symbols(
+        "TAIFEX_NIGHT_SESSION_ROOTS", "is_futures_night_session_product",
+        "get_futures_session_label",
+    )
     label = symbols["get_futures_session_label"]
     assert label(["一般交易時段", "盤後交易時段"]) == "日+夜"
     assert label(["一般交易時段"]) == "日盤"
     assert label(["一般交易時段"], root="QF") == "日+夜"
+    assert label(["一般"], root="QFF") == "日+夜"
 
 
 def test_monthly_revenue_prefers_latest_official_month_for_each_company():
@@ -178,6 +182,18 @@ def test_sinopac_list_parser_reads_current_direct_pdf_layout():
         </li></ul></div>
         """,
         "https://www.spf.com.tw/sinopacSPF/research/list.do?id=test",
+    )
+    assert reports == [{
+        "日期": "2026-08-11",
+        "title": "台指期籌碼快訊",
+        "url": "https://www.spf.com.tw/upload/sinopac/researchContent/latest.pdf",
+    }]
+
+
+def test_sinopac_text_proxy_parser_keeps_official_pdf_link():
+    symbols = load_app_symbols("parse_sinopac_report_markdown")
+    reports = symbols["parse_sinopac_report_markdown"](
+        "[台指期籌碼快訊](https://www.spf.com.tw/upload/sinopac/researchContent/latest.pdf) 2026/08/11"
     )
     assert reports == [{
         "日期": "2026-08-11",
