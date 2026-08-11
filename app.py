@@ -5757,51 +5757,64 @@ def parse_sinopac_report_markdown(page_text):
 
 
 @st.cache_data(ttl=600, max_entries=1, show_spinner=False)
-def fetch_sinopac_report_list():
-    """讀取永豐期貨盤後快訊；失敗時拋錯以避免 Streamlit 快取空清單。"""
-    official_urls = (
-        "https://www.spf.com.tw/sinopacSPF/research/list_1709f20d3ff00000d8e2039e8984ed51.do",
-        "https://www.spf.com.tw/sinopacSPF/research/list.do?id=1709f20d3ff00000d8e2039e8984ed51",
-    )
-    headers = {
-        'User-Agent': (
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-            'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0 Safari/537.36'
-        ),
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'zh-TW,zh;q=0.9,en;q=0.7',
-    }
-    for url in official_urls:
-        try:
-            response = requests.get(url, headers=headers, timeout=15)
-            response.raise_for_status()
-            response.encoding = response.apparent_encoding or 'utf-8'
-            reports = parse_sinopac_report_list(response.text, url)
-            if reports:
-                return reports
-        except requests.RequestException:
-            continue
-
-    # Streamlit Cloud 的出口 IP 偶爾會被官網清單頁擋下。只有直連兩個官方網址
-    # 都失敗時，才以唯讀文字代理解析相同官網頁面；PDF 仍連回永豐官方網址。
-    proxy_url = f"https://r.jina.ai/{official_urls[0]}"
-    try:
-        response = requests.get(proxy_url, headers=headers, timeout=30)
-        response.raise_for_status()
-        reports = parse_sinopac_report_markdown(response.text)
-        if reports:
-            return reports
-    except requests.RequestException:
-        pass
-    raise RuntimeError("永豐官網與備援來源皆未回傳可辨識的台指期籌碼快訊")
-
-
 def get_report_list():
-    """保留舊版 UI 的清單介面，同時避免暫時失敗被快取成空資料。"""
+    """回復大修改前的永豐期貨盤後快訊清單抓取方式。"""
+    url = "https://www.spf.com.tw/sinopacSPF/research/list.do?id=1709f20d3ff00000d8e2039e8984ed51"
+    base_url = "https://www.spf.com.tw"
+    headers = {'User-Agent': 'Mozilla/5.0'}
     try:
-        return fetch_sinopac_report_list(), ""
+        response = requests.get(url, headers=headers, timeout=10, verify=False)
+        response.encoding = 'utf-8'
+        soup = BeautifulSoup(response.text, 'html.parser')
+        reports = []
+        items = soup.select('div.list_news ul li')
+
+        if items:
+            for item in items:
+                link_tag = item.find('a')
+                date_tag = item.find('span', class_='date')
+                if not link_tag:
+                    continue
+                title = link_tag.get_text(strip=True)
+                if "台指期籌碼快訊" not in title:
+                    continue
+                href = link_tag.get('href', '')
+                pdf_url = f"{base_url}{href}" if href.startswith('/') else f"{base_url}/sinopacSPF/research/{href}"
+                date_match = re.search(r'(202\d)(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])', title)
+                if date_match:
+                    date_str = f"{date_match.group(1)}-{date_match.group(2)}-{date_match.group(3)}"
+                elif date_tag:
+                    date_str = date_tag.get_text(strip=True).replace('/', '-')
+                else:
+                    date_str = "近期發布"
+                reports.append({'日期': date_str, 'title': title, 'url': pdf_url})
+        else:
+            for link_tag in soup.find_all('a', href=re.compile(r'\.pdf')):
+                title = link_tag.get_text(strip=True) or link_tag.get('title', '')
+                if "台指期籌碼快訊" not in title:
+                    continue
+                href = link_tag.get('href', '')
+                pdf_url = f"{base_url}{href}" if href.startswith('/') else href
+                date_match = re.search(r'(202\d)(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])', title)
+                if date_match:
+                    date_str = f"{date_match.group(1)}-{date_match.group(2)}-{date_match.group(3)}"
+                else:
+                    parent = link_tag.find_parent(['tr', 'li'])
+                    date_text = parent.get_text(' ', strip=True) if parent else ''
+                    match = re.search(r'202\d[/-]\d{2}[/-]\d{2}', date_text)
+                    date_str = match.group().replace('/', '-') if match else "近期發布"
+                reports.append({'日期': date_str, 'title': title, 'url': pdf_url})
+
+        unique_reports = []
+        seen = set()
+        for report in reports:
+            if report['url'] not in seen:
+                unique_reports.append(report)
+                seen.add(report['url'])
+        unique_reports.sort(key=lambda report: report['日期'], reverse=True)
+        return unique_reports
     except Exception as exc:
-        return [], str(exc)
+        return []
 
 @st.cache_data(ttl=600, max_entries=1, show_spinner=False)
 def fetch_and_parse_pdf(pdf_url):
@@ -5809,7 +5822,7 @@ def fetch_and_parse_pdf(pdf_url):
     headers = {'User-Agent': 'Mozilla/5.0'}
     try:
         if not pdf_url.lower().endswith('.pdf'):
-            r_inner = requests.get(pdf_url, headers=headers, timeout=10)
+            r_inner = requests.get(pdf_url, headers=headers, timeout=10, verify=False)
             r_inner.raise_for_status()
             if r_inner.content.startswith(b'%PDF'):
                 pdf_bytes = r_inner.content
@@ -5826,7 +5839,7 @@ def fetch_and_parse_pdf(pdf_url):
             pdf_bytes = None
 
         if pdf_bytes is None:
-            response = requests.get(pdf_url, headers=headers, timeout=15)
+            response = requests.get(pdf_url, headers=headers, timeout=15, verify=False)
             response.raise_for_status()
             pdf_bytes = response.content
         if not pdf_bytes.startswith(b'%PDF'):
@@ -14421,16 +14434,14 @@ with tab_db:
         st.markdown("#### 📑 永豐期貨盤後籌碼自動化工具")
         
         if st.button("🔄 刷新最新報告清單"):
-            fetch_sinopac_report_list.clear()  # 只清報告清單
+            get_report_list.clear()        # 只清報告清單
             fetch_and_parse_pdf.clear()   # 只清 PDF 快取
             st.rerun()
 
-        reports, report_error = get_report_list()
+        reports = get_report_list()
 
         if not reports:
             st.warning("目前找不到相關報告，請檢查官網是否變動或稍後再試。")
-            if report_error:
-                st.caption(f"來源診斷：{report_error}")
         else:
             latest_report = reports[0]
             st.markdown(f"### 🔥 最新快訊: {latest_report['日期']} | {latest_report['title']}")
