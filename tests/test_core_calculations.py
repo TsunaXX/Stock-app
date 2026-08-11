@@ -102,6 +102,24 @@ def test_futures_ticks_follow_product_specification():
     assert get_tick("0050", 50, "ETF") == 0.05
 
 
+def test_futures_day_and_night_sessions_display_in_the_table_cell():
+    symbols = load_app_symbols("get_futures_session_label")
+    label = symbols["get_futures_session_label"]
+    assert label(["一般交易時段", "盤後交易時段"]) == "日+夜"
+    assert label(["一般交易時段"]) == "日盤"
+
+
+def test_monthly_revenue_prefers_latest_official_month_for_each_company():
+    symbols = load_app_symbols("select_latest_monthly_revenue_rows")
+    rows = symbols["select_latest_monthly_revenue_rows"]([
+        {"公司代號": "2408", "資料年月": "11506", "營業收入-當月營收": "100"},
+        {"公司代號": "2408", "資料年月": "11507", "營業收入-當月營收": "110"},
+        {"公司代號": "2330", "資料年月": "11507", "營業收入-當月營收": "120"},
+    ])
+    assert rows["2408"]["資料年月"] == "11507"
+    assert rows["2408"]["營業收入-當月營收"] == "110"
+
+
 def test_goodinfo_table_requires_real_turnover_rows():
     symbols = load_app_symbols("_clean_goodinfo_table")
     clean = symbols["_clean_goodinfo_table"]

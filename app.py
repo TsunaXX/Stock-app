@@ -1922,9 +1922,13 @@ def _signed_percent(value):
 
 
 def _latest_completed_roc_month():
-    """回傳最近一個已結束月份的民國年月，用於 MOPS 單一公司補查。"""
+    """回傳依月營收申報期限可期待的最新民國年月。"""
     today = datetime.now(pytz.timezone("Asia/Taipei")).date()
     last_day = today.replace(day=1) - timedelta(days=1)
+    # 月營收通常在次月 10 日前公告；10 日以前維持前一個已完整公告月份，
+    # 11 日起才要求前一個曆月，避免把仍可用的最新資料誤判為過期。
+    if today.day <= 10:
+        last_day = last_day.replace(day=1) - timedelta(days=1)
     return last_day.year - 1911, last_day.month
 
 
@@ -1945,8 +1949,11 @@ def fetch_mops_company_monthly_revenue(code, roc_year, month, market_type):
         "step": "1",
         "firstin": "1",
         "off": "1",
+        "queryName": "co_id",
         "inpuType": "co_id",
-        "TYPEK": market_type,
+        # MOPS 單一公司查詢可同時辨識上市與上櫃；傳 sii／otc 會使部分代號
+        # 在資料彙總更新前查不到最新月份。
+        "TYPEK": "all",
         "isnew": "false",
         "co_id": str(code),
         "year": str(roc_year),
@@ -2122,6 +2129,22 @@ def fetch_twse_monthly_revenue_rows():
     return rows
 
 
+def select_latest_monthly_revenue_rows(rows):
+    """Keep only each company's newest reported ROC month from mixed official feeds."""
+    latest_rows = {}
+    for source_row in rows or []:
+        if not isinstance(source_row, dict):
+            continue
+        code = str(source_row.get("公司代號", "")).strip()
+        month = str(source_row.get("資料年月", "")).strip()
+        if not code or not re.fullmatch(r"\d{5}", month):
+            continue
+        current = latest_rows.get(code)
+        if current is None or month > str(current.get("資料年月", "")).strip():
+            latest_rows[code] = source_row
+    return latest_rows
+
+
 @st.cache_data(ttl=60 * 60 * 4, show_spinner=False)
 def fetch_taiwan_monthly_revenue_events(inputs):
     """依追蹤清單產生台股最新月營收事件，必要時由 MOPS 單一公司資料補齊。"""
@@ -2137,7 +2160,7 @@ def fetch_taiwan_monthly_revenue_events(inputs):
         return {"events": [], "missing": []}
 
     revenue_rows = fetch_twse_monthly_revenue_rows()
-    rows_by_code = {str(row.get("公司代號", "")).strip(): row for row in revenue_rows}
+    rows_by_code = select_latest_monthly_revenue_rows(revenue_rows)
     bulk_months = [
         str(row.get("資料年月", "")).strip()
         for row in revenue_rows
@@ -2153,30 +2176,30 @@ def fetch_taiwan_monthly_revenue_events(inputs):
     for code, item in input_by_code.items():
         row = rows_by_code.get(code)
         if should_check_mops or row is None:
-            direct_row = None
-            for market_type in ("sii", "otc"):
-                direct_row = fetch_mops_company_monthly_revenue(
-                    code, target_roc_year, target_month, market_type
-                )
-                if direct_row:
-                    break
+            direct_row = fetch_mops_company_monthly_revenue(
+                code, target_roc_year, target_month, "all"
+            )
             if direct_row:
                 previous_row = None
                 if row and str(row.get("資料年月", "")).strip() == previous_month_text:
                     previous_row = row
                 else:
-                    for market_type in ("sii", "otc"):
-                        previous_row = fetch_mops_company_monthly_revenue(
-                            code, previous_roc_year, previous_month, market_type
-                        )
-                        if previous_row:
-                            break
+                    previous_row = fetch_mops_company_monthly_revenue(
+                        code, previous_roc_year, previous_month, "all"
+                    )
                 previous_revenue = previous_row.get("營業收入-當月營收") if previous_row else None
                 direct_row["營業收入-上月營收"] = previous_revenue
                 current_number, previous_number = _to_number(direct_row["營業收入-當月營收"]), _to_number(previous_revenue)
                 if current_number is not None and previous_number not in (None, 0):
                     direct_row["營業收入-上月比較增減(%)"] = (current_number - previous_number) / previous_number * 100
                 row = direct_row
+        if (
+            row
+            and str(row.get("資料年月", "")).strip() < target_month_text
+        ):
+            # 在應公告月已過期時不可把舊月營收當作最新資料顯示。
+            missing.append(f"{item['display_name']}（尚未取得 {target_month_text} 最新月營收）")
+            continue
         if not row:
             missing.append(f"{item['display_name']}（目前官方月營收彙總表未提供）")
             continue
@@ -7598,6 +7621,21 @@ def _safe_number(value, default=None):
     except (TypeError, ValueError):
         return default
 
+
+def get_futures_session_label(session_names, fallback='未知'):
+    """Normalize TAIFEX day/night session labels for the table cell."""
+    normalized_names = {str(name).strip() for name in session_names if str(name).strip()}
+    has_day_session = any('一般' in name or '日盤' in name for name in normalized_names)
+    has_night_session = any(
+        ('盤後' in name or '夜盤' in name) and not ('一般' in name or '日盤' in name)
+        for name in normalized_names
+    )
+    if has_day_session and has_night_session:
+        return '日+夜'
+    if has_day_session:
+        return '日盤'
+    return str(fallback or '未知')
+
 def snapshot_change_rate(snapshot, price=None):
     """優先採券商快照漲跌幅，舊版物件缺欄位時再由漲跌價反推。"""
     direct_rate = _safe_number(getattr(snapshot, 'change_rate', None))
@@ -7806,21 +7844,22 @@ def fetch_futures_strategy_universe():
     result_rows = []
     for (root, month), rows in grouped.items():
         meta = product_meta[root]
-        general_rows = [row for row in rows if str(row.get('TradingSession', '')).strip() == '一般']
+        general_rows = [
+            row for row in rows
+            if (
+                '一般' in str(row.get('TradingSession', '')).strip()
+                or '日盤' in str(row.get('TradingSession', '')).strip()
+            )
+        ]
         session_rows = general_rows or [rows[0]]
         quote_row = session_rows[0]
         session_names = {
             str(row.get('TradingSession', '')).strip()
             for row in rows if str(row.get('TradingSession', '')).strip()
         }
-        has_day_session = '一般' in session_names
-        has_night_session = any(name != '一般' for name in session_names)
-        if has_day_session and has_night_session:
-            session_label = '日+夜'
-        elif has_day_session:
-            session_label = '日盤'
-        else:
-            session_label = str(quote_row.get('TradingSession', '未知'))
+        session_label = get_futures_session_label(
+            session_names, quote_row.get('TradingSession', '未知')
+        )
         valid_highs = [_safe_number(row.get('High')) for row in session_rows]
         valid_lows = [_safe_number(row.get('Low')) for row in session_rows]
         high = max((value for value in valid_highs if value is not None), default=None)
