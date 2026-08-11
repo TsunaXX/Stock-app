@@ -6348,8 +6348,11 @@ def fetch_goodinfo_data():
             except NoAlertPresentException:
                 pass
             try:
-                tables = pd.read_html(io.StringIO(driver.page_source))
-            except (ValueError, TypeError):
+                # Streamlit Cloud does not always include html5lib.  Pin the
+                # parser to lxml (which this app installs) so a fallback parser
+                # dependency cannot terminate the stock-strategy page.
+                tables = pd.read_html(io.StringIO(driver.page_source), flavor="lxml")
+            except (ValueError, TypeError, ImportError):
                 tables = []
             candidates = [
                 cleaned for cleaned in (_clean_goodinfo_table(table) for table in tables)
