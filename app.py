@@ -2309,6 +2309,25 @@ def select_cnyes_revenue_announcement_date(items, code, revenue_year, revenue_mo
     return min(matched_dates).isoformat() if matched_dates else None
 
 
+def extract_cnyes_search_items(payload):
+    """Support both the former data.items and current items.data envelopes."""
+    if not isinstance(payload, dict):
+        return []
+    data_container = payload.get('data')
+    if isinstance(data_container, dict):
+        rows = data_container.get('items')
+        if isinstance(rows, list):
+            return rows
+        if isinstance(rows, dict) and isinstance(rows.get('data'), list):
+            return rows['data']
+    item_container = payload.get('items')
+    if isinstance(item_container, list):
+        return item_container
+    if isinstance(item_container, dict) and isinstance(item_container.get('data'), list):
+        return item_container['data']
+    return []
+
+
 @st.cache_data(ttl=60 * 60 * 4, max_entries=300, show_spinner=False)
 def fetch_cnyes_revenue_announcement_date(code, revenue_year, revenue_month):
     """Find a corroborating public release date without using its revenue value."""
@@ -2327,11 +2346,7 @@ def fetch_cnyes_revenue_announcement_date(code, revenue_year, revenue_month):
                 payload = response.json()
                 if not isinstance(payload, dict):
                     continue
-                data = payload.get("data", {})
-                page_items = data.get("items", []) if isinstance(data, dict) else []
-                if not isinstance(page_items, list):
-                    top_items = payload.get("items", {})
-                    page_items = top_items.get("data", []) if isinstance(top_items, dict) else []
+                page_items = extract_cnyes_search_items(payload)
                 break
             except (requests.RequestException, ValueError, TypeError):
                 continue
@@ -5957,27 +5972,7 @@ def plot_fibonacci_chart(
             render_fibonacci_trade_suggestion(trade_suggestion)
 
     fig.update_layout(**layout_update)
-    fig.update_layout(
-        updatemenus=[dict(
-            type='buttons', direction='left', showactive=False,
-            x=0.995, xanchor='right', y=1.08, yanchor='top',
-            buttons=[dict(
-                label='Autoscale 0–1', method='relayout',
-                args=[{
-                    'yaxis.range': [y_min_view, y_max_view],
-                    'yaxis.autorange': False,
-                }],
-            )],
-        )],
-    )
-    st.plotly_chart(
-        fig, width='stretch',
-        config={
-            'displaylogo': False,
-            'doubleClick': 'reset',
-            'modeBarButtonsToRemove': ['autoScale2d'],
-        },
-    )
+    st.plotly_chart(fig, width='stretch')
     
     fetch_time_str = datetime.now(pytz.timezone('Asia/Taipei')).strftime('%Y-%m-%d %H:%M:%S')
     
@@ -11501,19 +11496,16 @@ tab1, tab_fibo, tab2, tab_db, tab_company, tab3 = st.tabs([
 ])
 
 with tab1:
-    if tab1.open:
-        render_opening_direction_prompt()
+    render_opening_direction_prompt()
     stock_strategy_tab, futures_strategy_tab, validation_strategy_tab = st.tabs([
         "📈 股票戰略室", "🧭 期貨戰略室", "📊 策略驗證"
     ])
     with stock_strategy_tab:
         stock_strategy_container = st.container()
     with futures_strategy_tab:
-        if tab1.open and futures_strategy_tab.open:
-            render_futures_strategy_room()
+        render_futures_strategy_room()
     with validation_strategy_tab:
-        if tab1.open and validation_strategy_tab.open:
-            render_strategy_validation_room()
+        render_strategy_validation_room()
 
 with stock_strategy_container:
     stock_settings_col, stock_help_col = st.columns([3, 2])
@@ -14802,7 +14794,7 @@ with tab_db:
         
         # 加入安全攔截，若發生錯誤則預設為 None
         try:
-            df_inst = get_major_institutional_data(date_str) if tab_db.open and sub_tab1.open else None
+            df_inst = get_major_institutional_data(date_str)
         except Exception:
             df_inst = None
             
@@ -14838,23 +14830,20 @@ with tab_db:
         st.markdown("#### 📈 法人當日買賣超個股")
         inst_tabs = st.tabs(["外資當日買賣超", "投信當日買賣超", "自營商當日買賣超"])
         with inst_tabs[0]:
-            if tab_db.open and sub_tab1.open and inst_tabs[0].open:
-                components.html(
-                    fetch_fubon_html("https://fubon-ebrokerdj.fbs.com.tw/Z/ZG/ZGK_D.djhtm"),
-                    height=1185, width=800, scrolling=True,
-                )
+            components.html(
+                fetch_fubon_html("https://fubon-ebrokerdj.fbs.com.tw/Z/ZG/ZGK_D.djhtm"),
+                height=1185, width=800, scrolling=True,
+            )
         with inst_tabs[1]:
-            if tab_db.open and sub_tab1.open and inst_tabs[1].open:
-                components.html(
-                    fetch_fubon_html("https://fubon-ebrokerdj.fbs.com.tw/Z/ZG/ZGK_DD.djhtm"),
-                    height=1185, width=800, scrolling=True,
-                )
+            components.html(
+                fetch_fubon_html("https://fubon-ebrokerdj.fbs.com.tw/Z/ZG/ZGK_DD.djhtm"),
+                height=1185, width=800, scrolling=True,
+            )
         with inst_tabs[2]:
-            if tab_db.open and sub_tab1.open and inst_tabs[2].open:
-                components.html(
-                    fetch_fubon_html("https://fubon-ebrokerdj.fbs.com.tw/Z/ZG/ZGK_DB.djhtm"),
-                    height=1185, width=800, scrolling=True,
-                )
+            components.html(
+                fetch_fubon_html("https://fubon-ebrokerdj.fbs.com.tw/Z/ZG/ZGK_DB.djhtm"),
+                height=1185, width=800, scrolling=True,
+            )
         
     with sub_tab2:
         st.markdown("#### 📑 永豐期貨盤後籌碼自動化工具")
@@ -14864,7 +14853,7 @@ with tab_db:
             fetch_and_parse_pdf.clear()   # 只清 PDF 快取
             st.rerun()
 
-        reports = get_report_list() if tab_db.open and sub_tab2.open else []
+        reports = get_report_list()
 
         if not reports:
             st.warning("目前找不到相關報告，請檢查官網是否變動或稍後再試。")
@@ -14931,12 +14920,11 @@ with tab_db:
         # 將計數器加入網址參數，藉由改變網址強制 iframe 重新載入
         refresh_url = f"https://cmfaren.github.io/dispositionforecast/?t={st.session_state.disposal_refresh_idx}"
         
-        if tab_db.open and sub_tab3.open:
-            st.iframe(
-                refresh_url,
-                height=800,
-                width='stretch',
-            )
+        st.iframe(
+            refresh_url,
+            height=800,
+            width='stretch',
+        )
 
 with tab3:
     # ==========================================
@@ -15323,9 +15311,8 @@ with tab3:
     with col_header: st.markdown(f"<div class='calendar-header'>{sel_year}/{sel_month:02}</div>", unsafe_allow_html=True)
 
     # 每次切換月份都以 TWSE 年度資料重新建立交易日判定；網路暫不可用才退回既有固定表。
-    calendar_is_open = bool(tab3.open)
-    twse_holiday_events = fetch_twse_holiday_events(sel_year) if calendar_is_open else []
-    twse_temporary_events = fetch_twse_temporary_closure_events() if calendar_is_open else []
+    twse_holiday_events = fetch_twse_holiday_events(sel_year)
+    twse_temporary_events = fetch_twse_temporary_closure_events()
     current_holidays = {
         (pd.Timestamp(event["date"]).month, pd.Timestamp(event["date"]).day): event["title"]
         for event in twse_holiday_events if event["closed"]
@@ -15353,19 +15340,19 @@ with tab3:
 
     if "台股開休市" in selected_event_types:
         add_network_source('台股開休市', twse_holiday_events)
-    if calendar_is_open and "FOMC 利率決議" in selected_event_types:
+    if "FOMC 利率決議" in selected_event_types:
         add_network_source('FOMC', fetch_fomc_events(sel_year))
-    if calendar_is_open and "美國 CPI" in selected_event_types:
+    if "美國 CPI" in selected_event_types:
         add_network_source('CPI', fetch_bls_cpi_events(sel_year))
-    if calendar_is_open and "美國核心 PCE" in selected_event_types:
+    if "美國核心 PCE" in selected_event_types:
         add_network_source('核心 PCE', fetch_bea_core_pce_events(sel_year))
-    if calendar_is_open and "美國 GDP" in selected_event_types:
+    if "美國 GDP" in selected_event_types:
         add_network_source('GDP', fetch_bea_gdp_events(sel_year))
-    if calendar_is_open and "美國 ISM 製造業指數" in selected_event_types:
+    if "美國 ISM 製造業指數" in selected_event_types:
         add_network_source('ISM 製造業', fetch_ism_manufacturing_events(sel_year))
-    if calendar_is_open and "美國大非農" in selected_event_types:
+    if "美國大非農" in selected_event_types:
         add_network_source('大非農', fetch_bls_employment_events(sel_year))
-    if calendar_is_open and "美國小非農 ADP" in selected_event_types:
+    if "美國小非農 ADP" in selected_event_types:
         add_network_source('小非農 ADP', fetch_adp_employment_events(sel_year))
     if "美國初領失業金" in selected_event_types:
         add_network_source('初領失業金', build_us_initial_claims_events(sel_year))
@@ -15833,6 +15820,11 @@ with tab_company:
             )
             new_snapshot = apply_revenue_announcement_date_overrides(new_snapshot)
             st.session_state.company_event_snapshot = new_snapshot
+            # The date-input widgets are created later in this rerun. Clear their
+            # previous values so a newly fetched 8/4 cannot keep displaying 8/3.
+            for state_key in list(st.session_state.keys()):
+                if str(state_key).startswith('revenue_date_'):
+                    del st.session_state[state_key]
             save_company_event_snapshot(new_snapshot)
             company_sync_ok = save_data_cache(
                 st.session_state.stock_data, st.session_state.ignored_stocks,
@@ -15868,47 +15860,57 @@ with tab_company:
                 "MOPS 單一公司頁未提供可驗證的公告日；此處填入公司官網／公告確認的日期後，"
                 "再按下方套用按鈕，行事曆與下次同步都會沿用校正值。"
             )
-            correction_rows = []
-            for event in revenue_events:
-                revenue = event.get('revenue', {}) if isinstance(event.get('revenue'), dict) else {}
-                correction_rows.append({
-                    '校正鍵': f"{event.get('ticker', '')}:{revenue.get('revenue_month', '')}",
-                    '代號': str(event.get('ticker', '')),
-                    '公司': str(revenue.get('company', event.get('title', ''))),
-                    '營收月份': str(revenue.get('revenue_month', '')),
-                    '目前日期': str(event.get('date', '')),
-                    '實際公告日': pd.to_datetime(event.get('date', ''), errors='coerce').date(),
-                })
-            correction_frame = pd.DataFrame(correction_rows)
-            edited_corrections = st.data_editor(
-                correction_frame,
-                hide_index=True,
-                width='stretch',
-                disabled=['校正鍵', '代號', '公司', '營收月份', '目前日期'],
-                column_config={
-                    '實際公告日': st.column_config.DateColumn('實際公告日', required=True),
-                },
-                key='revenue_announcement_date_corrections',
-            )
-            if st.button('套用實際公告日到行事曆', key='apply_revenue_announcement_dates'):
-                corrections = {}
-                for _, correction in edited_corrections.iterrows():
-                    corrected_date = pd.to_datetime(correction.get('實際公告日'), errors='coerce')
-                    current_date = pd.to_datetime(correction.get('目前日期'), errors='coerce')
-                    if (
-                        pd.notna(corrected_date)
-                        and (pd.isna(current_date) or corrected_date.date() != current_date.date())
-                    ):
-                        corrections[str(correction['校正鍵'])] = corrected_date.date().isoformat()
+            correction_values = {}
+            with st.form('revenue_announcement_date_form'):
+                for event in revenue_events:
+                    revenue = event.get('revenue', {}) if isinstance(event.get('revenue'), dict) else {}
+                    code = str(event.get('ticker', '')).strip()
+                    revenue_month = str(revenue.get('revenue_month', '')).strip()
+                    company = str(revenue.get('company', event.get('title', ''))).strip()
+                    correction_key = f"{code}:{revenue_month}"
+                    current_date = parse_calendar_event_date(event.get('date')) or date.today()
+                    info_col, date_col = st.columns([3, 2], vertical_alignment='center')
+                    info_col.markdown(
+                        f"**{company}（{code}）**｜營收月份 `{revenue_month}`｜"
+                        f"目前：`{current_date.isoformat()}`"
+                    )
+                    correction_values[correction_key] = date_col.date_input(
+                        f"{company}實際公告日",
+                        value=current_date,
+                        key=f"revenue_date_{code}_{revenue_month}",
+                        label_visibility='collapsed',
+                    )
+                apply_revenue_dates = st.form_submit_button(
+                    '套用實際公告日到行事曆', width='stretch',
+                )
+            if apply_revenue_dates:
+                corrections = {
+                    key: value.isoformat()
+                    for key, value in correction_values.items()
+                    if isinstance(value, date)
+                }
                 corrected_snapshot = apply_revenue_announcement_date_overrides(snapshot, corrections)
+                corrected_snapshot['updated_at'] = datetime.now(
+                    pytz.timezone('Asia/Taipei')
+                ).strftime('%Y/%m/%d %H:%M:%S')
                 st.session_state.company_event_snapshot = corrected_snapshot
                 save_company_event_snapshot(corrected_snapshot)
-                save_data_cache(
+                cloud_saved = save_data_cache(
                     st.session_state.stock_data, st.session_state.ignored_stocks,
                     st.session_state.all_candidates, st.session_state.saved_notes,
                 )
-                st.success('已套用實際公告日，行事曆會依校正日期顯示。')
+                if get_app_secret('gsheet_api_url') and not cloud_saved:
+                    st.session_state['_revenue_date_save_notice'] = (
+                        '日期已套用於目前程式，但 Google Sheet 同步失敗，請稍後再按一次。'
+                    )
+                else:
+                    st.session_state['_revenue_date_save_notice'] = (
+                        '已套用實際公告日，行事曆會依校正日期顯示。'
+                    )
                 st.rerun()
+            notice = st.session_state.pop('_revenue_date_save_notice', '')
+            if notice:
+                st.success(notice)
     summary_cols = st.columns(3)
     summary_cols[0].metric("財報事件", len(snapshot.get("earnings", {}).get("events", [])))
     summary_cols[1].metric("台股月營收", len(snapshot.get("taiwan_revenue", {}).get("events", [])))
