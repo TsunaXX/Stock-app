@@ -2320,8 +2320,9 @@ def fetch_taiwan_monthly_revenue_events(inputs):
                             (current_number - previous_number) / previous_number * 100
                         )
 
-        # 數值優先採 MOPS；若 MOPS 彙總尚未更新則採最新 FinMind。相同月份時，
-        # 用 FinMind create_time 補上公司實際公布日，避免把同步日誤當公告日。
+        # 數值優先採 MOPS；若 MOPS 彙總尚未更新則採最新 FinMind。MOPS 單一
+        # 公司頁未提供確切出表日，因此保留原本「系統偵測日」的誠實標示，不把
+        # FinMind 收錄時間誤稱為官方公告日。
         candidates = [candidate for candidate in (row, direct_row, finmind_row) if candidate]
         if candidates:
             row = max(
@@ -2331,15 +2332,6 @@ def fetch_taiwan_monthly_revenue_events(inputs):
                     2 if candidate.get("_mops_direct") else (1 if not candidate.get("_source") else 0),
                 ),
             )
-        selected_month = str(row.get("資料年月", "")) if row else ""
-        if (
-            row and finmind_row
-            and selected_month == str(finmind_row.get("資料年月", ""))
-            and finmind_row.get("_report_date")
-        ):
-            row = dict(row)
-            row["_report_date"] = finmind_row["_report_date"]
-            row["_report_date_source"] = "FinMind create_time"
         if not row:
             missing.append(f"{item['display_name']}（目前官方月營收彙總表未提供）")
             continue
@@ -2382,12 +2374,7 @@ def fetch_taiwan_monthly_revenue_events(inputs):
             "detail": (
                 fallback_note
                 + f"{revenue_month} 月營收：{_thousand_currency(revenue_data['current_month'])}；"
-                + (
-                    "MOPS 單一公司資料，公告日依 FinMind 收錄時間；"
-                    if row.get("_mops_direct") and row.get("_report_date_source") else
-                    "MOPS 單一公司資料（公告日未提供，顯示系統偵測日）；"
-                    if row.get("_mops_direct") else ""
-                )
+                + ("MOPS 單一公司資料（公告日未提供，顯示系統偵測日）；" if row.get("_mops_direct") else "")
                 + "點擊事件名稱查看月營收明細。"
             ),
             "closed": False,
@@ -5770,8 +5757,8 @@ def parse_sinopac_report_markdown(page_text):
 
 
 @st.cache_data(ttl=600, max_entries=1, show_spinner=False)
-def get_report_list():
-    """讀取永豐期貨盤後快訊，畫面維持原本的最新報告與歷史清單樣式。"""
+def fetch_sinopac_report_list():
+    """讀取永豐期貨盤後快訊；失敗時拋錯以避免 Streamlit 快取空清單。"""
     official_urls = (
         "https://www.spf.com.tw/sinopacSPF/research/list_1709f20d3ff00000d8e2039e8984ed51.do",
         "https://www.spf.com.tw/sinopacSPF/research/list.do?id=1709f20d3ff00000d8e2039e8984ed51",
@@ -5806,7 +5793,15 @@ def get_report_list():
             return reports
     except requests.RequestException:
         pass
-    return []
+    raise RuntimeError("永豐官網與備援來源皆未回傳可辨識的台指期籌碼快訊")
+
+
+def get_report_list():
+    """保留舊版 UI 的清單介面，同時避免暫時失敗被快取成空資料。"""
+    try:
+        return fetch_sinopac_report_list(), ""
+    except Exception as exc:
+        return [], str(exc)
 
 @st.cache_data(ttl=600, max_entries=1, show_spinner=False)
 def fetch_and_parse_pdf(pdf_url):
@@ -7844,7 +7839,7 @@ def get_futures_session_label(session_names, fallback='未知', root=''):
         for name in normalized_names
     )
     if has_day_session and has_night_session:
-        return '日+夜'
+        return '日盤+夜盤'
     if has_day_session:
         return '日盤'
     return str(fallback or '未知')
@@ -10854,7 +10849,7 @@ def render_futures_strategy_room():
             '名稱': st.column_config.TextColumn(width=88, disabled=True),
             '交易時段': st.column_config.TextColumn(
                 width=68, disabled=True,
-                help='「日+夜」代表此商品同時有日盤與夜盤；表內行情與策略計算仍採同一交易時段資料，避免混合不同時段的開高低收與成交量。',
+                help='「日盤+夜盤」代表此商品同時有日盤與夜盤；表內行情與策略計算仍採同一交易時段資料，避免混合不同時段的開高低收與成交量。',
             ),
             '當日成交口數': st.column_config.NumberColumn(format='%d', width=72, disabled=True),
             '未平倉量': st.column_config.NumberColumn(format='%d', width=70, disabled=True),
@@ -14426,14 +14421,16 @@ with tab_db:
         st.markdown("#### 📑 永豐期貨盤後籌碼自動化工具")
         
         if st.button("🔄 刷新最新報告清單"):
-            get_report_list.clear()        # 只清報告清單
+            fetch_sinopac_report_list.clear()  # 只清報告清單
             fetch_and_parse_pdf.clear()   # 只清 PDF 快取
             st.rerun()
 
-        reports = get_report_list()
+        reports, report_error = get_report_list()
 
         if not reports:
             st.warning("目前找不到相關報告，請檢查官網是否變動或稍後再試。")
+            if report_error:
+                st.caption(f"來源診斷：{report_error}")
         else:
             latest_report = reports[0]
             st.markdown(f"### 🔥 最新快訊: {latest_report['日期']} | {latest_report['title']}")

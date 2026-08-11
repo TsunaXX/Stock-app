@@ -108,10 +108,10 @@ def test_futures_day_and_night_sessions_display_in_the_table_cell():
         "get_futures_session_label",
     )
     label = symbols["get_futures_session_label"]
-    assert label(["一般交易時段", "盤後交易時段"]) == "日+夜"
+    assert label(["一般交易時段", "盤後交易時段"]) == "日盤+夜盤"
     assert label(["一般交易時段"]) == "日盤"
-    assert label(["一般交易時段"], root="QF") == "日+夜"
-    assert label(["一般"], root="QFF") == "日+夜"
+    assert label(["一般交易時段"], root="QF") == "日盤+夜盤"
+    assert label(["一般"], root="QFF") == "日盤+夜盤"
 
 
 def test_monthly_revenue_prefers_latest_official_month_for_each_company():
