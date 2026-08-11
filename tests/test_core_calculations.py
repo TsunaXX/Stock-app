@@ -277,6 +277,18 @@ def test_google_news_revenue_date_uses_earliest_matching_company_report():
     ) == "2026-08-04"
 
 
+def test_direct_revenue_report_wins_when_google_news_date_disagrees():
+    choose = load_app_symbols(
+        "choose_revenue_announcement_date"
+    )["choose_revenue_announcement_date"]
+    assert choose("2026-08-04", "2026-08-03") == (
+        "2026-08-04", "鉅亨網直接營收報導",
+    )
+    assert choose(None, "2026-08-04") == (
+        "2026-08-04", "Google News 營收報導",
+    )
+
+
 def test_public_report_date_removes_later_stale_sync_date_override():
     symbols = load_app_symbols(
         "empty_company_event_snapshot", "normalize_company_event_snapshot",
@@ -315,6 +327,27 @@ def test_public_report_date_removes_older_timezone_shift_override():
     corrected = symbols["apply_revenue_announcement_date_overrides"](snapshot)
     assert corrected["taiwan_revenue"]["events"][0]["date"] == "2026-08-04"
     assert "2408:11507" not in corrected["revenue_date_overrides"]
+
+
+def test_explicit_user_revenue_date_correction_is_not_discarded():
+    symbols = load_app_symbols(
+        "empty_company_event_snapshot", "normalize_company_event_snapshot",
+        "apply_revenue_announcement_date_overrides",
+    )
+    snapshot = {
+        "taiwan_revenue": {"events": [{
+            "date": "2026-08-03", "title": "南亞科 7月營收", "ticker": "2408",
+            "revenue": {
+                "company": "南亞科", "revenue_month": "11507",
+                "date_source": "多來源公開營收報導日期（採 Google News 營收報導）",
+            },
+        }]},
+    }
+    corrected = symbols["apply_revenue_announcement_date_overrides"](
+        snapshot, {"2408:11507": "2026-08-04"},
+    )
+    assert corrected["taiwan_revenue"]["events"][0]["date"] == "2026-08-04"
+    assert corrected["revenue_date_overrides"]["2408:11507"] == "2026-08-04"
 
 
 def test_calendar_date_only_value_does_not_shift_to_previous_day():
