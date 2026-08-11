@@ -2219,6 +2219,8 @@ def fetch_taiwan_monthly_revenue_events(inputs):
             "closed": False,
             "temporary": False,
             "source": "MOPS 單一公司月營收" if row.get("_mops_direct") else "TWSE OpenAPI（MOPS 每月營收）",
+            "ticker": code,
+            "market": "台股",
             "revenue": revenue_data,
         })
     return {"events": events, "missing": missing}
@@ -2325,6 +2327,79 @@ def empty_company_event_snapshot():
     }
 
 
+def normalize_company_event_snapshot(saved):
+    """Migrate legacy flat company events and rebuild a consistent cross-device snapshot."""
+    normalized = empty_company_event_snapshot()
+    if not isinstance(saved, dict):
+        return normalized
+    normalized['updated_at'] = str(saved.get('updated_at', '') or '')
+    normalized['tickers'] = str(saved.get('tickers', '') or '')
+    for section in ('earnings', 'taiwan_revenue', 'us_revenue'):
+        section_value = saved.get(section, {})
+        if isinstance(section_value, dict):
+            normalized[section] = dict(section_value)
+        if not isinstance(normalized[section].get('events'), list):
+            normalized[section]['events'] = []
+
+    def event_key(event):
+        return (
+            str(event.get('date', '')), str(event.get('title', '')),
+            str(event.get('ticker', '')), str(event.get('source', '')),
+        )
+
+    section_events = {
+        section: list(normalized[section].get('events', []))
+        for section in ('earnings', 'taiwan_revenue', 'us_revenue')
+    }
+    section_keys = {
+        section: {event_key(event) for event in events if isinstance(event, dict)}
+        for section, events in section_events.items()
+    }
+    unclassified_events = []
+    for event in saved.get('events', []) if isinstance(saved.get('events'), list) else []:
+        if not isinstance(event, dict):
+            continue
+        title = str(event.get('title', ''))
+        source = str(event.get('source', ''))
+        market = str(event.get('market', ''))
+        ticker = str(event.get('ticker', ''))
+        if '月營收' in title or 'MOPS' in source or '每月營收' in source:
+            section = 'taiwan_revenue'
+            event.setdefault('market', '台股')
+        elif '財報' in title or source == 'Yahoo Finance':
+            if not market:
+                market = '台股' if re.fullmatch(r'\d{4,6}\.(?:TW|TWO)', ticker, re.I) else '美股'
+                event.setdefault('market', market)
+            section = 'earnings'
+        elif market == '美股' or '營收' in title:
+            section = 'us_revenue'
+        else:
+            unclassified_events.append(event)
+            continue
+        key = event_key(event)
+        if key not in section_keys[section]:
+            section_events[section].append(event)
+            section_keys[section].add(key)
+
+    all_events, all_keys = [], set()
+    for section in ('earnings', 'taiwan_revenue', 'us_revenue'):
+        normalized[section]['events'] = section_events[section]
+        for event in section_events[section]:
+            if not isinstance(event, dict):
+                continue
+            key = event_key(event)
+            if key not in all_keys:
+                all_events.append(event)
+                all_keys.add(key)
+    for event in unclassified_events:
+        key = event_key(event)
+        if key not in all_keys:
+            all_events.append(event)
+            all_keys.add(key)
+    normalized['events'] = all_events
+    return normalized
+
+
 def load_company_event_snapshot():
     """讀取公司事件快照；行事曆只讀這個小檔案，不觸發外部財報／營收查詢。"""
     snapshot = empty_company_event_snapshot()
@@ -2335,17 +2410,18 @@ def load_company_event_snapshot():
             saved = json.load(file)
         if not isinstance(saved, dict):
             return snapshot
-        for key in snapshot:
-            if key in saved:
-                snapshot[key] = saved[key]
-        return snapshot
+        return normalize_company_event_snapshot(saved)
     except (OSError, ValueError, TypeError):
         return snapshot
 
 
 def save_company_event_snapshot(snapshot):
     try:
-        _write_json_atomic(COMPANY_EVENT_SNAPSHOT_FILE, _json_safe(snapshot), indent=2)
+        _write_json_atomic(
+            COMPANY_EVENT_SNAPSHOT_FILE,
+            _json_safe(normalize_company_event_snapshot(snapshot)),
+            indent=2,
+        )
     except (OSError, TypeError, ValueError):
         pass
 
@@ -5466,137 +5542,52 @@ def fetch_fubon_html(url):
         return f"<html><body><h3>無法載入資料: {e}</h3></body></html>"
 
 
-@st.cache_data(ttl=300, max_entries=3, show_spinner=False)
-def fetch_fubon_institutional_rankings(url):
-    """Parse Fubon's paired buy/sell ranking page into native Streamlit tables."""
-    page_html = fetch_fubon_html(url)
-    if not page_html or '無法載入資料:' in page_html:
-        return pd.DataFrame(), pd.DataFrame(), ''
-    source_date_match = re.search(r'日期[：:]\s*(\d{1,2}/\d{1,2})', page_html)
-    source_date = source_date_match.group(1) if source_date_match else ''
-    buy_rows, sell_rows = [], []
+def parse_sinopac_report_list(page_html, page_url):
+    """Parse current and legacy Sinopac lists without relying on fragile CSS classes."""
+    soup = BeautifulSoup(page_html or '', 'html.parser')
+    reports, seen = [], set()
+    for link_tag in soup.find_all('a', href=True):
+        title = link_tag.get_text(' ', strip=True) or str(link_tag.get('title', '')).strip()
+        compact_title = re.sub(r'\s+', '', title)
+        if '台指期籌碼快訊' not in compact_title:
+            continue
+        report_url = urljoin(page_url, link_tag.get('href', '').strip())
+        if not report_url or report_url in seen:
+            continue
+        context = link_tag.find_parent(['li', 'tr', 'article', 'div'])
+        context_text = context.get_text(' ', strip=True) if context else title
+        date_match = re.search(
+            r'(202\d)\s*[/-]?\s*(0?[1-9]|1[0-2])\s*[/-]?\s*(0?[1-9]|[12]\d|3[01])(?!\d)',
+            f'{title} {context_text}',
+        )
+        date_str = (
+            f'{date_match.group(1)}-{int(date_match.group(2)):02d}-{int(date_match.group(3)):02d}'
+            if date_match else '近期發布'
+        )
+        reports.append({'日期': date_str, 'title': title, 'url': report_url})
+        seen.add(report_url)
+    reports.sort(key=lambda item: item['日期'], reverse=True)
+    return reports
 
-    def parse_number(value):
-        value = str(value).replace(',', '').replace('+', '').strip()
-        try:
-            return float(value)
-        except ValueError:
-            return None
-
-    def parse_half(cells):
-        if len(cells) < 5 or not str(cells[0]).strip().isdigit():
-            return None
-        stock_match = re.match(r'^(\d{4,6}[A-Za-z]*)\s*(.+)$', str(cells[1]).strip())
-        quantity, close, change = (parse_number(cells[index]) for index in (2, 3, 4))
-        if not stock_match or quantity is None or close is None or change is None:
-            return None
-        return {
-            '排名': int(cells[0]), '代號': stock_match.group(1), '名稱': stock_match.group(2).strip(),
-            '超張數': quantity, '收盤價': close, '漲跌': change,
-        }
-
-    try:
-        soup = BeautifulSoup(page_html, 'html.parser')
-        for row in soup.find_all('tr'):
-            cells = [cell.get_text(' ', strip=True) for cell in row.find_all(['th', 'td'])]
-            if len(cells) < 10:
-                continue
-            buy = parse_half(cells[:5])
-            sell = parse_half(cells[5:10])
-            if buy:
-                buy_rows.append(buy)
-            if sell:
-                sell_rows.append(sell)
-    except (TypeError, ValueError, AttributeError):
-        return pd.DataFrame(), pd.DataFrame(), source_date
-    return pd.DataFrame(buy_rows), pd.DataFrame(sell_rows), source_date
 
 @st.cache_data(ttl=600, max_entries=1, show_spinner=False)
 def get_report_list():
-    """爬取永豐期貨盤後快訊列表，嚴格過濾台指期籌碼快訊"""
+    """讀取永豐期貨盤後快訊，畫面維持原本的最新報告與歷史清單樣式。"""
     url = "https://www.spf.com.tw/sinopacSPF/research/list.do?id=1709f20d3ff00000d8e2039e8984ed51"
-    base_url = "https://www.spf.com.tw"
-    headers = {'User-Agent': 'Mozilla/5.0'}
+    headers = {
+        'User-Agent': (
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+            'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0 Safari/537.36'
+        ),
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'zh-TW,zh;q=0.9,en;q=0.7',
+    }
     try:
-        response = requests.get(url, headers=headers, timeout=10)
+        response = requests.get(url, headers=headers, timeout=15)
+        response.raise_for_status()
         response.encoding = 'utf-8'
-        soup = BeautifulSoup(response.text, 'html.parser')
-        
-        reports = []
-        items = soup.select('div.list_news ul li')
-        
-        if items:
-            for item in items:
-                link_tag = item.find('a')
-                date_tag = item.find('span', class_='date')
-                if link_tag:
-                    title = link_tag.get_text(strip=True)
-                    # 嚴格過濾: 只有標題含有 "台指期籌碼快訊" 才會抓取
-                    if "台指期籌碼快訊" not in title:
-                        continue
-                        
-                    href = link_tag['href']
-                    pdf_url = urljoin(url, href)
-                    
-                    date_str = ""
-                    date_match = re.search(r'(202\d)(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])', title)
-                    if date_match:
-                        date_str = f"{date_match.group(1)}-{date_match.group(2)}-{date_match.group(3)}"
-                    elif date_tag:
-                        date_str = date_tag.get_text(strip=True).replace("/", "-")
-                    else:
-                        date_str = "近期發布"
-                        
-                    reports.append({"日期": date_str, "title": title, "url": pdf_url})
-        else:
-            # 舊的 DOM 結構 fallback
-            for a_tag in soup.find_all('a', href=re.compile(r'\.pdf')):
-                title = a_tag.get_text(strip=True) or a_tag.get('title', '')
-                if "台指期籌碼快訊" not in title:
-                    continue
-                    
-                href = a_tag['href']
-                pdf_url = urljoin(url, href)
-                
-                date_match = re.search(r'(202\d)(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])', title)
-                if date_match:
-                    date_str = f"{date_match.group(1)}-{date_match.group(2)}-{date_match.group(3)}"
-                else:
-                    parent = a_tag.find_parent(['tr', 'li'])
-                    dt_span = parent.find(text=re.compile(r'202\d[/-]\d{2}[/-]\d{2}')) if parent else None
-                    date_str = re.search(r'202\d[/-]\d{2}[/-]\d{2}', dt_span).group() if dt_span else "近期發布"
-
-                reports.append({"日期": date_str, "title": title, "url": pdf_url})
-                
-        # 網站近期的清單 class 會變動；只要是台指期籌碼快訊就不依 DOM class 漏抓。
-        if not reports:
-            for link_tag in soup.find_all('a', href=True):
-                title = link_tag.get_text(' ', strip=True) or link_tag.get('title', '')
-                if '台指期' not in title or '籌碼快訊' not in title:
-                    continue
-                context = link_tag.find_parent(['li', 'tr', 'div'])
-                context_text = context.get_text(' ', strip=True) if context else title
-                date_match = re.search(r'(202\d)[/-]?(0[1-9]|1[0-2])[/-]?(0[1-9]|[12]\d|3[01])', context_text)
-                date_str = (
-                    f"{date_match.group(1)}-{date_match.group(2)}-{date_match.group(3)}"
-                    if date_match else '近期發布'
-                )
-                reports.append({
-                    '日期': date_str, 'title': title,
-                    'url': urljoin(url, link_tag['href']),
-                })
-
-        # 過濾重複連結並依照日期降冪排列 (確保第一筆一定是最新的)
-        unique_reports = []
-        seen = set()
-        for r in reports:
-            if r['url'] not in seen:
-                unique_reports.append(r)
-                seen.add(r['url'])
-                
-        unique_reports.sort(key=lambda x: x['日期'], reverse=True)
-        return unique_reports
-    except Exception as e:
+        return parse_sinopac_report_list(response.text, url)
+    except requests.RequestException:
         return []
 
 @st.cache_data(ttl=600, max_entries=1, show_spinner=False)
@@ -5881,6 +5872,47 @@ ANALYSIS_MAX_WORKERS = 2
 API_REQUEST_GAP_SECONDS = 0.1
 
 _RUNTIME_FILE_LOCK = threading.RLock()
+
+
+@st.cache_data(max_entries=1)
+def load_local_stock_names():
+    if os.path.exists("stock_names.csv"):
+        try:
+            df = pd.read_csv("stock_names.csv", header=None, names=["code", "name"], dtype=str)
+            codes = df['code'].astype(str).str.strip()
+            names = df['name'].astype(str).str.strip()
+            return dict(zip(codes, names)), dict(zip(names, codes))
+        except Exception:
+            pass
+    return {}, {}
+
+
+def normalize_fibo_quick_tag(value, code_map=None, name_map=None):
+    """Normalize persisted/user-entered tags to the selector's 名稱(代號) value."""
+    raw = str(value or '').strip().replace('（', '(').replace('）', ')')
+    if not raw:
+        return ''
+    if code_map is None or name_map is None:
+        code_map, name_map = load_local_stock_names()
+    code_match = re.search(r'(?<!\d)(\d{4,6}[A-Za-z]?)(?:\.(?:TW|TWO))?(?!\d)', raw, re.I)
+    if code_match:
+        code = code_match.group(1).upper()
+        name = code_map.get(code)
+        if name:
+            return f"{name}({code})"
+    normalized_name = re.sub(r'\s+', '', raw.split('(', 1)[0])
+    exact_code = name_map.get(normalized_name)
+    if exact_code:
+        return f"{code_map.get(exact_code, normalized_name)}({exact_code})"
+    matched_stocks = [
+        (name, code) for name, code in name_map.items()
+        if normalized_name and normalized_name in re.sub(r'\s+', '', name)
+    ]
+    if matched_stocks:
+        matched_stocks.sort(key=lambda item: (not item[1].isdigit(), len(item[1]), item[1]))
+        name, code = matched_stocks[0]
+        return f"{name}({code})"
+    return raw
 
 
 def load_config():
@@ -6756,13 +6788,15 @@ def _valid_fibo_tags(tags):
 
 def save_fibo_config():
     config = load_config()
-    fibo_tags = [
+    fibo_tags = [normalize_fibo_quick_tag(tag) for tag in [
         st.session_state.get('custom_tag_1', "台積電(2330)"), 
         st.session_state.get('custom_tag_2', "鴻海(2317)"), 
         st.session_state.get('custom_tag_3', "聯發科(2454)"), 
         st.session_state.get('custom_tag_4', "和椿(6215)"), 
         st.session_state.get('custom_tag_5', "晶彩科(3535)")
-    ]
+    ]]
+    for index, tag in enumerate(fibo_tags, start=1):
+        st.session_state[f'custom_tag_{index}'] = tag
     config['fibo_tags'] = fibo_tags
     st.session_state.fibo_tags = fibo_tags
     if 'ma_w' in st.session_state:
@@ -6816,8 +6850,8 @@ def _merge_unique_values(remote_values, local_values):
 
 def _newer_company_event_snapshot(remote_snapshot, local_snapshot):
     """Keep the newest non-empty company snapshot when computer and phone both save."""
-    remote_snapshot = remote_snapshot if isinstance(remote_snapshot, dict) else {}
-    local_snapshot = local_snapshot if isinstance(local_snapshot, dict) else {}
+    remote_snapshot = normalize_company_event_snapshot(remote_snapshot)
+    local_snapshot = normalize_company_event_snapshot(local_snapshot)
     remote_has_events = bool(remote_snapshot.get('events'))
     local_has_events = bool(local_snapshot.get('events'))
     if not local_has_events:
@@ -7037,6 +7071,7 @@ def reload_fibo_tags_from_cloud():
     """手動從 Google Sheet 還原標籤，供清除 Cookie 後的新手機工作階段使用。"""
     payload, error = _fetch_remote_data_cache(get_app_secret('gsheet_api_url'), timeout=8)
     tags = _valid_fibo_tags(payload.get('fibo_tags', [])) if payload else []
+    tags = [normalize_fibo_quick_tag(tag) for tag in tags]
     if not tags:
         return False, error or '雲端尚無五組快速標籤'
     st.session_state.fibo_tags = tags
@@ -7146,6 +7181,7 @@ elif cached_fibo_tags:
 else:
     fibo_tags_source = list(DEFAULT_FIBO_TAGS)
     st.session_state['_fibo_tags_source'] = 'default'
+fibo_tags_source = [normalize_fibo_quick_tag(tag) for tag in fibo_tags_source]
 st.session_state.fibo_tags = list(fibo_tags_source)
 
 if 'fibo_search_input' not in st.session_state: st.session_state.fibo_search_input = ""
@@ -7209,18 +7245,6 @@ if sj and st.session_state.remember_sj and st.session_state.sj_key and not st.se
             raise
         st.session_state.sj_logged_in = False
         st.session_state.sj_connection_error = type(exc).__name__
-
-@st.cache_data(max_entries=1)
-def load_local_stock_names():
-    if os.path.exists("stock_names.csv"):
-        try:
-            df = pd.read_csv("stock_names.csv", header=None, names=["code", "name"], dtype=str)
-            codes = df['code'].astype(str).str.strip()
-            names = df['name'].astype(str).str.strip()
-            return dict(zip(codes, names)), dict(zip(names, codes))
-        except Exception:
-            pass
-    return {}, {}
 
 @st.cache_data(ttl=300)
 def get_stock_name_online(code):
@@ -7794,7 +7818,7 @@ def fetch_futures_strategy_universe():
         has_day_session = '一般' in session_names
         has_night_session = any(name != '一般' for name in session_names)
         if has_day_session and has_night_session:
-            session_label = '日＋夜（計算採日盤）'
+            session_label = '日+夜'
         elif has_day_session:
             session_label = '日盤'
         else:
@@ -10566,8 +10590,8 @@ def render_futures_strategy_room():
             '契約月份': st.column_config.TextColumn(width=58, disabled=True),
             '名稱': st.column_config.TextColumn(width=88, disabled=True),
             '交易時段': st.column_config.TextColumn(
-                width=150, disabled=True,
-                help='「日＋夜」代表期交所同時提供兩時段資料；為避免混用兩個時段的 OHLC 與成交量，策略計算固定採日盤欄位。',
+                width=68, disabled=True,
+                help='「日+夜」代表此商品同時有日盤與夜盤；表內行情與策略計算仍採同一交易時段資料，避免混合不同時段的開高低收與成交量。',
             ),
             '當日成交口數': st.column_config.NumberColumn(format='%d', width=72, disabled=True),
             '未平倉量': st.column_config.NumberColumn(format='%d', width=70, disabled=True),
@@ -13197,33 +13221,8 @@ with tab_fibo:
             save_fibo_config()
             return
 
-        st.session_state[key] = normalize_fibo_tag(val)
+        st.session_state[key] = normalize_fibo_quick_tag(val)
         save_fibo_config()
-
-    def normalize_fibo_tag(value):
-        """Convert a saved quick-tag into the same 名稱(代號) form as the selector."""
-        raw = str(value or '').strip().replace('（', '(').replace('）', ')')
-        if not raw:
-            return ''
-        code_map, name_map = load_local_stock_names()
-        code_match = re.search(r'(?<!\d)(\d{4,6}[A-Za-z]?)(?!\d)', raw)
-        if code_match:
-            code = code_match.group(1).upper()
-            name = code_map.get(code)
-            if name:
-                return f"{name}({code})"
-        normalized_name = re.sub(r'\s+', '', raw.split('(', 1)[0])
-        if normalized_name in name_map:
-            return f"{normalized_name}({name_map[normalized_name]})"
-        matched_stocks = [
-            (name, code) for name, code in name_map.items()
-            if normalized_name and normalized_name in re.sub(r'\s+', '', name)
-        ]
-        if matched_stocks:
-            matched_stocks.sort(key=lambda item: (not item[1].isdigit(), len(item[1]), item[1]))
-            name, code = matched_stocks[0]
-            return f"{name}({code})"
-        return raw
     
     tab_trade_plan, tab_option_plan, tab_fibo_thermometer, tab_fibo_chart, tab_fibo_manual = st.tabs(
         ["🧭 指數操作計畫", "📅 選擇權操作計畫", "🌡️ 市場溫度計", "📊 費波圖表", "🧮 手動費波"],
@@ -13905,7 +13904,7 @@ with tab_fibo:
         search_list = ["加權股價指數(TAIEX)", "臺股期貨(TX)", "微型臺指期貨(TMF)"] + fibo_stock_options
 
         def set_fibo_search(val):
-            canonical_value = normalize_fibo_tag(val)
+            canonical_value = normalize_fibo_quick_tag(val)
             st.session_state.fibo_search_input = canonical_value
             if canonical_value in search_list:
                 st.session_state.fibo_selectbox = canonical_value
@@ -13980,7 +13979,7 @@ with tab_fibo:
         def selectbox_changed():
             val = st.session_state.fibo_selectbox
             if val:
-                st.session_state.fibo_search_input = normalize_fibo_tag(val)
+                st.session_state.fibo_search_input = normalize_fibo_quick_tag(val)
                 st.session_state.fibo_interval = "1d"
             else:
                 st.session_state.fibo_search_input = ""
@@ -13994,7 +13993,7 @@ with tab_fibo:
             on_change=selectbox_changed
         )
         
-        final_target = normalize_fibo_tag(st.session_state.fibo_search_input)
+        final_target = normalize_fibo_quick_tag(st.session_state.fibo_search_input)
         
         st.write("---")
         st.write("⚙️ **圖表顯示設定**")
@@ -14144,53 +14143,12 @@ with tab_db:
         st.markdown("---")
         st.markdown("#### 📈 法人當日買賣超個股")
         inst_tabs = st.tabs(["外資當日買賣超", "投信當日買賣超", "自營商當日買賣超"])
-        def render_fubon_ranking(url):
-            buy_table, sell_table, source_date = fetch_fubon_institutional_rankings(url)
-            if buy_table.empty and sell_table.empty:
-                st.warning("法人個股排行暫時無法表格化，以下保留原始來源內容。")
-                st.html(fetch_fubon_html(url), width=800)
-                return
-
-            def style_price_change(value):
-                try:
-                    value = float(value)
-                except (TypeError, ValueError):
-                    return ''
-                if value > 0:
-                    return 'color:#ff4b4b;font-weight:700;'
-                if value < 0:
-                    return 'color:#00c853;font-weight:700;'
-                return 'color:#B0BEC5;'
-
-            buy_col, sell_col = st.columns(2)
-            table_config = {
-                '排名': st.column_config.NumberColumn(width=48, format='%d'),
-                '代號': st.column_config.TextColumn(width=66),
-                '名稱': st.column_config.TextColumn(width=92),
-                '超張數': st.column_config.NumberColumn(width=80, format='%,.0f'),
-                '收盤價': st.column_config.NumberColumn(width=72, format='%.4g'),
-                '漲跌': st.column_config.NumberColumn(width=64, format='%+.4g'),
-            }
-            with buy_col:
-                st.caption("🔴 買超排行")
-                st.dataframe(
-                    buy_table.style.map(style_price_change, subset=['漲跌']),
-                    hide_index=True, width='stretch', height=420, column_config=table_config,
-                )
-            with sell_col:
-                st.caption("🟢 賣超排行")
-                st.dataframe(
-                    sell_table.style.map(style_price_change, subset=['漲跌']),
-                    hide_index=True, width='stretch', height=420, column_config=table_config,
-                )
-            st.caption(f"資料來源：富邦 DJ 法人排行{f'｜資料日期 {source_date}' if source_date else ''}")
-
         with inst_tabs[0]:
-            render_fubon_ranking("https://fubon-ebrokerdj.fbs.com.tw/Z/ZG/ZGK_D.djhtm")
+            st.html(fetch_fubon_html("https://fubon-ebrokerdj.fbs.com.tw/Z/ZG/ZGK_D.djhtm"), width=800)
         with inst_tabs[1]:
-            render_fubon_ranking("https://fubon-ebrokerdj.fbs.com.tw/Z/ZG/ZGK_DD.djhtm")
+            st.html(fetch_fubon_html("https://fubon-ebrokerdj.fbs.com.tw/Z/ZG/ZGK_DD.djhtm"), width=800)
         with inst_tabs[2]:
-            render_fubon_ranking("https://fubon-ebrokerdj.fbs.com.tw/Z/ZG/ZGK_DB.djhtm")
+            st.html(fetch_fubon_html("https://fubon-ebrokerdj.fbs.com.tw/Z/ZG/ZGK_DB.djhtm"), width=800)
         
     with sub_tab2:
         st.markdown("#### 📑 永豐期貨盤後籌碼自動化工具")
@@ -14474,9 +14432,13 @@ with tab3:
         )
     if "company_event_snapshot" not in st.session_state:
         cached_snapshot = st.session_state.get('_cached_company_event_snapshot')
+        remote_snapshot = normalize_company_event_snapshot(cached_snapshot)
         st.session_state.company_event_snapshot = (
-            cached_snapshot if isinstance(cached_snapshot, dict) and cached_snapshot.get('events')
-            else load_company_event_snapshot()
+            remote_snapshot if remote_snapshot.get('events') else load_company_event_snapshot()
+        )
+    else:
+        st.session_state.company_event_snapshot = normalize_company_event_snapshot(
+            st.session_state.company_event_snapshot
         )
 
     with st.expander("🛠️ 自訂與校正行事曆事件"):
@@ -14506,6 +14468,11 @@ with tab3:
 
     with st.expander("🌐 網路同步與追蹤事件", expanded=False):
         st.caption("選擇要顯示的事件；公司資料只讀取獨立分頁的最近快照，不會在切換月份時重新查詢。")
+        if 'calendar_event_groups' in st.session_state:
+            migrated_widget_groups = normalize_calendar_preferences({
+                'groups': st.session_state.calendar_event_groups,
+            })['groups']
+            st.session_state.calendar_event_groups = migrated_widget_groups
         selected_event_groups = st.multiselect(
             "追蹤類別",
             options=CALENDAR_GROUP_OPTIONS,
@@ -14704,7 +14671,8 @@ with tab3:
             build_msci_quarterly_rebalance_events(sel_year, taiwan_closed_dates),
         )
 
-    company_snapshot = st.session_state.company_event_snapshot
+    company_snapshot = normalize_company_event_snapshot(st.session_state.company_event_snapshot)
+    st.session_state.company_event_snapshot = company_snapshot
     earnings_events = list(company_snapshot.get("earnings", {}).get("events", []))
     legacy_market_by_name = {}
     for resolved_text in company_snapshot.get("earnings", {}).get("resolved", []):

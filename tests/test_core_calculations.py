@@ -8,7 +8,7 @@ import re
 from datetime import date, datetime, time as dt_time, timedelta
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP
 from pathlib import Path
-from types import SimpleNamespace
+from urllib.parse import urljoin
 
 import numpy as np
 import pandas as pd
@@ -41,13 +41,13 @@ def load_app_symbols(*names):
         "ROUND_FLOOR": ROUND_FLOOR,
         "ROUND_HALF_UP": ROUND_HALF_UP,
         "BeautifulSoup": BeautifulSoup,
-        "st": SimpleNamespace(cache_data=lambda **_kwargs: lambda func: func),
         "json": json,
         "math": math,
         "np": np,
         "pd": pd,
         "pytz": pytz,
         "re": re,
+        "urljoin": urljoin,
     }
     module = ast.fix_missing_locations(ast.Module(body=selected, type_ignores=[]))
     exec(compile(module, APP_PATH, "exec"), namespace)
@@ -115,27 +115,54 @@ def test_goodinfo_table_requires_real_turnover_rows():
     assert clean(invalid) is None
 
 
-def test_fubon_paired_rankings_are_normalized_into_two_tables():
-    symbols = load_app_symbols("fetch_fubon_institutional_rankings")
-    symbols["fetch_fubon_html"] = lambda _url: """
-        <html>日期：08/11<table>
-        <tr><th>名次</th><th>股票名稱</th><th>超張數</th><th>收盤價</th><th>漲跌</th>
-            <th>名次</th><th>股票名稱</th><th>超張數</th><th>收盤價</th><th>漲跌</th></tr>
-        <tr><td>1</td><td>2408南亞科</td><td>15,173</td><td>489</td><td>-13</td>
-            <td>1</td><td>2409友達</td><td>-56,259</td><td>26.1</td><td>-0.9</td></tr>
-        </table></html>
-    """
-    buy, sell, source_date = symbols["fetch_fubon_institutional_rankings"]("https://example.test")
-    assert source_date == "08/11"
-    assert buy.iloc[0]["代號"] == "2408"
-    assert buy.iloc[0]["超張數"] == 15173
-    assert sell.iloc[0]["名稱"] == "友達"
+def test_fibo_quick_tag_resolves_nanya_technology_code():
+    symbols = load_app_symbols("normalize_fibo_quick_tag")
+    normalize = symbols["normalize_fibo_quick_tag"]
+    code_map = {"2408": "南亞科"}
+    name_map = {"南亞科": "2408"}
+    assert normalize("南亞科", code_map, name_map) == "南亞科(2408)"
+    assert normalize("南亞科（2408.TW）", code_map, name_map) == "南亞科(2408)"
+
+
+def test_sinopac_list_parser_reads_current_direct_pdf_layout():
+    symbols = load_app_symbols("parse_sinopac_report_list")
+    reports = symbols["parse_sinopac_report_list"](
+        """
+        <div class="research-list"><ul><li>
+          <a href="/upload/sinopac/researchContent/latest.pdf">台指期籌碼快訊</a>
+          <span>2026/08/11</span>
+        </li></ul></div>
+        """,
+        "https://www.spf.com.tw/sinopacSPF/research/list.do?id=test",
+    )
+    assert reports == [{
+        "日期": "2026-08-11",
+        "title": "台指期籌碼快訊",
+        "url": "https://www.spf.com.tw/upload/sinopac/researchContent/latest.pdf",
+    }]
+
+
+def test_legacy_company_events_are_restored_to_calendar_sections():
+    symbols = load_app_symbols("empty_company_event_snapshot", "normalize_company_event_snapshot")
+    snapshot = symbols["normalize_company_event_snapshot"]({
+        "updated_at": "2026/08/11 12:00",
+        "tickers": "2408",
+        "events": [{
+            "date": "2026-08-11", "title": "南亞科 月營收 MOM+1%／YOY+2%",
+            "source": "TWSE OpenAPI（MOPS 每月營收）", "ticker": "2408",
+        }],
+    })
+    assert len(snapshot["taiwan_revenue"]["events"]) == 1
+    assert snapshot["taiwan_revenue"]["events"][0]["market"] == "台股"
+    assert len(snapshot["events"]) == 1
 
 
 def test_cache_merge_preserves_remote_device_sections():
     symbols = load_app_symbols(
         "_json_safe", "_valid_fibo_tags", "_merge_unique_records",
-        "_merge_unique_values", "_newer_company_event_snapshot", "_merge_data_cache_payload",
+        "_merge_unique_values", "empty_company_event_snapshot",
+        "normalize_company_event_snapshot", "_newer_company_event_snapshot",
+        "_merge_data_cache_payload",
     )
     remote = {
         "stock_data": [{"代號": "2330", "收盤價": 100}],
