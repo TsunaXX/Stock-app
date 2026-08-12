@@ -3,6 +3,7 @@
 import ast
 import calendar
 import html
+import io
 import json
 import math
 import re
@@ -35,6 +36,7 @@ def load_app_symbols(*names):
     namespace = {
         "calendar": calendar,
         "html": html,
+        "io": io,
         "date": date,
         "datetime": datetime,
         "dt_time": dt_time,
@@ -181,6 +183,33 @@ def test_goodinfo_table_requires_real_turnover_rows():
     assert clean(valid) is not None
     invalid = valid.assign(**{"週轉率(%)": ["--"] * len(valid)})
     assert clean(invalid) is None
+
+
+def test_goodinfo_parser_uses_only_verified_ranking_table_html():
+    symbols = load_app_symbols("_clean_goodinfo_table", "_parse_goodinfo_table_html")
+    row_html = ''.join(
+        f"<tr><td>{2300 + index}</td><td>股票{index}</td><td>{index + 1}.2%</td></tr>"
+        for index in range(12)
+    )
+    table_html = (
+        "<table><thead><tr><th>股票代號</th><th>名稱</th><th>週轉率(%)</th></tr></thead>"
+        f"<tbody>{row_html}</tbody></table>"
+    )
+    parsed = symbols["_parse_goodinfo_table_html"]([table_html, "<table><tr><td>廣告</td></tr></table>"])
+    assert parsed is not None
+    assert len(parsed) == 12
+
+
+def test_stock_direction_basis_is_compact_but_keeps_key_signals():
+    symbols = load_app_symbols("_as_float", "determine_stock_direction")
+    result = symbols["determine_stock_direction"]({
+        "收盤價": 100, "漲跌幅": 1, "_ma5": 95, "_risk_ma20": 90,
+        "_risk_ma20_slope": 1, "_risk_prev_high": 105, "_risk_prev_low": 85,
+        "_risk_close_position": 70,
+    })
+    assert result["label"] == "🔴 建議多"
+    assert result["basis"] == "日K｜日 K 站上 5 日線、日 K 站上 20 日線"
+    assert "多 " not in result["basis"]
 
 
 def test_fibo_quick_tag_resolves_nanya_technology_code():
