@@ -6269,12 +6269,6 @@ _GOODINFO_URL = (
     "&INDUSTRY_CAT=%E7%B4%AF%E8%A8%88%E6%88%90%E4%BA%A4%E9%87%8F%E9%80%B1%E8%BD%89%E7%8E%87%28%E7%95%B6%E6%97%A5%29"
     "%40%40%E7%B4%AF%E8%A8%88%E6%88%90%E4%BA%A4%E9%87%8F%E9%80%B1%E8%BD%89%E7%8E%87%40%40%E7%95%B6%E6%97%A5"
 )
-_GOODINFO_USER_AGENT = (
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-)
-
-
 def _clean_goodinfo_table(dataframe):
     cleaned = dataframe.copy()
     if isinstance(cleaned.columns, pd.MultiIndex):
@@ -6339,7 +6333,7 @@ def _goodinfo_rank_table_html(driver):
 
 
 def fetch_goodinfo_data():
-    """在 15 秒期限內等待並驗證 Goodinfo 上市／上櫃綜合週轉率表。"""
+    """等待並驗證 Goodinfo 排行表；首輪失敗時在同次操作內再試一次。"""
     chrome_options = Options()
     chrome_options.add_argument("--headless=new")
     chrome_options.add_argument("--no-sandbox")
@@ -6347,74 +6341,62 @@ def fetch_goodinfo_data():
     chrome_options.add_argument("--disable-gpu")
     chrome_options.add_argument("--window-size=1920x1080")
     chrome_options.add_argument("--disable-software-rasterizer")
-    chrome_options.add_argument("--disable-background-networking")
-    chrome_options.add_argument("--disable-features=Translate,OptimizationHints")
-    chrome_options.add_argument(f"--user-agent={_GOODINFO_USER_AGENT}")
+    chrome_options.add_argument("--lang=zh-TW")
     chrome_options.add_argument("--disable-blink-features=AutomationControlled")
     chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
     chrome_options.add_experimental_option('useAutomationExtension', False)
     chrome_options.page_load_strategy = 'eager'
 
     chrome_options.binary_location = "/usr/bin/chromium"
-    request_started_at = time.monotonic()
-    deadline = request_started_at + 15
     acquired = _GOODINFO_BROWSER_SEMAPHORE.acquire(timeout=15)
     if not acquired:
         return None
     driver = None
-    refreshed_after_alert = False
-    reloaded_for_incomplete_table = False
     try:
-        if time.monotonic() >= deadline:
-            return None
         service = Service("/usr/bin/chromedriver")
         driver = webdriver.Chrome(service=service, options=chrome_options)
-        driver.set_page_load_timeout(max(1, min(6, deadline - time.monotonic())))
-        driver.execute_cdp_cmd("Network.setUserAgentOverride", {
-            "userAgent": _GOODINFO_USER_AGENT,
-            "acceptLanguage": "zh-TW,zh;q=0.9,en;q=0.8",
-            "platform": "Linux x86_64",
-        })
+        driver.set_page_load_timeout(7)
         driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
             "source": """
                 Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
                 Object.defineProperty(navigator, 'languages', {get: () => ['zh-TW', 'zh', 'en-US', 'en']});
             """
         })
-        try:
-            driver.get(_GOODINFO_URL)
-        except (TimeoutException, UnexpectedAlertPresentException):
-            pass
-        while time.monotonic() < deadline:
+        for attempt in range(2):
             try:
-                alert = driver.switch_to.alert
-                alert_text = alert.text
-                alert.accept()
-                logger.warning('Goodinfo alert: %s', alert_text)
-                if not refreshed_after_alert and time.monotonic() + 3 < deadline:
-                    refreshed_after_alert = True
-                    try:
-                        driver.refresh()
-                    except (TimeoutException, UnexpectedAlertPresentException):
-                        pass
-            except NoAlertPresentException:
-                pass
-            ranking = _parse_goodinfo_table_html(_goodinfo_rank_table_html(driver))
-            if ranking is not None:
-                return ranking
-            # Dynamic rows can occasionally stall after an otherwise successful
-            # document load. Reload once inside the same user-request deadline.
-            if (
-                not reloaded_for_incomplete_table
-                and time.monotonic() >= request_started_at + 7
-                and time.monotonic() + 3 < deadline
-            ):
-                reloaded_for_incomplete_table = True
-                try:
+                if attempt == 0:
                     driver.get(_GOODINFO_URL)
-                except (TimeoutException, UnexpectedAlertPresentException):
+                else:
+                    driver.refresh()
+            except (TimeoutException, UnexpectedAlertPresentException):
+                pass
+
+            # Goodinfo currently performs CLIENT_KEY initialization followed by
+            # a JavaScript redirect; the ranking table commonly appears around
+            # 12 seconds later. Never reload midway through this wait.
+            attempt_deadline = time.monotonic() + 16
+            full_page_checked = False
+            while time.monotonic() < attempt_deadline:
+                try:
+                    alert = driver.switch_to.alert
+                    alert_text = alert.text
+                    alert.accept()
+                    logger.warning('Goodinfo alert on attempt %s: %s', attempt + 1, alert_text)
+                    break
+                except NoAlertPresentException:
                     pass
-            time.sleep(min(0.5, max(0, deadline - time.monotonic())))
+
+                ranking = _parse_goodinfo_table_html(_goodinfo_rank_table_html(driver))
+                if ranking is not None:
+                    return ranking
+                # Preserve the previously working whole-page parser as a
+                # fallback in case Goodinfo changes the table's DOM wrapper.
+                if not full_page_checked and time.monotonic() + 4 >= attempt_deadline:
+                    full_page_checked = True
+                    ranking = _parse_goodinfo_table_html([driver.page_source])
+                    if ranking is not None:
+                        return ranking
+                time.sleep(min(0.5, max(0, attempt_deadline - time.monotonic())))
     except (WebDriverException, OSError, ValueError) as exc:
         logger.exception('Goodinfo fetch failed: %s', type(exc).__name__)
     finally:
@@ -8134,7 +8116,7 @@ def render_stock_strategy_controls():
             st.markdown("#### 外部資源")
 
             def perform_goodinfo_fetch():
-                with st.spinner("正在抓取最新資料，約需 15 秒..."):
+                with st.spinner("正在抓取最新資料，通常約 15 秒；若首輪未完成會自動再試一次..."):
                     result = fetch_goodinfo_data()
                     if result is not None and not result.empty:
                         st.session_state['goodinfo_df'] = result.astype(str)
@@ -8145,7 +8127,7 @@ def render_stock_strategy_controls():
                         st.error("抓取失敗或查無資料，請稍後再試。")
 
             if st.button(
-                "📥 抓取 Goodinfo 週轉率排行", help="需等待動態表格載入",
+                "📥 抓取 Goodinfo 週轉率排行", help="需等待動態表格載入；首輪失敗會自動重試",
                 width='stretch', key='fetch_goodinfo_in_stock_room'
             ):
                 perform_goodinfo_fetch()

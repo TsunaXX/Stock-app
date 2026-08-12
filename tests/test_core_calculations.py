@@ -195,7 +195,11 @@ def test_goodinfo_parser_uses_only_verified_ranking_table_html():
         "<table><thead><tr><th>股票代號</th><th>名稱</th><th>週轉率(%)</th></tr></thead>"
         f"<tbody>{row_html}</tbody></table>"
     )
-    parsed = symbols["_parse_goodinfo_table_html"]([table_html, "<table><tr><td>廣告</td></tr></table>"])
+    whole_page = (
+        "<html><body><table><tr><td>廣告</td></tr></table>"
+        f"{table_html}</body></html>"
+    )
+    parsed = symbols["_parse_goodinfo_table_html"]([whole_page])
     assert parsed is not None
     assert len(parsed) == 12
 
