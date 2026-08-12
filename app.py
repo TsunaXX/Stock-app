@@ -7807,6 +7807,9 @@ def save_search_cache(selected_items):
 if 'stock_data' not in st.session_state:
     cached_df, cached_ignored, cached_candidates, cached_saved_notes, cached_fibo_tags, cached_note_dict = load_data_cache()
     st.session_state.stock_data = cached_df
+    # A persisted table preserves the user's symbols, ordering and notes only.
+    # Market values must be refreshed once when a new browser session starts.
+    st.session_state._stock_cache_refresh_pending = not cached_df.empty
     st.session_state.ignored_stocks = cached_ignored
     st.session_state.all_candidates = cached_candidates
     st.session_state.saved_notes = cached_saved_notes
@@ -10753,8 +10756,79 @@ def fetch_stock_data_raw(code, name_hint="", extra_data=None, futures_set=None, 
         "_risk_atr14": risk_atr14, "_risk_ma20": risk_ma20, "_risk_ma20_slope": risk_ma20_slope,
         "_risk_close_position": risk_close_position, "_risk_prev_high": risk_prev_high, "_risk_prev_low": risk_prev_low,
         "_plan_prev_high": plan_prev_high, "_plan_prev_low": plan_prev_low,
-        "_quote_bid": live_quote_bid, "_quote_ask": live_quote_ask, "_quote_time": live_quote_time
+        "_quote_bid": live_quote_bid, "_quote_ask": live_quote_ask, "_quote_time": live_quote_time,
+        "_data_as_of": live_quote_time or pd.Timestamp(hist.index[-1]).strftime('%Y/%m/%d'),
+        "_data_stale": False,
     }
+
+
+def _merge_refreshed_stock_rows(stock_data, fetched_results):
+    """Replace cached rows with fresh results while retaining ordering metadata."""
+    if not isinstance(stock_data, pd.DataFrame) or stock_data.empty:
+        return pd.DataFrame(), 0
+    refreshed_rows = []
+    updated_count = 0
+    result_map = {
+        str(code).strip(): result
+        for code, result in (fetched_results or [])
+        if str(code).strip()
+    }
+    metadata_columns = ('_source', '_order', '_source_rank')
+    for _, cached_row in stock_data.iterrows():
+        code = str(cached_row.get('代號', '')).strip()
+        fresh = result_map.get(code)
+        if isinstance(fresh, dict) and fresh:
+            merged = dict(fresh)
+            for column in metadata_columns:
+                if column in cached_row.index:
+                    merged[column] = cached_row.get(column)
+            if not str(merged.get('期貨', '')).strip() and str(cached_row.get('期貨', '')).strip():
+                merged['期貨'] = cached_row.get('期貨')
+            merged['_data_stale'] = False
+            refreshed_rows.append(merged)
+            updated_count += 1
+        else:
+            preserved = cached_row.to_dict()
+            preserved['_data_stale'] = True
+            refreshed_rows.append(preserved)
+    refreshed = pd.DataFrame(refreshed_rows)
+    if '_source_rank' in refreshed.columns and '_order' in refreshed.columns:
+        refreshed = refreshed.sort_values(['_source_rank', '_order'], kind='stable')
+    return refreshed.reset_index(drop=True), updated_count
+
+
+def refresh_persisted_stock_rows(
+    stock_data, futures_set, saved_notes_dict, name_map_dict,
+    sj_logged_in=False, sj_api=None,
+):
+    """Refresh restored table rows; persisted data supplies identity/order, not market values."""
+    if not isinstance(stock_data, pd.DataFrame) or stock_data.empty or '代號' not in stock_data.columns:
+        return stock_data, 0
+    futures_copy = dict(futures_set) if isinstance(futures_set, dict) else futures_set
+    notes_copy = dict(saved_notes_dict or {})
+    name_copy = dict(name_map_dict or {})
+    tasks = [
+        (str(row.get('代號', '')).strip(), str(row.get('名稱', '')).strip())
+        for _, row in stock_data.iterrows()
+        if str(row.get('代號', '')).strip()
+    ]
+
+    def fetch_latest(task):
+        code, name = task
+        try:
+            time.sleep(API_REQUEST_GAP_SECONDS)
+            result = fetch_stock_data_raw(
+                code, name, None, futures_copy, notes_copy, name_copy,
+                sj_logged_in, sj_api,
+            )
+            return code, result
+        except Exception:
+            return code, None
+
+    with ThreadPoolExecutor(max_workers=ANALYSIS_MAX_WORKERS) as executor:
+        results = list(executor.map(fetch_latest, tasks))
+    return _merge_refreshed_stock_rows(stock_data, results)
+
 
 def refresh_risk_metrics_for_codes(stock_data, futures_set, saved_notes_dict, name_map_dict, sj_logged_in=False, sj_api=None):
     """手動重抓日 K，僅回填風險篩選所需欄位，保留原本的表格與備註資料。"""
@@ -11580,11 +11654,44 @@ with tab1:
         render_strategy_validation_room()
 
 with stock_strategy_container:
+    if st.session_state.pop('_stock_cache_refresh_pending', False):
+        code_name_map, _ = load_local_stock_names()
+        cached_row_count = len(st.session_state.stock_data)
+        with st.spinner(f"正在更新保留表格中的 {cached_row_count} 檔股票資料..."):
+            refreshed_stock_data, refreshed_stock_count = refresh_persisted_stock_rows(
+                st.session_state.stock_data,
+                st.session_state.get('futures_list', {}),
+                st.session_state.get('saved_notes', {}),
+                code_name_map,
+                st.session_state.get('sj_logged_in', False),
+                st.session_state.get('sj_api'),
+            )
+        st.session_state.stock_data = refreshed_stock_data
+        st.session_state.stock_strategy_editor_revision += 1
+        save_data_cache(
+            st.session_state.stock_data, st.session_state.ignored_stocks,
+            st.session_state.all_candidates, st.session_state.saved_notes,
+        )
+        if refreshed_stock_count:
+            st.session_state['_stock_auto_refresh_notice'] = (
+                f"已自動更新 {refreshed_stock_count}/{cached_row_count} 檔；"
+                "未更新成功的股票會保留並標示資料過期。"
+            )
+        else:
+            st.session_state['_stock_auto_refresh_notice'] = (
+                "本次未取得最新行情，已保留原表並標示資料過期；可稍後按執行分析重試。"
+            )
     stock_settings_col, stock_help_col = st.columns([3, 2])
     with stock_settings_col:
         hide_non_stock, show_3d_hilo = render_stock_strategy_controls()
     with stock_help_col:
         render_stock_strategy_explanation()
+    stock_auto_refresh_notice = st.session_state.pop('_stock_auto_refresh_notice', '')
+    if stock_auto_refresh_notice:
+        if st.session_state.stock_data.get('_data_stale', pd.Series(dtype=bool)).fillna(False).any():
+            st.warning(stock_auto_refresh_notice)
+        else:
+            st.caption(stock_auto_refresh_notice)
     col_search = st.expander(
         "📥 選股資料來源與快速查詢",
         expanded=st.session_state.stock_data.empty,
@@ -12090,7 +12197,9 @@ with stock_strategy_container:
                 signal_state = classify_signal_state(result['rule'], result['eligible'], result['score'], risk_min_score)
                 quote_time = row.get('_quote_time') or (row.get('_daytrade_data_time') if is_daytrade_mode else None)
                 required_ready = bool(result.get('data_time')) if is_daytrade_mode else result.get('extension') is not None
-                if row.get('_quote_time'):
+                if bool(row.get('_data_stale', False)):
+                    data_health = '🔴 資料過期'
+                elif row.get('_quote_time'):
                     data_health = build_data_health(row.get('_quote_time'), required_ready, live_expected=True)
                 else:
                     data_health = build_data_health(quote_time, required_ready, live_expected=is_daytrade_mode)

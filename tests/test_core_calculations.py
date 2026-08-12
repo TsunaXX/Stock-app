@@ -7,6 +7,8 @@ import io
 import json
 import math
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, time as dt_time, timedelta
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP
 from email.utils import parsedate_to_datetime
@@ -53,6 +55,8 @@ def load_app_symbols(*names):
         "parsedate_to_datetime": parsedate_to_datetime,
         "pytz": pytz,
         "re": re,
+        "time": time,
+        "ThreadPoolExecutor": ThreadPoolExecutor,
         "urljoin": urljoin,
     }
     module = ast.fix_missing_locations(ast.Module(body=selected, type_ignores=[]))
@@ -122,6 +126,49 @@ def test_stock_limit_color_requires_actual_equality_not_stale_status():
     assert state("100", 100.5, 90) == ""
     assert state("100.5", 100.5, 90) == "up"
     assert state("90", 100.5, 90) == "down"
+
+
+def test_restored_stock_rows_use_fresh_values_and_mark_failed_rows_stale():
+    merge = load_app_symbols("_merge_refreshed_stock_rows")["_merge_refreshed_stock_rows"]
+    cached = pd.DataFrame([
+        {"代號": "2330", "名稱": "台積電", "收盤價": 100, "_source": "upload", "_order": 0, "_source_rank": 1},
+        {"代號": "2408", "名稱": "南亞科", "收盤價": 50, "_source": "search", "_order": 1, "_source_rank": 2},
+    ])
+    refreshed, count = merge(cached, [
+        ("2330", {"代號": "2330", "名稱": "台積電", "收盤價": 110, "_data_as_of": "2026/08/12"}),
+        ("2408", None),
+    ])
+    assert count == 1
+    assert refreshed.loc[0, "收盤價"] == 110
+    assert refreshed.loc[0, "_source"] == "upload"
+    assert not bool(refreshed.loc[0, "_data_stale"])
+    assert refreshed.loc[1, "收盤價"] == 50
+    assert bool(refreshed.loc[1, "_data_stale"])
+
+
+def test_persisted_stock_refresh_fetches_every_cached_symbol():
+    symbols = load_app_symbols(
+        "ANALYSIS_MAX_WORKERS", "API_REQUEST_GAP_SECONDS",
+        "_merge_refreshed_stock_rows", "refresh_persisted_stock_rows",
+    )
+    fetched_codes = []
+
+    def fake_fetch(code, name, extra, futures, notes, names, logged_in, api):
+        fetched_codes.append(code)
+        return {"代號": code, "名稱": name, "收盤價": 200 + len(fetched_codes)}
+
+    symbols["fetch_stock_data_raw"] = fake_fetch
+    symbols["API_REQUEST_GAP_SECONDS"] = 0
+    cached = pd.DataFrame([
+        {"代號": "2330", "名稱": "台積電", "收盤價": 100},
+        {"代號": "2408", "名稱": "南亞科", "收盤價": 50},
+    ])
+    refreshed, count = symbols["refresh_persisted_stock_rows"](
+        cached, {}, {}, {}, False, None,
+    )
+    assert sorted(fetched_codes) == ["2330", "2408"]
+    assert count == 2
+    assert set(refreshed["收盤價"]) == {201, 202}
 
 
 def test_futures_day_and_night_sessions_display_in_the_table_cell():
