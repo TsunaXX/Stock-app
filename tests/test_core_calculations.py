@@ -114,6 +114,14 @@ def test_futures_limit_color_requires_actual_equality():
     assert state("90", 100, 90) == "down"
 
 
+def test_stock_limit_color_requires_actual_equality_not_stale_status():
+    symbols = load_app_symbols("_safe_number", "get_tick_size", "stock_limit_state")
+    state = symbols["stock_limit_state"]
+    assert state("100", 100.5, 90) == ""
+    assert state("100.5", 100.5, 90) == "up"
+    assert state("90", 100.5, 90) == "down"
+
+
 def test_futures_day_and_night_sessions_display_in_the_table_cell():
     symbols = load_app_symbols(
         "TAIFEX_NIGHT_SESSION_ROOTS", "is_futures_night_session_product",

@@ -2912,7 +2912,7 @@ def render_company_event_snapshot(snapshot):
     taiwan_result = snapshot.get("taiwan_revenue", {})
     us_result = snapshot.get("us_revenue", {})
 
-    earnings_tab, taiwan_tab, us_tab = st.tabs(["📅 財報時間", "🏢 台股月營收", "🌎 美股季度／年度營收"])
+    taiwan_tab, earnings_tab, us_tab = st.tabs(["🏢 台股月營收", "📅 財報時間", "🌎 美股季度／年度營收"])
     with earnings_tab:
         earnings_events = earnings_result.get("events", [])
         if earnings_events:
@@ -8253,6 +8253,25 @@ def futures_limit_state(price, limit_up, limit_down):
     return ''
 
 
+def stock_limit_state(price, limit_up, limit_down):
+    """Return a stock limit state only when the displayed trade price is at its limit."""
+    price_value = _safe_number(price)
+    up_value = _safe_number(limit_up)
+    down_value = _safe_number(limit_down)
+    if price_value is None:
+        return ''
+    try:
+        # A fraction of the legal tick absorbs only float conversion noise.
+        tolerance = max(float(get_tick_size(price_value)) * 0.001, 1e-6)
+    except (TypeError, ValueError):
+        tolerance = 1e-6
+    if up_value is not None and math.isclose(price_value, up_value, rel_tol=0, abs_tol=tolerance):
+        return 'up'
+    if down_value is not None and math.isclose(price_value, down_value, rel_tol=0, abs_tol=tolerance):
+        return 'down'
+    return ''
+
+
 TAIFEX_NIGHT_SESSION_ROOTS = {
     # 期交所盤後交易商品；用商品資格補足每日行情僅回傳日盤列的情況。
     'TX', 'MTX', 'TMF', 'TE', 'ZEF', 'SOF',
@@ -11506,7 +11525,7 @@ tab1, tab_fibo, tab2, tab_db, tab_company, tab3 = st.tabs([
     "📈 指數操盤室",
     "💰 交易損益室 💰",
     "📚 戰略資料庫",
-    "🏢 公司財報與營收",
+    "🏢 公司營收與財報",
     "📅 股市行事曆",
 ])
 
@@ -12116,19 +12135,23 @@ with stock_strategy_container:
         def style_tab1_df(row):
             styles = [''] * len(row)
             note = str(row.get('戰略備註', ''))
-            # 精簡主表不顯示「狀態」，但名稱底色仍必須依原列的漲／跌停狀態判斷。
+            # 精簡主表不顯示「狀態」，名稱底色必須以目前成交價與漲跌停價
+            # 重新比對；不能沿用可能是上一輪報價留下的「漲停／跌停」文字。
             st_val = str(row.get('狀態', ''))
             if not st_val and row.name in df_display.index:
                 st_val = str(df_display.at[row.name, '狀態'])
+            limit_state = stock_limit_state(
+                row.get('收盤價'), row.get('當日漲停價'), row.get('當日跌停價'),
+            )
             risk_val = str(row.get('風險', ''))
             vwap_val = str(row.get('VWAP 狀態', ''))
             signal_state = str(row.get('訊號狀態', ''))
             data_health = str(row.get('資料狀態', ''))
             market_alignment = str(row.get('市場一致', ''))
             
-            if st_val == "漲停":
+            if limit_state == 'up':
                 name_c = 'background-color: #ff4b4b; color: #ffffff; font-weight: bold;'
-            elif st_val == "跌停":
+            elif limit_state == 'down':
                 name_c = 'background-color: #00e676; color: #ffffff; font-weight: bold;'
             elif st_val == "命中":
                 name_c = 'background-color: #ffeb3b; color: #000000; font-weight: bold;'
@@ -15249,7 +15272,7 @@ with tab3:
             if snapshot.get("updated_at"):
                 st.caption(f"公司事件快照：{snapshot['updated_at']}｜追蹤：{snapshot.get('tickers', '—')}")
             else:
-                st.info("尚無公司事件快照；請到「公司財報與營收」分頁同步一次。")
+                st.info("尚無公司事件快照；請到「公司營收與財報」分頁同步一次。")
         update_col, save_col = st.columns(2)
         with update_col:
             if st.button("🔄 更新市場行事曆", key="refresh_calendar_network"):
@@ -15284,7 +15307,7 @@ with tab3:
                 )
                 st.toast("追蹤設定已儲存。", icon="✅")
 
-    st.caption("行事曆資料來源：TWSE、Federal Reserve、U.S. BLS、U.S. BEA、ISM、U.S. Department of Labor、ADP、Cboe、SGX、MSCI，以及 TradingView 免費經濟日曆備援；公司財報與營收顯示獨立分頁的最近快照。")
+    st.caption("行事曆資料來源：TWSE、Federal Reserve、U.S. BLS、U.S. BEA、ISM、U.S. Department of Labor、ADP、Cboe、SGX、MSCI，以及 TradingView 免費經濟日曆備援；公司營收與財報顯示獨立分頁的最近快照。")
 
     def change_month(delta):
         st.session_state.cal_month += delta
@@ -15427,7 +15450,7 @@ with tab3:
             f"本月顯示 {len(visible_company_events)} 筆。"
         )
         if not taiwan_earnings_events and not taiwan_revenue_events:
-            st.info("目前快照沒有可顯示的台股財報／月營收；請到「公司財報與營收」按「同步公司資料」。")
+            st.info("目前快照沒有可顯示的台股財報／月營收；請到「公司營收與財報」按「同步公司資料」。")
     if US_COMPANY_GROUP in selected_event_groups:
         network_events.extend(company_earnings_for_market("美股"))
         network_events.extend(company_snapshot.get("us_revenue", {}).get("events", []))
@@ -15772,7 +15795,7 @@ with tab_company:
         font-weight: 700;
     }
     </style>
-    <div class='company-room-title'>🏢 公司財報與營收</div>
+    <div class='company-room-title'>🏢 公司營收與財報</div>
     """, unsafe_allow_html=True)
     st.caption("這個分頁採手動同步；只有按下按鈕時才查詢 MOPS／TWSE／Yahoo。行事曆只讀取完成後的摘要快照。")
 
@@ -15870,7 +15893,7 @@ with tab_company:
     snapshot = st.session_state.company_event_snapshot
     revenue_events = list(snapshot.get('taiwan_revenue', {}).get('events', []))
     if revenue_events:
-        with st.expander("🗓️ 月營收公告日校正（可直接修改日期）", expanded=True):
+        with st.expander("🗓️ 月營收公告日校正（可直接修改日期）", expanded=False):
             st.caption(
                 "MOPS 單一公司頁未提供可驗證的公告日；此處填入公司官網／公告確認的日期後，"
                 "再按下方套用按鈕，行事曆與下次同步都會沿用校正值。"
