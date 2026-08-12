@@ -6264,6 +6264,15 @@ def get_tw_stocker_data(direction):
     return pd.DataFrame()
 
 _GOODINFO_BROWSER_SEMAPHORE = threading.BoundedSemaphore(1)
+_GOODINFO_URL = (
+    "https://goodinfo.tw/tw/StockList.asp?RPT_TIME=&MARKET_CAT=%E7%86%B1%E9%96%80%E6%8E%92%E8%A1%8C"
+    "&INDUSTRY_CAT=%E7%B4%AF%E8%A8%88%E6%88%90%E4%BA%A4%E9%87%8F%E9%80%B1%E8%BD%89%E7%8E%87%28%E7%95%B6%E6%97%A5%29"
+    "%40%40%E7%B4%AF%E8%A8%88%E6%88%90%E4%BA%A4%E9%87%8F%E9%80%B1%E8%BD%89%E7%8E%87%40%40%E7%95%B6%E6%97%A5"
+)
+_GOODINFO_USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
 
 
 def _clean_goodinfo_table(dataframe):
@@ -6298,9 +6307,39 @@ def _clean_goodinfo_table(dataframe):
     return cleaned
 
 
+def _parse_goodinfo_table_html(table_html_list):
+    """Parse only DOM tables that already match Goodinfo's ranking schema."""
+    candidates = []
+    for table_html in table_html_list or []:
+        try:
+            tables = pd.read_html(io.StringIO(str(table_html)), flavor="lxml")
+        except (ValueError, TypeError, ImportError):
+            continue
+        candidates.extend(
+            cleaned for cleaned in (_clean_goodinfo_table(table) for table in tables)
+            if cleaned is not None
+        )
+    return max(candidates, key=lambda table: table.shape[0] * table.shape[1]) if candidates else None
+
+
+def _goodinfo_rank_table_html(driver):
+    """Return completed Goodinfo ranking-table markup, excluding menus and challenge pages."""
+    try:
+        return driver.execute_script("""
+            return Array.from(document.querySelectorAll('table')).filter((table) => {
+                const text = (table.innerText || '').replace(/\\s/g, '');
+                return table.rows.length >= 11
+                    && /(股票)?代號/.test(text)
+                    && text.includes('名稱')
+                    && text.includes('週轉率');
+            }).map((table) => table.outerHTML);
+        """) or []
+    except (WebDriverException, TypeError):
+        return []
+
+
 def fetch_goodinfo_data():
     """在 15 秒期限內等待並驗證 Goodinfo 上市／上櫃綜合週轉率表。"""
-    url = "https://goodinfo.tw/tw/StockList.asp?RPT_TIME=&MARKET_CAT=%E7%86%B1%E9%96%80%E6%8E%92%E8%A1%8C&INDUSTRY_CAT=%E7%B4%AF%E8%A8%88%E6%88%90%E4%BA%A4%E9%87%8F%E9%80%B1%E8%BD%89%E7%8E%87%28%E7%95%B6%E6%97%A5%29%40%40%E7%B4%AF%E8%A8%88%E6%88%90%E4%BA%A4%E9%87%8F%E9%80%B1%E8%BD%89%E7%8E%87%40%40%E7%95%B6%E6%97%A5"
     chrome_options = Options()
     chrome_options.add_argument("--headless=new")
     chrome_options.add_argument("--no-sandbox")
@@ -6308,9 +6347,13 @@ def fetch_goodinfo_data():
     chrome_options.add_argument("--disable-gpu")
     chrome_options.add_argument("--window-size=1920x1080")
     chrome_options.add_argument("--disable-software-rasterizer")
+    chrome_options.add_argument("--disable-background-networking")
+    chrome_options.add_argument("--disable-features=Translate,OptimizationHints")
+    chrome_options.add_argument(f"--user-agent={_GOODINFO_USER_AGENT}")
     chrome_options.add_argument("--disable-blink-features=AutomationControlled")
     chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
     chrome_options.add_experimental_option('useAutomationExtension', False)
+    chrome_options.page_load_strategy = 'eager'
 
     chrome_options.binary_location = "/usr/bin/chromium"
     request_started_at = time.monotonic()
@@ -6320,18 +6363,27 @@ def fetch_goodinfo_data():
         return None
     driver = None
     refreshed_after_alert = False
+    reloaded_for_incomplete_table = False
     try:
         if time.monotonic() >= deadline:
             return None
         service = Service("/usr/bin/chromedriver")
         driver = webdriver.Chrome(service=service, options=chrome_options)
-        driver.set_page_load_timeout(max(1, min(8, deadline - time.monotonic())))
+        driver.set_page_load_timeout(max(1, min(6, deadline - time.monotonic())))
+        driver.execute_cdp_cmd("Network.setUserAgentOverride", {
+            "userAgent": _GOODINFO_USER_AGENT,
+            "acceptLanguage": "zh-TW,zh;q=0.9,en;q=0.8",
+            "platform": "Linux x86_64",
+        })
         driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
-            "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+            "source": """
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                Object.defineProperty(navigator, 'languages', {get: () => ['zh-TW', 'zh', 'en-US', 'en']});
+            """
         })
         try:
-            driver.get(url)
-        except TimeoutException:
+            driver.get(_GOODINFO_URL)
+        except (TimeoutException, UnexpectedAlertPresentException):
             pass
         while time.monotonic() < deadline:
             try:
@@ -6347,19 +6399,21 @@ def fetch_goodinfo_data():
                         pass
             except NoAlertPresentException:
                 pass
-            try:
-                # Streamlit Cloud does not always include html5lib.  Pin the
-                # parser to lxml (which this app installs) so a fallback parser
-                # dependency cannot terminate the stock-strategy page.
-                tables = pd.read_html(io.StringIO(driver.page_source), flavor="lxml")
-            except (ValueError, TypeError, ImportError):
-                tables = []
-            candidates = [
-                cleaned for cleaned in (_clean_goodinfo_table(table) for table in tables)
-                if cleaned is not None
-            ]
-            if candidates:
-                return max(candidates, key=lambda table: table.shape[0] * table.shape[1])
+            ranking = _parse_goodinfo_table_html(_goodinfo_rank_table_html(driver))
+            if ranking is not None:
+                return ranking
+            # Dynamic rows can occasionally stall after an otherwise successful
+            # document load. Reload once inside the same user-request deadline.
+            if (
+                not reloaded_for_incomplete_table
+                and time.monotonic() >= request_started_at + 7
+                and time.monotonic() + 3 < deadline
+            ):
+                reloaded_for_incomplete_table = True
+                try:
+                    driver.get(_GOODINFO_URL)
+                except (TimeoutException, UnexpectedAlertPresentException):
+                    pass
             time.sleep(min(0.5, max(0, deadline - time.monotonic())))
     except (WebDriverException, OSError, ValueError) as exc:
         logger.exception('Goodinfo fetch failed: %s', type(exc).__name__)
@@ -9687,7 +9741,7 @@ def determine_stock_direction(row, is_daytrade_mode=False, direction_choice='系
         return {
             'direction': direction,
             'label': '🔴 多（手動）' if direction == '多頭' else '🟢 空（手動）',
-            'basis': '依使用者指定方向計算；系統仍會檢查趨勢、支撐壓力與風險門檻。',
+            'basis': '手動方向｜仍檢查風險。',
             'long_score': None,
             'short_score': None,
             'source': '手動',
@@ -9738,7 +9792,7 @@ def determine_stock_direction(row, is_daytrade_mode=False, direction_choice='系
     if change_pct is not None and change_pct != 0:
         add_signal(change_pct > 0, 1, 1, '價格動能偏多', '價格動能偏空')
 
-    source = '日 K（波段）'
+    source = '日K'
     intraday_close = _as_float(row.get('_daytrade_close'))
     vwap = _as_float(row.get('_daytrade_vwap'))
     opening_high = _as_float(row.get('_daytrade_or_high'))
@@ -9749,7 +9803,7 @@ def determine_stock_direction(row, is_daytrade_mode=False, direction_choice='系
     if has_intraday:
         daily_long_reason_count = len(long_reasons)
         daily_short_reason_count = len(short_reasons)
-        source = f"{row.get('_daytrade_source', '分 K')}（當沖）＋日 K"
+        source = '分K＋日K'
         add_signal(intraday_close >= vwap, 4, 4, '分 K 站上 VWAP', '分 K 跌破 VWAP')
         if intraday_close > opening_high:
             long_score += 4
@@ -9778,7 +9832,7 @@ def determine_stock_direction(row, is_daytrade_mode=False, direction_choice='系
         long_reasons = long_reasons[daily_long_reason_count:] + long_reasons[:daily_long_reason_count]
         short_reasons = short_reasons[daily_short_reason_count:] + short_reasons[:daily_short_reason_count]
     elif is_daytrade_mode:
-        source = '日 K 備援（尚未更新分 K）'
+        source = '日K備援'
 
     if long_score == short_score:
         note = str(row.get('戰略備註', ''))
@@ -9799,8 +9853,10 @@ def determine_stock_direction(row, is_daytrade_mode=False, direction_choice='系
     chosen_reasons = long_reasons if is_long else short_reasons
     direction = '多頭' if is_long else '空頭'
     label = '🔴 建議多' if is_long else '🟢 建議空'
-    evidence = '、'.join(chosen_reasons[:4]) if chosen_reasons else '可用指標有限'
-    basis = f'{source}：{evidence}（多 {long_score}／空 {short_score}）'
+    # Keep the table decision-oriented: detailed scoring remains in the
+    # confidence details, while this cell shows only the two key drivers.
+    evidence = '、'.join(chosen_reasons[:2]) if chosen_reasons else '指標不足'
+    basis = f'{source}｜{evidence}'
     return {
         'direction': direction,
         'label': label,
