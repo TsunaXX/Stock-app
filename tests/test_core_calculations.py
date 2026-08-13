@@ -491,7 +491,7 @@ def test_nested_google_sheet_payload_restores_fibo_tags():
 def test_cache_merge_preserves_remote_device_sections():
     symbols = load_app_symbols(
         "_json_safe", "_valid_fibo_tags", "_merge_unique_records",
-        "_merge_unique_values", "empty_company_event_snapshot",
+        "_merge_unique_values", "merge_strategy_signal_state", "empty_company_event_snapshot",
         "normalize_company_event_snapshot", "_newer_company_event_snapshot",
         "_merge_data_cache_payload",
     )
@@ -525,7 +525,7 @@ def test_cache_merge_preserves_remote_device_sections():
 def test_cache_merge_can_replace_cloud_stock_snapshot_without_resurrecting_old_rows():
     symbols = load_app_symbols(
         "_json_safe", "_valid_fibo_tags", "_merge_unique_records",
-        "_merge_unique_values", "empty_company_event_snapshot",
+        "_merge_unique_values", "merge_strategy_signal_state", "empty_company_event_snapshot",
         "normalize_company_event_snapshot", "_newer_company_event_snapshot",
         "_merge_data_cache_payload",
     )
@@ -547,7 +547,7 @@ def test_cache_merge_can_replace_cloud_stock_snapshot_without_resurrecting_old_r
 def test_only_explicit_save_replaces_fibo_tags_and_keeps_recovery_copy():
     symbols = load_app_symbols(
         "_json_safe", "_valid_fibo_tags", "_merge_unique_records",
-        "_merge_unique_values", "empty_company_event_snapshot",
+        "_merge_unique_values", "merge_strategy_signal_state", "empty_company_event_snapshot",
         "normalize_company_event_snapshot", "_newer_company_event_snapshot",
         "_merge_data_cache_payload", "_extract_fibo_tags",
     )
@@ -566,3 +566,63 @@ def test_only_explicit_save_replaces_fibo_tags_and_keeps_recovery_copy():
     assert explicit["fibo_tags_backup"]["tags"] == local["fibo_tags"]
     damaged_primary = dict(explicit, fibo_tags=[])
     assert symbols["_extract_fibo_tags"](damaged_primary) == local["fibo_tags"]
+
+
+def test_deleted_strategy_signal_wins_over_stale_cloud_copy():
+    symbols = load_app_symbols(
+        "_json_safe", "_merge_unique_records", "_merge_unique_values",
+        "merge_strategy_signal_state",
+    )
+    remote = [
+        {"dedupe_key": "deleted-1", "名稱": "舊訊號"},
+        {"dedupe_key": "remote-2", "名稱": "遠端保留"},
+    ]
+    local = [{"dedupe_key": "local-3", "名稱": "本機新增"}]
+    records, deleted = symbols["merge_strategy_signal_state"](
+        remote, local, ["deleted-1"], [],
+    )
+    assert {row["dedupe_key"] for row in records} == {"remote-2", "local-3"}
+    assert deleted == ["deleted-1"]
+
+
+def test_daytrade_plan_rejects_limit_up_chase_with_low_reward_risk():
+    symbols = load_app_symbols(
+        "get_taiwan_tick_size", "round_to_tick", "get_tick_size", "move_tick",
+        "_safe_number", "_as_float", "fmt_price", "build_trade_plan",
+    )
+    plan = symbols["build_trade_plan"](
+        {
+            "_daytrade_vwap": 158,
+            "_daytrade_or_high": 160,
+            "_daytrade_or_low": 157,
+            "_daytrade_close": 160.5,
+            "_daytrade_phase": "開盤區間完成",
+            "當日漲停價": 162,
+        },
+        "多頭", True, {"eligible": True, "rule": "觸發"},
+    )
+    assert plan["valid"] is False
+    assert plan["reward_risk"] < 1.3
+    assert "不追價" in plan["summary"]
+    assert "可接受進場 ≤159.5" in plan["summary"]
+
+
+def test_daytrade_plan_keeps_normal_breakout_when_space_is_sufficient():
+    symbols = load_app_symbols(
+        "get_taiwan_tick_size", "round_to_tick", "get_tick_size", "move_tick",
+        "_safe_number", "_as_float", "fmt_price", "build_trade_plan",
+    )
+    plan = symbols["build_trade_plan"](
+        {
+            "_daytrade_vwap": 158,
+            "_daytrade_or_high": 160,
+            "_daytrade_or_low": 157,
+            "_daytrade_close": 160.5,
+            "_daytrade_phase": "開盤區間完成",
+            "當日漲停價": 180,
+        },
+        "多頭", True, {"eligible": True, "rule": "觸發"},
+    )
+    assert plan["valid"] is True
+    assert plan["reward_risk"] >= 1.3
+    assert "RR" in plan["summary"]

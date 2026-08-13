@@ -6464,6 +6464,7 @@ DATA_CACHE_FILE = "data_cache.json"
 URL_CACHE_FILE = "url_cache.json"
 SEARCH_CACHE_FILE = "search_cache.json"
 STRATEGY_SIGNAL_LOG_FILE = "strategy_signal_log.json"
+STRATEGY_SIGNAL_TOMBSTONES_FILE = "strategy_signal_tombstones.json"
 FIBO_TAG_CACHE_FILE = "fibo_tags.json"
 DEFAULT_FIBO_TAGS = ["台積電(2330)", "鴻海(2317)", "聯發科(2454)", "和椿(6215)", "晶彩科(3535)"]
 ANALYSIS_MAX_WORKERS = 2
@@ -6617,7 +6618,11 @@ def load_strategy_signal_log():
         for record in records:
             if isinstance(record, dict) and record.get('策略') == '當沖預覽':
                 record['策略'] = '當沖'
-        return records
+        deleted_keys = set(load_strategy_signal_tombstones())
+        return [
+            record for record in records
+            if str(record.get('dedupe_key', '')).strip() not in deleted_keys
+        ]
     except (OSError, ValueError, TypeError):
         return []
 
@@ -6631,6 +6636,56 @@ def save_strategy_signal_log(records):
         return True
     except (OSError, TypeError, ValueError):
         return False
+
+
+def load_strategy_signal_tombstones():
+    """讀取已刪除訊號鍵，避免舊雲端快取把紀錄復原。"""
+    if not os.path.exists(STRATEGY_SIGNAL_TOMBSTONES_FILE):
+        return []
+    try:
+        with open(STRATEGY_SIGNAL_TOMBSTONES_FILE, "r", encoding="utf-8") as file:
+            values = json.load(file)
+        if not isinstance(values, list):
+            return []
+        return list(dict.fromkeys(str(value).strip() for value in values if str(value).strip()))[-4000:]
+    except (OSError, ValueError, TypeError):
+        return []
+
+
+def save_strategy_signal_tombstones(values):
+    """保存刪除標記；筆數上限高於訊號紀錄，確保舊副本無法復活。"""
+    try:
+        normalized = list(dict.fromkeys(
+            str(value).strip() for value in values if str(value).strip()
+        ))[-4000:]
+        with _RUNTIME_FILE_LOCK:
+            _write_json_atomic(
+                STRATEGY_SIGNAL_TOMBSTONES_FILE, normalized, indent=2,
+            )
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def mark_strategy_signals_deleted(records):
+    """將明確刪除的訊號留下墓碑，供本機與雲端合併時排除。"""
+    deleted = load_strategy_signal_tombstones()
+    deleted.extend(
+        str(record.get('dedupe_key', '')).strip()
+        for record in records if isinstance(record, dict)
+    )
+    return save_strategy_signal_tombstones(deleted)
+
+
+def merge_strategy_signal_state(remote_records, local_records, remote_deleted=None, local_deleted=None):
+    """合併多裝置訊號；刪除標記優先於任何舊紀錄。"""
+    deleted = set(_merge_unique_values(remote_deleted or [], local_deleted or []))
+    records = _merge_unique_records(remote_records, local_records, 'dedupe_key')
+    records = [
+        record for record in records
+        if str(record.get('dedupe_key', '')).strip() not in deleted
+    ][-2000:]
+    return records, sorted(str(value) for value in deleted if str(value).strip())[-4000:]
 
 def parse_trade_plan_numbers(plan_text):
     """從「進／停／目」摘要解析三個價位。"""
@@ -6783,11 +6838,24 @@ def register_strategy_signals(records):
     """新增未重複的訊號；同商品同交易日、策略與進場價只留一筆。"""
     existing = load_strategy_signal_log()
     existing_keys = {str(record.get('dedupe_key', '')) for record in existing}
+    deleted_keys = set(load_strategy_signal_tombstones())
     added = 0
     now_tw = datetime.now(pytz.timezone('Asia/Taipei'))
     now_text = now_tw.strftime('%Y/%m/%d %H:%M:%S')
     for raw_record in records:
         record = dict(raw_record)
+        if str(record.get('市場', '')) == '股票':
+            entry = _safe_number(record.get('進場價'))
+            stop = _safe_number(record.get('停損價'))
+            target = _safe_number(record.get('目標價'))
+            is_long = str(record.get('方向', '')) in ('多頭', '偏多')
+            ordered = (
+                stop < entry < target if is_long else target < entry < stop
+            ) if None not in (entry, stop, target) else False
+            risk_distance = abs(entry - stop) if ordered else 0
+            reward_risk = abs(target - entry) / risk_distance if risk_distance > 0 else 0
+            if not ordered or reward_risk < 1.3:
+                continue
         trade_day = (
             get_futures_trading_date(now_tw).strftime('%Y%m%d')
             if str(record.get('市場', '')) == '期貨'
@@ -6797,7 +6865,7 @@ def register_strategy_signals(records):
             trade_day, str(record.get('市場', '')), str(record.get('商品鍵', '')),
             str(record.get('策略', '')), str(record.get('方向', '')), str(record.get('進場價', '')),
         ])
-        if dedupe_key in existing_keys:
+        if dedupe_key in existing_keys or dedupe_key in deleted_keys:
             continue
         record.update({
             'dedupe_key': dedupe_key, '建立時間': now_text, '最後更新': now_text,
@@ -6946,7 +7014,10 @@ def render_strategy_validation_room():
             remaining = [] if clear_all_signals else [
                 record for record in records if str(record.get('市場', '')) != market_to_clear
             ]
-            if save_strategy_signal_log(remaining):
+            removed = [] if len(remaining) == len(records) else [
+                record for record in records if record not in remaining
+            ]
+            if mark_strategy_signals_deleted(removed) and save_strategy_signal_log(remaining):
                 save_data_cache(
                     st.session_state.stock_data, st.session_state.ignored_stocks,
                     st.session_state.all_candidates, st.session_state.saved_notes
@@ -7277,8 +7348,9 @@ def render_strategy_validation_room():
     with hint_col:
         st.caption('刪除只影響勾選紀錄；其餘歷史訊號與目前篩選條件不受影響。')
     if delete_selected:
+        removed = [record for index, record in enumerate(records) if index in selected_ids]
         remaining = [record for index, record in enumerate(records) if index not in selected_ids]
-        if save_strategy_signal_log(remaining):
+        if mark_strategy_signals_deleted(removed) and save_strategy_signal_log(remaining):
             save_data_cache(
                 st.session_state.stock_data, st.session_state.ignored_stocks,
                 st.session_state.all_candidates, st.session_state.saved_notes
@@ -7336,6 +7408,7 @@ def _is_valid_data_cache_payload(value):
         'fibo_tags': list,
         'cached_notes': dict,
         'strategy_signal_log': list,
+        'strategy_signal_deleted_keys': list,
         'company_event_snapshot': dict,
     }
     present = [key for key in expected_types if key in value]
@@ -7594,6 +7667,14 @@ def _merge_data_cache_payload(
             merged['fibo_tags_updated_at'] = remote.get('fibo_tags_updated_at')
         if 'fibo_tags_backup' in remote:
             merged['fibo_tags_backup'] = remote.get('fibo_tags_backup')
+    signal_records, deleted_signal_keys = merge_strategy_signal_state(
+        remote.get('strategy_signal_log', []),
+        local.get('strategy_signal_log', []),
+        remote.get('strategy_signal_deleted_keys', []),
+        local.get('strategy_signal_deleted_keys', []),
+    )
+    merged['strategy_signal_log'] = signal_records
+    merged['strategy_signal_deleted_keys'] = deleted_signal_keys
     merged['version'] = 3
     merged['updated_at'] = datetime.now(pytz.timezone('Asia/Taipei')).isoformat()
     return _json_safe(merged)
@@ -7644,6 +7725,7 @@ def save_data_cache(
             'fibo_tags_updated_at': fibo_tags_updated_at,
             'cached_notes': cached_notes,
             'strategy_signal_log': load_strategy_signal_log(),
+            'strategy_signal_deleted_keys': load_strategy_signal_tombstones(),
             'company_event_snapshot': company_snapshot,
         })
         merged_payload = local_payload
@@ -7731,6 +7813,17 @@ def save_data_cache(
         return False
 
 def load_data_cache():
+    local_signal_records = load_strategy_signal_log()
+    local_deleted_signal_keys = load_strategy_signal_tombstones()
+
+    def restore_signal_state(data):
+        signal_records, deleted_signal_keys = merge_strategy_signal_state(
+            data.get('strategy_signal_log', []), local_signal_records,
+            data.get('strategy_signal_deleted_keys', []), local_deleted_signal_keys,
+        )
+        save_strategy_signal_tombstones(deleted_signal_keys)
+        save_strategy_signal_log(signal_records)
+
     gsheet_api_url = get_app_secret('gsheet_api_url')
     if gsheet_api_url:
         data, remote_error = _fetch_remote_data_cache(gsheet_api_url, timeout=8)
@@ -7747,8 +7840,7 @@ def load_data_cache():
             ).strip()
             if isinstance(data.get('company_event_snapshot'), dict):
                 st.session_state['_cached_company_event_snapshot'] = data['company_event_snapshot']
-            if isinstance(data.get('strategy_signal_log'), list):
-                save_strategy_signal_log(data['strategy_signal_log'])
+            restore_signal_state(data)
             return df, ignored, candidates, saved_notes, fibo_tags, data.get('cached_notes', {})
         st.session_state['_data_cache_remote_error'] = remote_error or '讀取失敗'
 
@@ -7769,8 +7861,7 @@ def load_data_cache():
             ).strip()
             if isinstance(data.get('company_event_snapshot'), dict):
                 st.session_state['_cached_company_event_snapshot'] = data['company_event_snapshot']
-            if isinstance(data.get('strategy_signal_log'), list):
-                save_strategy_signal_log(data['strategy_signal_log'])
+            restore_signal_state(data)
             st.session_state['_data_cache_source'] = 'local'
             return df, ignored, candidates, saved_notes, fibo_tags, data.get('cached_notes', {})
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
@@ -10200,10 +10291,13 @@ def calculate_daytrade_filter_result(row, direction, attention_counts=None, disp
 
 def build_trade_plan(row, direction, is_daytrade_mode, filter_result):
     """依已通過的篩選條件建立觀察用進場、停損與目標價，不執行下單。"""
+    minimum_reward_risk = 1.3
+    maximum_chase_r = 0.25
     if not filter_result.get('eligible'):
         return {
             'summary': '—',
-            'detail': f"未通過條件，不預判點位（{filter_result.get('rule', '資料不足')}）"
+            'detail': f"未通過條件，不預判點位（{filter_result.get('rule', '資料不足')}）",
+            'valid': False, 'reward_risk': None,
         }
 
     is_long = direction == '多頭'
@@ -10211,15 +10305,75 @@ def build_trade_plan(row, direction, is_daytrade_mode, filter_result):
     def _round(value):
         return round_to_tick(max(0.01, value))
 
-    def _format_plan(entry, stop, target, trigger_text):
+    def _format_plan(entry, stop, target, trigger_text, current_price=None):
         if is_long and not (stop < entry < target):
-            return {'summary': '—', 'detail': '風險距離不足，不預判點位。'}
+            return {
+                'summary': '⛔ 不追價｜可用獲利空間不足',
+                'detail': '停損、進場與目標的順序不合理，本次不建立訊號。',
+                'valid': False, 'reward_risk': None,
+                'blocking_reason': '價位空間不足',
+            }
         if not is_long and not (target < entry < stop):
-            return {'summary': '—', 'detail': '風險距離不足，不預判點位。'}
-        summary = f"進 {fmt_price(entry)}｜停 {fmt_price(stop)}｜目 {fmt_price(target)}"
+            return {
+                'summary': '⛔ 不追價｜可用獲利空間不足',
+                'detail': '停損、進場與目標的順序不合理，本次不建立訊號。',
+                'valid': False, 'reward_risk': None,
+                'blocking_reason': '價位空間不足',
+            }
+        risk_distance = abs(entry - stop)
+        reward_distance = abs(target - entry)
+        reward_risk = reward_distance / risk_distance if risk_distance > 0 else 0
+        if reward_risk < minimum_reward_risk:
+            acceptable_entry = (
+                (target + minimum_reward_risk * stop) / (1 + minimum_reward_risk)
+            )
+            rounded_acceptable_entry = _round(acceptable_entry)
+            if is_long and rounded_acceptable_entry > acceptable_entry:
+                rounded_acceptable_entry = move_tick(rounded_acceptable_entry, -1)
+            elif not is_long and rounded_acceptable_entry < acceptable_entry:
+                rounded_acceptable_entry = move_tick(rounded_acceptable_entry, 1)
+            acceptable_label = '≤' if is_long else '≥'
+            return {
+                'summary': (
+                    f"⛔ 不追價｜可接受進場 {acceptable_label}{fmt_price(rounded_acceptable_entry)}｜"
+                    f"停 {fmt_price(stop)}｜目 {fmt_price(target)}｜RR {reward_risk:.2f}"
+                ),
+                'detail': (
+                    f'漲跌停或壓力限制後，剩餘風報比僅 {reward_risk:.2f}，低於 {minimum_reward_risk:.1f}；'
+                    '等待價格回測到可接受區，不建立策略驗證訊號。'
+                ),
+                'valid': False, 'reward_risk': round(reward_risk, 2),
+                'blocking_reason': '剩餘風報比不足',
+            }
+        price = _as_float(current_price)
+        chase_r = (
+            ((price - entry) if is_long else (entry - price)) / risk_distance
+            if price is not None and risk_distance > 0 else None
+        )
+        if chase_r is not None and chase_r > maximum_chase_r:
+            return {
+                'summary': (
+                    f"⛔ 不追價｜等待回測 {fmt_price(entry)} 附近｜"
+                    f"停 {fmt_price(stop)}｜目 {fmt_price(target)}"
+                ),
+                'detail': (
+                    f'目前價格已越過原進場點 {chase_r:.2f}R，超過 {maximum_chase_r:.2f}R 追價上限；'
+                    '等待回測守穩，不建立策略驗證訊號。'
+                ),
+                'valid': False, 'reward_risk': round(reward_risk, 2),
+                'blocking_reason': '已偏離進場點',
+            }
+        summary = (
+            f"進 {fmt_price(entry)}｜停 {fmt_price(stop)}｜目 {fmt_price(target)}｜"
+            f"RR {reward_risk:.2f}"
+        )
         return {
             'summary': summary,
-            'detail': f"{trigger_text}；預判進場 {fmt_price(entry)}、策略失效離場 {fmt_price(stop)}、第一目標 {fmt_price(target)}（目標距離約為進場至失效點的 1.5 倍）"
+            'detail': (
+                f"{trigger_text}；預判進場 {fmt_price(entry)}、策略失效離場 {fmt_price(stop)}、"
+                f"第一目標 {fmt_price(target)}（實際風報比 {reward_risk:.2f}）"
+            ),
+            'valid': True, 'reward_risk': round(reward_risk, 2),
         }
 
     if is_daytrade_mode:
@@ -10228,7 +10382,12 @@ def build_trade_plan(row, direction, is_daytrade_mode, filter_result):
         opening_low = _as_float(row.get('_daytrade_or_low'))
         opening_forming = str(row.get('_daytrade_phase', '')) == '開盤形成中'
         if None in (vwap, opening_high, opening_low):
-            return {'summary': '—', 'detail': '缺少 VWAP 或開盤區間，不預判點位。'}
+            return {
+                'summary': '—', 'detail': '缺少 VWAP 或開盤區間，不預判點位。',
+                'valid': False, 'reward_risk': None,
+            }
+
+        current_price = _as_float(row.get('_daytrade_close'))
 
         if is_long:
             entry = _round(move_tick(opening_high, 1))
@@ -10238,12 +10397,12 @@ def build_trade_plan(row, direction, is_daytrade_mode, filter_result):
             target = _round(entry + (entry - stop) * 1.5)
             limit_up = _as_float(row.get('當日漲停價'))
             if limit_up is not None and limit_up > entry:
-                target = min(target, _round(limit_up))
+                target = min(target, _round(move_tick(limit_up, -1)))
             trigger = (
                 '突破目前開盤高點且維持 VWAP 上方（區間形成中）'
                 if opening_forming else '開盤區間高點突破後，維持 VWAP 上方'
             )
-            return _format_plan(entry, stop, target, trigger)
+            return _format_plan(entry, stop, target, trigger, current_price)
 
         entry = _round(move_tick(opening_low, -1))
         stop = _round(min(vwap, opening_high))
@@ -10252,18 +10411,21 @@ def build_trade_plan(row, direction, is_daytrade_mode, filter_result):
         target = _round(entry - (stop - entry) * 1.5)
         limit_down = _as_float(row.get('當日跌停價'))
         if limit_down is not None and 0 < limit_down < entry:
-            target = max(target, _round(limit_down))
+            target = max(target, _round(move_tick(limit_down, 1)))
         trigger = (
             '跌破目前開盤低點且維持 VWAP 下方（區間形成中）'
             if opening_forming else '開盤區間低點跌破後，維持 VWAP 下方'
         )
-        return _format_plan(entry, stop, target, trigger)
+        return _format_plan(entry, stop, target, trigger, current_price)
 
     atr14 = _as_float(row.get('_risk_atr14'))
     previous_high = _as_float(row.get('_plan_prev_high', row.get('_risk_prev_high')))
     previous_low = _as_float(row.get('_plan_prev_low', row.get('_risk_prev_low')))
     if atr14 is None or atr14 <= 0 or previous_high is None or previous_low is None:
-        return {'summary': '—', 'detail': '缺少 ATR 或昨高／昨低，不預判次日開盤點位。'}
+        return {
+            'summary': '—', 'detail': '缺少 ATR 或昨高／昨低，不預判次日開盤點位。',
+            'valid': False, 'reward_risk': None,
+        }
 
     if is_long:
         entry = _round(move_tick(previous_high, 1))
@@ -12251,6 +12413,13 @@ with stock_strategy_container:
                     df_display.at[i, '乖離'] = f"{_format_compact_number(result['extension'], 1, signed=True)} ATR" if result['extension'] is not None else "—"
                     df_display.at[i, '隔日規則'] = result['rule']
                 trade_plan = build_trade_plan(row, row_direction, is_daytrade_mode, result)
+                if result.get('eligible') and not trade_plan.get('valid', False):
+                    result['eligible'] = False
+                    result['rule'] = f"觀察：{trade_plan.get('blocking_reason', '進場品質未達門檻')}"
+                    if is_daytrade_mode:
+                        df_display.at[i, '盤中觸發'] = result['rule']
+                    else:
+                        df_display.at[i, '隔日規則'] = result['rule']
                 result['trade_plan'] = trade_plan
                 result['direction_info'] = direction_info
                 risk_details[code] = result
@@ -12290,7 +12459,10 @@ with stock_strategy_container:
                 df_display.at[i, '資料狀態'] = data_health
                 df_display.at[i, '買賣價差'] = f'{spread_ticks:.0f}跳' if spread_ticks is not None else '—'
                 df_display.at[i, '_risk_eligible'] = eligible_with_score
-                df_display.at[i, '_附加可記錄'] = eligible_with_score and signal_state in ('✅ 已觸發', '🔵 回測確認')
+                df_display.at[i, '_附加可記錄'] = (
+                    bool(trade_plan.get('valid')) and eligible_with_score
+                    and signal_state in ('✅ 已觸發', '🔵 回測確認')
+                )
 
             notify_signal_state_changes(
                 'stocks',
@@ -12939,6 +13111,13 @@ with stock_strategy_container:
                             df_indep.at[i, '乖離'] = f"{_format_compact_number(result['extension'], 1, signed=True)} ATR" if result['extension'] is not None else "—"
                             df_indep.at[i, '隔日規則'] = result['rule']
                         trade_plan = build_trade_plan(row, row_direction, indep_is_daytrade, result)
+                        if result.get('eligible') and not trade_plan.get('valid', False):
+                            result['eligible'] = False
+                            result['rule'] = f"觀察：{trade_plan.get('blocking_reason', '進場品質未達門檻')}"
+                            if indep_is_daytrade:
+                                df_indep.at[i, '盤中觸發'] = result['rule']
+                            else:
+                                df_indep.at[i, '隔日規則'] = result['rule']
                         result['trade_plan'] = trade_plan
                         result['direction_info'] = direction_info
                         signal_state = classify_signal_state(
@@ -12979,7 +13158,10 @@ with stock_strategy_container:
                         df_indep.at[i, '市場一致'] = market_alignment
                         df_indep.at[i, '資料狀態'] = data_health
                         df_indep.at[i, '買賣價差'] = f'{spread_ticks:.0f}跳' if spread_ticks is not None else '—'
-                        df_indep.at[i, '_indep_eligible'] = result['eligible'] and confidence['score'] >= indep_min_score
+                        df_indep.at[i, '_indep_eligible'] = (
+                            bool(trade_plan.get('valid')) and result['eligible']
+                            and confidence['score'] >= indep_min_score
+                        )
 
                     if indep_show_only_eligible:
                         df_indep = df_indep[df_indep['_indep_eligible']].reset_index(drop=True)
