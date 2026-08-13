@@ -11636,41 +11636,46 @@ def render_futures_strategy_room():
                     styles[position] = 'color:#ff4b4b;font-weight:bold;'
         return styles
 
-    def futures_column_config(include_ignore=True):
+    def futures_column_config(frame=None, include_ignore=True):
+        """依實際儲存格內容收合欄寬，長訊息保留完整可讀空間。"""
+        def content_width(column, minimum, maximum=520):
+            values = frame.get(column) if isinstance(frame, pd.DataFrame) else None
+            return _content_column_width(values, minimum, maximum)
+
         config = {
-            '忽略': st.column_config.CheckboxColumn('隱藏', width=45),
-            '期貨代碼': st.column_config.TextColumn(width=48, disabled=True),
-            '契約月份': st.column_config.TextColumn(width=58, disabled=True),
-            '名稱': st.column_config.TextColumn(width=88, disabled=True),
+            '忽略': st.column_config.CheckboxColumn('隱藏', width=40),
+            '期貨代碼': st.column_config.TextColumn(width=content_width('期貨代碼', 44, 70), disabled=True),
+            '契約月份': st.column_config.TextColumn(width=content_width('契約月份', 54, 82), disabled=True),
+            '名稱': st.column_config.TextColumn(width=content_width('名稱', 48, 130), disabled=True),
             '交易時段': st.column_config.TextColumn(
-                width=68, disabled=True,
+                width=content_width('交易時段', 54, 100), disabled=True,
                 help='「日盤+夜盤」代表此商品同時有日盤與夜盤；表內行情與策略計算仍採同一交易時段資料，避免混合不同時段的開高低收與成交量。',
             ),
-            '當日成交口數': st.column_config.NumberColumn(format='%d', width=72, disabled=True),
-            '未平倉量': st.column_config.NumberColumn(format='%d', width=70, disabled=True),
-            '方向': st.column_config.TextColumn(width=48, disabled=True),
-            '支撐壓力': st.column_config.TextColumn(width=108, disabled=True),
-            '進出場點位': st.column_config.TextColumn(width=155, disabled=True, help='進＝條件成立後觀察價；停＝失效點；目＝第一目標。'),
-            '觸發條件': st.column_config.TextColumn(width=96, disabled=True, help='條件成立後才評估進場；未成立時不以預判價直接下單。'),
-            '當日漲停價': st.column_config.NumberColumn(format='%.12g', width=70, disabled=True, help='依期交所漲跌資料反推參考價後估算；實際限制以期交所與券商下單畫面為準。'),
-            '當日跌停價': st.column_config.NumberColumn(format='%.12g', width=70, disabled=True, help='依期交所漲跌資料反推參考價後估算；實際限制以期交所與券商下單畫面為準。'),
-            '收盤價': st.column_config.TextColumn('成交價', width=70, disabled=True),
-            '漲跌幅': st.column_config.TextColumn(width=70, disabled=True),
-            '所需保證金': st.column_config.NumberColumn(format='%,.0f', width=82, disabled=True),
-            '維持保證金': st.column_config.NumberColumn(format='%,.0f', width=82, disabled=True),
-            '訊號狀態': st.column_config.TextColumn(width=105, disabled=True, help='等待、接近、觸發或失效；不會自動下單。'),
-            '信心分': st.column_config.ProgressColumn('進場信心', min_value=0, max_value=100, format='%d', width=90, help='綜合觸發位置、成交量、未平倉、價差、報價與市場方向；代表條件一致度，不是勝率。'),
-            '信心判讀': st.column_config.TextColumn(width=80, disabled=True, help='高／中高／中／低；若追離進場點、條件失效或資料過期會自動降級。'),
-            '可交易性': st.column_config.TextColumn(width=105, disabled=True, help='綜合成交量、未平倉量、買賣價差與報價新鮮度。'),
-            '資料狀態': st.column_config.TextColumn(width=115, disabled=True, help='顯示即時、官方日行情、尚未更新或報價過期。'),
-            '市場一致': st.column_config.TextColumn(width=110, disabled=True, help='策略方向是否與近月臺指期環境一致；不改變原排序。'),
+            '當日成交口數': st.column_config.NumberColumn(format='%d', width=content_width('當日成交口數', 56, 100), disabled=True),
+            '未平倉量': st.column_config.NumberColumn(format='%d', width=content_width('未平倉量', 56, 100), disabled=True),
+            '方向': st.column_config.TextColumn(width=content_width('方向', 48, 86), disabled=True),
+            '支撐壓力': st.column_config.TextColumn(width=content_width('支撐壓力', 80), disabled=True),
+            '進出場點位': st.column_config.TextColumn(width=content_width('進出場點位', 96), disabled=True, help='進＝條件成立後觀察價；停＝失效點；目＝第一目標。'),
+            '觸發條件': st.column_config.TextColumn(width=content_width('觸發條件', 72), disabled=True, help='條件成立後才評估進場；未成立時不以預判價直接下單。'),
+            '當日漲停價': st.column_config.NumberColumn(format='%.12g', width=content_width('當日漲停價', 54, 96), disabled=True, help='依期交所漲跌資料反推參考價後估算；實際限制以期交所與券商下單畫面為準。'),
+            '當日跌停價': st.column_config.NumberColumn(format='%.12g', width=content_width('當日跌停價', 54, 96), disabled=True, help='依期交所漲跌資料反推參考價後估算；實際限制以期交所與券商下單畫面為準。'),
+            '收盤價': st.column_config.TextColumn('成交價', width=content_width('收盤價', 54, 96), disabled=True),
+            '漲跌幅': st.column_config.TextColumn(width=content_width('漲跌幅', 54, 96), disabled=True),
+            '所需保證金': st.column_config.NumberColumn(format='%,.0f', width=content_width('所需保證金', 62, 110), disabled=True),
+            '維持保證金': st.column_config.NumberColumn(format='%,.0f', width=content_width('維持保證金', 62, 110), disabled=True),
+            '訊號狀態': st.column_config.TextColumn(width=content_width('訊號狀態', 64, 140), disabled=True, help='等待、接近、觸發或失效；不會自動下單。'),
+            '信心分': st.column_config.ProgressColumn('進場信心', min_value=0, max_value=100, format='%d', width=82, help='綜合觸發位置、成交量、未平倉、價差、報價與市場方向；代表條件一致度，不是勝率。'),
+            '信心判讀': st.column_config.TextColumn(width=content_width('信心判讀', 54, 96), disabled=True, help='高／中高／中／低；若追離進場點、條件失效或資料過期會自動降級。'),
+            '可交易性': st.column_config.TextColumn(width=content_width('可交易性', 64, 150), disabled=True, help='綜合成交量、未平倉量、買賣價差與報價新鮮度。'),
+            '資料狀態': st.column_config.TextColumn(width=content_width('資料狀態', 56, 150), disabled=True, help='顯示即時、官方日行情、尚未更新或報價過期。'),
+            '市場一致': st.column_config.TextColumn(width=content_width('市場一致', 56, 130), disabled=True, help='策略方向是否與近月臺指期環境一致；不改變原排序。'),
             '買賣價差': st.column_config.TextColumn(
-                width=75, disabled=True,
+                width=content_width('買賣價差', 56, 96), disabled=True,
                 help='最佳賣價－最佳買價換算成跳動單位；跳數越少通常代表進出成本較低、報價較連續。無即時買賣價時顯示「—」。'
             ),
-            '量倉比': st.column_config.NumberColumn(format='%.12g', width=58, disabled=True, help='當日成交口數 ÷ 未平倉量。'),
+            '量倉比': st.column_config.NumberColumn(format='%.12g', width=content_width('量倉比', 52, 90), disabled=True, help='當日成交口數 ÷ 未平倉量。'),
             '到期提醒': st.column_config.TextColumn(
-                width=75, disabled=True,
+                width=content_width('到期提醒', 56, 110), disabled=True,
                 help='依目前契約距到期日的天數提示。接近到期時注意流動性、轉倉與近月／次月價格差；不是強制平倉通知。'
             ),
         }
@@ -11698,7 +11703,7 @@ def render_futures_strategy_room():
         editor_display['漲跌幅'] = editor_display['漲跌幅'].apply(_signed_percent)
         edited = st.data_editor(
             editor_display.style.apply(style_futures_row, axis=1),
-            column_config=futures_column_config(),
+            column_config=futures_column_config(editor_display),
             hide_index=True, width='stretch', row_height=30,
             key=futures_editor_key
         )
@@ -11848,7 +11853,7 @@ def render_futures_strategy_room():
         independent_display['漲跌幅'] = independent_display['漲跌幅'].apply(_signed_percent)
         st.dataframe(
             independent_display.style.apply(style_futures_row, axis=1),
-            column_config=futures_column_config(include_ignore=False),
+            column_config=futures_column_config(independent_display, include_ignore=False),
             hide_index=True, width='stretch', row_height=30
         )
 
@@ -12616,36 +12621,39 @@ with stock_strategy_container:
             
         styled_df = df_display[input_cols].style.apply(style_tab1_df, axis=1)
 
+        def stock_content_width(column, minimum, maximum=520):
+            return _content_column_width(df_display.get(column), minimum, maximum)
+
         risk_column_config = {}
         if risk_preview_enabled:
             risk_column_config = {
-                "建議方向": st.column_config.TextColumn(width=90, disabled=True, help="系統自動時逐檔判斷；紅色為建議多、綠色為建議空。選擇手動多／空時會標示為手動。"),
-                "方向依據": st.column_config.TextColumn(width=190, disabled=True, help="當沖優先列出分 K、VWAP、開盤區間與量能；隔日／波段列出日 K 均線、前高前低及 K 棒位置。括號為多空條件分數。"),
-                "風險": st.column_config.TextColumn("處置／注意", width=95, disabled=True, help="官方注意與處置查核結果；不預測漲跌方向。"),
-                "訊號狀態": st.column_config.TextColumn(width=88, disabled=True, help="將原條件濃縮為等待、接近、觸發或暫停；原規則仍在明細。"),
-                "市場一致": st.column_config.TextColumn(width=90, disabled=True, help="目前方向是否與近月臺指期環境一致；不改變原排序。"),
-                "資料狀態": st.column_config.TextColumn(width=96, disabled=True, help="顯示即時、手動／暫存、官方日行情或資料過期。"),
+                "建議方向": st.column_config.TextColumn(width=stock_content_width('建議方向', 56, 90), disabled=True, help="系統自動時逐檔判斷；紅色為建議多、綠色為建議空。選擇手動多／空時會標示為手動。"),
+                "方向依據": st.column_config.TextColumn(width=stock_content_width('方向依據', 86), disabled=True, help="當沖優先列出分 K、VWAP、開盤區間與量能；隔日／波段列出日 K 均線、前高前低及 K 棒位置。括號為多空條件分數。"),
+                "風險": st.column_config.TextColumn("處置／注意", width=stock_content_width('風險', 64, 110), disabled=True, help="官方注意與處置查核結果；不預測漲跌方向。"),
+                "訊號狀態": st.column_config.TextColumn(width=stock_content_width('訊號狀態', 56, 140), disabled=True, help="將原條件濃縮為等待、接近、觸發或暫停；原規則仍在明細。"),
+                "市場一致": st.column_config.TextColumn(width=stock_content_width('市場一致', 56, 120), disabled=True, help="目前方向是否與近月臺指期環境一致；不改變原排序。"),
+                "資料狀態": st.column_config.TextColumn(width=stock_content_width('資料狀態', 56, 150), disabled=True, help="顯示即時、手動／暫存、官方日行情或資料過期。"),
                 "買賣價差": st.column_config.TextColumn(
-                    width=75, disabled=True,
+                    width=stock_content_width('買賣價差', 56, 96), disabled=True,
                     help="即時最佳賣價與最佳買價的距離，換算為跳動單位；跳數越少通常代表報價較連續、進出成本較低。無即時買賣價時顯示「—」。"
                 ),
-                "信心分": st.column_config.ProgressColumn("進場信心", min_value=0, max_value=100, format="%d", width=100, help="綜合方向條件、觸發位置、市場一致與資料狀態；代表條件一致度，不是勝率。"),
-                "信心判讀": st.column_config.TextColumn(width=70, disabled=True, help="高／中高／中／低；追離進場點、條件失效或資料過期時會降級。"),
-                "支撐壓力": st.column_config.TextColumn(width=120, disabled=True, help="當沖採開盤區間與 VWAP；隔日／波段沿用原戰略價位，顯示最接近目前價格的支撐與壓力。"),
+                "信心分": st.column_config.ProgressColumn("進場信心", min_value=0, max_value=100, format="%d", width=82, help="綜合方向條件、觸發位置、市場一致與資料狀態；代表條件一致度，不是勝率。"),
+                "信心判讀": st.column_config.TextColumn(width=stock_content_width('信心判讀', 48, 96), disabled=True, help="高／中高／中／低；追離進場點、條件失效或資料過期時會降級。"),
+                "支撐壓力": st.column_config.TextColumn(width=stock_content_width('支撐壓力', 76), disabled=True, help="當沖採開盤區間與 VWAP；隔日／波段沿用原戰略價位，顯示最接近目前價格的支撐與壓力。"),
             }
             if is_daytrade_mode:
                 risk_column_config.update({
-                    "VWAP 狀態": st.column_config.TextColumn(width=95, disabled=True, help="價格相對成交量加權平均價的位置；上方偏多、下方偏空。"),
-                    "開盤區間": st.column_config.TextColumn(width=100, disabled=True, help="09:00–09:15 顯示形成中的即時低點－高點；09:15 後固定為完整開盤區間。"),
-                    "量能": st.column_config.TextColumn(width=65, disabled=True, help="目前累積量相對最近交易日同時段平均量。"),
-                    "盤中觸發": st.column_config.TextColumn(width=150, disabled=True, help="僅在盤中條件同時成立時提供觀察提示，不是自動買賣指令。"),
-                    "進出場預判": st.column_config.TextColumn(width=160, disabled=True, help="通過條件後，以開盤區間與 VWAP 推估進場、策略失效離場與第一目標；僅供觀察與回測。"),
+                    "VWAP 狀態": st.column_config.TextColumn(width=stock_content_width('VWAP 狀態', 72, 150), disabled=True, help="價格相對成交量加權平均價的位置；上方偏多、下方偏空。"),
+                    "開盤區間": st.column_config.TextColumn(width=stock_content_width('開盤區間', 80, 150), disabled=True, help="09:00–09:15 顯示形成中的即時低點－高點；09:15 後固定為完整開盤區間。"),
+                    "量能": st.column_config.TextColumn(width=stock_content_width('量能', 52, 96), disabled=True, help="目前累積量相對最近交易日同時段平均量。"),
+                    "盤中觸發": st.column_config.TextColumn(width=stock_content_width('盤中觸發', 72), disabled=True, help="僅在盤中條件同時成立時提供觀察提示，不是自動買賣指令。"),
+                    "進出場預判": st.column_config.TextColumn(width=stock_content_width('進出場預判', 86), disabled=True, help="通過條件後，以開盤區間與 VWAP 推估進場、策略失效離場與第一目標；僅供觀察與回測。"),
                 })
             else:
                 risk_column_config.update({
-                    "乖離": st.column_config.TextColumn(width=75, disabled=True, help="收盤價相對 20 日線的 ATR 距離；數值越大越不宜追價或追空。"),
-                    "隔日規則": st.column_config.TextColumn(width=130, disabled=True, help="僅在隔日條件成真時才列入評估，不是自動買賣指令。"),
-                    "進出場預判": st.column_config.TextColumn(width=160, disabled=True, help="通過條件後，以昨高／昨低與 ATR 推估進場、策略失效離場與第一目標；僅供觀察與回測。"),
+                    "乖離": st.column_config.TextColumn(width=stock_content_width('乖離', 52, 96), disabled=True, help="收盤價相對 20 日線的 ATR 距離；數值越大越不宜追價或追空。"),
+                    "隔日規則": st.column_config.TextColumn(width=stock_content_width('隔日規則', 72), disabled=True, help="僅在隔日條件成真時才列入評估，不是自動買賣指令。"),
+                    "進出場預判": st.column_config.TextColumn(width=stock_content_width('進出場預判', 86), disabled=True, help="通過條件後，以昨高／昨低與 ATR 推估進場、策略失效離場與第一目標；僅供觀察與回測。"),
                 })
 
         stock_table_signature = abs(hash((
@@ -12660,7 +12668,7 @@ with stock_strategy_container:
                 **risk_column_config,
                 "移除": st.column_config.CheckboxColumn("刪除", width=40, help="勾選後刪除並自動遞補"),
                 "代號": st.column_config.TextColumn(disabled=True, width=_content_column_width(df_display.get("代號"), 44, 62)),
-                "名稱": st.column_config.TextColumn(disabled=True, width=_content_column_width(df_display.get("名稱"), 48, 88)),
+                "名稱": st.column_config.TextColumn(disabled=True, width=_content_column_width(df_display.get("名稱"), 44, 130)),
                 "收盤價": st.column_config.TextColumn("成交價", width=_content_column_width(df_display.get("收盤價"), 52, 78), disabled=True),
                 "漲跌幅": st.column_config.TextColumn(disabled=True, width=_content_column_width(df_display.get("漲跌幅"), 56, 78)),
                 "期貨": st.column_config.TextColumn(width=_content_column_width(df_display.get("期貨"), 44, 70), disabled=True),
@@ -13203,32 +13211,35 @@ with stock_strategy_container:
 
                 # 套用與主表格完全一致的顏色邏輯
                 styled_indep = df_indep[input_cols].style.apply(style_tab1_df, axis=1)
+                def indep_content_width(column, minimum, maximum=520):
+                    return _content_column_width(df_indep.get(column), minimum, maximum)
+
                 indep_column_config = {}
                 if risk_preview_enabled:
                     indep_column_config.update({
-                        "建議方向": st.column_config.TextColumn(width=90, disabled=True, help="紅色為建議多、綠色為建議空；手動指定時會顯示手動。"),
-                        "方向依據": st.column_config.TextColumn(width=190, disabled=True, help="列出本檔採用的分 K／日 K、VWAP 與支撐壓力判斷。"),
-                        "風險": st.column_config.TextColumn("處置／注意", width=95, disabled=True, help="官方注意與處置查核結果；不預測漲跌方向。"),
-                        "訊號狀態": st.column_config.TextColumn(width=88, disabled=True),
-                        "信心分": st.column_config.ProgressColumn("進場信心", min_value=0, max_value=100, format="%d", width=100, help="條件一致度，不是勝率。"),
-                        "信心判讀": st.column_config.TextColumn(width=80, disabled=True),
-                        "支撐壓力": st.column_config.TextColumn(width=120, disabled=True),
-                        "市場一致": st.column_config.TextColumn(width=90, disabled=True),
-                        "資料狀態": st.column_config.TextColumn(width=96, disabled=True),
+                        "建議方向": st.column_config.TextColumn(width=indep_content_width('建議方向', 56, 90), disabled=True, help="紅色為建議多、綠色為建議空；手動指定時會顯示手動。"),
+                        "方向依據": st.column_config.TextColumn(width=indep_content_width('方向依據', 86), disabled=True, help="列出本檔採用的分 K／日 K、VWAP 與支撐壓力判斷。"),
+                        "風險": st.column_config.TextColumn("處置／注意", width=indep_content_width('風險', 64, 110), disabled=True, help="官方注意與處置查核結果；不預測漲跌方向。"),
+                        "訊號狀態": st.column_config.TextColumn(width=indep_content_width('訊號狀態', 56, 140), disabled=True),
+                        "信心分": st.column_config.ProgressColumn("進場信心", min_value=0, max_value=100, format="%d", width=82, help="條件一致度，不是勝率。"),
+                        "信心判讀": st.column_config.TextColumn(width=indep_content_width('信心判讀', 48, 96), disabled=True),
+                        "支撐壓力": st.column_config.TextColumn(width=indep_content_width('支撐壓力', 76), disabled=True),
+                        "市場一致": st.column_config.TextColumn(width=indep_content_width('市場一致', 56, 120), disabled=True),
+                        "資料狀態": st.column_config.TextColumn(width=indep_content_width('資料狀態', 56, 150), disabled=True),
                     })
                     if indep_is_daytrade:
                         indep_column_config.update({
-                            "VWAP 狀態": st.column_config.TextColumn(width=95, disabled=True, help="偏多：站上 VWAP；偏空：跌破 VWAP。"),
-                            "開盤區間": st.column_config.TextColumn(width=100, disabled=True, help="09:00–09:15 顯示形成中的即時低點－高點；09:15 後固定為完整開盤區間。"),
-                            "量能": st.column_config.TextColumn(width=65, disabled=True, help="目前累積量相對最近交易日同時段平均量。"),
-                            "盤中觸發": st.column_config.TextColumn(width=150, disabled=True, help="僅為盤中觀察提示，不是自動買賣指令。"),
-                            "進出場預判": st.column_config.TextColumn(width=160, disabled=True, help="以開盤區間與 VWAP 推估進場、策略失效離場與第一目標。"),
+                            "VWAP 狀態": st.column_config.TextColumn(width=indep_content_width('VWAP 狀態', 72, 150), disabled=True, help="偏多：站上 VWAP；偏空：跌破 VWAP。"),
+                            "開盤區間": st.column_config.TextColumn(width=indep_content_width('開盤區間', 80, 150), disabled=True, help="09:00–09:15 顯示形成中的即時低點－高點；09:15 後固定為完整開盤區間。"),
+                            "量能": st.column_config.TextColumn(width=indep_content_width('量能', 52, 96), disabled=True, help="目前累積量相對最近交易日同時段平均量。"),
+                            "盤中觸發": st.column_config.TextColumn(width=indep_content_width('盤中觸發', 72), disabled=True, help="僅為盤中觀察提示，不是自動買賣指令。"),
+                            "進出場預判": st.column_config.TextColumn(width=indep_content_width('進出場預判', 86), disabled=True, help="以開盤區間與 VWAP 推估進場、策略失效離場與第一目標。"),
                         })
                     else:
                         indep_column_config.update({
-                            "乖離": st.column_config.TextColumn(width=75, disabled=True),
-                            "隔日規則": st.column_config.TextColumn(width=130, disabled=True),
-                            "進出場預判": st.column_config.TextColumn(width=160, disabled=True, help="以昨高／昨低與 ATR 推估進場、策略失效離場與第一目標。"),
+                            "乖離": st.column_config.TextColumn(width=indep_content_width('乖離', 52, 96), disabled=True),
+                            "隔日規則": st.column_config.TextColumn(width=indep_content_width('隔日規則', 72), disabled=True),
+                            "進出場預判": st.column_config.TextColumn(width=indep_content_width('進出場預判', 86), disabled=True, help="以昨高／昨低與 ATR 推估進場、策略失效離場與第一目標。"),
                         })
 
                 st.dataframe(
@@ -13236,22 +13247,22 @@ with stock_strategy_container:
                     column_config={
                         **indep_column_config,
                         "代號": st.column_config.TextColumn(width=_content_column_width(df_indep.get("代號"), 44, 62)),
-                        "名稱": st.column_config.TextColumn(width=_content_column_width(df_indep.get("名稱"), 48, 88)),
+                        "名稱": st.column_config.TextColumn(width=_content_column_width(df_indep.get("名稱"), 44, 130)),
                         "收盤價": st.column_config.TextColumn("成交價", width=_content_column_width(df_indep.get("收盤價"), 52, 78)),
                         "漲跌幅": st.column_config.TextColumn(width=_content_column_width(df_indep.get("漲跌幅"), 56, 78)),
                         "期貨": st.column_config.TextColumn(width=_content_column_width(df_indep.get("期貨"), 44, 70)),
                         "當日漲停價": st.column_config.TextColumn(width=_content_column_width(df_indep.get("當日漲停價"), 54, 78)),
                         "當日跌停價": st.column_config.TextColumn(width=_content_column_width(df_indep.get("當日跌停價"), 54, 78)),
                         "成交價價差": st.column_config.TextColumn(
-                            width=80,
+                            width=indep_content_width('成交價價差', 56, 96),
                             help="目前成交價減去昨日收盤價；正值為上漲點數，負值為下跌點數。"
                         ),
                         "5日線價差": st.column_config.TextColumn(
-                            width=80,
+                            width=indep_content_width('5日線價差', 56, 96),
                             help="目前成交價減去 5 日均線；正值在均線上方，負值在均線下方。"
                         ),
                         "買賣價差": st.column_config.TextColumn(
-                            width=75,
+                            width=indep_content_width('買賣價差', 56, 96),
                             help="即時最佳賣價與最佳買價的距離，換算為跳動單位。"
                         ),
                         "狀態": None, # 設定為 None 隱藏獨立計算結果的狀態欄位
