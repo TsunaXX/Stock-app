@@ -1864,7 +1864,7 @@ def _format_compact_number(value, max_decimals=2, signed=False, thousands=True):
 pd.options.display.float_format = lambda value: _format_compact_number(value, 8)
 
 
-def _content_column_width(values, min_width=44, max_width=180):
+def _content_column_width(values, min_width=44, max_width=180, full_content=False):
     """只依儲存格內容估算欄寬，不讓較長的欄位標題撐出大段空白。"""
     try:
         series = pd.Series(values).dropna().astype(str)
@@ -1873,7 +1873,10 @@ def _content_column_width(values, min_width=44, max_width=180):
     if series.empty:
         return min_width
     lengths = series.map(lambda text: sum(2 if ord(char) > 127 else 1 for char in text))
-    content_length = float(lengths.quantile(0.95)) if len(lengths) > 4 else float(lengths.max())
+    content_length = (
+        float(lengths.max())
+        if full_content or len(lengths) <= 4 else float(lengths.quantile(0.95))
+    )
     return max(min_width, min(max_width, int(content_length * 7 + 12)))
 
 
@@ -11638,9 +11641,9 @@ def render_futures_strategy_room():
 
     def futures_column_config(frame=None, include_ignore=True):
         """依實際儲存格內容收合欄寬，長訊息保留完整可讀空間。"""
-        def content_width(column, minimum, maximum=520):
+        def content_width(column, minimum, maximum=520, full_content=False):
             values = frame.get(column) if isinstance(frame, pd.DataFrame) else None
-            return _content_column_width(values, minimum, maximum)
+            return _content_column_width(values, minimum, maximum, full_content)
 
         config = {
             '忽略': st.column_config.CheckboxColumn('隱藏', width=40),
@@ -11655,7 +11658,7 @@ def render_futures_strategy_room():
             '未平倉量': st.column_config.NumberColumn(format='%d', width=content_width('未平倉量', 56, 100), disabled=True),
             '方向': st.column_config.TextColumn(width=content_width('方向', 48, 86), disabled=True),
             '支撐壓力': st.column_config.TextColumn(width=content_width('支撐壓力', 80), disabled=True),
-            '進出場點位': st.column_config.TextColumn(width=content_width('進出場點位', 96), disabled=True, help='進＝條件成立後觀察價；停＝失效點；目＝第一目標。'),
+            '進出場點位': st.column_config.TextColumn(width=content_width('進出場點位', 96, 720, True), disabled=True, help='進＝條件成立後觀察價；停＝失效點；目＝第一目標。'),
             '觸發條件': st.column_config.TextColumn(width=content_width('觸發條件', 72), disabled=True, help='條件成立後才評估進場；未成立時不以預判價直接下單。'),
             '當日漲停價': st.column_config.NumberColumn(format='%.12g', width=content_width('當日漲停價', 54, 96), disabled=True, help='依期交所漲跌資料反推參考價後估算；實際限制以期交所與券商下單畫面為準。'),
             '當日跌停價': st.column_config.NumberColumn(format='%.12g', width=content_width('當日跌停價', 54, 96), disabled=True, help='依期交所漲跌資料反推參考價後估算；實際限制以期交所與券商下單畫面為準。'),
@@ -12621,8 +12624,10 @@ with stock_strategy_container:
             
         styled_df = df_display[input_cols].style.apply(style_tab1_df, axis=1)
 
-        def stock_content_width(column, minimum, maximum=520):
-            return _content_column_width(df_display.get(column), minimum, maximum)
+        def stock_content_width(column, minimum, maximum=520, full_content=False):
+            return _content_column_width(
+                df_display.get(column), minimum, maximum, full_content,
+            )
 
         risk_column_config = {}
         if risk_preview_enabled:
@@ -12647,13 +12652,13 @@ with stock_strategy_container:
                     "開盤區間": st.column_config.TextColumn(width=stock_content_width('開盤區間', 80, 150), disabled=True, help="09:00–09:15 顯示形成中的即時低點－高點；09:15 後固定為完整開盤區間。"),
                     "量能": st.column_config.TextColumn(width=stock_content_width('量能', 52, 96), disabled=True, help="目前累積量相對最近交易日同時段平均量。"),
                     "盤中觸發": st.column_config.TextColumn(width=stock_content_width('盤中觸發', 72), disabled=True, help="僅在盤中條件同時成立時提供觀察提示，不是自動買賣指令。"),
-                    "進出場預判": st.column_config.TextColumn(width=stock_content_width('進出場預判', 86), disabled=True, help="通過條件後，以開盤區間與 VWAP 推估進場、策略失效離場與第一目標；僅供觀察與回測。"),
+                    "進出場預判": st.column_config.TextColumn(width=stock_content_width('進出場預判', 86, 720, True), disabled=True, help="通過條件後，以開盤區間與 VWAP 推估進場、策略失效離場與第一目標；僅供觀察與回測。"),
                 })
             else:
                 risk_column_config.update({
                     "乖離": st.column_config.TextColumn(width=stock_content_width('乖離', 52, 96), disabled=True, help="收盤價相對 20 日線的 ATR 距離；數值越大越不宜追價或追空。"),
                     "隔日規則": st.column_config.TextColumn(width=stock_content_width('隔日規則', 72), disabled=True, help="僅在隔日條件成真時才列入評估，不是自動買賣指令。"),
-                    "進出場預判": st.column_config.TextColumn(width=stock_content_width('進出場預判', 86), disabled=True, help="通過條件後，以昨高／昨低與 ATR 推估進場、策略失效離場與第一目標；僅供觀察與回測。"),
+                    "進出場預判": st.column_config.TextColumn(width=stock_content_width('進出場預判', 86, 720, True), disabled=True, help="通過條件後，以昨高／昨低與 ATR 推估進場、策略失效離場與第一目標；僅供觀察與回測。"),
                 })
 
         stock_table_signature = abs(hash((
@@ -13211,8 +13216,10 @@ with stock_strategy_container:
 
                 # 套用與主表格完全一致的顏色邏輯
                 styled_indep = df_indep[input_cols].style.apply(style_tab1_df, axis=1)
-                def indep_content_width(column, minimum, maximum=520):
-                    return _content_column_width(df_indep.get(column), minimum, maximum)
+                def indep_content_width(column, minimum, maximum=520, full_content=False):
+                    return _content_column_width(
+                        df_indep.get(column), minimum, maximum, full_content,
+                    )
 
                 indep_column_config = {}
                 if risk_preview_enabled:
@@ -13233,13 +13240,13 @@ with stock_strategy_container:
                             "開盤區間": st.column_config.TextColumn(width=indep_content_width('開盤區間', 80, 150), disabled=True, help="09:00–09:15 顯示形成中的即時低點－高點；09:15 後固定為完整開盤區間。"),
                             "量能": st.column_config.TextColumn(width=indep_content_width('量能', 52, 96), disabled=True, help="目前累積量相對最近交易日同時段平均量。"),
                             "盤中觸發": st.column_config.TextColumn(width=indep_content_width('盤中觸發', 72), disabled=True, help="僅為盤中觀察提示，不是自動買賣指令。"),
-                            "進出場預判": st.column_config.TextColumn(width=indep_content_width('進出場預判', 86), disabled=True, help="以開盤區間與 VWAP 推估進場、策略失效離場與第一目標。"),
+                            "進出場預判": st.column_config.TextColumn(width=indep_content_width('進出場預判', 86, 720, True), disabled=True, help="以開盤區間與 VWAP 推估進場、策略失效離場與第一目標。"),
                         })
                     else:
                         indep_column_config.update({
                             "乖離": st.column_config.TextColumn(width=indep_content_width('乖離', 52, 96), disabled=True),
                             "隔日規則": st.column_config.TextColumn(width=indep_content_width('隔日規則', 72), disabled=True),
-                            "進出場預判": st.column_config.TextColumn(width=indep_content_width('進出場預判', 86), disabled=True, help="以昨高／昨低與 ATR 推估進場、策略失效離場與第一目標。"),
+                            "進出場預判": st.column_config.TextColumn(width=indep_content_width('進出場預判', 86, 720, True), disabled=True, help="以昨高／昨低與 ATR 推估進場、策略失效離場與第一目標。"),
                         })
 
                 st.dataframe(
