@@ -129,7 +129,8 @@ def test_stock_limit_color_requires_actual_equality_not_stale_status():
 
 
 def test_restored_stock_rows_use_fresh_values_and_mark_failed_rows_stale():
-    merge = load_app_symbols("_merge_refreshed_stock_rows")["_merge_refreshed_stock_rows"]
+    symbols = load_app_symbols("_stale_stock_identity_row", "_merge_refreshed_stock_rows")
+    merge = symbols["_merge_refreshed_stock_rows"]
     cached = pd.DataFrame([
         {"代號": "2330", "名稱": "台積電", "收盤價": 100, "_source": "upload", "_order": 0, "_source_rank": 1},
         {"代號": "2408", "名稱": "南亞科", "收盤價": 50, "_source": "search", "_order": 1, "_source_rank": 2},
@@ -142,14 +143,16 @@ def test_restored_stock_rows_use_fresh_values_and_mark_failed_rows_stale():
     assert refreshed.loc[0, "收盤價"] == 110
     assert refreshed.loc[0, "_source"] == "upload"
     assert not bool(refreshed.loc[0, "_data_stale"])
-    assert refreshed.loc[1, "收盤價"] == 50
+    assert pd.isna(refreshed.loc[1, "收盤價"])
+    assert refreshed.loc[1, "代號"] == "2408"
     assert bool(refreshed.loc[1, "_data_stale"])
 
 
 def test_persisted_stock_refresh_fetches_every_cached_symbol():
     symbols = load_app_symbols(
         "ANALYSIS_MAX_WORKERS", "API_REQUEST_GAP_SECONDS",
-        "_merge_refreshed_stock_rows", "refresh_persisted_stock_rows",
+        "_stale_stock_identity_row", "_merge_refreshed_stock_rows",
+        "refresh_persisted_stock_rows",
     )
     fetched_codes = []
 
@@ -481,6 +484,8 @@ def test_nested_google_sheet_payload_restores_fibo_tags():
     assert symbols["_extract_fibo_tags"](decoded) == tags
     legacy = symbols["_decode_data_cache_payload"]({"tags": tags})
     assert symbols["_extract_fibo_tags"](legacy) == tags
+    backup = {"fibo_tags": [], "fibo_tags_backup": {"tags": tags}}
+    assert symbols["_extract_fibo_tags"](backup) == tags
 
 
 def test_cache_merge_preserves_remote_device_sections():
@@ -515,3 +520,49 @@ def test_cache_merge_preserves_remote_device_sections():
     assert merged["fibo_tags"] == remote["fibo_tags"]
     assert {row["dedupe_key"] for row in merged["strategy_signal_log"]} == {"remote-1", "local-1"}
     assert merged["company_event_snapshot"]["updated_at"] == "2026/08/11 10:00"
+
+
+def test_cache_merge_can_replace_cloud_stock_snapshot_without_resurrecting_old_rows():
+    symbols = load_app_symbols(
+        "_json_safe", "_valid_fibo_tags", "_merge_unique_records",
+        "_merge_unique_values", "empty_company_event_snapshot",
+        "normalize_company_event_snapshot", "_newer_company_event_snapshot",
+        "_merge_data_cache_payload",
+    )
+    remote = {
+        "stock_data": [{"代號": "2330", "收盤價": 100}],
+        "fibo_tags": ["A", "B", "C", "D", "E"],
+    }
+    local = {
+        "stock_data": [{"代號": "2408", "收盤價": 60}],
+        "fibo_tags": ["1", "2", "3", "4", "5"],
+    }
+    merged = symbols["_merge_data_cache_payload"](
+        remote, local, replace_stock_data=True,
+    )
+    assert [row["代號"] for row in merged["stock_data"]] == ["2408"]
+    assert merged["fibo_tags"] == remote["fibo_tags"]
+
+
+def test_only_explicit_save_replaces_fibo_tags_and_keeps_recovery_copy():
+    symbols = load_app_symbols(
+        "_json_safe", "_valid_fibo_tags", "_merge_unique_records",
+        "_merge_unique_values", "empty_company_event_snapshot",
+        "normalize_company_event_snapshot", "_newer_company_event_snapshot",
+        "_merge_data_cache_payload", "_extract_fibo_tags",
+    )
+    remote = {"stock_data": [], "fibo_tags": []}
+    local = {
+        "stock_data": [],
+        "fibo_tags": ["南亞科(2408)", "台積電(2330)", "鴻海(2317)", "聯發科(2454)", "和椿(6215)"],
+        "fibo_tags_updated_at": "2026-08-13T10:00:00+08:00",
+    }
+    ordinary = symbols["_merge_data_cache_payload"](remote, local)
+    assert ordinary["fibo_tags"] == []
+    explicit = symbols["_merge_data_cache_payload"](
+        remote, local, explicit_fibo_tag_save=True,
+    )
+    assert explicit["fibo_tags"] == local["fibo_tags"]
+    assert explicit["fibo_tags_backup"]["tags"] == local["fibo_tags"]
+    damaged_primary = dict(explicit, fibo_tags=[])
+    assert symbols["_extract_fibo_tags"](damaged_primary) == local["fibo_tags"]
