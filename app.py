@@ -7419,7 +7419,11 @@ def _extract_fibo_tags(payload):
                 tags = _valid_fibo_tags(value.get(key))
                 if tags:
                     return tags
-            queue.extend(value.get(key) for key in ('data', 'payload', 'result') if key in value)
+            queue.extend(
+                value.get(key)
+                for key in ('fibo_tags_backup', 'data', 'payload', 'result')
+                if key in value
+            )
         elif isinstance(value, list):
             tags = _valid_fibo_tags(value)
             if tags:
@@ -7444,6 +7448,7 @@ def save_fibo_config():
     try:
         updated_at = datetime.now(pytz.timezone('Asia/Taipei')).isoformat()
         config['fibo_tags_updated_at'] = updated_at
+        st.session_state['_fibo_tags_updated_at'] = updated_at
         _write_json_atomic(CONFIG_FILE, config)
         _write_json_atomic(
             FIBO_TAG_CACHE_FILE,
@@ -7510,13 +7515,20 @@ def _newer_company_event_snapshot(remote_snapshot, local_snapshot):
 
 def _merge_data_cache_payload(
     remote, local, *, explicit_fibo_tag_save=False,
-    clear_stock_data=False, replace_ignored=False,
+    clear_stock_data=False, replace_ignored=False, replace_stock_data=False,
 ):
     remote = remote if isinstance(remote, dict) else {}
     local = local if isinstance(local, dict) else {}
     if explicit_fibo_tag_save and remote:
         merged = dict(remote)
-        merged['fibo_tags'] = list(local.get('fibo_tags', []))
+        saved_tags = list(local.get('fibo_tags', []))
+        tags_updated_at = str(local.get('fibo_tags_updated_at', '')).strip()
+        merged['fibo_tags'] = saved_tags
+        merged['fibo_tags_updated_at'] = tags_updated_at
+        merged['fibo_tags_backup'] = {
+            'tags': saved_tags,
+            'updated_at': tags_updated_at,
+        }
     elif clear_stock_data:
         merged = dict(remote)
         for key, empty_value in (
@@ -7526,8 +7538,11 @@ def _merge_data_cache_payload(
             merged[key] = empty_value
         merged['fibo_tags'] = (
             _valid_fibo_tags(remote.get('fibo_tags', []))
-            or list(local.get('fibo_tags', []))
         )
+        if 'fibo_tags_updated_at' in remote:
+            merged['fibo_tags_updated_at'] = remote.get('fibo_tags_updated_at')
+        if 'fibo_tags_backup' in remote:
+            merged['fibo_tags_backup'] = remote.get('fibo_tags_backup')
         merged['strategy_signal_log'] = remote.get(
             'strategy_signal_log', local.get('strategy_signal_log', []),
         )
@@ -7538,9 +7553,14 @@ def _merge_data_cache_payload(
         remote_ignored = set(remote.get('ignored_stocks', []))
         local_ignored = set(local.get('ignored_stocks', []))
         ignored = local_ignored if replace_ignored else remote_ignored | local_ignored
-        stock_rows = _merge_unique_records(
-            remote.get('stock_data', []), local.get('stock_data', []), '代號',
-        )
+        if replace_stock_data:
+            # The visible stock table is a current snapshot.  Unioning it with an
+            # older cloud snapshot resurrects removed/obsolete rows after reload.
+            stock_rows = list(local.get('stock_data', []))
+        else:
+            stock_rows = _merge_unique_records(
+                remote.get('stock_data', []), local.get('stock_data', []), '代號',
+            )
         stock_rows = [
             row for row in stock_rows
             if str(row.get('代號', '')).strip() not in ignored
@@ -7557,10 +7577,10 @@ def _merge_data_cache_payload(
             ),
             'saved_notes': saved_notes,
             'cached_notes': cached_notes,
-            'fibo_tags': (
-                _valid_fibo_tags(remote.get('fibo_tags', []))
-                or list(local.get('fibo_tags', []))
-            ),
+            # Only an explicit "save quick tags" action may change cloud tags.
+            # A transient read failure must never promote local defaults and wipe
+            # the last good phone/computer configuration.
+            'fibo_tags': _valid_fibo_tags(remote.get('fibo_tags', [])),
             'strategy_signal_log': _merge_unique_records(
                 remote.get('strategy_signal_log', []),
                 local.get('strategy_signal_log', []),
@@ -7570,6 +7590,10 @@ def _merge_data_cache_payload(
                 remote.get('company_event_snapshot'), local.get('company_event_snapshot'),
             ),
         }
+        if 'fibo_tags_updated_at' in remote:
+            merged['fibo_tags_updated_at'] = remote.get('fibo_tags_updated_at')
+        if 'fibo_tags_backup' in remote:
+            merged['fibo_tags_backup'] = remote.get('fibo_tags_backup')
     merged['version'] = 3
     merged['updated_at'] = datetime.now(pytz.timezone('Asia/Taipei')).isoformat()
     return _json_safe(merged)
@@ -7577,7 +7601,7 @@ def _merge_data_cache_payload(
 
 def save_data_cache(
     df, ignored_set, candidates=None, saved_notes=None, fibo_tags=None,
-    *, clear_stock_data=False, replace_ignored=False,
+    *, clear_stock_data=False, replace_ignored=False, replace_stock_data=True,
 ):
     candidates = list(candidates or [])
     saved_notes = dict(saved_notes or {})
@@ -7606,6 +7630,10 @@ def save_data_cache(
         company_snapshot = st.session_state.get('company_event_snapshot')
         if not isinstance(company_snapshot, dict):
             company_snapshot = load_company_event_snapshot()
+        fibo_tags_updated_at = str(st.session_state.get('_fibo_tags_updated_at', '')).strip()
+        if explicit_fibo_tag_save and not fibo_tags_updated_at:
+            fibo_tags_updated_at = datetime.now(pytz.timezone('Asia/Taipei')).isoformat()
+            st.session_state['_fibo_tags_updated_at'] = fibo_tags_updated_at
         local_payload = _json_safe({
             'version': 3,
             'stock_data': df_save.to_dict(orient='records'),
@@ -7613,6 +7641,7 @@ def save_data_cache(
             'all_candidates': candidates,
             'saved_notes': saved_notes,
             'fibo_tags': fibo_tags,
+            'fibo_tags_updated_at': fibo_tags_updated_at,
             'cached_notes': cached_notes,
             'strategy_signal_log': load_strategy_signal_log(),
             'company_event_snapshot': company_snapshot,
@@ -7631,20 +7660,27 @@ def save_data_cache(
                         explicit_fibo_tag_save=explicit_fibo_tag_save,
                         clear_stock_data=clear_stock_data,
                         replace_ignored=replace_ignored,
+                        replace_stock_data=replace_stock_data,
                     )
                     last_error = None
                     for attempt in range(2):
                         try:
+                            request_payload = {
+                                'action': 'save',
+                                'data': json.dumps(merged_payload, ensure_ascii=False),
+                                'updated_at': merged_payload.get('updated_at', ''),
+                            }
+                            # Legacy Apps Script deployments receive this direct
+                            # field only for an intentional tag save.  Ordinary
+                            # stock refreshes cannot clear or replace quick tags.
+                            if explicit_fibo_tag_save:
+                                request_payload['fibo_tags'] = merged_payload.get('fibo_tags', [])
+                                request_payload['fibo_tags_updated_at'] = merged_payload.get(
+                                    'fibo_tags_updated_at', ''
+                                )
                             response = requests.post(
                                 gsheet_api_url,
-                                json={
-                                    'action': 'save',
-                                    'data': json.dumps(merged_payload, ensure_ascii=False),
-                                    # Legacy Apps Script deployments can persist
-                                    # these direct fields even when they ignore data.
-                                    'fibo_tags': merged_payload.get('fibo_tags', []),
-                                    'updated_at': merged_payload.get('updated_at', ''),
-                                },
+                                json=request_payload,
                                 timeout=8,
                             )
                             response.raise_for_status()
@@ -7705,7 +7741,10 @@ def load_data_cache():
             ignored = set(data.get('ignored_stocks', []))
             candidates = data.get('all_candidates', [])
             saved_notes = data.get('saved_notes', {})
-            fibo_tags = _valid_fibo_tags(data.get('fibo_tags', []))
+            fibo_tags = _extract_fibo_tags(data)
+            st.session_state['_fibo_tags_updated_at'] = str(
+                data.get('fibo_tags_updated_at', '')
+            ).strip()
             if isinstance(data.get('company_event_snapshot'), dict):
                 st.session_state['_cached_company_event_snapshot'] = data['company_event_snapshot']
             if isinstance(data.get('strategy_signal_log'), list):
@@ -7724,7 +7763,10 @@ def load_data_cache():
             ignored = set(data.get('ignored_stocks', []))
             candidates = data.get('all_candidates', [])
             saved_notes = data.get('saved_notes', {}) 
-            fibo_tags = _valid_fibo_tags(data.get('fibo_tags', []))
+            fibo_tags = _extract_fibo_tags(data)
+            st.session_state['_fibo_tags_updated_at'] = str(
+                data.get('fibo_tags_updated_at', '')
+            ).strip()
             if isinstance(data.get('company_event_snapshot'), dict):
                 st.session_state['_cached_company_event_snapshot'] = data['company_event_snapshot']
             if isinstance(data.get('strategy_signal_log'), list):
@@ -7749,6 +7791,9 @@ def reload_fibo_tags_from_cloud():
         st.session_state[f'custom_tag_{index}'] = tag
     st.session_state['_data_cache_source'] = 'google_sheet'
     st.session_state['_fibo_cloud_save_status'] = 'loaded'
+    cloud_updated_at = str((payload or {}).get('fibo_tags_updated_at', '')).strip()
+    if cloud_updated_at:
+        st.session_state['_fibo_tags_updated_at'] = cloud_updated_at
     try:
         updated_at = datetime.now(pytz.timezone('Asia/Taipei')).isoformat()
         config = load_config()
@@ -10762,6 +10807,21 @@ def fetch_stock_data_raw(code, name_hint="", extra_data=None, futures_set=None, 
     }
 
 
+def _stale_stock_identity_row(row):
+    """Keep a failed symbol visible without presenting yesterday's strategy as current."""
+    row_dict = row.to_dict() if isinstance(row, pd.Series) else dict(row or {})
+    identity_columns = (
+        '代號', '名稱', '期貨', '_source', '_order', '_source_rank', '_data_as_of',
+    )
+    stale_row = {
+        column: row_dict.get(column)
+        for column in identity_columns
+        if column in row_dict
+    }
+    stale_row['_data_stale'] = True
+    return stale_row
+
+
 def _merge_refreshed_stock_rows(stock_data, fetched_results):
     """Replace cached rows with fresh results while retaining ordering metadata."""
     if not isinstance(stock_data, pd.DataFrame) or stock_data.empty:
@@ -10788,9 +10848,7 @@ def _merge_refreshed_stock_rows(stock_data, fetched_results):
             refreshed_rows.append(merged)
             updated_count += 1
         else:
-            preserved = cached_row.to_dict()
-            preserved['_data_stale'] = True
-            refreshed_rows.append(preserved)
+            refreshed_rows.append(_stale_stock_identity_row(cached_row))
     refreshed = pd.DataFrame(refreshed_rows)
     if '_source_rank' in refreshed.columns and '_order' in refreshed.columns:
         refreshed = refreshed.sort_values(['_source_rank', '_order'], kind='stable')
@@ -10815,15 +10873,18 @@ def refresh_persisted_stock_rows(
 
     def fetch_latest(task):
         code, name = task
-        try:
-            time.sleep(API_REQUEST_GAP_SECONDS)
-            result = fetch_stock_data_raw(
-                code, name, None, futures_copy, notes_copy, name_copy,
-                sj_logged_in, sj_api,
-            )
-            return code, result
-        except Exception:
-            return code, None
+        for attempt in range(2):
+            try:
+                time.sleep(API_REQUEST_GAP_SECONDS if attempt == 0 else 0.25)
+                result = fetch_stock_data_raw(
+                    code, name, None, futures_copy, notes_copy, name_copy,
+                    sj_logged_in, sj_api,
+                )
+                if isinstance(result, dict) and result:
+                    return code, result
+            except Exception:
+                pass
+        return code, None
 
     with ThreadPoolExecutor(max_workers=ANALYSIS_MAX_WORKERS) as executor:
         results = list(executor.map(fetch_latest, tasks))
@@ -11671,6 +11732,7 @@ with stock_strategy_container:
         save_data_cache(
             st.session_state.stock_data, st.session_state.ignored_stocks,
             st.session_state.all_candidates, st.session_state.saved_notes,
+            replace_stock_data=True,
         )
         if refreshed_stock_count:
             st.session_state['_stock_auto_refresh_notice'] = (
@@ -11904,12 +11966,10 @@ with stock_strategy_container:
             for _, previous_row in previous_failed.iterrows():
                 previous_code = str(previous_row.get('代號', ''))
                 if previous_code:
-                    preserved = previous_row.to_dict()
-                    preserved['_data_stale'] = True
-                    existing_data[previous_code] = preserved
+                    existing_data[previous_code] = _stale_stock_identity_row(previous_row)
             if not previous_failed.empty:
                 st.warning(
-                    f"{len(previous_failed)} 檔本次更新失敗，已保留上次資料並標記為過期。"
+                    f"{len(previous_failed)} 檔本次更新失敗；已保留代號，舊行情與舊策略不再顯示。"
                 )
         
         if existing_data:
@@ -11919,7 +11979,11 @@ with stock_strategy_container:
                 df_temp = df_temp.sort_values(by=['_source_rank', '_order']).reset_index(drop=True)
             st.session_state.stock_data = df_temp
             st.session_state.stock_strategy_editor_revision += 1
-            save_data_cache(st.session_state.stock_data, st.session_state.ignored_stocks, st.session_state.all_candidates, st.session_state.saved_notes)
+            save_data_cache(
+                st.session_state.stock_data, st.session_state.ignored_stocks,
+                st.session_state.all_candidates, st.session_state.saved_notes,
+                replace_stock_data=True,
+            )
         else:
             st.session_state.stock_data = previous_stock_data
             if tasks_to_run:
