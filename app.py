@@ -12090,7 +12090,10 @@ with stock_strategy_container:
                         st.rerun()
             st.text_input("輸入連結 (CSV/Excel/Google Sheet)", key="cloud_url_input", placeholder="https://...")
         
-        def update_search_cache(): save_search_cache(st.session_state.search_multiselect)
+        def update_search_cache():
+            save_search_cache(
+                st.session_state.get("search_multiselect", [])
+            )
         search_selection = st.multiselect("🔍 快速查詢 (中文/代號)", options=stock_options, key="search_multiselect", on_change=update_search_cache, placeholder="輸入 2330 或 台積電...")
 
     c_run, c_space = st.columns([1.5, 5])
