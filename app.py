@@ -9892,10 +9892,19 @@ def fetch_market_risk_lists():
         fields = payload.get('fields', [])
         for values in payload.get('data', []):
             record = dict(zip(fields, values))
-            raw_code = str(record.get('證券代號', record.get('有價證券代號', '')))
-            code_match = re.search(r'\d{4,6}', raw_code)
-            if not code_match:
+            raw_code = str(
+                record.get(
+                    '證券代號',
+                    record.get('有價證券代號', '')
+                )
+            ).strip()
+
+            # 只接受完整 4 碼股票代號，避免將 61827 / 61828
+            # 等其他有價證券誤套到 6182。
+            if not re.fullmatch(r'\d{4}', raw_code):
                 continue
+
+            code = raw_code
             code = code_match.group(0)
             if is_attention:
                 raw_count = str(record.get('累計次數', record.get('累計', '1')))
@@ -9935,10 +9944,16 @@ def fetch_market_risk_lists():
     ]:
         try:
             for record in fetch_json(name, url, list):
-                code_match = re.search(r'\d{4,6}', str(record.get('SecuritiesCompanyCode', '')))
-                if not code_match:
+                raw_code = str(
+                    record.get('SecuritiesCompanyCode', '')
+                ).strip()
+
+                # 上櫃股票只接受 4 碼股票代號。
+                # 5 碼以上有價證券不得進入股票處置／注意名單。
+                if not re.fullmatch(r'\d{4}', raw_code):
                     continue
-                code = code_match.group(0)
+
+                code = raw_code
                 if is_attention:
                     # 累計異常名單表示隔日再列注意時可能進入處置，至少以 2 次標示。
                     count = 2 if is_accumulated_note else 1
