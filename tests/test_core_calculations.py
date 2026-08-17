@@ -491,7 +491,8 @@ def test_nested_google_sheet_payload_restores_fibo_tags():
 def test_cache_merge_preserves_remote_device_sections():
     symbols = load_app_symbols(
         "_json_safe", "_valid_fibo_tags", "_merge_unique_records",
-        "_merge_unique_values", "merge_strategy_signal_state", "empty_company_event_snapshot",
+        "_merge_unique_values", "merge_strategy_signal_state", "_cache_payload_timestamp",
+        "empty_company_event_snapshot",
         "normalize_company_event_snapshot", "_newer_company_event_snapshot",
         "_merge_data_cache_payload",
     )
@@ -525,7 +526,8 @@ def test_cache_merge_preserves_remote_device_sections():
 def test_cache_merge_can_replace_cloud_stock_snapshot_without_resurrecting_old_rows():
     symbols = load_app_symbols(
         "_json_safe", "_valid_fibo_tags", "_merge_unique_records",
-        "_merge_unique_values", "merge_strategy_signal_state", "empty_company_event_snapshot",
+        "_merge_unique_values", "merge_strategy_signal_state", "_cache_payload_timestamp",
+        "empty_company_event_snapshot",
         "normalize_company_event_snapshot", "_newer_company_event_snapshot",
         "_merge_data_cache_payload",
     )
@@ -544,10 +546,63 @@ def test_cache_merge_can_replace_cloud_stock_snapshot_without_resurrecting_old_r
     assert merged["fibo_tags"] == remote["fibo_tags"]
 
 
+def test_cache_merge_keeps_newer_remote_snapshot_when_local_session_is_stale():
+    symbols = load_app_symbols(
+        "_json_safe", "_valid_fibo_tags", "_merge_unique_records",
+        "_merge_unique_values", "merge_strategy_signal_state", "_cache_payload_timestamp",
+        "empty_company_event_snapshot", "normalize_company_event_snapshot",
+        "_newer_company_event_snapshot", "_merge_data_cache_payload",
+    )
+    remote = {
+        "stock_data": [{"代號": "2330", "收盤價": 105}],
+        "stock_data_updated_at": "2026-08-17T09:05:00+08:00",
+        "fibo_tags": ["A", "B", "C", "D", "E"],
+    }
+    local = {
+        "stock_data": [{"代號": "2330", "收盤價": 100}],
+        "stock_data_updated_at": "2026-08-17T09:00:00+08:00",
+    }
+    merged = symbols["_merge_data_cache_payload"](
+        remote, local, replace_stock_data=True,
+    )
+    assert merged["stock_data"][0]["收盤價"] == 105
+    assert merged["stock_data_updated_at"] == remote["stock_data_updated_at"]
+
+
+def test_newer_local_cache_snapshot_is_not_replaced_by_delayed_cloud_read():
+    symbols = load_app_symbols(
+        "_cache_payload_timestamp", "_prefer_newer_cache_payload",
+    )
+    remote = {
+        "stock_data": [{"代號": "2330", "收盤價": 100}],
+        "stock_data_updated_at": "2026-08-17T09:00:00+08:00",
+    }
+    local = {
+        "stock_data": [{"代號": "2330", "收盤價": 105}],
+        "stock_data_updated_at": "2026-08-17T09:05:00+08:00",
+    }
+    selected, source = symbols["_prefer_newer_cache_payload"](remote, local)
+    assert source == "local_newer"
+    assert selected["stock_data"][0]["收盤價"] == 105
+
+
+def test_stock_snapshot_verification_checks_all_saved_strategy_fields():
+    symbols = load_app_symbols("_json_safe", "_stock_rows_signature", "_stock_snapshot_matches")
+    expected = {
+        "stock_data": [{"代號": "8043", "收盤價": 154, "_daytrade_vwap": 157.45}],
+    }
+    assert symbols["_stock_snapshot_matches"](expected, expected)
+    stale = {
+        "stock_data": [{"代號": "8043", "收盤價": 160.5, "_daytrade_vwap": 158}],
+    }
+    assert not symbols["_stock_snapshot_matches"](stale, expected)
+
+
 def test_only_explicit_save_replaces_fibo_tags_and_keeps_recovery_copy():
     symbols = load_app_symbols(
         "_json_safe", "_valid_fibo_tags", "_merge_unique_records",
-        "_merge_unique_values", "merge_strategy_signal_state", "empty_company_event_snapshot",
+        "_merge_unique_values", "merge_strategy_signal_state", "_cache_payload_timestamp",
+        "empty_company_event_snapshot",
         "normalize_company_event_snapshot", "_newer_company_event_snapshot",
         "_merge_data_cache_payload", "_extract_fibo_tags",
     )
