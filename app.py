@@ -9967,7 +9967,51 @@ def fetch_market_risk_lists():
                     count = 2 if is_accumulated_note else 1
                     attention_counts[code] = max(attention_counts.get(code, 0), count)
                 else:
-                    disposition_codes.add(code)
+                    # 只有今天仍落在處置期間內，才列為「處置中」。
+                    # API 可能保留歷史處置資料，因此不能只看到代號就加入。
+                    period_raw = str(
+                        record.get('DispositionPeriod', '')
+                    ).strip()
+
+                    period_match = re.search(
+                        r'(\d{6,8})\D+(\d{6,8})',
+                        period_raw
+                    )
+
+                    if period_match:
+                        start_raw = period_match.group(1)
+                        end_raw = period_match.group(2)
+
+                        try:
+                            if len(start_raw) == 6:
+                                start_date = datetime.strptime(
+                                    '20' + start_raw,
+                                    '%Y%m%d'
+                                ).date()
+                            else:
+                                start_date = datetime.strptime(
+                                    start_raw,
+                                    '%Y%m%d'
+                                ).date()
+
+                            if len(end_raw) == 6:
+                                end_date = datetime.strptime(
+                                    '20' + end_raw,
+                                    '%Y%m%d'
+                                ).date()
+                            else:
+                                end_date = datetime.strptime(
+                                    end_raw,
+                                    '%Y%m%d'
+                                ).date()
+
+                            today = datetime.now().date()
+
+                            if start_date <= today <= end_date:
+                                disposition_codes.add(code)
+
+                        except ValueError:
+                            pass
         except Exception as exc:
             errors.append(f'{name}: {exc}')
 
