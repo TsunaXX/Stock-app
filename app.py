@@ -9887,6 +9887,50 @@ def fetch_market_risk_lists():
                 if attempt < 2:
                     time.sleep(0.8 * (attempt + 1))
         raise RuntimeError(f"{name} 已重試 3 次仍失敗：{last_error}")
+        def is_current_disposition(period_raw):
+        """判斷處置期間是否包含今天。"""
+        period_raw = str(period_raw or '').strip()
+
+        date_matches = re.findall(
+            r'\d{6,8}',
+            period_raw
+        )
+
+        if len(date_matches) < 2:
+            return False
+
+        try:
+            start_raw = date_matches[0]
+            end_raw = date_matches[1]
+
+            if len(start_raw) == 6:
+                start_date = datetime.strptime(
+                    '20' + start_raw,
+                    '%Y%m%d'
+                ).date()
+            else:
+                start_date = datetime.strptime(
+                    start_raw,
+                    '%Y%m%d'
+                ).date()
+
+            if len(end_raw) == 6:
+                end_date = datetime.strptime(
+                    '20' + end_raw,
+                    '%Y%m%d'
+                ).date()
+            else:
+                end_date = datetime.strptime(
+                    end_raw,
+                    '%Y%m%d'
+                ).date()
+
+            today = datetime.now().date()
+
+            return start_date <= today <= end_date
+
+        except ValueError:
+            return False
 
     def parse_twse_rows(payload, target, is_attention=False, minimum_attention=1):
         fields = payload.get('fields', [])
@@ -9916,7 +9960,21 @@ def fetch_market_risk_lists():
                 parsed_count = int(count_match.group()) if count_match else minimum_attention
                 target[code] = max(target.get(code, 0), minimum_attention, parsed_count)
             else:
-                target.add(code)
+                period_raw = str(
+                    record.get(
+                        '處置期間',
+                        record.get(
+                            '處置起迄日期',
+                            record.get(
+                                '處置日期',
+                                ''
+                            )
+                        )
+                    )
+                ).strip()
+
+                if is_current_disposition(period_raw):
+                    target.add(code)
 
     for name, url, target, is_attention in [
         ('上市注意', 'https://www.twse.com.tw/announcement/notice?response=json', attention_counts, True),
@@ -9967,51 +10025,15 @@ def fetch_market_risk_lists():
                     count = 2 if is_accumulated_note else 1
                     attention_counts[code] = max(attention_counts.get(code, 0), count)
                 else:
-                    # 只有今天仍落在處置期間內，才列為「處置中」。
-                    # API 可能保留歷史處置資料，因此不能只看到代號就加入。
                     period_raw = str(
-                        record.get('DispositionPeriod', '')
+                        record.get(
+                            'DispositionPeriod',
+                            ''
+                        )
                     ).strip()
 
-                    period_match = re.search(
-                        r'(\d{6,8})\D+(\d{6,8})',
-                        period_raw
-                    )
-
-                    if period_match:
-                        start_raw = period_match.group(1)
-                        end_raw = period_match.group(2)
-
-                        try:
-                            if len(start_raw) == 6:
-                                start_date = datetime.strptime(
-                                    '20' + start_raw,
-                                    '%Y%m%d'
-                                ).date()
-                            else:
-                                start_date = datetime.strptime(
-                                    start_raw,
-                                    '%Y%m%d'
-                                ).date()
-
-                            if len(end_raw) == 6:
-                                end_date = datetime.strptime(
-                                    '20' + end_raw,
-                                    '%Y%m%d'
-                                ).date()
-                            else:
-                                end_date = datetime.strptime(
-                                    end_raw,
-                                    '%Y%m%d'
-                                ).date()
-
-                            today = datetime.now().date()
-
-                            if start_date <= today <= end_date:
-                                disposition_codes.add(code)
-
-                        except ValueError:
-                            pass
+                    if is_current_disposition(period_raw):
+                        disposition_codes.add(code)
         except Exception as exc:
             errors.append(f'{name}: {exc}')
 
