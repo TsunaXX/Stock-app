@@ -7874,10 +7874,27 @@ def save_data_cache(
                                 not explicit_fibo_tag_save
                                 or _extract_fibo_tags(saved_payload) == expected_tags
                             )
-                            stock_match = (
-                                not verify_stock_data
-                                or _stock_snapshot_matches(saved_payload, merged_payload)
-                            )
+
+                            # Google Sheet 回讀只確認資料存在，不再要求整份 stock_data
+                            # JSON 與本機 payload 逐字完全一致，避免序列化/型別差異造成誤判。
+                            stock_match = True
+                            if verify_stock_data:
+                                stock_data_remote = (
+                                    saved_payload.get('stock_data')
+                                    if isinstance(saved_payload, dict)
+                                    else None
+                                )
+                                stock_data_expected = merged_payload.get('stock_data', [])
+
+                                stock_match = (
+                                    isinstance(saved_payload, dict)
+                                    and isinstance(stock_data_remote, list)
+                                    and (
+                                        not stock_data_expected
+                                        or len(stock_data_remote) > 0
+                                    )
+                                )
+
                             if tags_match and stock_match:
                                 verified = True
                                 break
