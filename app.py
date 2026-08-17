@@ -6604,21 +6604,7 @@ def save_futures_strategy_state(
                 'rank_time': rank_time if rank_time is not None else (existing.get('rank_time') if isinstance(existing, dict) else None),
                 'live_time': live_time if live_time is not None else (existing.get('live_time') if isinstance(existing, dict) else None),
             })
-            futures_payload = config['futures_strategy_state']
             _write_json_atomic(CONFIG_FILE, config)
-
-        # 新增：同步期貨表格至 Google Sheet B1
-        gsheet_api_url = get_app_secret('gsheet_api_url')
-        if gsheet_api_url:
-            try:
-                requests.post(
-                    gsheet_api_url,
-                    json={'action': 'save', 'futures_cache': futures_payload},
-                    timeout=8
-                )
-            except Exception:
-                pass
-
         return True
     except (OSError, TypeError, ValueError):
         return False
@@ -7435,42 +7421,32 @@ def _is_valid_data_cache_payload(value):
 
 
 def _decode_data_cache_payload(payload):
-    """相容新版分欄格式 (A1:股票, B1:期貨, C1:標籤) 與舊版 JSON 格式。"""
-    if isinstance(payload, bytes):
-        payload = payload.decode('utf-8-sig', errors='replace')
-    if isinstance(payload, str):
-        try:
-            payload = json.loads(payload.strip().lstrip('\ufeff'))
-        except (ValueError, TypeError):
+    """相容 Apps Script 直接回傳 JSON、JSON 字串或包在 data 欄位中的格式。"""
+    def decode(value, depth=0):
+        if depth > 5:
             return {}
-    if not isinstance(payload, dict):
+        if isinstance(value, bytes):
+            return decode(value.decode('utf-8-sig', errors='replace'), depth + 1)
+        if isinstance(value, str):
+            text = value.strip().lstrip('\ufeff')
+            if not text:
+                return {}
+            try:
+                return decode(json.loads(text), depth + 1)
+            except (ValueError, TypeError):
+                return {}
+        if isinstance(value, dict):
+            candidate = {key: item for key, item in value.items() if key != 'data'}
+            nested = value.get('data')
+            if isinstance(nested, (dict, str, bytes)):
+                decoded_nested = decode(nested, depth + 1)
+                if decoded_nested:
+                    candidate.update(decoded_nested)
+            if 'fibo_tags' not in candidate and isinstance(candidate.get('tags'), list):
+                candidate['fibo_tags'] = candidate['tags']
+            return candidate if _is_valid_data_cache_payload(candidate) else {}
         return {}
-        
-    # 新版分欄回傳解析
-    if 'stock_cache' in payload or 'futures_cache' in payload:
-        stock_part = payload.get('stock_cache', {})
-        futures_part = payload.get('futures_cache', {})
-        fibo_tags_part = payload.get('fibo_tags', [])
-        
-        result = dict(stock_part) if isinstance(stock_part, dict) else {}
-        if isinstance(futures_part, dict) and futures_part:
-            result['futures_strategy_state'] = futures_part
-        if isinstance(fibo_tags_part, list) and fibo_tags_part:
-            result['fibo_tags'] = fibo_tags_part
-        return result
-
-    # 舊版格式相容
-    candidate = {key: item for key, item in payload.items() if key != 'data'}
-    nested = payload.get('data')
-    if isinstance(nested, (dict, str)):
-        if isinstance(nested, str):
-            try: nested = json.loads(nested)
-            except Exception: nested = {}
-        if isinstance(nested, dict):
-            candidate.update(nested)
-    if 'fibo_tags' not in candidate and isinstance(candidate.get('tags'), list):
-        candidate['fibo_tags'] = candidate['tags']
-    return candidate if _is_valid_data_cache_payload(candidate) else {}
+    return decode(payload)
 
 
 def _fetch_remote_data_cache(gsheet_api_url, timeout=5):
@@ -7759,8 +7735,11 @@ def save_data_cache(
         sync_ok = True
         if gsheet_api_url:
             with get_data_cache_sync_lock():
-                remote_payload, remote_error = _fetch_remote_data_cache(gsheet_api_url, timeout=8)
-                if remote_payload is not None:
+                remote_payload, remote_error = _fetch_remote_data_cache(gsheet_api_url, timeout=5)
+                if remote_payload is None:
+                    sync_ok = False
+                    st.session_state['_data_cache_remote_error'] = remote_error or '讀取失敗'
+                else:
                     merged_payload = _merge_data_cache_payload(
                         remote_payload, local_payload,
                         explicit_fibo_tag_save=explicit_fibo_tag_save,
@@ -7768,65 +7747,63 @@ def save_data_cache(
                         replace_ignored=replace_ignored,
                         replace_stock_data=replace_stock_data,
                     )
-                else:
-                    merged_payload = local_payload
-                    st.session_state['_data_cache_remote_error'] = remote_error or '讀取失敗(改用本地覆蓋)'
-
-                # 將大物件分拆為 A1 (股票)、B1 (期貨)、C1 (標籤)
-                futures_state = load_futures_strategy_state()
-                stock_only_payload = {k: v for k, v in merged_payload.items() if k not in ('fibo_tags', 'strategy_signal_log')}
-                
-                request_payload = {
-                    'action': 'save',
-                    'stock_cache': stock_only_payload,
-                    'futures_cache': futures_state,
-                    'fibo_tags': merged_payload.get('fibo_tags', fibo_tags)
-                }
-
-                last_error = None
-                for attempt in range(2):
-                    try:
-                        response = requests.post(
-                            gsheet_api_url,
-                            json=request_payload,
-                            timeout=12,
-                        )
-                        response.raise_for_status()
+                    last_error = None
+                    for attempt in range(2):
                         try:
-                            acknowledgement = response.json()
-                        except (ValueError, TypeError):
-                            acknowledgement = None
-                        if isinstance(acknowledgement, dict) and (
-                            acknowledgement.get('success') is False
-                            or str(acknowledgement.get('status', '')).lower() in {'error', 'failed'}
-                        ):
-                            raise requests.RequestException('Google Sheet rejected save')
-                        last_error = None
-                        break
-                    except requests.RequestException as exc:
-                        last_error = exc
-                        if attempt == 0:
-                            time.sleep(0.4)
-                if last_error is not None:
-                    sync_ok = False
-                    st.session_state['_data_cache_remote_error'] = type(last_error).__name__
-                elif explicit_fibo_tag_save:
-                    expected_tags = _valid_fibo_tags(merged_payload.get('fibo_tags', []))
-                    verified = False
-                    verification_error = ''
-                    for delay in (0.15, 0.5, 1.0):
-                        time.sleep(delay)
-                        saved_payload, verification_error = _fetch_remote_data_cache(
-                            gsheet_api_url, timeout=8,
-                        )
-                        if _extract_fibo_tags(saved_payload) == expected_tags:
-                            verified = True
+                            request_payload = {
+                                'action': 'save',
+                                'data': json.dumps(merged_payload, ensure_ascii=False),
+                                'updated_at': merged_payload.get('updated_at', ''),
+                            }
+                            # Legacy Apps Script deployments receive this direct
+                            # field only for an intentional tag save.  Ordinary
+                            # stock refreshes cannot clear or replace quick tags.
+                            if explicit_fibo_tag_save:
+                                request_payload['fibo_tags'] = merged_payload.get('fibo_tags', [])
+                                request_payload['fibo_tags_updated_at'] = merged_payload.get(
+                                    'fibo_tags_updated_at', ''
+                                )
+                            response = requests.post(
+                                gsheet_api_url,
+                                json=request_payload,
+                                timeout=8,
+                            )
+                            response.raise_for_status()
+                            try:
+                                acknowledgement = response.json()
+                            except (ValueError, TypeError):
+                                acknowledgement = None
+                            if isinstance(acknowledgement, dict) and (
+                                acknowledgement.get('success') is False
+                                or str(acknowledgement.get('status', '')).lower() in {'error', 'failed'}
+                            ):
+                                raise requests.RequestException('Google Sheet rejected save')
+                            last_error = None
                             break
-                    if not verified:
+                        except requests.RequestException as exc:
+                            last_error = exc
+                            if attempt == 0:
+                                time.sleep(0.4)
+                    if last_error is not None:
                         sync_ok = False
-                        st.session_state['_data_cache_remote_error'] = (
-                            verification_error or 'Google Sheet 寫入後回讀不一致'
-                        )
+                        st.session_state['_data_cache_remote_error'] = type(last_error).__name__
+                    elif explicit_fibo_tag_save:
+                        expected_tags = _valid_fibo_tags(merged_payload.get('fibo_tags', []))
+                        verified = False
+                        verification_error = ''
+                        for delay in (0.15, 0.5, 1.0):
+                            time.sleep(delay)
+                            saved_payload, verification_error = _fetch_remote_data_cache(
+                                gsheet_api_url, timeout=8,
+                            )
+                            if _extract_fibo_tags(saved_payload) == expected_tags:
+                                verified = True
+                                break
+                        if not verified:
+                            sync_ok = False
+                            st.session_state['_data_cache_remote_error'] = (
+                                verification_error or 'Google Sheet 寫入後回讀不一致'
+                            )
         _write_json_atomic(DATA_CACHE_FILE, merged_payload, indent=2)
         st.session_state['_data_cache_sync_status'] = 'ok' if sync_ok else 'local_only'
         if explicit_fibo_tag_save:
@@ -12290,7 +12267,7 @@ with stock_strategy_container:
                     'attention': {}, 'disposition': [], 'updated': None, 'errors': []
                 }
 
-            with st.expander("🧭 選股條件與進場信心設定", expanded=True):
+            with st.expander("🧭 選股條件與進場信心設定", expanded=False):
                 strategy_mode = st.radio(
                     "策略模式", ["當沖", "隔日／波段"], horizontal=True,
                     key="risk_filter_strategy_mode",
