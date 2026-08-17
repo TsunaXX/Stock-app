@@ -9887,7 +9887,8 @@ def fetch_market_risk_lists():
                 if attempt < 2:
                     time.sleep(0.8 * (attempt + 1))
         raise RuntimeError(f"{name} 已重試 3 次仍失敗：{last_error}")
-        def is_current_disposition(period_raw):
+    
+    def is_current_disposition(period_raw):
         """判斷處置期間是否包含今天。"""
         period_raw = str(period_raw or '').strip()
 
@@ -9931,7 +9932,7 @@ def fetch_market_risk_lists():
 
         except ValueError:
             return False
-
+            
     def parse_twse_rows(payload, target, is_attention=False, minimum_attention=1):
         fields = payload.get('fields', [])
         for values in payload.get('data', []):
