@@ -12267,7 +12267,7 @@ with stock_strategy_container:
                     'attention': {}, 'disposition': [], 'updated': None, 'errors': []
                 }
 
-            with st.expander("🧭 選股條件與進場信心設定", expanded=False):
+            with st.expander("🧭 選股條件與進場信心設定", expanded=True):
                 strategy_mode = st.radio(
                     "策略模式", ["當沖", "隔日／波段"], horizontal=True,
                     key="risk_filter_strategy_mode",
