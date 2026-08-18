@@ -8047,8 +8047,24 @@ def _extract_fibo_tags(payload):
     return []
 
 
-def save_fibo_config():
+def save_fibo_config(save_tags=True):
     config = load_config()
+
+    if not save_tags:
+        if 'ma_w' in st.session_state:
+            config['ma_width'] = st.session_state.ma_w
+        try:
+            _write_json_atomic(
+                CONFIG_FILE,
+                config,
+            )
+        except (
+            OSError,
+            TypeError,
+            ValueError,
+        ):
+            pass
+        return True
 
     fibo_tags = [
         normalize_fibo_quick_tag(
@@ -16583,7 +16599,7 @@ with tab_fibo:
         s_vol = col_v.checkbox("📊 顯示成交量", value=True)
         ma_w = col_w.slider(
             "均線粗細", min_value=1.0, max_value=5.0, step=0.5,
-            key="ma_w", on_change=save_fibo_config, label_visibility="collapsed"
+            key="ma_w", on_change=lambda: save_fibo_config(save_tags=False), label_visibility="collapsed"
         )
         
         ma_flags = {'5': s_ma5, '10': s_ma10, '20': s_ma20, '60': s_ma60}
