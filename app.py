@@ -6704,26 +6704,25 @@ def normalize_fibo_quick_tag(value, code_map=None, name_map=None):
     raw = str(value or '').strip().replace('（', '(').replace('）', ')')
     if not raw:
         return ''
+
     if code_map is None or name_map is None:
         code_map, name_map = load_local_stock_names()
-    code_match = re.search(r'(?<!\d)(\d{4,6}[A-Za-z]?)(?:\.(?:TW|TWO))?(?!\d)', raw, re.I)
-    if code_match:
-        code = code_match.group(1).upper()
-        name = code_map.get(code)
-        if name:
-            return f"{name}({code})"
-    normalized_name = re.sub(r'\s+', '', raw.split('(', 1)[0])
-    exact_code = name_map.get(normalized_name)
-    if exact_code:
-        return f"{code_map.get(exact_code, normalized_name)}({exact_code})"
-    matched_stocks = [
-        (name, code) for name, code in name_map.items()
-        if normalized_name and normalized_name in re.sub(r'\s+', '', name)
-    ]
-    if matched_stocks:
-        matched_stocks.sort(key=lambda item: (not item[1].isdigit(), len(item[1]), item[1]))
-        name, code = matched_stocks[0]
-        return f"{name}({code})"
+
+    # 已經是「名稱(股號)」格式，直接統一格式後返回
+    match = re.match(r'^(.+?)\((\d{4,6})\)$', raw)
+    if match:
+        name = match.group(1).strip()
+        code = match.group(2).strip()
+        return f'{name}({code})'
+
+    # 輸入純股號 → 補上股票名稱
+    if raw in code_map:
+        return f'{code_map[raw]}({raw})'
+
+    # 輸入股票名稱 → 找對應股號
+    if raw in name_map:
+        return f'{raw}({name_map[raw]})'
+
     return raw
 
 
