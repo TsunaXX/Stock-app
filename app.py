@@ -9869,84 +9869,111 @@ def fetch_market_risk_lists():
     def fetch_json(name, url, expected_type):
         """官方站偶發回空頁或 5xx；同一次按鈕內完成重試，不要求使用者連按。"""
         last_error = None
+
         for attempt in range(3):
             try:
                 response = session.get(
-                    url, headers=headers, params={'_': int(time.time() * 1000)} if attempt else None,
+                    url,
+                    headers=headers,
+                    params={'_': int(time.time() * 1000)} if attempt else None,
                     timeout=(6, 18),
                 )
                 response.raise_for_status()
+
                 payload = response.json()
+
                 if not isinstance(payload, expected_type):
-                    raise ValueError(f"回傳格式應為 {expected_type.__name__}")
-                if isinstance(payload, dict) and not isinstance(payload.get('data', []), list):
+                    raise ValueError(
+                        f"回傳格式應為 {expected_type.__name__}"
+                    )
+
+                if (
+                    isinstance(payload, dict)
+                    and not isinstance(payload.get('data', []), list)
+                ):
                     raise ValueError("缺少名單資料列")
+
                 return payload
-            except (requests.RequestException, ValueError, json.JSONDecodeError) as exc:
+
+            except (
+                requests.RequestException,
+                ValueError,
+                json.JSONDecodeError,
+            ) as exc:
                 last_error = exc
+
                 if attempt < 2:
                     time.sleep(0.8 * (attempt + 1))
-        raise RuntimeError(f"{name} 已重試 3 次仍失敗：{last_error}")
-    
+
+        raise RuntimeError(
+            f"{name} 已重試 3 次仍失敗：{last_error}"
+        )
+
     def is_current_disposition(period_raw):
-        """判斷處置期間是否包含今天。"""
+        """判斷處置期間是否包含今天，支援民國年與西元年格式。"""
         period_raw = str(period_raw or '').strip()
 
         date_matches = re.findall(
-            r'\d{6,8}',
-            period_raw
+            r'(\d{3,4})[/-](\d{1,2})[/-](\d{1,2})',
+            period_raw,
         )
 
         if len(date_matches) < 2:
             return False
 
         try:
-            start_raw = date_matches[0]
-            end_raw = date_matches[1]
+            def parse_date(match):
+                year, month, day = map(int, match)
 
-            if len(start_raw) == 6:
-                start_date = datetime.strptime(
-                    '20' + start_raw,
-                    '%Y%m%d'
-                ).date()
-            else:
-                start_date = datetime.strptime(
-                    start_raw,
-                    '%Y%m%d'
-                ).date()
+                # 民國年轉西元年
+                if year < 1911:
+                    year += 1911
 
-            if len(end_raw) == 6:
-                end_date = datetime.strptime(
-                    '20' + end_raw,
-                    '%Y%m%d'
-                ).date()
-            else:
-                end_date = datetime.strptime(
-                    end_raw,
-                    '%Y%m%d'
+                return datetime(
+                    year,
+                    month,
+                    day,
                 ).date()
 
-            today = datetime.now().date()
+            start_date = parse_date(date_matches[0])
+            end_date = parse_date(date_matches[1])
+
+            # 使用台灣時區，避免 Streamlit Cloud 使用 UTC
+            # 在台灣跨日時判斷錯誤。
+            today = datetime.now(
+                pytz.timezone('Asia/Taipei')
+            ).date()
 
             return start_date <= today <= end_date
 
-        except ValueError:
+        except (ValueError, TypeError):
             return False
-            
-    def parse_twse_rows(payload, target, is_attention=False, minimum_attention=1):
+
+    def parse_twse_rows(
+        payload,
+        target,
+        is_attention=False,
+        minimum_attention=1,
+    ):
         fields = payload.get('fields', [])
+
         for values in payload.get('data', []):
             record = dict(zip(fields, values))
+
             raw_code = str(
                 record.get(
                     '證券代號',
-                    record.get('有價證券代號', '')
+                    record.get('有價證券代號', ''),
                 )
             ).strip()
 
-            # 先從代號欄位取得完整數字代號。
-            # 只接受 4 碼普通股票代號，5～6 碼證券代號排除。
-            code_match = re.search(r'\d{4,6}', raw_code)
+            # 只處理 4 碼普通股票。
+            # 5～6 碼的權證、公司債等有價證券不納入股票戰略室。
+            code_match = re.search(
+                r'\d{4,6}',
+                raw_code,
+            )
+
             if not code_match:
                 continue
 
@@ -9954,23 +9981,39 @@ def fetch_market_risk_lists():
 
             if len(code) != 4:
                 continue
-                
+
             if is_attention:
-                raw_count = str(record.get('累計次數', record.get('累計', '1')))
-                count_match = re.search(r'\d+', raw_count)
-                parsed_count = int(count_match.group()) if count_match else minimum_attention
-                target[code] = max(target.get(code, 0), minimum_attention, parsed_count)
+                raw_count = str(
+                    record.get(
+                        '累計次數',
+                        record.get('累計', '1'),
+                    )
+                )
+
+                count_match = re.search(
+                    r'\d+',
+                    raw_count,
+                )
+
+                parsed_count = (
+                    int(count_match.group())
+                    if count_match
+                    else minimum_attention
+                )
+
+                target[code] = max(
+                    target.get(code, 0),
+                    minimum_attention,
+                    parsed_count,
+                )
+
             else:
+                # TWSE 的實際欄位名稱是「處置起迄時間」，
+                # 格式例如 115/07/03～115/07/16。
                 period_raw = str(
                     record.get(
-                        '處置期間',
-                        record.get(
-                            '處置起迄日期',
-                            record.get(
-                                '處置日期',
-                                ''
-                            )
-                        )
+                        '處置起迄時間',
+                        '',
                     )
                 ).strip()
 
@@ -9978,13 +10021,33 @@ def fetch_market_risk_lists():
                     target.add(code)
 
     for name, url, target, is_attention in [
-        ('上市注意', 'https://www.twse.com.tw/announcement/notice?response=json', attention_counts, True),
-        ('上市處置', 'https://www.twse.com.tw/announcement/punish?response=json', disposition_codes, False),
+        (
+            '上市注意',
+            'https://www.twse.com.tw/announcement/notice?response=json',
+            attention_counts,
+            True,
+        ),
+        (
+            '上市處置',
+            'https://www.twse.com.tw/announcement/punish?response=json',
+            disposition_codes,
+            False,
+        ),
     ]:
         try:
-            parse_twse_rows(fetch_json(name, url, dict), target, is_attention)
+            parse_twse_rows(
+                fetch_json(
+                    name,
+                    url,
+                    dict,
+                ),
+                target,
+                is_attention,
+            )
         except Exception as exc:
-            errors.append(f'{name}: {exc}')
+            errors.append(
+                f'{name}: {exc}'
+            )
 
     try:
         parse_twse_rows(
@@ -9998,48 +10061,101 @@ def fetch_market_risk_lists():
             minimum_attention=2,
         )
     except Exception as exc:
-        errors.append(f'上市注意累計異常: {exc}')
+        errors.append(
+            f'上市注意累計異常: {exc}'
+        )
 
-    for name, url, is_attention, is_accumulated_note in [
-        ('上櫃注意', 'https://www.tpex.org.tw/openapi/v1/tpex_trading_warning_information', True, False),
-        ('上櫃注意累計異常', 'https://www.tpex.org.tw/openapi/v1/tpex_trading_warning_note', True, True),
-        ('上櫃處置', 'https://www.tpex.org.tw/openapi/v1/tpex_disposal_information', False, False),
+    for (
+        name,
+        url,
+        is_attention,
+        is_accumulated_note,
+    ) in [
+        (
+            '上櫃注意',
+            'https://www.tpex.org.tw/openapi/v1/tpex_trading_warning_information',
+            True,
+            False,
+        ),
+        (
+            '上櫃注意累計異常',
+            'https://www.tpex.org.tw/openapi/v1/tpex_trading_warning_note',
+            True,
+            True,
+        ),
+        (
+            '上櫃處置',
+            'https://www.tpex.org.tw/openapi/v1/tpex_disposal_information',
+            False,
+            False,
+        ),
     ]:
         try:
-            for record in fetch_json(name, url, list):
+            for record in fetch_json(
+                name,
+                url,
+                list,
+            ):
                 raw_code = str(
-                    record.get('SecuritiesCompanyCode', '')
+                    record.get(
+                        'SecuritiesCompanyCode',
+                        '',
+                    )
                 ).strip()
 
-                code_match = re.search(r'\d{4,6}', raw_code)
+                code_match = re.search(
+                    r'\d{4,6}',
+                    raw_code,
+                )
+
                 if not code_match:
                     continue
 
                 code = code_match.group(0)
 
                 # 只保留 4 碼普通股票。
-                # 61827 / 61828 等 5 碼證券不進入股票處置／注意名單。
                 if len(code) != 4:
                     continue
+
                 if is_attention:
-                    # 累計異常名單表示隔日再列注意時可能進入處置，至少以 2 次標示。
-                    count = 2 if is_accumulated_note else 1
-                    attention_counts[code] = max(attention_counts.get(code, 0), count)
+                    # 累計異常名單至少以 2 次注意標示。
+                    count = (
+                        2
+                        if is_accumulated_note
+                        else 1
+                    )
+
+                    attention_counts[code] = max(
+                        attention_counts.get(code, 0),
+                        count,
+                    )
+
                 else:
+                    # TPEx API 的處置期間欄位。
                     period_raw = str(
                         record.get(
                             'DispositionPeriod',
-                            ''
+                            '',
                         )
                     ).strip()
 
-                    if is_current_disposition(period_raw):
+                    if is_current_disposition(
+                        period_raw
+                    ):
                         disposition_codes.add(code)
+
         except Exception as exc:
-            errors.append(f'{name}: {exc}')
+            errors.append(
+                f'{name}: {exc}'
+            )
 
     session.close()
-    return attention_counts, sorted(disposition_codes), errors
+
+    return (
+        attention_counts,
+        sorted(disposition_codes),
+        errors,
+    )
 
 def _as_float(value, default=None):
     try:
