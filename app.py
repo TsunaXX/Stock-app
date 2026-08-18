@@ -17076,22 +17076,11 @@ with tab3:
         st.session_state.calendar_preferences = load_calendar_preferences()
     else:
         # Streamlit Cloud 部署新版程式時會沿用既有 session，需在讀取欄位前即時遷移。
-        st.session_state.calendar_preferences = normalize_calendar_preferences(
-            st.session_state.calendar_preferences
-        )
-    if (
-    "company_event_snapshot"
-    not in st.session_state
-):
-    st.session_state.company_event_snapshot = (
-        load_company_event_snapshot()
-    )
-else:
-    st.session_state.company_event_snapshot = (
-        normalize_company_event_snapshot(
-            st.session_state.company_event_snapshot
-        )
-    )
+        st.session_state.calendar_preferences = normalize_calendar_preferences(st.session_state.calendar_preferences)
+    if 'company_event_snapshot' not in st.session_state:
+        st.session_state.company_event_snapshot = load_company_event_snapshot()
+    else:
+        st.session_state.company_event_snapshot = normalize_company_event_snapshot(st.session_state.company_event_snapshot)
 
     with st.expander("🛠️ 自訂與校正行事曆事件"):
         st.info("若發現系統預設日期或時間有誤，可在此手動新增或覆寫事件（例如：提前休市、自訂總經數據時間）。")
