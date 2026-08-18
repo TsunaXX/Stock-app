@@ -15736,7 +15736,7 @@ with tab2:
 with tab_fibo:
     
     def format_fibo_tag(key):
-        val = str(st.session_state[key] or '').strip()
+        val = str(st.session_state.get(key, '') or '').strip()
         if not val:
             save_fibo_config()
             return
