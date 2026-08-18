@@ -7934,184 +7934,37 @@ def _fetch_remote_scope(
         return None, 'Google Sheet scope 回傳格式錯誤'
 
 
-def _save_remote_scope(
-    gsheet_api_url,
-    scope,
-    payload,
-    updated_at=None,
-    timeout=8,
-    verify=True,
-):
-    """只寫入 Google Sheet 指定 scope。"""
-    if not gsheet_api_url:
+def _save_remote_scope(gsheet_api_url, scope, payload, updated_at=None, timeout=8, verify=True):
+    if not gsheet_api_url or not scope:
         return True, payload
 
-    scope = str(scope or '').strip()
-
-    if not scope:
-        return False, None
-
-    updated_at = str(
-        updated_at
-        or datetime.now(
-            pytz.timezone(
-                'Asia/Taipei'
-            )
-        ).isoformat()
-    )
+    updated_at = updated_at or datetime.now(
+        pytz.timezone('Asia/Taipei')
+    ).isoformat()
 
     request_payload = {
         'action': 'save',
         'scope': scope,
-        'data': json.dumps(
-            _json_safe(payload),
-            ensure_ascii=False,
-        ),
+        'data': json.dumps(_json_safe(payload), ensure_ascii=False),
         'updated_at': updated_at,
     }
 
-    last_error = None
+    try:
+        response = requests.post(
+            gsheet_api_url,
+            json=request_payload,
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        result = response.json()
 
-    for attempt in range(2):
-        try:
-            response = requests.post(
-                gsheet_api_url,
-                json=request_payload,
-                timeout=timeout,
-            )
+        if isinstance(result, dict) and result.get('success') is False:
+            return False, None
 
-            response.raise_for_status()
-
-            try:
-                acknowledgement = (
-                    response.json()
-                )
-            except (
-                ValueError,
-                TypeError,
-            ):
-                acknowledgement = {}
-
-            if (
-                isinstance(
-                    acknowledgement,
-                    dict
-                )
-                and (
-                    acknowledgement.get(
-                        'success'
-                    ) is False
-                    or str(
-                        acknowledgement.get(
-                            'status',
-                            ''
-                        )
-                    ).lower()
-                    in {
-                        'error',
-                        'failed',
-                    }
-                )
-            ):
-                raise requests.RequestException(
-                    str(
-                        acknowledgement.get(
-                            'error',
-                            'Google Sheet rejected save'
-                        )
-                    )
-                )
-
-            last_error = None
-            break
-
-        except requests.RequestException as exc:
-            last_error = exc
-
-            if attempt == 0:
-                time.sleep(
-                    0.4
-                )
-
-    if last_error is not None:
-        return False, None
-
-    if not verify:
         return True, payload
 
-    for delay in (
-        0.2,
-        0.8,
-        2.0,
-    ):
-        time.sleep(delay)
-
-        remote, remote_error = (
-            _fetch_remote_scope(
-                gsheet_api_url,
-                scope,
-                timeout=timeout,
-            )
-        )
-
-        if not isinstance(
-            remote,
-            dict
-        ):
-            continue
-
-        remote_timestamp = pd.Timestamp(
-            remote.get(
-                '_scope_updated_at',
-                ''
-            )
-        )
-
-        expected_timestamp = pd.Timestamp(
-            updated_at
-        )
-
-        try:
-            if (
-                pd.notna(
-                    remote_timestamp
-                )
-                and pd.notna(
-                    expected_timestamp
-                )
-                and remote_timestamp
-                >= expected_timestamp
-            ):
-                return True, remote
-        except (
-            TypeError,
-            ValueError,
-        ):
-            pass
-
-        remote_compare = {
-            key: value
-            for key, value
-            in remote.items()
-            if key != '_scope_updated_at'
-        }
-
-        if json.dumps(
-            _json_safe(
-                remote_compare
-            ),
-            ensure_ascii=False,
-            sort_keys=True,
-        ) == json.dumps(
-            _json_safe(
-                payload
-            ),
-            ensure_ascii=False,
-            sort_keys=True,
-        ):
-            return True, remote
-
-    return False, None
+    except (requests.RequestException, ValueError, TypeError):
+        return False, None
 
 
 def _read_json_cache_file(
