@@ -13707,10 +13707,11 @@ with stock_strategy_container:
                     if st.button("🔄 更新上市／上櫃注意與處置名單", key="refresh_risk_filter_market_data"):
                         fetch_market_risk_lists.clear()
                         with st.spinner("正在更新上市／上櫃注意與處置名單..."):
-                            attention, disposition, errors = fetch_market_risk_lists()
+                            attention, disposition, disposition_tomorrow, errors = fetch_market_risk_lists()
                         st.session_state.risk_filter_market_data = {
                             'attention': attention,
                             'disposition': disposition,
+                            'disposition_tomorrow': disposition_tomorrow,
                             'updated': datetime.now(pytz.timezone('Asia/Taipei')).strftime('%Y/%m/%d %H:%M:%S'),
                             'errors': errors
                         }
