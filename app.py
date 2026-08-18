@@ -13731,7 +13731,42 @@ with stock_strategy_container:
                 cache_sync_notice = st.session_state.pop('_stock_cache_sync_notice', '')
                 if cache_sync_notice:
                     st.warning(cache_sync_notice)
+                
+                tz_tw = pytz.timezone('Asia/Taipei')
+                today_text = datetime.now(tz_tw).strftime('%Y/%m/%d')
+
                 market_risk_data = st.session_state.risk_filter_market_data
+                last_updated_text = str(
+                    market_risk_data.get('updated', '')
+                ).strip()
+
+                if (
+                    last_updated_text
+                    and not market_risk_data.get('errors')
+                    and not last_updated_text.startswith(today_text)
+                ):
+                    fetch_market_risk_lists.clear()
+
+                    with st.spinner("跨日自動更新上市／上櫃注意與處置名單..."):
+                        (
+                            attention,
+                            disposition,
+                            disposition_tomorrow,
+                            errors,
+                        ) = fetch_market_risk_lists()
+
+                    st.session_state.risk_filter_market_data = {
+                        'attention': attention,
+                        'disposition': disposition,
+                        'disposition_tomorrow': disposition_tomorrow,
+                        'updated': datetime.now(
+                            tz_tw
+                        ).strftime('%Y/%m/%d %H:%M:%S'),
+                        'errors': errors,
+                    }
+
+                    market_risk_data = st.session_state.risk_filter_market_data
+                
                 if market_risk_data.get('updated') and not market_risk_data.get('errors'):
                     st.caption(f"上市／上櫃注意與處置名單更新：{market_risk_data['updated']}。")
                 elif market_risk_data.get('errors'):
