@@ -10926,41 +10926,41 @@ def fetch_market_risk_lists():
         )
 
     def get_disposition_status(period_raw, target_date=None):
-    """判斷處置開始日是今天還是明天，支援民國年與西元年格式。"""
-    period_raw = str(period_raw or '').strip()
-    target_date = target_date or datetime.now(
-        pytz.timezone('Asia/Taipei')
-    ).date()
-
-    date_matches = re.findall(
-        r'(\d{3,4})[/-](\d{1,2})[/-](\d{1,2})',
-        period_raw
-    )
-
-    if len(date_matches) < 2:
+        """判斷處置開始日是今天還是明天，支援民國年與西元年格式。"""
+        period_raw = str(period_raw or '').strip()
+        target_date = target_date or datetime.now(
+            pytz.timezone('Asia/Taipei')
+        ).date()
+    
+        date_matches = re.findall(
+            r'(\d{3,4})[/-](\d{1,2})[/-](\d{1,2})',
+            period_raw
+        )
+    
+        if len(date_matches) < 2:
+            return None
+    
+        start_year, start_month, start_day = map(int, date_matches[0])
+        end_year, end_month, end_day = map(int, date_matches[1])
+    
+        if start_year < 1000:
+            start_year += 1911
+        if end_year < 1000:
+            end_year += 1911
+    
+        try:
+            start_date = date(start_year, start_month, start_day)
+            end_date = date(end_year, end_month, end_day)
+        except ValueError:
+            return None
+    
+        if start_date <= target_date <= end_date:
+            return 'today'
+    
+        if start_date == target_date + timedelta(days=1):
+            return 'tomorrow'
+    
         return None
-
-    start_year, start_month, start_day = map(int, date_matches[0])
-    end_year, end_month, end_day = map(int, date_matches[1])
-
-    if start_year < 1000:
-        start_year += 1911
-    if end_year < 1000:
-        end_year += 1911
-
-    try:
-        start_date = date(start_year, start_month, start_day)
-        end_date = date(end_year, end_month, end_day)
-    except ValueError:
-        return None
-
-    if start_date <= target_date <= end_date:
-        return 'today'
-
-    if start_date == target_date + timedelta(days=1):
-        return 'tomorrow'
-
-    return None
             
     def parse_twse_rows(
         payload,
