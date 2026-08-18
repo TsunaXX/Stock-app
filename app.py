@@ -10939,28 +10939,28 @@ def fetch_market_risk_lists():
 
         if len(date_matches) < 2:
             compact_dates = re.findall(
-                r'(?<!\d)(\d{7,8})(?!\d)',
+                r'(\d{7,8})',
                 period_raw
             )
 
             if len(compact_dates) >= 2:
                 date_matches = []
 
-                for compact_date in compact_dates[:2]:
-                    if len(compact_date) == 8:
+                for value in compact_dates[:2]:
+                    if len(value) == 7:
                         date_matches.append(
                             (
-                                compact_date[:4],
-                                compact_date[4:6],
-                                compact_date[6:8],
+                                value[:3],
+                                value[3:5],
+                                value[5:7],
                             )
                         )
-                    else:
+                    elif len(value) == 8:
                         date_matches.append(
                             (
-                                compact_date[:3],
-                                compact_date[3:5],
-                                compact_date[5:7],
+                                value[:4],
+                                value[4:6],
+                                value[6:8],
                             )
                         )
     
@@ -11175,30 +11175,21 @@ def fetch_market_risk_lists():
                     )
 
                 else:
-                    # TPEx API 的處置期間欄位。
-                    start_raw = str(
+                    period_raw = str(
                         record.get(
-                            'DispositionStartDate',
-                            record.get('處置開始日期', ''),
+                            'DispositionPeriod',
+                            '',
                         )
                     ).strip()
-                    
-                    end_raw = str(
-                        record.get(
-                            'DispositionEndDate',
-                            record.get('處置結束日期', ''),
-                        )
-                    ).strip()
-                    
-                    if start_raw:
-                        disposition_state = get_disposition_status(
-                            f'{start_raw}-{end_raw}'
-                        )
-                    
-                        if disposition_state == 'today':
-                            disposition_codes.add(code)
-                        elif disposition_state == 'tomorrow':
-                            disposition_tomorrow_codes.add(code)
+
+                    disposition_state = get_disposition_status(
+                        period_raw
+                    )
+
+                    if disposition_state == 'today':
+                        disposition_codes.add(code)
+                    elif disposition_state == 'tomorrow':
+                        disposition_tomorrow_codes.add(code)
 
         except Exception as exc:
             errors.append(
