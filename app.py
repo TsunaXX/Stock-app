@@ -14033,54 +14033,12 @@ with stock_strategy_container:
             st_val = str(row.get('狀態', ''))
             if not st_val and row.name in df_display.index:
                 st_val = str(df_display.at[row.name, '狀態'])
-                        limit_up_value = row.get(
-                '當日漲停價'
-            )
-
-            limit_down_value = row.get(
-                '當日跌停價'
-            )
-
+            limit_up_value = row.get('當日漲停價')
+            limit_down_value = row.get('當日跌停價')
             if row.name in df_display.index:
-                if (
-                    limit_up_value is None
-                    or str(
-                        limit_up_value
-                    ).strip() == ''
-                ):
-                    if (
-                        '當日漲停價'
-                        in df_display.columns
-                    ):
-                        limit_up_value = (
-                            df_display.at[
-                                row.name,
-                                '當日漲停價'
-                            ]
-                        )
-
-                if (
-                    limit_down_value is None
-                    or str(
-                        limit_down_value
-                    ).strip() == ''
-                ):
-                    if (
-                        '當日跌停價'
-                        in df_display.columns
-                    ):
-                        limit_down_value = (
-                            df_display.at[
-                                row.name,
-                                '當日跌停價'
-                            ]
-                        )
-
-            limit_state = stock_limit_state(
-                row.get('收盤價'),
-                limit_up_value,
-                limit_down_value,
-            )
+                limit_up_value = limit_up_value or df_display.at[row.name, '當日漲停價']
+                limit_down_value = limit_down_value or df_display.at[row.name, '當日跌停價']
+            limit_state = stock_limit_state(row.get('收盤價'), limit_up_value, limit_down_value)
             risk_val = str(row.get('風險', ''))
             vwap_val = str(row.get('VWAP 狀態', ''))
             signal_state = str(row.get('訊號狀態', ''))
