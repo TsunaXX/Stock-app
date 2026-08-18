@@ -9915,7 +9915,7 @@ def fetch_market_risk_lists():
 
         date_matches = re.findall(
             r'(\d{3,4})[/-](\d{1,2})[/-](\d{1,2})',
-            period_raw,
+            period_raw
         )
 
         if len(date_matches) < 2:
@@ -9925,21 +9925,18 @@ def fetch_market_risk_lists():
             def parse_date(match):
                 year, month, day = map(int, match)
 
-                # 民國年轉西元年
                 if year < 1911:
                     year += 1911
 
                 return datetime(
                     year,
                     month,
-                    day,
+                    day
                 ).date()
 
             start_date = parse_date(date_matches[0])
             end_date = parse_date(date_matches[1])
 
-            # 使用台灣時區，避免 Streamlit Cloud 使用 UTC
-            # 在台灣跨日時判斷錯誤。
             today = datetime.now(
                 pytz.timezone('Asia/Taipei')
             ).date()
@@ -9948,7 +9945,7 @@ def fetch_market_risk_lists():
 
         except (ValueError, TypeError):
             return False
-
+            
     def parse_twse_rows(
         payload,
         target,
