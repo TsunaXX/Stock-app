@@ -7719,13 +7719,8 @@ def render_strategy_validation_room():
                         record['結果'], record['結果(R)'] = '追蹤中', None
             actual_entry_changed = True
     if actual_entry_changed:
-        if save_strategy_signal_log(
-    records
-):
-    st.toast(
-        '實際進場價已儲存；後續行情更新將以此計算盈虧與結果。',
-        icon='✅'
-    )
+        if save_strategy_signal_log(records):
+            st.toast('實際進場價已儲存；後續行情更新將以此計算盈虧與結果。', icon='✅')
         else:
             st.error('實際進場價儲存失敗，請確認檔案是否可寫入。')
     selected_mask = edited_validation['刪除'].fillna(False).astype(bool).to_numpy()
