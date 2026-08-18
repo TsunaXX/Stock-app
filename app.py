@@ -10933,7 +10933,7 @@ def fetch_market_risk_lists():
         ).date()
     
         date_matches = re.findall(
-            r'(\d{3,4})[/-](\d{1,2})[/-](\d{1,2})',
+            r'(\d{3,4})[年/-](\d{1,2})[月/-](\d{1,2})日?',
             period_raw
         )
     
@@ -11149,19 +11149,29 @@ def fetch_market_risk_lists():
 
                 else:
                     # TPEx API 的處置期間欄位。
-                    period_raw = str(
+                    start_raw = str(
                         record.get(
-                            'DispositionPeriod',
-                            '',
+                            'DispositionStartDate',
+                            record.get('處置開始日期', ''),
                         )
                     ).strip()
-
-                    disposition_state = get_disposition_status(period_raw)
-
-                    if disposition_state == 'today':
-                        disposition_codes.add(code)
-                    elif disposition_state == 'tomorrow':
-                        disposition_tomorrow_codes.add(code)
+                    
+                    end_raw = str(
+                        record.get(
+                            'DispositionEndDate',
+                            record.get('處置結束日期', ''),
+                        )
+                    ).strip()
+                    
+                    if start_raw:
+                        disposition_state = get_disposition_status(
+                            f'{start_raw}-{end_raw}'
+                        )
+                    
+                        if disposition_state == 'today':
+                            disposition_codes.add(code)
+                        elif disposition_state == 'tomorrow':
+                            disposition_tomorrow_codes.add(code)
 
         except Exception as exc:
             errors.append(
@@ -11171,10 +11181,10 @@ def fetch_market_risk_lists():
     session.close()
 
     return (
-    attention_counts,
-    sorted(disposition_codes),
-    sorted(disposition_tomorrow_codes),
-    errors,
+        attention_counts,
+        sorted(disposition_codes),
+        sorted(disposition_tomorrow_codes),
+        errors,
     )
 
 def _as_float(value, default=None):
