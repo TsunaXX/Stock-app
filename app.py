@@ -7736,15 +7736,8 @@ def render_strategy_validation_room():
     if delete_selected:
         removed = [record for index, record in enumerate(records) if index in selected_ids]
         remaining = [record for index, record in enumerate(records) if index not in selected_ids]
-        if mark_strategy_signals_deleted(
-    removed
-) and save_strategy_signal_log(
-    remaining
-):
-    st.toast(
-        f'已刪除 {len(selected_ids)} 筆訊號紀錄',
-        icon='🗑️'
-    )
+        if mark_strategy_signals_deleted(removed) and save_strategy_signal_log(remaining):
+            st.toast(f'已刪除 {len(selected_ids)} 筆訊號紀錄', icon='🗑️')
             st.rerun()
         else:
             st.error('訊號刪除失敗，請確認紀錄檔是否可寫入。')
