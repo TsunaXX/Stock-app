@@ -7411,8 +7411,7 @@ def render_strategy_validation_room():
             removed = [] if len(remaining) == len(records) else [
                 record for record in records if record not in remaining
             ]
-            if mark_strategy_signals_deleted(removed) and save_strategy_signal_log(remaining
-):
+            if mark_strategy_signals_deleted(removed) and save_strategy_signal_log(remaining):
                 cleared_count = len(records) - len(remaining)
                 st.toast(f"已清除 {cleared_count} 筆策略驗證紀錄", icon="🧹")
                 st.rerun()
@@ -7742,11 +7741,7 @@ def render_strategy_validation_room():
     if delete_selected:
         removed = [record for index, record in enumerate(records) if index in selected_ids]
         remaining = [record for index, record in enumerate(records) if index not in selected_ids]
-        if mark_strategy_signals_deleted(
-    removed
-) and save_strategy_signal_log(
-    remaining
-):
+        if mark_strategy_signals_deleted(removed) and save_strategy_signal_log(remaining):
             st.toast(f'已刪除 {len(selected_ids)} 筆訊號紀錄', icon='🗑️')
             st.rerun()
         else:
