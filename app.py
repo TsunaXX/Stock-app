@@ -10872,6 +10872,7 @@ def fetch_market_risk_lists():
     """取得上市、上櫃注意／處置名單；僅在使用者手動更新時呼叫。"""
     attention_counts = {}
     disposition_codes = set()
+    disposition_tomorrow_codes = set()
     errors = []
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36',
@@ -10924,42 +10925,42 @@ def fetch_market_risk_lists():
             f"{name} 已重試 3 次仍失敗：{last_error}"
         )
 
-    def is_current_disposition(period_raw):
-        """判斷處置期間是否包含今天，支援民國年與西元年格式。"""
-        period_raw = str(period_raw or '').strip()
+    def get_disposition_status(period_raw, target_date=None):
+    """判斷處置開始日是今天還是明天，支援民國年與西元年格式。"""
+    period_raw = str(period_raw or '').strip()
+    target_date = target_date or datetime.now(
+        pytz.timezone('Asia/Taipei')
+    ).date()
 
-        date_matches = re.findall(
-            r'(\d{3,4})[/-](\d{1,2})[/-](\d{1,2})',
-            period_raw
-        )
+    date_matches = re.findall(
+        r'(\d{3,4})[/-](\d{1,2})[/-](\d{1,2})',
+        period_raw
+    )
 
-        if len(date_matches) < 2:
-            return False
+    if len(date_matches) < 2:
+        return None
 
-        try:
-            def parse_date(match):
-                year, month, day = map(int, match)
+    start_year, start_month, start_day = map(int, date_matches[0])
+    end_year, end_month, end_day = map(int, date_matches[1])
 
-                if year < 1911:
-                    year += 1911
+    if start_year < 1000:
+        start_year += 1911
+    if end_year < 1000:
+        end_year += 1911
 
-                return datetime(
-                    year,
-                    month,
-                    day
-                ).date()
+    try:
+        start_date = date(start_year, start_month, start_day)
+        end_date = date(end_year, end_month, end_day)
+    except ValueError:
+        return None
 
-            start_date = parse_date(date_matches[0])
-            end_date = parse_date(date_matches[1])
+    if start_date <= target_date <= end_date:
+        return 'today'
 
-            today = datetime.now(
-                pytz.timezone('Asia/Taipei')
-            ).date()
+    if start_date == target_date + timedelta(days=1):
+        return 'tomorrow'
 
-            return start_date <= today <= end_date
-
-        except (ValueError, TypeError):
-            return False
+    return None
             
     def parse_twse_rows(
         payload,
@@ -11029,8 +11030,12 @@ def fetch_market_risk_lists():
                     )
                 ).strip()
 
-                if is_current_disposition(period_raw):
+                disposition_state = get_disposition_status(period_raw)
+
+                if disposition_state == 'today':
                     target.add(code)
+                elif disposition_state == 'tomorrow':
+                    disposition_tomorrow_codes.add(code)
 
     for name, url, target, is_attention in [
         (
@@ -11151,10 +11156,12 @@ def fetch_market_risk_lists():
                         )
                     ).strip()
 
-                    if is_current_disposition(
-                        period_raw
-                    ):
+                    disposition_state = get_disposition_status(period_raw)
+
+                    if disposition_state == 'today':
                         disposition_codes.add(code)
+                    elif disposition_state == 'tomorrow':
+                        disposition_tomorrow_codes.add(code)
 
         except Exception as exc:
             errors.append(
@@ -11164,9 +11171,10 @@ def fetch_market_risk_lists():
     session.close()
 
     return (
-        attention_counts,
-        sorted(disposition_codes),
-        errors,
+    attention_counts,
+    sorted(disposition_codes),
+    sorted(disposition_tomorrow_codes),
+    errors,
     )
 
 def _as_float(value, default=None):
@@ -11311,10 +11319,11 @@ def determine_stock_direction(row, is_daytrade_mode=False, direction_choice='系
     }
 
 
-def calculate_risk_filter_result(row, direction, max_extension_atr, attention_counts=None, disposition_codes=None, market_lists_updated=False, block_attention=True):
+def calculate_risk_filter_result(row, direction, max_extension_atr, attention_counts=None, disposition_codes=None, market_lists_updated=False, block_attention=True, disposition_tomorrow_codes=None):
     """建立風險篩選預覽資料；不會改寫原本的選股資料或下單行為。"""
     attention_counts = attention_counts or {}
     disposition_codes = set(disposition_codes or [])
+    disposition_tomorrow_codes = set(disposition_tomorrow_codes or [])
     code = str(row.get('代號', '')).strip()
     close = _as_float(row.get('收盤價'))
     ma5 = _as_float(row.get('_ma5'))
@@ -11360,8 +11369,12 @@ def calculate_risk_filter_result(row, direction, max_extension_atr, attention_co
 
     attention_count = attention_counts.get(code, 0)
     is_disposed = code in disposition_codes
+    is_tomorrow_disposition = code in disposition_tomorrow_codes
+    
     if is_disposed:
         risk_label, risk_score = '🚫 處置中', 0
+    elif is_tomorrow_disposition:
+        risk_label, risk_score = '明天處置', 0
     elif attention_count >= 2:
         risk_label, risk_score = f'🔴 注意 {attention_count}', 0
     elif attention_count == 1:
@@ -13735,6 +13748,7 @@ with stock_strategy_container:
             market_risk_data = st.session_state.risk_filter_market_data
             attention_counts = market_risk_data.get('attention', {})
             disposition_codes = market_risk_data.get('disposition', [])
+            disposition_tomorrow_codes = market_risk_data.get('disposition_tomorrow', [])
             market_lists_updated = bool(market_risk_data.get('updated')) and not market_risk_data.get('errors')
             market_environment = st.session_state.get('strategy_market_environment', {})
             market_bias = str(market_environment.get('bias', '盤整'))
@@ -13751,13 +13765,15 @@ with stock_strategy_container:
                     market_lists_updated, risk_block_attention
                 ) if is_daytrade_mode else calculate_risk_filter_result(
                     row, row_direction, risk_max_extension, attention_counts, disposition_codes,
-                    market_lists_updated, risk_block_attention
+                    market_lists_updated, risk_block_attention,
+                    disposition_tomorrow_codes=disposition_tomorrow_codes
                 )
                 code = str(row.get('代號', ''))
                 if is_daytrade_mode:
                     daily_risk = calculate_risk_filter_result(
                         row, row_direction, risk_max_extension, attention_counts, disposition_codes,
-                        market_lists_updated, risk_block_attention
+                        market_lists_updated, risk_block_attention,
+                        disposition_tomorrow_codes=disposition_tomorrow_codes
                     )
                     # 日 ATR 乖離與官方風險是當沖的盤前門檻；盤中訊號成立也不放行過度延伸標的。
                     if not daily_risk['eligible']:
@@ -14326,10 +14342,11 @@ with stock_strategy_container:
                 if st.button("🔄 更新注意／處置名單", key="refresh_indep_market_risk_data"):
                     fetch_market_risk_lists.clear()
                     with st.spinner("正在更新上市／上櫃注意與處置名單..."):
-                        attention, disposition, errors = fetch_market_risk_lists()
+                        attention, disposition, disposition_tomorrow, errors = fetch_market_risk_lists()
                     st.session_state.risk_filter_market_data = {
                         'attention': attention,
                         'disposition': disposition,
+                        'disposition_tomorrow': disposition_tomorrow,
                         'updated': datetime.now(pytz.timezone('Asia/Taipei')).strftime('%Y/%m/%d %H:%M:%S'),
                         'errors': errors
                     }
