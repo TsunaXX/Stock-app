@@ -11048,16 +11048,20 @@ def fetch_market_risk_lists():
                 )
 
             else:
-                # TWSE 的實際欄位名稱是「處置起迄時間」，
-                # 格式例如 115/07/03～115/07/16。
+                # TWSE /announcement/punish：
+                # row[6] 為「處置起迄時間」，例如 115/07/03～115/07/16。
                 period_raw = str(
-                    record.get(
+                    values[6]
+                    if len(values) > 6
+                    else record.get(
                         '處置起迄時間',
                         '',
                     )
                 ).strip()
 
-                disposition_state = get_disposition_status(period_raw)
+                disposition_state = get_disposition_status(
+                    period_raw
+                )
 
                 if disposition_state == 'today':
                     target.add(code)
