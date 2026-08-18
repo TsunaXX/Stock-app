@@ -10936,6 +10936,33 @@ def fetch_market_risk_lists():
             r'(\d{3,4})[年/-](\d{1,2})[月/-](\d{1,2})日?',
             period_raw
         )
+
+        if len(date_matches) < 2:
+            compact_dates = re.findall(
+                r'(?<!\d)(\d{7,8})(?!\d)',
+                period_raw
+            )
+
+            if len(compact_dates) >= 2:
+                date_matches = []
+
+                for compact_date in compact_dates[:2]:
+                    if len(compact_date) == 8:
+                        date_matches.append(
+                            (
+                                compact_date[:4],
+                                compact_date[4:6],
+                                compact_date[6:8],
+                            )
+                        )
+                    else:
+                        date_matches.append(
+                            (
+                                compact_date[:3],
+                                compact_date[3:5],
+                                compact_date[5:7],
+                            )
+                        )
     
         if len(date_matches) < 2:
             return None
