@@ -9192,6 +9192,7 @@ if 'ignored_data_cache' not in st.session_state: st.session_state.ignored_data_c
 if 'prefetch_cache' not in st.session_state: st.session_state.prefetch_cache = {} # 🚀 新增：預載快取
 if 'cached_notes' not in st.session_state: st.session_state.cached_notes = {}    
 
+saved_config = load_config()
 
 # =========================================================
 # Fibo 標籤獨立初始化
