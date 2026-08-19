@@ -10895,50 +10895,52 @@ def fetch_market_risk_lists():
         'Accept-Language': 'zh-TW,zh;q=0.9,en;q=0.8',
         'Cache-Control': 'no-cache',
     }
-    session = requests.Session()
-
     def fetch_json(name, url, expected_type):
-        """官方站偶發回空頁或 5xx；同一次按鈕內完成重試，不要求使用者連按。"""
+        """官方站偶發回空頁或 5xx；每個 API 獨立執行重試。"""
+        session = requests.Session()
         last_error = None
 
-        for attempt in range(3):
-            try:
-                response = session.get(
-                    url,
-                    headers=headers,
-                    params={'_': int(time.time() * 1000)} if attempt else None,
-                    timeout=(6, 18),
-                )
-                response.raise_for_status()
-
-                payload = response.json()
-
-                if not isinstance(payload, expected_type):
-                    raise ValueError(
-                        f"回傳格式應為 {expected_type.__name__}"
+        try:
+            for attempt in range(3):
+                try:
+                    response = session.get(
+                        url,
+                        headers=headers,
+                        params={'_': int(time.time() * 1000)} if attempt else None,
+                        timeout=(6, 18),
                     )
+                    response.raise_for_status()
 
-                if (
-                    isinstance(payload, dict)
-                    and not isinstance(payload.get('data', []), list)
-                ):
-                    raise ValueError("缺少名單資料列")
+                    payload = response.json()
 
-                return payload
+                    if not isinstance(payload, expected_type):
+                        raise ValueError(
+                            f"回傳格式應為 {expected_type.__name__}"
+                        )
 
-            except (
-                requests.RequestException,
-                ValueError,
-                json.JSONDecodeError,
-            ) as exc:
-                last_error = exc
+                    if (
+                        isinstance(payload, dict)
+                        and not isinstance(payload.get('data', []), list)
+                    ):
+                        raise ValueError("缺少名單資料列")
 
-                if attempt < 2:
-                    time.sleep(0.8 * (attempt + 1))
+                    return payload
 
-        raise RuntimeError(
-            f"{name} 已重試 3 次仍失敗：{last_error}"
-        )
+                except (
+                    requests.RequestException,
+                    ValueError,
+                    json.JSONDecodeError,
+                ) as exc:
+                    last_error = exc
+
+                    if attempt < 2:
+                        time.sleep(0.8 * (attempt + 1))
+
+            raise RuntimeError(
+                f"{name} 已重試 3 次仍失敗：{last_error}"
+            )
+        finally:
+            session.close()
 
     def get_disposition_status(period_raw, target_date=None):
         """判斷處置開始日是今天還是明天，支援民國年與西元年格式。"""
@@ -11083,82 +11085,95 @@ def fetch_market_risk_lists():
                 elif disposition_state == 'tomorrow':
                     disposition_tomorrow_codes.add(code)
 
-    for name, url, target, is_attention in [
+    # 6 個官方名單 API 同時抓取，避免逐一等待造成更新按鈕卡頓。
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    fetch_jobs = [
         (
             '上市注意',
             'https://www.twse.com.tw/announcement/notice?response=json',
-            attention_counts,
-            True,
+            dict,
         ),
         (
             '上市處置',
             'https://www.twse.com.tw/announcement/punish?response=json',
-            disposition_codes,
-            False,
+            dict,
         ),
-    ]:
-        try:
-            parse_twse_rows(
-                fetch_json(
-                    name,
-                    url,
-                    dict,
-                ),
-                target,
-                is_attention,
-            )
-        except Exception as exc:
-            errors.append(
-                f'{name}: {exc}'
-            )
-
-    try:
-        parse_twse_rows(
-            fetch_json(
-                '上市注意累計異常',
-                'https://www.twse.com.tw/announcement/notetrans?response=json',
-                dict,
-            ),
-            attention_counts,
-            True,
-            minimum_attention=2,
-        )
-    except Exception as exc:
-        errors.append(
-            f'上市注意累計異常: {exc}'
-        )
-
-    for (
-        name,
-        url,
-        is_attention,
-        is_accumulated_note,
-    ) in [
+        (
+            '上市注意累計異常',
+            'https://www.twse.com.tw/announcement/notetrans?response=json',
+            dict,
+        ),
         (
             '上櫃注意',
             'https://www.tpex.org.tw/openapi/v1/tpex_trading_warning_information',
-            True,
-            False,
+            list,
         ),
         (
             '上櫃注意累計異常',
             'https://www.tpex.org.tw/openapi/v1/tpex_trading_warning_note',
-            True,
-            True,
+            list,
         ),
         (
             '上櫃處置',
             'https://www.tpex.org.tw/openapi/v1/tpex_disposal_information',
-            False,
-            False,
+            list,
         ),
+    ]
+
+    fetched = {}
+
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        future_map = {
+            executor.submit(fetch_json, name, url, expected_type): name
+            for name, url, expected_type in fetch_jobs
+        }
+
+        for future in as_completed(future_map):
+            name = future_map[future]
+            try:
+                fetched[name] = future.result()
+            except Exception as exc:
+                errors.append(f'{name}: {exc}')
+
+    # 以下維持原本解析邏輯，只將 API 請求改為先並行完成。
+    twse_attention = fetched.get('上市注意')
+    if twse_attention is not None:
+        parse_twse_rows(
+            twse_attention,
+            attention_counts,
+            True,
+        )
+
+    twse_disposition = fetched.get('上市處置')
+    if twse_disposition is not None:
+        parse_twse_rows(
+            twse_disposition,
+            disposition_codes,
+            False,
+        )
+
+    twse_accumulated = fetched.get('上市注意累計異常')
+    if twse_accumulated is not None:
+        parse_twse_rows(
+            twse_accumulated,
+            attention_counts,
+            True,
+            minimum_attention=2,
+        )
+
+    for name, is_accumulated_note in [
+        ('上櫃注意', False),
+        ('上櫃注意累計異常', True),
+        ('上櫃處置', False),
     ]:
+        payload = fetched.get(name)
+
+        if payload is None:
+            continue
+
         try:
-            for record in fetch_json(
-                name,
-                url,
-                list,
-            ):
+            for record in payload:
                 raw_code = str(
                     record.get(
                         'SecuritiesCompanyCode',
@@ -11176,12 +11191,10 @@ def fetch_market_risk_lists():
 
                 code = code_match.group(0)
 
-                # 只保留 4 碼普通股票。
                 if len(code) != 4:
                     continue
 
-                if is_attention:
-                    # 累計異常名單至少以 2 次注意標示。
+                if name != '上櫃處置':
                     count = (
                         2
                         if is_accumulated_note
@@ -11192,7 +11205,6 @@ def fetch_market_risk_lists():
                         attention_counts.get(code, 0),
                         count,
                     )
-
                 else:
                     period_raw = str(
                         record.get(
