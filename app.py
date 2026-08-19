@@ -11091,18 +11091,18 @@ def fetch_market_risk_lists():
     fetch_jobs = [
         (
             '上市注意',
-            'https://www.twse.com.tw/announcement/notice?response=json',
-            dict,
+            'https://openapi.twse.com.tw/v1/announcement/notice',
+            list,
         ),
         (
             '上市處置',
-            'https://www.twse.com.tw/announcement/punish?response=json',
-            dict,
+            'https://openapi.twse.com.tw/v1/announcement/punish',
+            list,
         ),
         (
             '上市注意累計異常',
-            'https://www.twse.com.tw/announcement/notetrans?response=json',
-            dict,
+            'https://openapi.twse.com.tw/v1/announcement/notetrans',
+            list,
         ),
         (
             '上櫃注意',
@@ -11136,32 +11136,129 @@ def fetch_market_risk_lists():
             except Exception as exc:
                 errors.append(f'{name}: {exc}')
 
-    # 以下維持原本解析邏輯，只將 API 請求改為先並行完成。
-    twse_attention = fetched.get('上市注意')
-    if twse_attention is not None:
-        parse_twse_rows(
-            twse_attention,
-            attention_counts,
-            True,
-        )
+    # TWSE OpenAPI 回傳 list；集中市場三個來源分開解析。
+    twse_notice = fetched.get('上市注意')
+    if twse_notice is not None:
+        try:
+            for record in twse_notice:
+                code = str(record.get('Code', '')).strip()
+                code_match = re.search(r'\d{4,6}', code)
+                if not code_match:
+                    continue
+
+                code = code_match.group(0)
+
+                if len(code) == 4:
+                    attention_counts[code] = max(
+                        attention_counts.get(code, 0),
+                        1,
+                    )
+        except Exception as exc:
+            errors.append(f'上市注意解析失敗: {exc}')
 
     twse_disposition = fetched.get('上市處置')
     if twse_disposition is not None:
-        parse_twse_rows(
-            twse_disposition,
-            disposition_codes,
-            False,
-        )
+        try:
+            for record in twse_disposition:
+                code = str(record.get('Code', '')).strip()
+                code_match = re.search(r'\d{4,6}', code)
+                if not code_match:
+                    continue
+
+                code = code_match.group(0)
+
+                if len(code) != 4:
+                    continue
+
+                period_raw = str(
+                    record.get('DispositionPeriod', '')
+                ).strip()
+
+                disposition_state = get_disposition_status(period_raw)
+
+                if disposition_state == 'today':
+                    disposition_codes.add(code)
+                elif disposition_state == 'tomorrow':
+                    disposition_tomorrow_codes.add(code)
+
+        except Exception as exc:
+            errors.append(f'上市處置解析失敗: {exc}')
 
     twse_accumulated = fetched.get('上市注意累計異常')
     if twse_accumulated is not None:
-        parse_twse_rows(
-            twse_accumulated,
-            attention_counts,
-            True,
-            minimum_attention=2,
-        )
+        try:
+            chinese_digits = {
+                '零': 0,
+                '一': 1,
+                '二': 2,
+                '三': 3,
+                '四': 4,
+                '五': 5,
+                '六': 6,
+                '七': 7,
+                '八': 8,
+                '九': 9,
+                '十': 10,
+            }
 
+            def parse_attention_count(text):
+                text = str(text or '')
+                matches = re.findall(
+                    r'(?:連續|已有)([一二三四五六七八九十\d]+)次',
+                    text,
+                )
+
+                counts = []
+
+                for value in matches:
+                    if value.isdigit():
+                        counts.append(int(value))
+                    elif value == '十':
+                        counts.append(10)
+                    elif len(value) == 2 and value[0] == '十':
+                        counts.append(10 + chinese_digits.get(value[1], 0))
+                    elif len(value) == 2 and value[1] == '十':
+                        counts.append(chinese_digits.get(value[0], 0) * 10)
+                    elif len(value) == 3 and value[1] == '十':
+                        counts.append(
+                            chinese_digits.get(value[0], 0) * 10
+                            + chinese_digits.get(value[2], 0)
+                        )
+                    elif len(value) == 1:
+                        counts.append(chinese_digits.get(value, 0))
+
+                return max(counts, default=2)
+
+            for record in twse_accumulated:
+                code = str(record.get('Code', '')).strip()
+                code_match = re.search(r'\d{4,6}', code)
+                if not code_match:
+                    continue
+
+                code = code_match.group(0)
+
+                if len(code) != 4:
+                    continue
+
+                criteria_text = record.get(
+                    'RecentlyMetAttentionSecuritiesCriteria',
+                    '',
+                )
+
+                attention_count = parse_attention_count(
+                    criteria_text
+                )
+
+                attention_counts[code] = max(
+                    attention_counts.get(code, 0),
+                    attention_count,
+                    2,
+                )
+
+        except Exception as exc:
+            errors.append(f'上市注意累計異常解析失敗: {exc}')
+
+    # TPEx 三個 API 維持原本解析方式。
     for name, is_accumulated_note in [
         ('上櫃注意', False),
         ('上櫃注意累計異常', True),
