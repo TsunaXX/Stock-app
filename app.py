@@ -11227,8 +11227,6 @@ def fetch_market_risk_lists():
                 f'{name}: {exc}'
             )
 
-    session.close()
-
     return (
         attention_counts,
         sorted(disposition_codes),
