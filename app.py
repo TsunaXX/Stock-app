@@ -3290,7 +3290,7 @@ def fetch_shioaji_data(api, code, interval='1d', lookback_days=10):
                     kbars_dict['Amount'] = all_amount
         else:
             # 關鍵修正：分K (短天數) 直接單次抓取，不經過複雜的迴圈切割，速度最快且最穩
-            for attempt in range(3):
+            for attempt in range(2):
                 try:
                     kbars = api.kbars(contract=contract, start=start_date, end=end_date)
                     if kbars and hasattr(kbars, 'ts') and len(kbars.ts) > 0:
@@ -10907,7 +10907,7 @@ def fetch_market_risk_lists():
                         url,
                         headers=headers,
                         params={'_': int(time.time() * 1000)} if attempt else None,
-                        timeout=(6, 18),
+                        timeout=(3, 8),
                     )
                     response.raise_for_status()
 
@@ -10933,11 +10933,11 @@ def fetch_market_risk_lists():
                 ) as exc:
                     last_error = exc
 
-                    if attempt < 2:
-                        time.sleep(0.8 * (attempt + 1))
+                    if attempt < 1:
+                        time.sleep(0.5)
 
             raise RuntimeError(
-                f"{name} 已重試 3 次仍失敗：{last_error}"
+                f"{name} 已重試 2 次仍失敗：{last_error}"
             )
         finally:
             session.close()
@@ -11123,7 +11123,7 @@ def fetch_market_risk_lists():
 
     fetched = {}
 
-    with ThreadPoolExecutor(max_workers=6) as executor:
+    with ThreadPoolExecutor(max_workers=3) as executor:
         future_map = {
             executor.submit(fetch_json, name, url, expected_type): name
             for name, url, expected_type in fetch_jobs
