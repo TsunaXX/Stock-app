@@ -14007,6 +14007,8 @@ with stock_strategy_container:
                 elif col == "風險":
                     if risk_val.startswith('🚫') or risk_val.startswith('🔴'):
                         styles[idx] = 'color: #ff4b4b; font-weight: bold;'
+                    elif risk_val.startswith('🔶'):
+                        styles[idx] = 'color: #ff9800; font-weight: bold;'
                     elif risk_val.startswith('🟡'):
                         styles[idx] = 'color: #ffeb3b; font-weight: bold;'
                     elif risk_val.startswith('🟢'):
