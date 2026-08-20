@@ -2727,7 +2727,6 @@ def fetch_us_revenue_events(inputs):
     return {"events": events, "missing": missing}
 
 
-COMPANY_EVENT_SNAPSHOT_FILE = "company_event_snapshot.json"
 
 
 def empty_company_event_snapshot():
@@ -2883,30 +2882,218 @@ def parse_calendar_event_date(value):
         return None
 
 
-def load_company_event_snapshot():
-    """讀取公司事件快照；行事曆只讀這個小檔案，不觸發外部財報／營收查詢。"""
-    snapshot = empty_company_event_snapshot()
-    if not os.path.exists(COMPANY_EVENT_SNAPSHOT_FILE):
-        return snapshot
+def load_company_event_snapshot(
+    force=False
+):
+    """
+    公司營收／財報／重大事件獨立快照。
+
+    不再從股票 strategy scope 取得。
+    """
+    local_snapshot = empty_company_event_snapshot()
+
     try:
-        with open(COMPANY_EVENT_SNAPSHOT_FILE, "r", encoding="utf-8") as file:
-            saved = json.load(file)
-        if not isinstance(saved, dict):
-            return snapshot
-        return normalize_company_event_snapshot(saved)
-    except (OSError, ValueError, TypeError):
-        return snapshot
+        local_snapshot = normalize_company_event_snapshot(
+            _read_json_cache_file(
+                COMPANY_EVENT_SNAPSHOT_FILE
+            )
+        )
+    except Exception:
+        local_snapshot = (
+            empty_company_event_snapshot()
+        )
+
+    if (
+        not force
+        and st.session_state.get(
+            '_company_event_cloud_loaded',
+            False
+        )
+    ):
+        return local_snapshot
+
+    gsheet_api_url = (
+        get_app_secret(
+            'gsheet_api_url'
+        )
+    )
+
+    if not gsheet_api_url:
+        st.session_state[
+            '_company_event_cloud_loaded'
+        ] = True
+
+        return local_snapshot
+
+    remote_payload, remote_error = (
+        _fetch_remote_scope(
+            gsheet_api_url,
+            GOOGLE_SCOPE_COMPANY,
+            timeout=8,
+        )
+    )
+
+    if isinstance(
+        remote_payload,
+        dict
+    ):
+        remote_snapshot = (
+            normalize_company_event_snapshot(
+                remote_payload
+            )
+        )
+
+        local_time = pd.Timestamp(
+            local_snapshot.get(
+                'updated_at',
+                ''
+            )
+        )
+
+        remote_time = pd.Timestamp(
+            remote_snapshot.get(
+                'updated_at',
+                ''
+            )
+        )
+
+        use_remote = False
+
+        try:
+            if (
+                remote_snapshot.get(
+                    'events'
+                )
+                and (
+                    pd.isna(
+                        local_time
+                    )
+                    or (
+                        pd.notna(
+                            remote_time
+                        )
+                        and remote_time
+                        >= local_time
+                    )
+                )
+            ):
+                use_remote = True
+        except (
+            TypeError,
+            ValueError,
+        ):
+            use_remote = bool(
+                remote_snapshot.get(
+                    'events'
+                )
+            )
+
+        if use_remote:
+            local_snapshot = (
+                remote_snapshot
+            )
+
+            try:
+                _write_json_atomic(
+                    COMPANY_EVENT_SNAPSHOT_FILE,
+                    _json_safe(
+                        local_snapshot
+                    ),
+                    indent=2,
+                )
+            except (
+                OSError,
+                TypeError,
+                ValueError,
+            ):
+                pass
+
+    st.session_state[
+        '_company_event_cloud_loaded'
+    ] = True
+
+    return local_snapshot
 
 
-def save_company_event_snapshot(snapshot):
+def save_company_event_snapshot(
+    snapshot
+):
+    """
+    公司事件快照獨立保存。
+
+    本機 + Google Sheet company_events。
+    """
+    normalized = (
+        normalize_company_event_snapshot(
+            snapshot
+        )
+    )
+
     try:
         _write_json_atomic(
             COMPANY_EVENT_SNAPSHOT_FILE,
-            _json_safe(normalize_company_event_snapshot(snapshot)),
+            _json_safe(
+                normalized
+            ),
             indent=2,
         )
-    except (OSError, TypeError, ValueError):
-        pass
+    except (
+        OSError,
+        TypeError,
+        ValueError,
+    ):
+        return False
+
+    gsheet_api_url = (
+        get_app_secret(
+            'gsheet_api_url'
+        )
+    )
+
+    if not gsheet_api_url:
+        st.session_state[
+            '_company_event_cloud_loaded'
+        ] = True
+
+        return True
+
+    updated_at = str(
+        normalized.get(
+            'updated_at',
+            ''
+        )
+    ).strip()
+
+    if not updated_at:
+        updated_at = (
+            datetime.now(
+                pytz.timezone(
+                    'Asia/Taipei'
+                )
+            ).isoformat()
+        )
+
+        normalized[
+            'updated_at'
+        ] = updated_at
+
+    with get_data_cache_sync_lock():
+        sync_ok, _ = (
+            _save_remote_scope(
+                gsheet_api_url,
+                GOOGLE_SCOPE_COMPANY,
+                normalized,
+                updated_at=updated_at,
+                timeout=8,
+                verify=True,
+            )
+        )
+
+    st.session_state[
+        '_company_event_cloud_loaded'
+    ] = bool(sync_ok)
+
+    return sync_ok
 
 
 def render_company_event_snapshot(snapshot):
@@ -3103,7 +3290,7 @@ def fetch_shioaji_data(api, code, interval='1d', lookback_days=10):
                     kbars_dict['Amount'] = all_amount
         else:
             # 關鍵修正：分K (短天數) 直接單次抓取，不經過複雜的迴圈切割，速度最快且最穩
-            for attempt in range(3):
+            for attempt in range(2):
                 try:
                     kbars = api.kbars(contract=contract, start=start_date, end=end_date)
                     if kbars and hasattr(kbars, 'ts') and len(kbars.ts) > 0:
@@ -6715,13 +6902,26 @@ st.markdown("""
 st.title("⚡ 台股全盤戰略室 ⚡")
 
 CONFIG_FILE = "config.json"
+
+# 舊版總快取僅保留作為一次性相容來源，不再作為正常存檔位置。
 DATA_CACHE_FILE = "data_cache.json"
+
+# 各功能獨立本機快取。
+STOCK_STRATEGY_CACHE_FILE = "stock_strategy_cache.json"
 URL_CACHE_FILE = "url_cache.json"
 SEARCH_CACHE_FILE = "search_cache.json"
 STRATEGY_SIGNAL_LOG_FILE = "strategy_signal_log.json"
 STRATEGY_SIGNAL_TOMBSTONES_FILE = "strategy_signal_tombstones.json"
 FIBO_TAG_CACHE_FILE = "fibo_tags.json"
 FUTURES_STATE_CACHE_FILE = "futures_strategy_cache.json"
+COMPANY_EVENT_SNAPSHOT_FILE = "company_event_snapshot.json"
+
+# Google Sheet 獨立 scope。
+GOOGLE_SCOPE_STOCK = "stock_strategy"
+GOOGLE_SCOPE_FIBO = "fibo_strategy"
+GOOGLE_SCOPE_COMPANY = "company_events"
+GOOGLE_SCOPE_SIGNALS = "strategy_signals"
+GOOGLE_SCOPE_FUTURES = "futures_strategy"
 DEFAULT_FIBO_TAGS = ["台積電(2330)", "鴻海(2317)", "聯發科(2454)", "和椿(6215)", "晶彩科(3535)"]
 ANALYSIS_MAX_WORKERS = 2
 API_REQUEST_GAP_SECONDS = 0.1
@@ -6853,7 +7053,28 @@ def load_futures_strategy_state():
                 _write_json_atomic(CONFIG_FILE, config)
             except (OSError, TypeError, ValueError):
                 pass
-    return _merge_futures_strategy_state(cloud_state, local_state)
+
+    if not st.session_state.get('_futures_cloud_loaded', False):
+        gsheet_api_url = get_app_secret('gsheet_api_url')
+        if gsheet_api_url:
+            remote_state, remote_error = _fetch_remote_scope(
+                gsheet_api_url, GOOGLE_SCOPE_FUTURES, timeout=8,
+            )
+            if isinstance(remote_state, dict):
+                cloud_state = remote_state
+                st.session_state['_futures_cloud_error'] = ''
+            else:
+                st.session_state['_futures_cloud_error'] = remote_error or '讀取失敗'
+        st.session_state['_futures_cloud_loaded'] = True
+
+    merged_state = _merge_futures_strategy_state(cloud_state, local_state)
+    st.session_state['_cached_futures_strategy_state'] = merged_state
+    if merged_state and merged_state != local_state:
+        try:
+            _write_json_atomic(FUTURES_STATE_CACHE_FILE, merged_state, indent=2)
+        except (OSError, TypeError, ValueError):
+            pass
+    return merged_state
 
 
 def _state_updated_at(value):
@@ -6936,7 +7157,28 @@ def save_futures_strategy_state(
             if 'futures_strategy_state' in config:
                 config.pop('futures_strategy_state', None)
                 _write_json_atomic(CONFIG_FILE, config)
+        sync_ok = True
+        gsheet_api_url = get_app_secret('gsheet_api_url')
+        if gsheet_api_url:
+            with get_data_cache_sync_lock():
+                remote_state, _ = _fetch_remote_scope(
+                    gsheet_api_url, GOOGLE_SCOPE_FUTURES, timeout=8,
+                )
+                cloud_state = _merge_futures_strategy_state(remote_state, saved_state)
+                sync_ok, _ = _save_remote_scope(
+                    gsheet_api_url,
+                    GOOGLE_SCOPE_FUTURES,
+                    cloud_state,
+                    updated_at=cloud_state.get('updated_at'),
+                    timeout=8,
+                    verify=True,
+                )
+                if sync_ok:
+                    saved_state = cloud_state
+                    _write_json_atomic(FUTURES_STATE_CACHE_FILE, saved_state, indent=2)
         st.session_state['_cached_futures_strategy_state'] = saved_state
+        st.session_state['_futures_cloud_loaded'] = True
+        st.session_state['_futures_cloud_save_status'] = 'ok' if sync_ok else 'local_only'
         return True
     except (OSError, TypeError, ValueError):
         return False
@@ -7212,16 +7454,208 @@ def load_strategy_signal_log():
     except (OSError, ValueError, TypeError):
         return []
 
-def save_strategy_signal_log(records):
-    """最多保留最近 2,000 筆策略訊號，避免長期使用造成檔案膨脹。"""
+def _sync_strategy_signal_scope_from_cloud():
+    """
+    第一次使用策略驗證時，
+    把 strategy_signals scope 與本機紀錄合併。
+    """
+    if st.session_state.get(
+        '_strategy_signal_cloud_loaded',
+        False
+    ):
+        return True
+
+    gsheet_api_url = (
+        get_app_secret(
+            'gsheet_api_url'
+        )
+    )
+
+    if not gsheet_api_url:
+        st.session_state[
+            '_strategy_signal_cloud_loaded'
+        ] = True
+
+        return True
+
+    local_records = (
+        load_strategy_signal_log()
+    )
+
+    local_deleted = (
+        load_strategy_signal_tombstones()
+    )
+
+    remote_payload, remote_error = (
+        _fetch_remote_scope(
+            gsheet_api_url,
+            GOOGLE_SCOPE_SIGNALS,
+            timeout=8,
+        )
+    )
+
+    if not isinstance(
+        remote_payload,
+        dict
+    ):
+        # Google 暫時讀不到時，
+        # 保留本機資料，不阻止程式使用。
+        return False
+
+    remote_records = (
+        remote_payload.get(
+            'strategy_signal_log',
+            remote_payload.get(
+                'records',
+                []
+            )
+        )
+    )
+
+    remote_deleted = (
+        remote_payload.get(
+            'strategy_signal_deleted_keys',
+            remote_payload.get(
+                'deleted_keys',
+                []
+            )
+        )
+    )
+
+    merged_records, deleted_keys = (
+        merge_strategy_signal_state(
+            remote_records,
+            local_records,
+            remote_deleted,
+            local_deleted,
+        )
+    )
+
+    save_strategy_signal_tombstones(
+        deleted_keys
+    )
+
     try:
         with _RUNTIME_FILE_LOCK:
             _write_json_atomic(
-                STRATEGY_SIGNAL_LOG_FILE, list(records)[-2000:], indent=2,
+                STRATEGY_SIGNAL_LOG_FILE,
+                merged_records[-2000:],
+                indent=2,
             )
-        return True
-    except (OSError, TypeError, ValueError):
+    except (
+        OSError,
+        TypeError,
+        ValueError,
+    ):
         return False
+
+    try:
+        with _RUNTIME_FILE_LOCK:
+            _write_json_atomic(
+                STRATEGY_SIGNAL_TOMBSTONES_FILE,
+                deleted_keys[-4000:],
+                indent=2,
+            )
+    except (
+        OSError,
+        TypeError,
+        ValueError,
+    ):
+        pass
+
+    st.session_state[
+        '_strategy_signal_cloud_loaded'
+    ] = True
+
+    return True
+
+
+def _sync_strategy_signal_scope_to_cloud(
+    records
+):
+    """把策略驗證資料獨立同步到 strategy_signals。"""
+    gsheet_api_url = (
+        get_app_secret(
+            'gsheet_api_url'
+        )
+    )
+
+    if not gsheet_api_url:
+        return True
+
+    payload = {
+        'version': 1,
+        'strategy_signal_log': list(
+            records
+        )[-2000:],
+        'strategy_signal_deleted_keys': (
+            load_strategy_signal_tombstones()
+        )[-4000:],
+    }
+
+    updated_at = (
+        datetime.now(
+            pytz.timezone(
+                'Asia/Taipei'
+            )
+        ).isoformat()
+    )
+
+    with get_data_cache_sync_lock():
+        sync_ok, _ = (
+            _save_remote_scope(
+                gsheet_api_url,
+                GOOGLE_SCOPE_SIGNALS,
+                payload,
+                updated_at=updated_at,
+                timeout=8,
+                verify=True,
+            )
+        )
+
+    return sync_ok
+
+def save_strategy_signal_log(
+    records
+):
+    """
+    最多保留最近 2,000 筆策略訊號。
+
+    本機 + Google Sheet strategy_signals。
+    """
+    normalized_records = list(
+        records
+    )[-2000:]
+
+    try:
+        with _RUNTIME_FILE_LOCK:
+            _write_json_atomic(
+                STRATEGY_SIGNAL_LOG_FILE,
+                normalized_records,
+                indent=2,
+            )
+    except (
+        OSError,
+        TypeError,
+        ValueError,
+    ):
+        return False
+
+    sync_ok = (
+        _sync_strategy_signal_scope_to_cloud(
+            normalized_records
+        )
+    )
+
+    st.session_state[
+        '_strategy_signal_sync_status'
+    ] = (
+        'ok'
+        if sync_ok
+        else 'local_only'
+    )
+
+    return sync_ok
 
 
 def load_strategy_signal_tombstones():
@@ -7236,7 +7670,6 @@ def load_strategy_signal_tombstones():
         return list(dict.fromkeys(str(value).strip() for value in values if str(value).strip()))[-4000:]
     except (OSError, ValueError, TypeError):
         return []
-
 
 def save_strategy_signal_tombstones(values):
     """保存刪除標記；筆數上限高於訊號紀錄，確保舊副本無法復活。"""
@@ -7573,6 +8006,7 @@ def render_strategy_validation_room():
         4. **R、MFE、MAE**：1R 是進場到失效點的距離，不是金額；例如多方進場 100、停損 95，1R = 5。MFE 是建立訊號後最有利曾走到多少 R，MAE 是最不利曾回撤多少 R，可用來檢查進場是否太晚、停損是否太近，不等於實際損益。
         5. **刪除與匯出**：可在下方明細勾選多筆「刪除」，再按刪除按鈕移除勾選紀錄；匯出按鈕會下載目前篩選後的 CSV。
         """)
+    _sync_strategy_signal_scope_from_cloud()
     records = load_strategy_signal_log()
     with st.expander("🧹 策略驗證紀錄管理", expanded=False):
         confirm_clear = st.checkbox(
@@ -7604,10 +8038,6 @@ def render_strategy_validation_room():
                 record for record in records if record not in remaining
             ]
             if mark_strategy_signals_deleted(removed) and save_strategy_signal_log(remaining):
-                save_data_cache(
-                    st.session_state.stock_data, st.session_state.ignored_stocks,
-                    st.session_state.all_candidates, st.session_state.saved_notes
-                )
                 cleared_count = len(records) - len(remaining)
                 st.toast(f"已清除 {cleared_count} 筆策略驗證紀錄", icon="🧹")
                 st.rerun()
@@ -7916,10 +8346,6 @@ def render_strategy_validation_room():
             actual_entry_changed = True
     if actual_entry_changed:
         if save_strategy_signal_log(records):
-            save_data_cache(
-                st.session_state.stock_data, st.session_state.ignored_stocks,
-                st.session_state.all_candidates, st.session_state.saved_notes
-            )
             st.toast('實際進場價已儲存；後續行情更新將以此計算盈虧與結果。', icon='✅')
         else:
             st.error('實際進場價儲存失敗，請確認檔案是否可寫入。')
@@ -7937,10 +8363,6 @@ def render_strategy_validation_room():
         removed = [record for index, record in enumerate(records) if index in selected_ids]
         remaining = [record for index, record in enumerate(records) if index not in selected_ids]
         if mark_strategy_signals_deleted(removed) and save_strategy_signal_log(remaining):
-            save_data_cache(
-                st.session_state.stock_data, st.session_state.ignored_stocks,
-                st.session_state.all_candidates, st.session_state.saved_notes
-            )
             st.toast(f'已刪除 {len(selected_ids)} 筆訊號紀錄', icon='🗑️')
             st.rerun()
         else:
@@ -8047,7 +8469,167 @@ def _fetch_remote_data_cache(gsheet_api_url, timeout=5):
         return payload, None
     except (requests.RequestException, ValueError, TypeError) as exc:
         return None, f'{type(exc).__name__}'
+def _fetch_remote_scope(
+    gsheet_api_url,
+    scope,
+    timeout=8,
+):
+    """只讀取 Google Sheet 指定 scope。"""
+    if not gsheet_api_url:
+        return None, '未設定 Google Sheet 同步'
 
+    scope = str(scope or '').strip()
+
+    if not scope:
+        return None, '未指定 Google Sheet scope'
+
+    try:
+        response = requests.get(
+            gsheet_api_url,
+            params={
+                'scope': scope
+            },
+            timeout=timeout,
+        )
+
+        response.raise_for_status()
+
+        payload = response.json()
+
+        if not isinstance(
+            payload,
+            dict
+        ):
+            return None, 'Google Sheet scope 回傳格式無法辨識'
+
+        if payload.get(
+            'success'
+        ) is False:
+            return None, str(
+                payload.get(
+                    'error'
+                ) or 'Google Sheet 讀取失敗'
+            )
+
+        data = payload.get(
+            'data'
+        )
+
+        if data is None:
+            return {}, None
+
+        if isinstance(
+            data,
+            str
+        ):
+            try:
+                data = json.loads(
+                    data
+                )
+            except (
+                ValueError,
+                TypeError,
+            ):
+                return None, 'Google Sheet scope JSON 無法解析'
+
+        if not isinstance(
+            data,
+            dict
+        ):
+            return None, 'Google Sheet scope 資料不是物件'
+
+        if payload.get(
+            'updated_at'
+        ):
+            data[
+                '_scope_updated_at'
+            ] = str(
+                payload.get(
+                    'updated_at'
+                )
+            )
+
+        return data, None
+
+    except requests.RequestException as exc:
+        return None, type(exc).__name__
+
+    except (
+        ValueError,
+        TypeError,
+    ):
+        return None, 'Google Sheet scope 回傳格式錯誤'
+
+
+def _save_remote_scope(gsheet_api_url, scope, payload, updated_at=None, timeout=8, verify=True):
+    if not gsheet_api_url or not scope:
+        return True, payload
+
+    updated_at = updated_at or datetime.now(
+        pytz.timezone('Asia/Taipei')
+    ).isoformat()
+
+    request_payload = {
+        'action': 'save',
+        'scope': scope,
+        'data': json.dumps(_json_safe(payload), ensure_ascii=False),
+        'updated_at': updated_at,
+    }
+
+    try:
+        response = requests.post(
+            gsheet_api_url,
+            json=request_payload,
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        result = response.json()
+
+        if isinstance(result, dict) and result.get('success') is False:
+            return False, None
+
+        return True, payload
+
+    except (requests.RequestException, ValueError, TypeError):
+        return False, None
+
+
+def _read_json_cache_file(
+    path
+):
+    """讀取指定本機 JSON 快取。"""
+    if not os.path.exists(
+        path
+    ):
+        return {}
+
+    try:
+        with _RUNTIME_FILE_LOCK:
+            with open(
+                path,
+                "r",
+                encoding="utf-8",
+            ) as file:
+                payload = json.load(
+                    file
+                )
+
+        return (
+            payload
+            if isinstance(
+                payload,
+                dict
+            )
+            else {}
+        )
+
+    except (
+        OSError,
+        ValueError,
+        TypeError,
+        json.JSONDecodeError,
+    ):
+        return {}
 
 def _valid_fibo_tags(tags):
     if not isinstance(tags, list) or len(tags) < 5:
@@ -8123,15 +8705,19 @@ def _extract_fibo_tags(payload):
 def _fibo_tag_timestamp(payload):
     if not isinstance(payload, dict):
         return None
-    timestamp_value = payload.get('fibo_tags_updated_at')
+    timestamp_values = [payload.get('fibo_tags_updated_at')]
     backup = payload.get('fibo_tags_backup')
-    if not timestamp_value and isinstance(backup, dict):
-        timestamp_value = backup.get('updated_at')
-    try:
-        timestamp = pd.Timestamp(timestamp_value)
-        return None if pd.isna(timestamp) else timestamp
-    except (TypeError, ValueError, OverflowError):
-        return None
+    if isinstance(backup, dict):
+        timestamp_values.append(backup.get('updated_at'))
+    timestamps = []
+    for timestamp_value in timestamp_values:
+        try:
+            timestamp = pd.Timestamp(timestamp_value)
+            if not pd.isna(timestamp):
+                timestamps.append(timestamp)
+        except (TypeError, ValueError, OverflowError):
+            continue
+    return max(timestamps) if timestamps else None
 
 
 def _newer_fibo_tag_payload(remote, local):
@@ -8150,39 +8736,166 @@ def _newer_fibo_tag_payload(remote, local):
     return remote
 
 
-def save_fibo_config():
+def save_fibo_config(save_tags=True):
     config = load_config()
-    fibo_tags = [normalize_fibo_quick_tag(tag) for tag in [
-        st.session_state.get('custom_tag_1', "台積電(2330)"), 
-        st.session_state.get('custom_tag_2', "鴻海(2317)"), 
-        st.session_state.get('custom_tag_3', "聯發科(2454)"), 
-        st.session_state.get('custom_tag_4', "和椿(6215)"), 
-        st.session_state.get('custom_tag_5', "晶彩科(3535)")
-    ]]
-    config['fibo_tags'] = fibo_tags
-    st.session_state.fibo_tags = fibo_tags
+
+    if not save_tags:
+        if 'ma_w' in st.session_state:
+            config['ma_width'] = st.session_state.ma_w
+        try:
+            _write_json_atomic(
+                CONFIG_FILE,
+                config,
+            )
+        except (
+            OSError,
+            TypeError,
+            ValueError,
+        ):
+            pass
+        return True
+
+    fibo_tags = [
+        normalize_fibo_quick_tag(
+            tag
+        )
+        for tag in [
+            st.session_state.get(
+                'custom_tag_1',
+                "台積電(2330)"
+            ),
+            st.session_state.get(
+                'custom_tag_2',
+                "鴻海(2317)"
+            ),
+            st.session_state.get(
+                'custom_tag_3',
+                "聯發科(2454)"
+            ),
+            st.session_state.get(
+                'custom_tag_4',
+                "和椿(6215)"
+            ),
+            st.session_state.get(
+                'custom_tag_5',
+                "晶彩科(3535)"
+            ),
+        ]
+    ]
+
+    fibo_tags = [
+        tag
+        for tag in fibo_tags
+        if tag
+    ][:5]
+
+    while len(fibo_tags) < 5:
+        fibo_tags.append(
+            DEFAULT_FIBO_TAGS[
+                len(fibo_tags)
+            ]
+        )
+
+    updated_at = (
+        datetime.now(
+            pytz.timezone(
+                'Asia/Taipei'
+            )
+        ).isoformat()
+    )
+
+    config[
+        'fibo_tags'
+    ] = fibo_tags
+
+    config[
+        'fibo_tags_updated_at'
+    ] = updated_at
+
     if 'ma_w' in st.session_state:
-        config['ma_width'] = st.session_state.ma_w
+        config[
+            'ma_width'
+        ] = st.session_state.ma_w
+
+    st.session_state[
+        'fibo_tags'
+    ] = list(fibo_tags)
+
+    st.session_state[
+        '_fibo_tags_updated_at'
+    ] = updated_at
+
     try:
-        updated_at = datetime.now(pytz.timezone('Asia/Taipei')).isoformat()
-        config['fibo_tags_updated_at'] = updated_at
-        st.session_state['_fibo_tags_updated_at'] = updated_at
-        _write_json_atomic(CONFIG_FILE, config)
+        _write_json_atomic(
+            CONFIG_FILE,
+            config,
+        )
+
         _write_json_atomic(
             FIBO_TAG_CACHE_FILE,
-            {'version': 2, 'updated_at': updated_at, 'tags': fibo_tags},
+            {
+                'version': 3,
+                'updated_at': updated_at,
+                'tags': fibo_tags,
+            },
             indent=2,
         )
-    except Exception: pass
-    # 標籤是明確儲存動作，傳入 fibo_tags 讓雲端同步不被視為一般股票快取寫入。
-    sync_saved = save_data_cache(
-        st.session_state.stock_data, st.session_state.ignored_stocks,
-        st.session_state.all_candidates, st.session_state.saved_notes, fibo_tags,
-    )
-    if sync_saved:
-        st.session_state['_fibo_tags_source'] = (
-            'google_sheet' if get_app_secret('gsheet_api_url') else 'local_tag_cache'
+    except (
+        OSError,
+        TypeError,
+        ValueError,
+    ):
+        pass
+
+    gsheet_api_url = (
+        get_app_secret(
+            'gsheet_api_url'
         )
+    )
+
+    sync_saved = True
+
+    if gsheet_api_url:
+        with get_data_cache_sync_lock():
+            sync_saved, _ = (
+                _save_remote_scope(
+                    gsheet_api_url,
+                    GOOGLE_SCOPE_FIBO,
+                    {
+                        'version': 3,
+                        'fibo_tags': fibo_tags,
+                        'fibo_tags_updated_at': updated_at,
+                        'fibo_tags_backup': {
+                            'tags': fibo_tags,
+                            'updated_at': updated_at,
+                        },
+                    },
+                    updated_at=updated_at,
+                    timeout=8,
+                    verify=True,
+                )
+            )
+
+    st.session_state[
+        '_fibo_cloud_save_status'
+    ] = (
+        'ok'
+        if sync_saved
+        else 'local_only'
+    )
+
+    st.session_state[
+        '_fibo_tags_source'
+    ] = (
+        'google_sheet'
+        if sync_saved and gsheet_api_url
+        else 'local_tag_cache'
+    )
+
+    st.session_state[
+        '_fibo_cloud_loaded'
+    ] = True
+
     return sync_saved
 
 
@@ -8436,263 +9149,646 @@ def _compact_cloud_data_cache_payload(payload, max_chars=45000):
 
 
 def save_data_cache(
-    df, ignored_set, candidates=None, saved_notes=None, fibo_tags=None,
-    *, clear_stock_data=False, replace_ignored=False, replace_stock_data=True,
+    df,
+    ignored_set,
+    candidates=None,
+    saved_notes=None,
+    fibo_tags=None,
+    *,
+    clear_stock_data=False,
+    replace_ignored=False,
+    replace_stock_data=True,
     verify_stock_data=False,
 ):
-    candidates = list(candidates or [])
-    saved_notes = dict(saved_notes or {})
-    explicit_fibo_tag_save = fibo_tags is not None
-    if fibo_tags is None:
-        dedicated_tags = load_fibo_tag_cache()
-        fibo_tags = (
-            dedicated_tags if len(dedicated_tags) >= 5
-            else st.session_state.get('fibo_tags', list(DEFAULT_FIBO_TAGS))
-        )
-    fibo_tags = [str(tag) for tag in list(fibo_tags)[:5]]
-    gsheet_api_url = get_app_secret('gsheet_api_url')
+    """
+    股票戰略室專用儲存。
+
+    保留原有函式參數，
+    但現在只寫 stock_strategy。
+
+    fibo_tags 不再寫進股票 scope。
+    company_event_snapshot 不再寫進股票 scope。
+    strategy_signal_log 不再寫進股票 scope。
+    """
+    candidates = list(
+        candidates or []
+    )
+
+    saved_notes = dict(
+        saved_notes or {}
+    )
+
     try:
-        df_save = df.fillna("").copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
-        ignored_list = list(ignored_set or [])
-        empty_col = pd.Series("", index=df_save.index, dtype=str)
-        codes = df_save.get('代號', empty_col).astype(str).str.strip()
-        notes = df_save.get('戰略備註', empty_col).astype(str).str.strip()
-        auto_notes = df_save.get('_auto_note', empty_col).astype(str).str.strip()
+        df_save = (
+            df.fillna(
+                ""
+            ).copy()
+            if isinstance(
+                df,
+                pd.DataFrame
+            )
+            else pd.DataFrame()
+        )
+
+        ignored_list = list(
+            ignored_set or []
+        )
+
+        empty_col = pd.Series(
+            "",
+            index=df_save.index,
+            dtype=str,
+        )
+
+        codes = (
+            df_save
+            .get(
+                '代號',
+                empty_col
+            )
+            .astype(str)
+            .str.strip()
+        )
+
+        notes = (
+            df_save
+            .get(
+                '戰略備註',
+                empty_col
+            )
+            .astype(str)
+            .str.strip()
+        )
+
+        auto_notes = (
+            df_save
+            .get(
+                '_auto_note',
+                empty_col
+            )
+            .astype(str)
+            .str.strip()
+        )
+
         cached_notes = {
-            code: {'note': note, 'auto': auto}
-            for code, note, auto in zip(codes, notes, auto_notes)
+            code: {
+                'note': note,
+                'auto': auto,
+            }
+            for code, note, auto
+            in zip(
+                codes,
+                notes,
+                auto_notes,
+            )
             if code
         }
-        df_save.drop(columns=['_auto_note'], errors='ignore', inplace=True)
-        company_snapshot = st.session_state.get('company_event_snapshot')
-        if not isinstance(company_snapshot, dict):
-            company_snapshot = load_company_event_snapshot()
-        fibo_tags_updated_at = str(st.session_state.get('_fibo_tags_updated_at', '')).strip()
-        if explicit_fibo_tag_save and not fibo_tags_updated_at:
-            fibo_tags_updated_at = datetime.now(pytz.timezone('Asia/Taipei')).isoformat()
-            st.session_state['_fibo_tags_updated_at'] = fibo_tags_updated_at
+
+        df_save.drop(
+            columns=[
+                '_auto_note'
+            ],
+            errors='ignore',
+            inplace=True,
+        )
+
         stock_data_updated_at = str(
-            st.session_state.get('_stock_data_updated_at', '')
-        ).strip() or mark_stock_data_updated()
+            st.session_state.get(
+                '_stock_data_updated_at',
+                ''
+            )
+        ).strip()
+
+        if not stock_data_updated_at:
+            stock_data_updated_at = (
+                datetime.now(
+                    pytz.timezone(
+                        'Asia/Taipei'
+                    )
+                ).isoformat()
+            )
+
+            st.session_state[
+                '_stock_data_updated_at'
+            ] = stock_data_updated_at
+
         local_payload = _json_safe({
-            'version': 3,
-            'stock_data': df_save.to_dict(orient='records'),
-            'ignored_stocks': ignored_list,
-            'all_candidates': candidates,
-            'saved_notes': saved_notes,
-            'fibo_tags': fibo_tags,
-            'fibo_tags_updated_at': fibo_tags_updated_at,
-            'cached_notes': cached_notes,
-            'strategy_signal_log': load_strategy_signal_log(),
-            'strategy_signal_deleted_keys': load_strategy_signal_tombstones(),
-            'stock_data_updated_at': stock_data_updated_at,
-            'company_event_snapshot': company_snapshot,
-            'futures_strategy_state': load_futures_strategy_state(),
+            'version': 4,
+            'stock_data': (
+                df_save.to_dict(
+                    orient='records'
+                )
+            ),
+            'ignored_stocks': (
+                ignored_list
+            ),
+            'all_candidates': (
+                candidates
+            ),
+            'saved_notes': (
+                saved_notes
+            ),
+            'cached_notes': (
+                cached_notes
+            ),
+            'stock_data_updated_at': (
+                stock_data_updated_at
+            ),
         })
-        merged_payload = local_payload
+
+        # 股票獨立本機快取。
+        _write_json_atomic(
+            STOCK_STRATEGY_CACHE_FILE,
+            local_payload,
+            indent=2,
+        )
+
+        gsheet_api_url = (
+            get_app_secret(
+                'gsheet_api_url'
+            )
+        )
+
         sync_ok = True
+
         if gsheet_api_url:
             with get_data_cache_sync_lock():
-                remote_payload, remote_error = _fetch_remote_data_cache(gsheet_api_url, timeout=5)
-                if remote_payload is None:
-                    sync_ok = False
-                    st.session_state['_data_cache_remote_error'] = remote_error or '讀取失敗'
-                else:
-                    merged_payload = _merge_data_cache_payload(
-                        remote_payload, local_payload,
-                        explicit_fibo_tag_save=explicit_fibo_tag_save,
-                        clear_stock_data=clear_stock_data,
-                        replace_ignored=replace_ignored,
-                        replace_stock_data=replace_stock_data,
+                sync_ok, _ = (
+                    _save_remote_scope(
+                        gsheet_api_url,
+                        GOOGLE_SCOPE_STOCK,
+                        local_payload,
+                        updated_at=(
+                            stock_data_updated_at
+                        ),
+                        timeout=8,
+                        verify=True,
                     )
-                    cloud_payload = _compact_cloud_data_cache_payload(merged_payload)
-                    last_error = None
-                    for attempt in range(2):
-                        try:
-                            request_payload = {
-                                'action': 'save',
-                                'data': json.dumps(cloud_payload, ensure_ascii=False),
-                                'updated_at': cloud_payload.get('updated_at', ''),
-                            }
-                            # Legacy Apps Script deployments receive this direct
-                            # field only for an intentional tag save.  Ordinary
-                            # stock refreshes cannot clear or replace quick tags.
-                            if explicit_fibo_tag_save:
-                                request_payload['fibo_tags'] = cloud_payload.get('fibo_tags', [])
-                                request_payload['fibo_tags_updated_at'] = cloud_payload.get(
-                                    'fibo_tags_updated_at', ''
-                                )
-                            response = requests.post(
-                                gsheet_api_url,
-                                json=request_payload,
-                                timeout=8,
-                            )
-                            response.raise_for_status()
-                            try:
-                                acknowledgement = response.json()
-                            except (ValueError, TypeError):
-                                acknowledgement = None
-                            if isinstance(acknowledgement, dict) and (
-                                acknowledgement.get('success') is False
-                                or str(acknowledgement.get('status', '')).lower() in {'error', 'failed'}
-                            ):
-                                raise requests.RequestException('Google Sheet rejected save')
-                            last_error = None
-                            break
-                        except requests.RequestException as exc:
-                            last_error = exc
-                            if attempt == 0:
-                                time.sleep(0.4)
-                    if last_error is not None:
-                        sync_ok = False
-                        st.session_state['_data_cache_remote_error'] = type(last_error).__name__
-                    elif explicit_fibo_tag_save or verify_stock_data:
-                        expected_tags = _valid_fibo_tags(cloud_payload.get('fibo_tags', []))
-                        verified = False
-                        verification_error = ''
-                        for delay in (0.2, 0.8, 2.0):
-                            time.sleep(delay)
-                            saved_payload, verification_error = _fetch_remote_data_cache(
-                                gsheet_api_url, timeout=8,
-                            )
-                            tags_match = (
-                                not explicit_fibo_tag_save
-                                or _extract_fibo_tags(saved_payload) == expected_tags
-                            )
-                            stock_match = (
-                                not verify_stock_data
-                                or _stock_snapshot_matches(saved_payload, cloud_payload)
-                            )
-                            if tags_match and stock_match:
-                                verified = True
-                                break
-                        if not verified:
-                            sync_ok = False
-                            st.session_state['_data_cache_remote_error'] = (
-                                verification_error or 'Google Sheet 寫入後回讀的股票資料不一致'
-                            )
-        _write_json_atomic(DATA_CACHE_FILE, merged_payload, indent=2)
-        st.session_state['_data_cache_sync_status'] = 'ok' if sync_ok else 'local_only'
-        if explicit_fibo_tag_save:
-            st.session_state['_fibo_cloud_save_status'] = 'ok' if sync_ok else 'local_only'
+                )
+
+        st.session_state[
+            '_data_cache_sync_status'
+        ] = (
+            'ok'
+            if sync_ok
+            else 'local_only'
+        )
+
+        if sync_ok:
+            st.session_state[
+                '_data_cache_remote_error'
+            ] = ''
+        else:
+            st.session_state[
+                '_data_cache_remote_error'
+            ] = (
+                '股票戰略室資料已保留於本機，'
+                '但 Google Sheet 回讀未確認成功。'
+            )
+
         return sync_ok
-    except (OSError, TypeError, ValueError) as exc:
-        st.session_state['_data_cache_sync_status'] = type(exc).__name__
-        if explicit_fibo_tag_save:
-            st.session_state['_fibo_cloud_save_status'] = 'local_only'
+
+    except (
+        OSError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        st.session_state[
+            '_data_cache_sync_status'
+        ] = type(exc).__name__
+
         return False
 
 def load_data_cache():
-    local_signal_records = load_strategy_signal_log()
-    local_deleted_signal_keys = load_strategy_signal_tombstones()
+    """
+    只讀取股票戰略室 scope。
 
-    def read_local_payload():
-        if not os.path.exists(DATA_CACHE_FILE):
-            return {}
-        try:
-            with _RUNTIME_FILE_LOCK:
-                with open(DATA_CACHE_FILE, "r", encoding='utf-8') as file:
-                    payload = json.load(file)
-            return payload if _is_valid_data_cache_payload(payload) else {}
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
-            return {}
+    回傳：
+        df,
+        ignored,
+        candidates,
+        saved_notes,
+        cached_notes
+    """
+    local_payload = _read_json_cache_file(
+        STOCK_STRATEGY_CACHE_FILE
+    )
 
-    def restore_signal_state(data):
-        signal_records, deleted_signal_keys = merge_strategy_signal_state(
-            data.get('strategy_signal_log', []), local_signal_records,
-            data.get('strategy_signal_deleted_keys', []), local_deleted_signal_keys,
+    # 舊版本機總快取相容。
+    if not local_payload:
+        legacy_payload = (
+            _read_json_cache_file(
+                DATA_CACHE_FILE
+            )
         )
-        save_strategy_signal_tombstones(deleted_signal_keys)
-        save_strategy_signal_log(signal_records)
 
-    def unpack_cache(data, source):
-        df = pd.DataFrame(data.get('stock_data', []))
-        ignored = set(data.get('ignored_stocks', []))
-        candidates = data.get('all_candidates', [])
-        saved_notes = data.get('saved_notes', {})
-        fibo_tags = _extract_fibo_tags(data)
-        st.session_state['_fibo_tags_updated_at'] = str(
-            data.get('fibo_tags_updated_at', '')
-        ).strip()
-        st.session_state['_stock_data_updated_at'] = str(
-            data.get('stock_data_updated_at') or data.get('updated_at') or ''
-        ).strip()
-        if isinstance(data.get('company_event_snapshot'), dict):
-            st.session_state['_cached_company_event_snapshot'] = data['company_event_snapshot']
-        if isinstance(data.get('futures_strategy_state'), dict):
-            st.session_state['_cached_futures_strategy_state'] = data['futures_strategy_state']
-        restore_signal_state(data)
-        st.session_state['_data_cache_source'] = source
-        return df, ignored, candidates, saved_notes, fibo_tags, data.get('cached_notes', {})
+        if _is_valid_data_cache_payload(
+            legacy_payload
+        ):
+            local_payload = {
+                'version': 4,
+                'stock_data': (
+                    legacy_payload.get(
+                        'stock_data',
+                        []
+                    )
+                ),
+                'ignored_stocks': (
+                    legacy_payload.get(
+                        'ignored_stocks',
+                        []
+                    )
+                ),
+                'all_candidates': (
+                    legacy_payload.get(
+                        'all_candidates',
+                        []
+                    )
+                ),
+                'saved_notes': (
+                    legacy_payload.get(
+                        'saved_notes',
+                        {}
+                    )
+                ),
+                'cached_notes': (
+                    legacy_payload.get(
+                        'cached_notes',
+                        {}
+                    )
+                ),
+                'stock_data_updated_at': (
+                    legacy_payload.get(
+                        'stock_data_updated_at'
+                    )
+                    or legacy_payload.get(
+                        'updated_at',
+                        ''
+                    )
+                ),
+            }
 
-    local_payload = read_local_payload()
+    gsheet_api_url = (
+        get_app_secret(
+            'gsheet_api_url'
+        )
+    )
 
-    gsheet_api_url = get_app_secret('gsheet_api_url')
+    remote_payload = None
+    remote_error = None
+
     if gsheet_api_url:
-        remote_payload, remote_error = _fetch_remote_data_cache(gsheet_api_url, timeout=8)
-        if remote_payload:
-            data, source = _prefer_newer_cache_payload(remote_payload, local_payload)
-            data = dict(data)
-            fibo_source_payload = _newer_fibo_tag_payload(remote_payload, local_payload)
-            cloud_tags = _extract_fibo_tags(fibo_source_payload)
-            if cloud_tags:
-                data['fibo_tags'] = cloud_tags
-                data['fibo_tags_updated_at'] = str(
-                    fibo_source_payload.get('fibo_tags_updated_at', '')
-                ).strip()
-                data['fibo_tags_backup'] = fibo_source_payload.get(
-                    'fibo_tags_backup',
-                    {'tags': cloud_tags, 'updated_at': data['fibo_tags_updated_at']},
-                )
-                st.session_state['_fibo_tags_cloud_loaded'] = (
-                    fibo_source_payload is remote_payload
-                )
-            data['futures_strategy_state'] = _merge_futures_strategy_state(
-                remote_payload.get('futures_strategy_state'),
-                local_payload.get('futures_strategy_state'),
+        remote_payload, remote_error = (
+            _fetch_remote_scope(
+                gsheet_api_url,
+                GOOGLE_SCOPE_STOCK,
+                timeout=8,
             )
-            st.session_state['_data_cache_remote_error'] = (
-                'Google Sheet 尚未完成前次寫入，已保留較新的本機分析資料。'
-                if source == 'local_newer' else ''
-            )
-            return unpack_cache(data, source)
-        st.session_state['_data_cache_remote_error'] = remote_error or '讀取失敗'
+        )
 
-    if local_payload:
-        return unpack_cache(local_payload, 'local')
-    st.session_state['_data_cache_source'] = 'default'
-    return pd.DataFrame(), set(), [], {}, [], {}
+    data = {}
+
+    if (
+        isinstance(
+            remote_payload,
+            dict
+        )
+        and remote_payload
+    ):
+        local_timestamp = (
+            _cache_payload_timestamp(
+                local_payload
+            )
+        )
+
+        remote_timestamp = (
+            _cache_payload_timestamp(
+                remote_payload
+            )
+        )
+
+        if (
+            local_payload
+            and local_timestamp is not None
+            and remote_timestamp is not None
+            and local_timestamp
+            > remote_timestamp
+        ):
+            data = local_payload
+
+            st.session_state[
+                '_data_cache_remote_error'
+            ] = (
+                'Google Sheet 尚未完成前次寫入，'
+                '已保留較新的股票本機資料。'
+            )
+
+            source = 'local_newer'
+
+        else:
+            data = remote_payload
+
+            st.session_state[
+                '_data_cache_remote_error'
+            ] = ''
+
+            source = 'google_sheet'
+
+            try:
+                _write_json_atomic(
+                    STOCK_STRATEGY_CACHE_FILE,
+                    _json_safe(
+                        remote_payload
+                    ),
+                    indent=2,
+                )
+            except (
+                OSError,
+                TypeError,
+                ValueError,
+            ):
+                pass
+
+    elif local_payload:
+        data = local_payload
+
+        source = 'local'
+
+        st.session_state[
+            '_data_cache_remote_error'
+        ] = (
+            remote_error or ''
+        )
+
+    else:
+        source = 'default'
+
+        st.session_state[
+            '_data_cache_remote_error'
+        ] = (
+            remote_error or ''
+        )
+
+    df = pd.DataFrame(
+        data.get(
+            'stock_data',
+            []
+        )
+    )
+
+    ignored = set(
+        data.get(
+            'ignored_stocks',
+            []
+        )
+    )
+
+    candidates = data.get(
+        'all_candidates',
+        []
+    )
+
+    saved_notes = data.get(
+        'saved_notes',
+        {}
+    )
+
+    cached_notes = data.get(
+        'cached_notes',
+        {}
+    )
+
+    st.session_state[
+        '_stock_data_updated_at'
+    ] = str(
+        data.get(
+            'stock_data_updated_at',
+            ''
+        )
+    ).strip()
+
+    st.session_state[
+        '_data_cache_source'
+    ] = source
+
+    return (
+        df,
+        ignored,
+        candidates,
+        saved_notes,
+        cached_notes,
+    )
+
+def load_fibo_tags_from_cloud(
+    force=False
+):
+    """
+    只讀取 fibo_strategy。
+
+    儲存與還原完全獨立於股票戰略室。
+    """
+    if (
+        not force
+        and st.session_state.get(
+            '_fibo_cloud_loaded',
+            False
+        )
+    ):
+        return list(
+            st.session_state.get(
+                'fibo_tags',
+                DEFAULT_FIBO_TAGS
+            )
+        )
+
+    gsheet_api_url = (
+        get_app_secret(
+            'gsheet_api_url'
+        )
+    )
+
+    tags = []
+    source = 'default'
+
+    if gsheet_api_url:
+        payload, error = (
+            _fetch_remote_scope(
+                gsheet_api_url,
+                GOOGLE_SCOPE_FIBO,
+                timeout=8,
+            )
+        )
+
+        if isinstance(
+            payload,
+            dict
+        ):
+            tags = _extract_fibo_tags(payload)
+
+            if len(tags) >= 5:
+                tags = [
+                    normalize_fibo_quick_tag(
+                        tag
+                    )
+                    for tag in tags
+                ]
+
+                source = (
+                    'google_sheet'
+                )
+
+                timestamp = _fibo_tag_timestamp(payload)
+                updated_at = timestamp.isoformat() if timestamp is not None else ''
+
+                if updated_at:
+                    st.session_state[
+                        '_fibo_tags_updated_at'
+                    ] = updated_at
+
+    if len(tags) < 5:
+        tags = _valid_fibo_tags(
+            load_fibo_tag_cache()
+        )
+
+        if len(tags) >= 5:
+            tags = [
+                normalize_fibo_quick_tag(
+                    tag
+                )
+                for tag in tags
+            ]
+
+            source = (
+                'local_tag_cache'
+            )
+
+    if len(tags) < 5:
+        config = load_config()
+
+        config_tags = _valid_fibo_tags(
+            config.get(
+                'fibo_tags',
+                []
+            )
+        )
+
+        if len(config_tags) >= 5:
+            tags = [
+                normalize_fibo_quick_tag(
+                    tag
+                )
+                for tag in config_tags
+            ]
+
+            source = 'config'
+
+    if len(tags) < 5:
+        tags = list(
+            DEFAULT_FIBO_TAGS
+        )
+
+        source = 'default'
+
+    st.session_state[
+        'fibo_tags'
+    ] = list(tags)
+
+    st.session_state[
+        '_fibo_tags_source'
+    ] = source
+
+    st.session_state[
+        '_fibo_cloud_loaded'
+    ] = True
+
+    return list(tags)
 
 
 def reload_fibo_tags_from_cloud():
-    """手動從 Google Sheet 還原標籤，供清除 Cookie 後的新手機工作階段使用。"""
-    payload, error = _fetch_remote_data_cache(get_app_secret('gsheet_api_url'), timeout=8)
-    tags = _extract_fibo_tags(payload)
-    tags = [normalize_fibo_quick_tag(tag) for tag in tags]
-    if not tags:
-        return False, error or '雲端尚無五組快速標籤'
-    st.session_state.fibo_tags = tags
-    for index, tag in enumerate(tags, start=1):
-        st.session_state[f'custom_tag_{index}'] = tag
-    st.session_state['_data_cache_source'] = 'google_sheet'
-    st.session_state['_fibo_cloud_save_status'] = 'loaded'
-    cloud_updated_at = str((payload or {}).get('fibo_tags_updated_at', '')).strip()
-    if cloud_updated_at:
-        st.session_state['_fibo_tags_updated_at'] = cloud_updated_at
+    """強制只從 fibo_strategy scope 還原快速標籤。"""
+    st.session_state.pop(
+        '_fibo_cloud_loaded',
+        None
+    )
+
+    tags = load_fibo_tags_from_cloud(
+        force=True
+    )
+
+    if not tags or len(tags) < 5:
+        return (
+            False,
+            '雲端尚無五組快速標籤'
+        )
+
+    st.session_state[
+        'fibo_tags'
+    ] = list(tags)
+
+    for index, tag in enumerate(
+        tags,
+        start=1
+    ):
+        st.session_state[
+            f'custom_tag_{index}'
+        ] = tag
+
+    st.session_state[
+        '_fibo_cloud_save_status'
+    ] = 'loaded'
+
     try:
-        updated_at = datetime.now(pytz.timezone('Asia/Taipei')).isoformat()
         config = load_config()
-        config['fibo_tags'] = tags
-        config['fibo_tags_updated_at'] = updated_at
-        _write_json_atomic(CONFIG_FILE, config)
+
+        config[
+            'fibo_tags'
+        ] = tags
+
+        updated_at = str(
+            st.session_state.get(
+                '_fibo_tags_updated_at',
+                ''
+            )
+        ).strip()
+
+        if updated_at:
+            config[
+                'fibo_tags_updated_at'
+            ] = updated_at
+
+        _write_json_atomic(
+            CONFIG_FILE,
+            config,
+        )
+
         _write_json_atomic(
             FIBO_TAG_CACHE_FILE,
-            {'version': 2, 'updated_at': updated_at, 'tags': tags},
+            {
+                'version': 3,
+                'updated_at': (
+                    updated_at
+                    or datetime.now(
+                        pytz.timezone(
+                            'Asia/Taipei'
+                        )
+                    ).isoformat()
+                ),
+                'tags': tags,
+            },
             indent=2,
         )
-    except (OSError, TypeError, ValueError):
+
+    except (
+        OSError,
+        TypeError,
+        ValueError,
+    ):
         pass
-    return True, '已從 Google Sheet 還原快速標籤'
+
+    return (
+        True,
+        '已從 Google Sheet 還原快速標籤'
+    )
 
 def load_url_history():
     if os.path.exists(URL_CACHE_FILE):
@@ -8735,16 +9831,37 @@ def save_search_cache(selected_items):
         pass
 
 if 'stock_data' not in st.session_state:
-    cached_df, cached_ignored, cached_candidates, cached_saved_notes, cached_fibo_tags, cached_note_dict = load_data_cache()
+    (
+        cached_df,
+        cached_ignored,
+        cached_candidates,
+        cached_saved_notes,
+        cached_note_dict,
+    ) = load_data_cache()
+
     st.session_state.stock_data = cached_df
-    # A persisted table preserves the user's symbols, ordering and notes only.
-    # Market values must be refreshed once when a new browser session starts.
-    st.session_state._stock_cache_refresh_pending = not cached_df.empty
-    st.session_state.ignored_stocks = cached_ignored
-    st.session_state.all_candidates = cached_candidates
-    st.session_state.saved_notes = cached_saved_notes
-    st.session_state.fibo_tags = cached_fibo_tags if cached_fibo_tags else list(DEFAULT_FIBO_TAGS)
-    st.session_state.cached_notes = cached_note_dict
+
+    # 持久化表格只保存股票符號、排序、備註；
+    # 新工作階段仍會依既有流程重新取得最新行情。
+    st.session_state._stock_cache_refresh_pending = (
+        not cached_df.empty
+    )
+
+    st.session_state.ignored_stocks = (
+        cached_ignored
+    )
+
+    st.session_state.all_candidates = (
+        cached_candidates
+    )
+
+    st.session_state.saved_notes = (
+        cached_saved_notes
+    )
+
+    st.session_state.cached_notes = (
+        cached_note_dict
+    )
 
 if 'stock_strategy_editor_revision' not in st.session_state:
     st.session_state.stock_strategy_editor_revision = 0
@@ -8762,36 +9879,73 @@ if 'ignored_data_cache' not in st.session_state: st.session_state.ignored_data_c
 if 'prefetch_cache' not in st.session_state: st.session_state.prefetch_cache = {} # 🚀 新增：預載快取
 if 'cached_notes' not in st.session_state: st.session_state.cached_notes = {}    
 
-
-# Fibo 標籤與狀態初始化。新工作階段若已成功讀到 Google Sheet，雲端標籤
-# 必須優先；否則手機清除 Cookie 後會被部署檔案內的預設標籤覆蓋。
 saved_config = load_config()
-configured_fibo_tags = saved_config.get('fibo_tags', [])
-cached_fibo_tags = _valid_fibo_tags(st.session_state.get('fibo_tags', []))
-dedicated_fibo_tags = load_fibo_tag_cache()
-if (
-    cached_fibo_tags
-    and (
-        st.session_state.get('_data_cache_source') == 'google_sheet'
-        or st.session_state.get('_fibo_tags_cloud_loaded', False)
+
+# =========================================================
+# Fibo 標籤獨立初始化
+# =========================================================
+
+fibo_tags_source = (
+    load_fibo_tags_from_cloud()
+)
+
+fibo_tags_source = [
+    normalize_fibo_quick_tag(
+        tag
     )
-):
-    fibo_tags_source = cached_fibo_tags
-    st.session_state['_fibo_tags_source'] = 'google_sheet'
-elif len(dedicated_fibo_tags) >= 5:
-    fibo_tags_source = dedicated_fibo_tags
-    st.session_state['_fibo_tags_source'] = 'local_tag_cache'
-elif isinstance(configured_fibo_tags, list) and len(configured_fibo_tags) >= 5:
-    fibo_tags_source = configured_fibo_tags
-    st.session_state['_fibo_tags_source'] = 'config'
-elif cached_fibo_tags:
-    fibo_tags_source = cached_fibo_tags
-    st.session_state['_fibo_tags_source'] = 'data_cache'
-else:
-    fibo_tags_source = list(DEFAULT_FIBO_TAGS)
-    st.session_state['_fibo_tags_source'] = 'default'
-fibo_tags_source = [normalize_fibo_quick_tag(tag) for tag in fibo_tags_source]
-st.session_state.fibo_tags = list(fibo_tags_source)
+    for tag in fibo_tags_source
+]
+
+st.session_state[
+    'fibo_tags'
+] = list(
+    fibo_tags_source
+)
+
+if 'custom_tag_1' not in st.session_state:
+    st.session_state[
+        'custom_tag_1'
+    ] = (
+        fibo_tags_source[0]
+        if len(fibo_tags_source) > 0
+        else "台積電(2330)"
+    )
+
+if 'custom_tag_2' not in st.session_state:
+    st.session_state[
+        'custom_tag_2'
+    ] = (
+        fibo_tags_source[1]
+        if len(fibo_tags_source) > 1
+        else "鴻海(2317)"
+    )
+
+if 'custom_tag_3' not in st.session_state:
+    st.session_state[
+        'custom_tag_3'
+    ] = (
+        fibo_tags_source[2]
+        if len(fibo_tags_source) > 2
+        else "聯發科(2454)"
+    )
+
+if 'custom_tag_4' not in st.session_state:
+    st.session_state[
+        'custom_tag_4'
+    ] = (
+        fibo_tags_source[3]
+        if len(fibo_tags_source) > 3
+        else "和椿(6215)"
+    )
+
+if 'custom_tag_5' not in st.session_state:
+    st.session_state[
+        'custom_tag_5'
+    ] = (
+        fibo_tags_source[4]
+        if len(fibo_tags_source) > 4
+        else "晶彩科(3535)"
+    )
 
 if 'fibo_search_input' not in st.session_state: st.session_state.fibo_search_input = ""
 if 'fibo_trigger_search' not in st.session_state: st.session_state.fibo_trigger_search = False
@@ -10608,6 +11762,7 @@ def fetch_market_risk_lists():
     """取得上市、上櫃注意／處置名單；僅在使用者手動更新時呼叫。"""
     attention_counts = {}
     disposition_codes = set()
+    disposition_tomorrow_codes = set()
     errors = []
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36',
@@ -10615,92 +11770,441 @@ def fetch_market_risk_lists():
         'Accept-Language': 'zh-TW,zh;q=0.9,en;q=0.8',
         'Cache-Control': 'no-cache',
     }
-    session = requests.Session()
-
     def fetch_json(name, url, expected_type):
-        """官方站偶發回空頁或 5xx；同一次按鈕內完成重試，不要求使用者連按。"""
+        """官方站偶發回空頁或 5xx；每個 API 獨立執行重試。"""
+        session = requests.Session()
         last_error = None
-        for attempt in range(3):
-            try:
-                response = session.get(
-                    url, headers=headers, params={'_': int(time.time() * 1000)} if attempt else None,
-                    timeout=(6, 18),
-                )
-                response.raise_for_status()
-                payload = response.json()
-                if not isinstance(payload, expected_type):
-                    raise ValueError(f"回傳格式應為 {expected_type.__name__}")
-                if isinstance(payload, dict) and not isinstance(payload.get('data', []), list):
-                    raise ValueError("缺少名單資料列")
-                return payload
-            except (requests.RequestException, ValueError, json.JSONDecodeError) as exc:
-                last_error = exc
-                if attempt < 2:
-                    time.sleep(0.8 * (attempt + 1))
-        raise RuntimeError(f"{name} 已重試 3 次仍失敗：{last_error}")
 
-    def parse_twse_rows(payload, target, is_attention=False, minimum_attention=1):
+        try:
+            for attempt in range(3):
+                try:
+                    response = session.get(
+                        url,
+                        headers=headers,
+                        params={'_': int(time.time() * 1000)} if attempt else None,
+                        timeout=(3, 8),
+                    )
+                    response.raise_for_status()
+
+                    payload = response.json()
+
+                    if not isinstance(payload, expected_type):
+                        raise ValueError(
+                            f"回傳格式應為 {expected_type.__name__}"
+                        )
+
+                    if (
+                        isinstance(payload, dict)
+                        and not isinstance(payload.get('data', []), list)
+                    ):
+                        raise ValueError("缺少名單資料列")
+
+                    return payload
+
+                except (
+                    requests.RequestException,
+                    ValueError,
+                    json.JSONDecodeError,
+                ) as exc:
+                    last_error = exc
+
+                    if attempt < 1:
+                        time.sleep(0.5)
+
+            raise RuntimeError(
+                f"{name} 已重試 2 次仍失敗：{last_error}"
+            )
+        finally:
+            session.close()
+
+    def get_disposition_status(period_raw, target_date=None):
+        """判斷處置開始日是今天還是明天，支援民國年與西元年格式。"""
+        period_raw = str(period_raw or '').strip()
+        target_date = target_date or datetime.now(
+            pytz.timezone('Asia/Taipei')
+        ).date()
+
+        date_matches = re.findall(
+            r'(\d{3,4})[年/-](\d{1,2})[月/-](\d{1,2})日?',
+            period_raw
+        )
+
+        if len(date_matches) < 2:
+            compact_dates = re.findall(
+                r'(\d{7,8})',
+                period_raw
+            )
+
+            if len(compact_dates) >= 2:
+                date_matches = []
+
+                for value in compact_dates[:2]:
+                    if len(value) == 7:
+                        date_matches.append(
+                            (
+                                value[:3],
+                                value[3:5],
+                                value[5:7],
+                            )
+                        )
+                    elif len(value) == 8:
+                        date_matches.append(
+                            (
+                                value[:4],
+                                value[4:6],
+                                value[6:8],
+                            )
+                        )
+
+        if len(date_matches) < 2:
+            return None
+
+        start_year, start_month, start_day = map(int, date_matches[0])
+        end_year, end_month, end_day = map(int, date_matches[1])
+
+        if start_year < 1000:
+            start_year += 1911
+        if end_year < 1000:
+            end_year += 1911
+
+        try:
+            start_date = date(start_year, start_month, start_day)
+            end_date = date(end_year, end_month, end_day)
+        except ValueError:
+            return None
+
+        if start_date <= target_date <= end_date:
+            return 'today'
+
+        if start_date == target_date + timedelta(days=1):
+            return 'tomorrow'
+
+        return None
+
+    def parse_twse_rows(
+        payload,
+        target,
+        is_attention=False,
+        minimum_attention=1,
+    ):
         fields = payload.get('fields', [])
+
         for values in payload.get('data', []):
             record = dict(zip(fields, values))
-            raw_code = str(record.get('證券代號', record.get('有價證券代號', '')))
-            code_match = re.search(r'\d{4,6}', raw_code)
+
+            raw_code = str(
+                record.get(
+                    '證券代號',
+                    record.get('有價證券代號', ''),
+                )
+            ).strip()
+
+            # 只處理 4 碼普通股票。
+            # 5～6 碼的權證、公司債等有價證券不納入股票戰略室。
+            code_match = re.search(
+                r'\d{4,6}',
+                raw_code,
+            )
+
             if not code_match:
                 continue
+
             code = code_match.group(0)
+
+            if len(code) != 4:
+                continue
+
             if is_attention:
-                raw_count = str(record.get('累計次數', record.get('累計', '1')))
-                count_match = re.search(r'\d+', raw_count)
-                parsed_count = int(count_match.group()) if count_match else minimum_attention
-                target[code] = max(target.get(code, 0), minimum_attention, parsed_count)
+                raw_count = str(
+                    record.get(
+                        '累計次數',
+                        record.get('累計', '1'),
+                    )
+                )
+
+                count_match = re.search(
+                    r'\d+',
+                    raw_count,
+                )
+
+                parsed_count = (
+                    int(count_match.group())
+                    if count_match
+                    else minimum_attention
+                )
+
+                target[code] = max(
+                    target.get(code, 0),
+                    minimum_attention,
+                    parsed_count,
+                )
+
             else:
-                target.add(code)
+                # TWSE /announcement/punish：
+                # row[6] 為「處置起迄時間」，例如 115/07/03～115/07/16。
+                period_raw = str(
+                    values[6]
+                    if len(values) > 6
+                    else record.get(
+                        '處置起迄時間',
+                        '',
+                    )
+                ).strip()
 
-    for name, url, target, is_attention in [
-        ('上市注意', 'https://www.twse.com.tw/announcement/notice?response=json', attention_counts, True),
-        ('上市處置', 'https://www.twse.com.tw/announcement/punish?response=json', disposition_codes, False),
-    ]:
+                disposition_state = get_disposition_status(
+                    period_raw
+                )
+
+                if disposition_state == 'today':
+                    target.add(code)
+                elif disposition_state == 'tomorrow':
+                    disposition_tomorrow_codes.add(code)
+
+    # 6 個官方名單 API 同時抓取，避免逐一等待造成更新按鈕卡頓。
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    fetch_jobs = [
+        (
+            '上市注意',
+            'https://openapi.twse.com.tw/v1/announcement/notice',
+            list,
+        ),
+        (
+            '上市處置',
+            'https://openapi.twse.com.tw/v1/announcement/punish',
+            list,
+        ),
+        (
+            '上市注意累計異常',
+            'https://openapi.twse.com.tw/v1/announcement/notetrans',
+            list,
+        ),
+        (
+            '上櫃注意',
+            'https://www.tpex.org.tw/openapi/v1/tpex_trading_warning_information',
+            list,
+        ),
+        (
+            '上櫃注意累計異常',
+            'https://www.tpex.org.tw/openapi/v1/tpex_trading_warning_note',
+            list,
+        ),
+        (
+            '上櫃處置',
+            'https://www.tpex.org.tw/openapi/v1/tpex_disposal_information',
+            list,
+        ),
+    ]
+
+    fetched = {}
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        future_map = {
+            executor.submit(fetch_json, name, url, expected_type): name
+            for name, url, expected_type in fetch_jobs
+        }
+
+        for future in as_completed(future_map):
+            name = future_map[future]
+            try:
+                fetched[name] = future.result()
+            except Exception as exc:
+                errors.append(f'{name}: {exc}')
+
+    # TWSE OpenAPI 回傳 list；集中市場三個來源分開解析。
+    twse_notice = fetched.get('上市注意')
+    if twse_notice is not None:
         try:
-            parse_twse_rows(fetch_json(name, url, dict), target, is_attention)
-        except Exception as exc:
-            errors.append(f'{name}: {exc}')
-
-    try:
-        parse_twse_rows(
-            fetch_json(
-                '上市注意累計異常',
-                'https://www.twse.com.tw/announcement/notetrans?response=json',
-                dict,
-            ),
-            attention_counts,
-            True,
-            minimum_attention=2,
-        )
-    except Exception as exc:
-        errors.append(f'上市注意累計異常: {exc}')
-
-    for name, url, is_attention, is_accumulated_note in [
-        ('上櫃注意', 'https://www.tpex.org.tw/openapi/v1/tpex_trading_warning_information', True, False),
-        ('上櫃注意累計異常', 'https://www.tpex.org.tw/openapi/v1/tpex_trading_warning_note', True, True),
-        ('上櫃處置', 'https://www.tpex.org.tw/openapi/v1/tpex_disposal_information', False, False),
-    ]:
-        try:
-            for record in fetch_json(name, url, list):
-                code_match = re.search(r'\d{4,6}', str(record.get('SecuritiesCompanyCode', '')))
+            for record in twse_notice:
+                code = str(record.get('Code', '')).strip()
+                code_match = re.search(r'\d{4,6}', code)
                 if not code_match:
                     continue
-                code = code_match.group(0)
-                if is_attention:
-                    # 累計異常名單表示隔日再列注意時可能進入處置，至少以 2 次標示。
-                    count = 2 if is_accumulated_note else 1
-                    attention_counts[code] = max(attention_counts.get(code, 0), count)
-                else:
-                    disposition_codes.add(code)
-        except Exception as exc:
-            errors.append(f'{name}: {exc}')
 
-    session.close()
-    return attention_counts, sorted(disposition_codes), errors
+                code = code_match.group(0)
+
+                if len(code) == 4:
+                    attention_counts[code] = max(
+                        attention_counts.get(code, 0),
+                        1,
+                    )
+        except Exception as exc:
+            errors.append(f'上市注意解析失敗: {exc}')
+
+    twse_disposition = fetched.get('上市處置')
+    if twse_disposition is not None:
+        try:
+            for record in twse_disposition:
+                code = str(record.get('Code', '')).strip()
+                code_match = re.search(r'\d{4,6}', code)
+                if not code_match:
+                    continue
+
+                code = code_match.group(0)
+
+                if len(code) != 4:
+                    continue
+
+                period_raw = str(
+                    record.get('DispositionPeriod', '')
+                ).strip()
+
+                disposition_state = get_disposition_status(period_raw)
+
+                if disposition_state == 'today':
+                    disposition_codes.add(code)
+                elif disposition_state == 'tomorrow':
+                    disposition_tomorrow_codes.add(code)
+
+        except Exception as exc:
+            errors.append(f'上市處置解析失敗: {exc}')
+
+    twse_accumulated = fetched.get('上市注意累計異常')
+    if twse_accumulated is not None:
+        try:
+            chinese_digits = {
+                '零': 0,
+                '一': 1,
+                '二': 2,
+                '三': 3,
+                '四': 4,
+                '五': 5,
+                '六': 6,
+                '七': 7,
+                '八': 8,
+                '九': 9,
+                '十': 10,
+            }
+
+            def parse_attention_count(text):
+                text = str(text or '')
+                matches = re.findall(
+                    r'(?:連續|已有)([一二三四五六七八九十\d]+)次',
+                    text,
+                )
+
+                counts = []
+
+                for value in matches:
+                    if value.isdigit():
+                        counts.append(int(value))
+                    elif value == '十':
+                        counts.append(10)
+                    elif len(value) == 2 and value[0] == '十':
+                        counts.append(10 + chinese_digits.get(value[1], 0))
+                    elif len(value) == 2 and value[1] == '十':
+                        counts.append(chinese_digits.get(value[0], 0) * 10)
+                    elif len(value) == 3 and value[1] == '十':
+                        counts.append(
+                            chinese_digits.get(value[0], 0) * 10
+                            + chinese_digits.get(value[2], 0)
+                        )
+                    elif len(value) == 1:
+                        counts.append(chinese_digits.get(value, 0))
+
+                return max(counts, default=2)
+
+            for record in twse_accumulated:
+                code = str(record.get('Code', '')).strip()
+                code_match = re.search(r'\d{4,6}', code)
+                if not code_match:
+                    continue
+
+                code = code_match.group(0)
+
+                if len(code) != 4:
+                    continue
+
+                criteria_text = record.get(
+                    'RecentlyMetAttentionSecuritiesCriteria',
+                    '',
+                )
+
+                attention_count = parse_attention_count(
+                    criteria_text
+                )
+
+                attention_counts[code] = max(
+                    attention_counts.get(code, 0),
+                    attention_count,
+                    2,
+                )
+
+        except Exception as exc:
+            errors.append(f'上市注意累計異常解析失敗: {exc}')
+
+    # TPEx 三個 API 維持原本解析方式。
+    for name, is_accumulated_note in [
+        ('上櫃注意', False),
+        ('上櫃注意累計異常', True),
+        ('上櫃處置', False),
+    ]:
+        payload = fetched.get(name)
+
+        if payload is None:
+            continue
+
+        try:
+            for record in payload:
+                raw_code = str(
+                    record.get(
+                        'SecuritiesCompanyCode',
+                        '',
+                    )
+                ).strip()
+
+                code_match = re.search(
+                    r'\d{4,6}',
+                    raw_code,
+                )
+
+                if not code_match:
+                    continue
+
+                code = code_match.group(0)
+
+                if len(code) != 4:
+                    continue
+
+                if name != '上櫃處置':
+                    count = (
+                        2
+                        if is_accumulated_note
+                        else 1
+                    )
+
+                    attention_counts[code] = max(
+                        attention_counts.get(code, 0),
+                        count,
+                    )
+                else:
+                    period_raw = str(
+                        record.get(
+                            'DispositionPeriod',
+                            '',
+                        )
+                    ).strip()
+
+                    disposition_state = get_disposition_status(
+                        period_raw
+                    )
+
+                    if disposition_state == 'today':
+                        disposition_codes.add(code)
+                    elif disposition_state == 'tomorrow':
+                        disposition_tomorrow_codes.add(code)
+
+        except Exception as exc:
+            errors.append(
+                f'{name}: {exc}'
+            )
+
+    return (
+        attention_counts,
+        sorted(disposition_codes),
+        sorted(disposition_tomorrow_codes),
+        errors,
+    )
 
 def _as_float(value, default=None):
     try:
@@ -10844,10 +12348,11 @@ def determine_stock_direction(row, is_daytrade_mode=False, direction_choice='系
     }
 
 
-def calculate_risk_filter_result(row, direction, max_extension_atr, attention_counts=None, disposition_codes=None, market_lists_updated=False, block_attention=True):
+def calculate_risk_filter_result(row, direction, max_extension_atr, attention_counts=None, disposition_codes=None, market_lists_updated=False, block_attention=True, disposition_tomorrow_codes=None):
     """建立風險篩選預覽資料；不會改寫原本的選股資料或下單行為。"""
     attention_counts = attention_counts or {}
     disposition_codes = set(disposition_codes or [])
+    disposition_tomorrow_codes = set(disposition_tomorrow_codes or [])
     code = str(row.get('代號', '')).strip()
     close = _as_float(row.get('收盤價'))
     ma5 = _as_float(row.get('_ma5'))
@@ -10893,8 +12398,12 @@ def calculate_risk_filter_result(row, direction, max_extension_atr, attention_co
 
     attention_count = attention_counts.get(code, 0)
     is_disposed = code in disposition_codes
+    is_tomorrow_disposition = code in disposition_tomorrow_codes
+
     if is_disposed:
         risk_label, risk_score = '🚫 處置中', 0
+    elif is_tomorrow_disposition:
+        risk_label, risk_score = '🔶 明天處置', 0
     elif attention_count >= 2:
         risk_label, risk_score = f'🔴 注意 {attention_count}', 0
     elif attention_count == 1:
@@ -12314,7 +13823,7 @@ def render_futures_strategy_room():
                 cache_value.pop(key, None)
 
     def persist_futures_room_state(snapshot=None):
-        saved_locally = save_futures_strategy_state(
+        return save_futures_strategy_state(
             universe=snapshot if isinstance(snapshot, pd.DataFrame) else universe,
             metadata=universe_meta,
             rank_cache=st.session_state.futures_strategy_rank_cache,
@@ -12323,14 +13832,6 @@ def render_futures_strategy_room():
             ignored=st.session_state.futures_strategy_ignored,
             rank_time=st.session_state.futures_strategy_rank_time,
             live_time=st.session_state.futures_strategy_live_time,
-        )
-        if not saved_locally:
-            return False
-        # 期貨成交量、保證金、分析點位與自訂清單一併寫入既有 Google
-        # Sheet 快取，手機清除 Cookie 或服務重啟後仍可還原。
-        return save_data_cache(
-            st.session_state.stock_data, st.session_state.ignored_stocks,
-            st.session_state.all_candidates, st.session_state.saved_notes,
         )
 
     rank_cache = st.session_state.futures_strategy_rank_cache
@@ -12937,7 +14438,10 @@ with stock_strategy_container:
                         st.rerun()
             st.text_input("輸入連結 (CSV/Excel/Google Sheet)", key="cloud_url_input", placeholder="https://...")
         
-        def update_search_cache(): save_search_cache(st.session_state.search_multiselect)
+        def update_search_cache():
+            save_search_cache(
+                st.session_state.get("search_multiselect", [])
+            )
         search_selection = st.multiselect("🔍 快速查詢 (中文/代號)", options=stock_options, key="search_multiselect", on_change=update_search_cache, placeholder="輸入 2330 或 台積電...")
         st.markdown("---")
         render_stock_external_resources()
@@ -13345,10 +14849,11 @@ with stock_strategy_container:
                     if st.button("🔄 更新上市／上櫃注意與處置名單", key="refresh_risk_filter_market_data"):
                         fetch_market_risk_lists.clear()
                         with st.spinner("正在更新上市／上櫃注意與處置名單..."):
-                            attention, disposition, errors = fetch_market_risk_lists()
+                            attention, disposition, disposition_tomorrow, errors = fetch_market_risk_lists()
                         st.session_state.risk_filter_market_data = {
                             'attention': attention,
                             'disposition': disposition,
+                            'disposition_tomorrow': disposition_tomorrow,
                             'updated': datetime.now(pytz.timezone('Asia/Taipei')).strftime('%Y/%m/%d %H:%M:%S'),
                             'errors': errors
                         }
@@ -13386,6 +14891,7 @@ with stock_strategy_container:
             market_risk_data = st.session_state.risk_filter_market_data
             attention_counts = market_risk_data.get('attention', {})
             disposition_codes = market_risk_data.get('disposition', [])
+            disposition_tomorrow_codes = market_risk_data.get('disposition_tomorrow', [])
             market_lists_updated = bool(market_risk_data.get('updated')) and not market_risk_data.get('errors')
             market_environment = st.session_state.get('strategy_market_environment', {})
             market_bias = str(market_environment.get('bias', '盤整'))
@@ -13402,13 +14908,15 @@ with stock_strategy_container:
                     market_lists_updated, risk_block_attention
                 ) if is_daytrade_mode else calculate_risk_filter_result(
                     row, row_direction, risk_max_extension, attention_counts, disposition_codes,
-                    market_lists_updated, risk_block_attention
+                    market_lists_updated, risk_block_attention,
+                    disposition_tomorrow_codes=disposition_tomorrow_codes
                 )
                 code = str(row.get('代號', ''))
                 if is_daytrade_mode:
                     daily_risk = calculate_risk_filter_result(
                         row, row_direction, risk_max_extension, attention_counts, disposition_codes,
-                        market_lists_updated, risk_block_attention
+                        market_lists_updated, risk_block_attention,
+                        disposition_tomorrow_codes=disposition_tomorrow_codes
                     )
                     # 日 ATR 乖離與官方風險是當沖的盤前門檻；盤中訊號成立也不放行過度延伸標的。
                     if not daily_risk['eligible']:
@@ -13595,6 +15103,8 @@ with stock_strategy_container:
                 elif col == "風險":
                     if risk_val.startswith('🚫') or risk_val.startswith('🔴'):
                         styles[idx] = 'color: #ff4b4b; font-weight: bold;'
+                    elif risk_val.startswith('🔶'):
+                        styles[idx] = 'color: #ff9800; font-weight: bold;'
                     elif risk_val.startswith('🟡'):
                         styles[idx] = 'color: #ffeb3b; font-weight: bold;'
                     elif risk_val.startswith('🟢'):
@@ -13978,10 +15488,11 @@ with stock_strategy_container:
                 if st.button("🔄 更新注意／處置名單", key="refresh_indep_market_risk_data"):
                     fetch_market_risk_lists.clear()
                     with st.spinner("正在更新上市／上櫃注意與處置名單..."):
-                        attention, disposition, errors = fetch_market_risk_lists()
+                        attention, disposition, disposition_tomorrow, errors = fetch_market_risk_lists()
                     st.session_state.risk_filter_market_data = {
                         'attention': attention,
                         'disposition': disposition,
+                        'disposition_tomorrow': disposition_tomorrow,
                         'updated': datetime.now(pytz.timezone('Asia/Taipei')).strftime('%Y/%m/%d %H:%M:%S'),
                         'errors': errors
                     }
@@ -15362,7 +16873,7 @@ with tab2:
 with tab_fibo:
     
     def format_fibo_tag(key):
-        val = str(st.session_state[key] or '').strip()
+        val = str(st.session_state.get(key, '') or '').strip()
         if not val:
             save_fibo_config()
             return
@@ -16153,7 +17664,7 @@ with tab_fibo:
         s_vol = col_v.checkbox("📊 顯示成交量", value=True)
         ma_w = col_w.slider(
             "均線粗細", min_value=1.0, max_value=5.0, step=0.5,
-            key="ma_w", on_change=save_fibo_config, label_visibility="collapsed"
+            key="ma_w", on_change=lambda: save_fibo_config(save_tags=False), label_visibility="collapsed"
         )
         
         ma_flags = {'5': s_ma5, '10': s_ma10, '20': s_ma20, '60': s_ma60}
@@ -16584,19 +18095,11 @@ with tab3:
         st.session_state.calendar_preferences = load_calendar_preferences()
     else:
         # Streamlit Cloud 部署新版程式時會沿用既有 session，需在讀取欄位前即時遷移。
-        st.session_state.calendar_preferences = normalize_calendar_preferences(
-            st.session_state.calendar_preferences
-        )
-    if "company_event_snapshot" not in st.session_state:
-        cached_snapshot = st.session_state.get('_cached_company_event_snapshot')
-        remote_snapshot = normalize_company_event_snapshot(cached_snapshot)
-        st.session_state.company_event_snapshot = (
-            remote_snapshot if remote_snapshot.get('events') else load_company_event_snapshot()
-        )
+        st.session_state.calendar_preferences = normalize_calendar_preferences(st.session_state.calendar_preferences)
+    if 'company_event_snapshot' not in st.session_state:
+        st.session_state.company_event_snapshot = load_company_event_snapshot()
     else:
-        st.session_state.company_event_snapshot = normalize_company_event_snapshot(
-            st.session_state.company_event_snapshot
-        )
+        st.session_state.company_event_snapshot = normalize_company_event_snapshot(st.session_state.company_event_snapshot)
 
     with st.expander("🛠️ 自訂與校正行事曆事件"):
         st.info("若發現系統預設日期或時間有誤，可在此手動新增或覆寫事件（例如：提前休市、自訂總經數據時間）。")
@@ -17287,11 +18790,7 @@ with tab_company:
             for state_key in list(st.session_state.keys()):
                 if str(state_key).startswith('revenue_date_'):
                     del st.session_state[state_key]
-            save_company_event_snapshot(new_snapshot)
-            company_sync_ok = save_data_cache(
-                st.session_state.stock_data, st.session_state.ignored_stocks,
-                st.session_state.all_candidates, st.session_state.saved_notes,
-            )
+            company_sync_ok = save_company_event_snapshot(new_snapshot)
             st.session_state.calendar_preferences["tickers"] = company_ticker_input
             save_calendar_preferences(
                 st.session_state.calendar_preferences.get("groups", CALENDAR_GROUP_OPTIONS),
@@ -17356,11 +18855,7 @@ with tab_company:
                     pytz.timezone('Asia/Taipei')
                 ).strftime('%Y/%m/%d %H:%M:%S')
                 st.session_state.company_event_snapshot = corrected_snapshot
-                save_company_event_snapshot(corrected_snapshot)
-                cloud_saved = save_data_cache(
-                    st.session_state.stock_data, st.session_state.ignored_stocks,
-                    st.session_state.all_candidates, st.session_state.saved_notes,
-                )
+                cloud_saved = save_company_event_snapshot(corrected_snapshot)
                 if get_app_secret('gsheet_api_url') and not cloud_saved:
                     st.session_state['_revenue_date_save_notice'] = (
                         '日期已套用於目前程式，但 Google Sheet 同步失敗，請稍後再按一次。'
