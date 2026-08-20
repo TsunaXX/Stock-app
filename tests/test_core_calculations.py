@@ -301,31 +301,6 @@ def test_goodinfo_table_requires_real_turnover_rows():
     assert clean(invalid) is None
 
 
-def test_goodinfo_browser_identity_removes_only_headless_marker():
-    helper = load_app_symbols("_goodinfo_normal_browser_user_agent")[
-        "_goodinfo_normal_browser_user_agent"
-    ]
-    raw = (
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) HeadlessChrome/151.0.7922.71 Safari/537.36"
-    )
-    normalized = helper(raw)
-    assert "HeadlessChrome" not in normalized
-    assert "Chrome/151.0.7922.71" in normalized
-    assert "X11; Linux x86_64" in normalized
-
-
-def test_goodinfo_failure_reason_distinguishes_cloud_ip_and_page_state():
-    classify = load_app_symbols("_goodinfo_failure_reason")[
-        "_goodinfo_failure_reason"
-    ]
-    assert classify([], 0) == "cloudflare_verification"
-    assert classify(["cf_clearance"], 0) == "client_cookie_missing"
-    assert classify(["cf_clearance", "CLIENT_KEY"], 5) == "ranking_not_loaded"
-    assert classify(["cf_clearance", "CLIENT_KEY"], 200) == "ranking_schema_changed"
-    assert classify(["cf_clearance", "CLIENT_KEY"], 200, "載入失敗") == "site_alert"
-
-
 def test_goodinfo_parser_uses_only_verified_ranking_table_html():
     symbols = load_app_symbols(
         "_goodinfo_normalize_text", "_clean_goodinfo_table", "_parse_goodinfo_table_html"
@@ -458,7 +433,7 @@ def test_goodinfo_turnover_parser_recovers_mojibake_code_and_name_columns():
     assert parsed["名稱"].eq("").all()
 
 
-def test_goodinfo_fetch_keeps_legacy_cookie_and_antiblock_flow():
+def test_goodinfo_fetch_uses_only_original_fixed_wait_flow():
     tree = ast.parse(APP_PATH.read_text(encoding="utf-8"))
     function = next(
         node for node in tree.body
@@ -476,22 +451,18 @@ def test_goodinfo_fetch_keeps_legacy_cookie_and_antiblock_flow():
         if isinstance(node.func, ast.Attribute) and node.func.attr == "Chrome"
     ]
     assert len(chrome_constructions) == 1
-    assert "page_load_strategy = 'eager'" in function_source
-    assert '--lang=zh-TW' in function_source
-    assert '--disable-software-rasterizer' in function_source
+    assert '--window-size=1920x1080' in function_source
     assert 'AutomationControlled' in function_source
-    assert "['zh-TW', 'zh', 'en-US', 'en']" in function_source
-    assert 'user-agent=' not in function_source
-    assert '--user-data-dir=' in function_source
-    assert '_configure_goodinfo_browser_identity' in function_source
-    assert 'time.monotonic' in function_source
-    assert 'find_elements' in called_attributes
-    assert 'len(fallback) >= 100' in function_source
-    assert '+ 15' in function_source
+    assert 'Chrome/114.0.0.0' in function_source
+    assert 'Windows NT 10.0; Win64; x64' in function_source
+    assert '--user-data-dir=' not in function_source
+    assert '_configure_goodinfo_browser_identity' not in function_source
+    assert 'time.sleep(20)' in function_source
     assert 'refresh' not in called_attributes
-    assert 'accept' in called_attributes
-    assert '_parse_goodinfo_table_html' in function_source
-    assert '_parse_goodinfo_turnover_table' in function_source
+    assert 'find_elements' not in called_attributes
+    assert '_parse_goodinfo_original_page' in function_source
+    assert '_parse_goodinfo_table_html' not in function_source
+    assert '_parse_goodinfo_turnover_table' not in function_source
 
 
 def test_shioaji_futures_resolver_uses_v17_lazy_root_api():

@@ -6656,61 +6656,6 @@ _GOODINFO_URL = (
     "&INDUSTRY_CAT=%E7%B4%AF%E8%A8%88%E6%88%90%E4%BA%A4%E9%87%8F%E9%80%B1%E8%BD%89%E7%8E%87%28%E7%95%B6%E6%97%A5%29"
     "%40%40%E7%B4%AF%E8%A8%88%E6%88%90%E4%BA%A4%E9%87%8F%E9%80%B1%E8%BD%89%E7%8E%87%40%40%E7%95%B6%E6%97%A5"
 )
-_GOODINFO_PROFILE_DIR = os.path.join(
-    tempfile.gettempdir(), f"stock_app_goodinfo_profile_{os.getpid()}"
-)
-
-
-def _goodinfo_normal_browser_user_agent(user_agent):
-    """Keep Chrome's real platform/version while removing the Headless marker."""
-    text = str(user_agent or '').strip()
-    return text.replace('HeadlessChrome/', 'Chrome/')
-
-
-def _configure_goodinfo_browser_identity(driver):
-    """Make server Chrome expose a coherent Taiwan desktop-browser identity."""
-    raw_user_agent = str(driver.execute_script('return navigator.userAgent') or '')
-    platform = str(driver.execute_script('return navigator.platform') or 'Linux x86_64')
-    user_agent = _goodinfo_normal_browser_user_agent(raw_user_agent)
-    try:
-        driver.execute_cdp_cmd('Network.enable', {})
-        driver.execute_cdp_cmd('Network.setUserAgentOverride', {
-            'userAgent': user_agent,
-            'acceptLanguage': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7',
-            'platform': platform,
-        })
-    except WebDriverException:
-        pass
-    for command, payload in (
-        ('Emulation.setTimezoneOverride', {'timezoneId': 'Asia/Taipei'}),
-        ('Emulation.setLocaleOverride', {'locale': 'zh-TW'}),
-    ):
-        try:
-            driver.execute_cdp_cmd(command, payload)
-        except WebDriverException:
-            pass
-    return {
-        'headless_marker_removed': bool(
-            raw_user_agent and 'HeadlessChrome/' in raw_user_agent
-            and 'HeadlessChrome/' not in user_agent
-        ),
-        'platform': platform,
-    }
-
-
-def _goodinfo_failure_reason(cookie_names, row_count, alert_text=''):
-    """Classify failures without exposing cookie values or Selenium traces."""
-    names = {str(name) for name in cookie_names or []}
-    alert = str(alert_text or '').strip()
-    if alert:
-        return 'site_alert'
-    if 'cf_clearance' not in names:
-        return 'cloudflare_verification'
-    if 'CLIENT_KEY' not in names:
-        return 'client_cookie_missing'
-    if int(row_count or 0) < 20:
-        return 'ranking_not_loaded'
-    return 'ranking_schema_changed'
 
 
 def _goodinfo_normalize_text(value):
@@ -6984,7 +6929,7 @@ def _parse_goodinfo_turnover_table(page_html):
 
 
 def fetch_goodinfo_data():
-    """以一般桌面 Chrome 指紋通過驗證後，讀取 Goodinfo 排行 DOM。"""
+    """完整使用最初可用的固定 UA、等待 20 秒與最大表格流程。"""
     started_at = time.monotonic()
     fetch_goodinfo_data.last_status = {
         'state': 'loading', 'reason': '', 'elapsed': 0.0,
@@ -6994,24 +6939,19 @@ def fetch_goodinfo_data():
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--disable-gpu")
-    chrome_options.add_argument("--window-size=1365x768")
-    chrome_options.add_argument("--disable-software-rasterizer")
-    chrome_options.add_argument("--lang=zh-TW")
+    chrome_options.add_argument("--window-size=1920x1080")
     chrome_options.add_argument("--disable-blink-features=AutomationControlled")
     chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
     chrome_options.add_experimental_option('useAutomationExtension', False)
-    try:
-        os.makedirs(_GOODINFO_PROFILE_DIR, exist_ok=True)
-        chrome_options.add_argument(f"--user-data-dir={_GOODINFO_PROFILE_DIR}")
-        chrome_options.add_argument("--profile-directory=Default")
-    except OSError:
-        pass
-    # 使用伺服器實際 Chrome 版本，啟動後只移除 HeadlessChrome 標記。
-    chrome_options.page_load_strategy = 'eager'
+    chrome_options.add_argument(
+        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/114.0.0.0 Safari/537.36"
+    )
     if os.path.exists('/usr/bin/chromium'):
         chrome_options.binary_location = '/usr/bin/chromium'
 
-    acquired = _GOODINFO_BROWSER_SEMAPHORE.acquire(timeout=15)
+    acquired = _GOODINFO_BROWSER_SEMAPHORE.acquire(timeout=25)
     if not acquired:
         logger.warning('Goodinfo browser is busy; skipped duplicate launch')
         fetch_goodinfo_data.last_status = {
@@ -7020,8 +6960,6 @@ def fetch_goodinfo_data():
         }
         return None
     driver = None
-    alert_text = ''
-    identity = {}
     try:
         service = (
             Service('/usr/bin/chromedriver')
@@ -7029,125 +6967,36 @@ def fetch_goodinfo_data():
             else Service()
         )
         driver = webdriver.Chrome(service=service, options=chrome_options)
-        driver.set_page_load_timeout(7)
-        identity = _configure_goodinfo_browser_identity(driver)
-        driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
-            'source': """
-                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                Object.defineProperty(navigator, 'languages', {
-                    get: () => ['zh-TW', 'zh', 'en-US', 'en']
-                });
+        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+            "source": """
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => undefined
+                })
             """
         })
+        driver.get(_GOODINFO_URL)
+        time.sleep(20)
 
-        try:
-            driver.get(_GOODINFO_URL)
-        except (TimeoutException, UnexpectedAlertPresentException):
-            pass
-
-        # 讓 CLIENT_KEY／REINIT 導向完整跑完；總等待限制為 15 秒，
-        # 中途不 refresh，所有解析都只使用同一份 Goodinfo DOM。
-        attempt_deadline = time.monotonic() + 15
-        full_page_checked = False
-        last_fallback_row_count = -1
-        best_ranking = None
-        while time.monotonic() < attempt_deadline:
-            try:
-                alert = driver.switch_to.alert
-                alert_text = alert.text
-                alert.accept()
-                logger.warning('Goodinfo alert: %s', alert_text)
-                break
-            except NoAlertPresentException:
-                pass
-
-            ranking = _parse_goodinfo_table_html(
-                _goodinfo_rank_table_html(driver)
-            )
-            if ranking is not None:
-                if best_ranking is None or len(ranking) > len(best_ranking):
-                    best_ranking = ranking
-                if len(ranking) >= 100:
-                    fetch_goodinfo_data.last_status = {
-                        'state': 'success', 'reason': '', 'rows': len(ranking),
-                        'elapsed': round(time.monotonic() - started_at, 2),
-                        **identity,
-                    }
-                    return ranking
-
-            # 動態表格形成時列數會由選單／骨架增加到完整排行；列數變化時
-            # 才解析一次整頁，避免固定等到最後 4 秒，也避免每 0.5 秒重做 pandas。
-            try:
-                row_count = len(driver.find_elements(By.TAG_NAME, 'tr'))
-            except WebDriverException:
-                row_count = 0
-            if row_count >= 20 and row_count != last_fallback_row_count:
-                last_fallback_row_count = row_count
-                fallback = _parse_goodinfo_turnover_table(driver.page_source)
-                if fallback is not None:
-                    if best_ranking is None or len(fallback) > len(best_ranking):
-                        best_ranking = fallback
-                    if len(fallback) >= 100:
-                        fetch_goodinfo_data.last_status = {
-                            'state': 'success', 'reason': '', 'rows': len(fallback),
-                            'elapsed': round(time.monotonic() - started_at, 2),
-                            **identity,
-                        }
-                        return fallback
-
-            # 先使用附件原本的整頁 schema；若 Goodinfo 把中文欄名解成
-            # 亂碼，再以同一張表格的 4～6 碼股票代號密度辨認，不更換來源。
-            if not full_page_checked and time.monotonic() + 4 >= attempt_deadline:
-                full_page_checked = True
-                page_html = driver.page_source
-                ranking = _parse_goodinfo_table_html([page_html])
-                if ranking is None:
-                    ranking = _parse_goodinfo_turnover_table(page_html)
-                if ranking is not None:
-                    if best_ranking is None or len(ranking) > len(best_ranking):
-                        best_ranking = ranking
-                    if len(ranking) >= 100:
-                        fetch_goodinfo_data.last_status = {
-                            'state': 'success', 'reason': '', 'rows': len(ranking),
-                            'elapsed': round(time.monotonic() - started_at, 2),
-                            **identity,
-                        }
-                        return ranking
-            time.sleep(min(0.5, max(0, attempt_deadline - time.monotonic())))
-    except (WebDriverException, OSError, ValueError) as exc:
-        logger.exception('Goodinfo legacy fetch failed: %s', type(exc).__name__)
+        ranking = _parse_goodinfo_original_page(driver.page_source)
+        if ranking is not None:
+            fetch_goodinfo_data.last_status = {
+                'state': 'success', 'reason': '', 'rows': len(ranking),
+                'elapsed': round(time.monotonic() - started_at, 2),
+            }
+            return ranking
+        fetch_goodinfo_data.last_status = {
+            'state': 'failed', 'reason': 'legacy_table_missing',
+            'elapsed': round(time.monotonic() - started_at, 2),
+        }
+    except Exception as exc:
+        logger.exception('Goodinfo original fetch failed: %s', type(exc).__name__)
         fetch_goodinfo_data.last_status = {
             'state': 'failed', 'reason': 'browser_error',
             'error_type': type(exc).__name__,
             'elapsed': round(time.monotonic() - started_at, 2),
-            **identity,
         }
     finally:
         if driver is not None:
-            if fetch_goodinfo_data.last_status.get('state') != 'success':
-                cookie_names = []
-                row_count = 0
-                try:
-                    cookie_names = [cookie.get('name', '') for cookie in driver.get_cookies()]
-                except WebDriverException:
-                    pass
-                try:
-                    row_count = len(driver.find_elements(By.TAG_NAME, 'tr'))
-                except WebDriverException:
-                    pass
-                current_status = dict(fetch_goodinfo_data.last_status)
-                current_status.update({
-                    'state': 'failed',
-                    'reason': _goodinfo_failure_reason(
-                        cookie_names, row_count, alert_text,
-                    ),
-                    'row_count': row_count,
-                    'has_client_key': 'CLIENT_KEY' in cookie_names,
-                    'has_cf_clearance': 'cf_clearance' in cookie_names,
-                    'elapsed': round(time.monotonic() - started_at, 2),
-                    **identity,
-                })
-                fetch_goodinfo_data.last_status = current_status
             try:
                 driver.quit()
             except WebDriverException:
@@ -10774,7 +10623,7 @@ def render_stock_external_resources():
     st.markdown("#### 外部資源")
 
     def perform_goodinfo_fetch():
-        with st.spinner("正在以一般桌面瀏覽器環境載入排行，最多約 15 秒..."):
+        with st.spinner("正在使用最初舊版流程載入排行，約需 20 秒..."):
             result = fetch_goodinfo_data()
             status = dict(getattr(fetch_goodinfo_data, 'last_status', {}) or {})
             if result is not None and not result.empty:
@@ -10787,30 +10636,18 @@ def render_stock_external_resources():
                 st.session_state['goodinfo_fetch_failed'] = True
                 reason_text = {
                     'browser_busy': '另一個頁面正在抓取，請稍後再按一次。',
-                    'cloudflare_verification': (
-                        'Goodinfo／Cloudflare 未允許這台 Streamlit 伺服器通過驗證；'
-                        '這通常與雲端機房 IP 有關。'
-                    ),
-                    'client_cookie_missing': 'Goodinfo 未建立瀏覽器驗證 Cookie。',
-                    'ranking_not_loaded': '已通過網站驗證，但動態排行在期限內尚未載入。',
-                    'ranking_schema_changed': '排行頁已有內容，但表格欄位與舊版格式不同。',
-                    'site_alert': 'Goodinfo 回報網頁載入失敗。',
-                    'browser_error': 'Streamlit 上的 Chrome 啟動或連線失敗。',
+                    'legacy_table_missing': '舊版流程已載入頁面，但沒有找到完整排行表格。',
+                    'browser_error': 'Streamlit 上的 Chrome 啟動、導向或解析失敗。',
                 }.get(status.get('reason'), '抓取失敗或查無資料。')
                 st.error(reason_text)
-                if status.get('reason') == 'cloudflare_verification':
-                    st.info(
-                        "可按右側「Goodinfo 週轉率排行」，由你的電腦／手機一般瀏覽器開啟，"
-                        "下載 Report.csv 後從選股資料來源上傳；這條路會使用你的網路 IP。"
-                    )
-                elif 'goodinfo_df' in st.session_state:
+                if 'goodinfo_df' in st.session_state:
                     st.warning("本次沒有覆蓋先前成功暫存，可先沿用並留意資料時間。")
 
     resource_col1, resource_col2, resource_col3 = st.columns(3)
     with resource_col1:
         if st.button(
             "📥 抓取 Goodinfo 週轉率排行",
-            help="使用相同版本的一般 Chrome UA、台北時區、繁中語系與持續 Cookie；最多等待 15 秒。",
+            help="完整使用最初可用流程：固定 Chrome 114／Windows 識別，等待 20 秒後解析最大表格。",
             width='stretch', key='fetch_goodinfo_in_stock_room'
         ):
             perform_goodinfo_fetch()
