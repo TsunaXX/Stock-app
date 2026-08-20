@@ -383,6 +383,34 @@ def test_goodinfo_legacy_parser_prefers_completed_rank_table_over_menu_table():
     assert parsed.iloc[0]["股票代號"] == 3000
 
 
+def test_goodinfo_original_parser_keeps_historical_largest_table_behavior():
+    parser = load_app_symbols("_parse_goodinfo_original_page")[
+        "_parse_goodinfo_original_page"
+    ]
+    small_rows = "".join(
+        f"<tr><td>{index}</td><td>選單{index}</td><td>A</td><td>B</td><td>C</td><td>D</td></tr>"
+        for index in range(11)
+    )
+    ranking_rows = "".join(
+        f"<tr><td>{index + 1}</td><td>{2400 + index}</td><td>股票{index}</td>"
+        f"<td>{100 + index}</td><td>{1000 + index}</td><td>{index + 1}.2%</td>"
+        f"<td>上市</td></tr>"
+        for index in range(15)
+    )
+    markup = (
+        "<html><body>"
+        "<table><tr><th>甲</th><th>乙</th><th>丙</th><th>丁</th><th>戊</th><th>己</th></tr>"
+        f"{small_rows}</table>"
+        "<table><tr><th>排名</th><th>代號欄</th><th>名稱欄</th><th>成交價</th>"
+        "<th>成交量</th><th>百分比</th><th>市場</th></tr>"
+        f"{ranking_rows}</table></body></html>"
+    )
+    parsed = parser(markup)
+    assert parsed is not None
+    assert len(parsed) == 15
+    assert parsed.iloc[0]["代號欄"] == 2400
+
+
 def test_shioaji_futures_resolver_uses_v17_lazy_root_api():
     symbols = load_app_symbols(
         "SHIOAJI_FUTURES_ROOT_ALIASES", "FUTURES_MONTH_CODE",

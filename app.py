@@ -6788,6 +6788,53 @@ def _parse_goodinfo_table_html(table_html_list):
     return max(candidates, key=lambda table: table.shape[0] * table.shape[1]) if candidates else None
 
 
+def _parse_goodinfo_original_page(markup):
+    """Reproduce the original working whole-page / largest-table parser.
+
+    This intentionally does not apply the newer DOM/schema gate.  Goodinfo's
+    completed ranking has historically appeared with several different nested
+    header layouts, while the original scraper reliably selected it as the
+    largest table after the fixed 15-second wait.  The stricter parser remains
+    available as a fallback after this compatibility path.
+    """
+    tables = []
+    for read_kwargs in ({}, {'flavor': 'lxml'}):
+        try:
+            tables = pd.read_html(io.StringIO(str(markup or '')), **read_kwargs)
+            if tables:
+                break
+        except (ValueError, TypeError, ImportError):
+            tables = []
+    target = None
+    for dataframe in tables:
+        if dataframe.shape[0] <= 10 or dataframe.shape[1] <= 5:
+            continue
+        if target is None or (
+            dataframe.shape[0] * dataframe.shape[1]
+            > target.shape[0] * target.shape[1]
+        ):
+            target = dataframe.copy()
+    if target is None:
+        return None
+    if isinstance(target.columns, pd.MultiIndex):
+        normalized_columns = []
+        for column in target.columns:
+            parts = []
+            for item in column:
+                text = str(item).replace(' ', '').strip()
+                if text and not text.startswith('Unnamed') and (
+                    not parts or parts[-1] != text
+                ):
+                    parts.append(text)
+            normalized_columns.append('_'.join(parts))
+        target.columns = normalized_columns
+    else:
+        target.columns = [
+            str(column).replace(' ', '').strip() for column in target.columns
+        ]
+    return target.dropna(how='all').reset_index(drop=True)
+
+
 def _parse_goodinfo_legacy_page(markup):
     """Compatibility path for the original Goodinfo 15-second whole-page flow.
 
@@ -6897,11 +6944,18 @@ def fetch_goodinfo_data():
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--disable-gpu")
     chrome_options.add_argument("--window-size=1920x1080")
+    # These two flags and the fixed UA are retained because they are part of
+    # the last deployed Goodinfo flow confirmed to work on Streamlit Cloud.
+    chrome_options.add_argument("--single-process")
+    chrome_options.add_argument("--no-zygote")
     chrome_options.add_argument("--disable-software-rasterizer")
-    chrome_options.add_argument("--lang=zh-TW")
     chrome_options.add_argument("--disable-blink-features=AutomationControlled")
     chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
     chrome_options.add_experimental_option('useAutomationExtension', False)
+    chrome_options.add_argument(
+        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
+    )
     # 保留歷史流程的完整導向行為；等待 15 秒從 driver.get() 結束後才
     # 開始計算，不能讓 Chromium 啟動或頁面導向時間吃掉資料載入額度。
     chrome_options.page_load_strategy = 'normal'
@@ -6915,23 +6969,9 @@ def fetch_goodinfo_data():
     try:
         service = Service("/usr/bin/chromedriver")
         driver = webdriver.Chrome(service=service, options=chrome_options)
-        driver.set_page_load_timeout(15)
-        try:
-            detected_user_agent = driver.execute_script('return navigator.userAgent')
-            detected_user_agent = str(detected_user_agent or _GOODINFO_FALLBACK_USER_AGENT).replace(
-                'HeadlessChrome', 'Chrome',
-            )
-            driver.execute_cdp_cmd("Network.setUserAgentOverride", {
-                "userAgent": detected_user_agent,
-                "acceptLanguage": "zh-TW,zh;q=0.9,en;q=0.8",
-                "platform": "Linux x86_64",
-            })
-        except (WebDriverException, TypeError):
-            pass
         driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
             "source": """
                 Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                Object.defineProperty(navigator, 'languages', {get: () => ['zh-TW', 'zh', 'en-US', 'en']});
             """
         })
         try:
@@ -6962,8 +7002,12 @@ def fetch_goodinfo_data():
         except (WebDriverException, UnexpectedAlertPresentException):
             page_markup = None
 
-        # The old whole-page parser is intentionally first.  This also keeps
-        # the combined listed + OTC turnover-ranking definition intact.
+        # Exact original parser first: after the fixed wait, choose the largest
+        # completed table before applying any newer DOM/schema assumptions.
+        ranking = _parse_goodinfo_original_page(page_markup) if page_markup else None
+        if ranking is not None:
+            return ranking
+
         ranking = _parse_goodinfo_legacy_page(page_markup) if page_markup else None
         if ranking is not None:
             return ranking
@@ -6999,7 +7043,9 @@ def fetch_goodinfo_data():
                 refreshed_markup = driver.page_source
             except (WebDriverException, UnexpectedAlertPresentException):
                 refreshed_markup = None
-            ranking = _parse_goodinfo_legacy_page(refreshed_markup) if refreshed_markup else None
+            ranking = _parse_goodinfo_original_page(refreshed_markup) if refreshed_markup else None
+            if ranking is None:
+                ranking = _parse_goodinfo_legacy_page(refreshed_markup) if refreshed_markup else None
             if ranking is None:
                 ranking = _parse_goodinfo_table_html(
                     _goodinfo_rank_table_html(driver),
@@ -10577,7 +10623,7 @@ def render_stock_external_resources():
     st.markdown("#### 外部資源")
 
     def perform_goodinfo_fetch():
-        with st.spinner("正在抓取最新資料，通常約 15 秒；同一輪會自動重載一次..."):
+        with st.spinner("正在依舊版流程載入排行，請完整等待約 15 秒；失敗後會自動使用備援..."):
             result = fetch_goodinfo_data()
             if result is not None and not result.empty:
                 st.session_state['goodinfo_df'] = result.astype(str)
@@ -10591,7 +10637,7 @@ def render_stock_external_resources():
     with resource_col1:
         if st.button(
             "📥 抓取 Goodinfo 週轉率排行",
-            help="抓取 Goodinfo 綜合上市／上櫃當日累積成交量週轉率排行；最多等待 15 秒並在同一輪重載一次。",
+            help="先使用曾成功的舊版 15 秒整頁流程抓取上市＋上櫃排行；若失敗，再於同一輪使用新版解析備援。",
             width='stretch', key='fetch_goodinfo_in_stock_room'
         ):
             perform_goodinfo_fetch()
