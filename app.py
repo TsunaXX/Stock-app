@@ -476,7 +476,37 @@ def get_stream_quotes(api, contracts, snapshot_fallback=True):
             if isinstance(exc, (KeyboardInterrupt, SystemExit)):
                 raise
             snapshots = []
-        for index, contract, snapshot in zip(fallback_indices, missing_contracts, snapshots):
+        snapshots_by_code = {
+            str(getattr(snapshot, 'code', '')): snapshot for snapshot in snapshots
+            if getattr(snapshot, 'code', None)
+        }
+        # A single invalid/rolling contract can make a mixed snapshot batch
+        # return fewer rows. Retry only the missing contracts so one bad symbol
+        # does not make the whole futures table look disconnected.
+        retry_contracts = missing_contracts if len(missing_contracts) <= 30 else []
+        for contract in retry_contracts:
+            contract_codes = _stream_contract_codes(contract)
+            if any(code in snapshots_by_code for code in contract_codes):
+                continue
+            try:
+                single = api.snapshots([contract]) or []
+            except BaseException as exc:
+                if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                    raise
+                single = []
+            if single:
+                snapshot = single[0]
+                snapshot_code = str(getattr(snapshot, 'code', '') or '')
+                if snapshot_code:
+                    snapshots_by_code[snapshot_code] = snapshot
+        for index, contract in zip(fallback_indices, missing_contracts):
+            contract_codes = _stream_contract_codes(contract)
+            snapshot = next(
+                (snapshots_by_code[code] for code in contract_codes if code in snapshots_by_code),
+                None,
+            )
+            if snapshot is None:
+                continue
             _stream_store_snapshot(api, contract, snapshot)
             results[index] = _stream_quote_for_contract(api, contract)
     return results
@@ -4545,6 +4575,33 @@ def _txo_strike_step(contracts, default=50.0):
     return float(np.median(gaps)) if gaps else float(default)
 
 
+def evaluate_txo_directional_quality(
+    premium, target_pnl, stop_pnl, probability, spread_pct, liquidity, target_reachable,
+):
+    """Gate quick BC/BP ideas on reachable profit, liquidity and payoff quality."""
+    premium_risk = max(float(premium or 0) * 50 * 0.40, 1.0)
+    scenario_risk = max(abs(min(float(stop_pnl or 0), 0.0)), premium_risk)
+    payoff_ratio = max(float(target_pnl or 0), 0.0) / scenario_risk
+    reasons = []
+    if not target_reachable:
+        reasons.append('短波目標尚未越過損益兩平')
+    if float(target_pnl or 0) <= 0:
+        reasons.append('目標情境仍未獲利')
+    if payoff_ratio < 1.25:
+        reasons.append('目標報酬／風險低於 1.25')
+    if probability is None or float(probability) < 0.40:
+        reasons.append('模型獲利機率低於 40%')
+    if liquidity not in ('高', '中'):
+        reasons.append('流動性不足')
+    if spread_pct is None or float(spread_pct) > 15:
+        reasons.append('買賣價差過寬')
+    return {
+        'trade_ready': not reasons,
+        'payoff_ratio': payoff_ratio,
+        'quality_notes': reasons,
+    }
+
+
 def rank_txo_directional_candidates(
     contracts, quotes, plan, is_buy_call, moneyness_preference, selected_expiry,
 ):
@@ -4587,7 +4644,7 @@ def rank_txo_directional_candidates(
         theoretical_now = black_scholes_index_option_price(
             spot, strike, years, model_vol, is_buy_call,
         )
-        expected_pnl = (theoretical_now - premium) * 50
+        model_value_gap = (theoretical_now - premium) * 50
         distance_points = abs(strike - spot)
         target_reachable = target >= breakeven if is_buy_call else target <= breakeven
         liquidity_score = {'高': 1.0, '中': 0.65, '低': 0.25, '報價不足': 0.0}.get(quote['liquidity'], 0.0)
@@ -4600,19 +4657,23 @@ def rank_txo_directional_candidates(
             float(np.clip(1 - float(spread_pct_value) / 30, 0, 1))
             if spread_pct_value is not None else 0.0
         )
-        payoff_ratio = max(target_pnl, 0.0) / max(abs(min(stop_pnl, 0.0)), 1.0)
+        quality = evaluate_txo_directional_quality(
+            premium, target_pnl, stop_pnl, probability, spread_pct_value,
+            quote['liquidity'], target_reachable,
+        )
+        payoff_ratio = quality['payoff_ratio']
         payoff_score = float(np.clip(payoff_ratio / 3, 0, 1))
-        expected_score = float(np.clip((float(expected_pnl or 0) / max(premium * 50, 1.0) + 1) / 2, 0, 1))
+        value_score = float(np.clip((float(model_value_gap or 0) / max(premium * 50, 1.0) + 1) / 2, 0, 1))
         if moneyness == '價外':
-            moneyness_score = 1.0 if target_reachable else 0.1
+            moneyness_score = 0.60 if target_reachable else 0.1
         elif moneyness == '平價':
-            moneyness_score = 0.85
+            moneyness_score = 0.90
         else:
-            moneyness_score = 0.70
+            moneyness_score = 1.0
         score = 100 * (
-            0.24 * probability_score + 0.16 * capital_efficiency + 0.14 * liquidity_score
+            0.25 * probability_score + 0.15 * capital_efficiency + 0.14 * liquidity_score
             + 0.10 * spread_quality + 0.09 * volume_score + 0.07 * flow_score
-            + 0.08 * payoff_score + 0.07 * expected_score + 0.05 * moneyness_score
+            + 0.12 * payoff_score + 0.03 * value_score + 0.05 * moneyness_score
         )
         rows.append({
             **quote, 'contract': contract, 'strike': strike, 'moneyness': moneyness,
@@ -4622,9 +4683,11 @@ def rank_txo_directional_candidates(
             'volatility_source': volatility_source, 'model_probability': probability,
             'target_option_price': target_option_price, 'stop_option_price': stop_option_price,
             'target_pnl': target_pnl, 'stop_pnl': stop_pnl,
-            'target_return_pct': target_return_pct, 'expected_pnl': expected_pnl,
+            'target_return_pct': target_return_pct,
+            'model_value_gap': model_value_gap, 'expected_pnl': model_value_gap,
+            **quality,
         })
-    rows.sort(key=lambda row: row['score'], reverse=True)
+    rows.sort(key=lambda row: (row['trade_ready'], row['score']), reverse=True)
     return rows
 
 
@@ -4796,11 +4859,14 @@ def get_txo_directional_quote(api, plan, expiry_choice, moneyness_preference='�
         'target_reachable': selected['target_reachable'], 'profile': moneyness_preference,
         'breakeven': breakeven, 'target_intrinsic': target_intrinsic,
         'target_pnl': selected['target_pnl'], 'stop_pnl': selected['stop_pnl'],
-        'target_return_pct': selected['target_return_pct'], 'expected_pnl': selected['expected_pnl'],
+        'target_return_pct': selected['target_return_pct'],
+        'model_value_gap': selected['model_value_gap'], 'expected_pnl': selected['model_value_gap'],
         'implied_volatility': selected['implied_volatility'],
         'model_volatility': selected['model_volatility'],
         'volatility_source': selected['volatility_source'],
         'model_probability': selected['model_probability'], 'selection_score': selected['score'],
+        'trade_ready': selected['trade_ready'], 'payoff_ratio': selected['payoff_ratio'],
+        'quality_notes': selected['quality_notes'],
         'alternatives': ranked[:6],
     }
 
@@ -4818,13 +4884,26 @@ def recommend_txo_strategy(directional_quote, spread_quote, plan):
     dte = int(directional_quote.get('dte', 0) or 0)
     probability = float(directional_quote.get('model_probability', 0) or 0)
     liquidity = directional_quote.get('liquidity')
+    if not directional_quote.get('trade_ready', False):
+        detail = '、'.join(directional_quote.get('quality_notes') or ['單買條件未達門檻'])
+        if valid_spread:
+            return {
+                'choice': '價差單', 'color': '#ffc107',
+                'reason': f'單買暫不採用（{detail}）；改看最大風險已限定的價差單。',
+                'iv_ratio': iv_ratio,
+            }
+        return {
+            'choice': '等待', 'color': '#ffc107',
+            'reason': f'單買暫不採用：{detail}。等價格、流動性或報酬風險改善後再評估。',
+            'iv_ratio': iv_ratio,
+        }
     if valid_spread and (iv_ratio >= 1.20 or (dte <= 1 and probability < 0.45)):
         reason = (
             f"隱含／模型波動率約為 20 日實現波動率的 {_format_compact_number(iv_ratio, 2)} 倍，"
             "單買權利金相對偏貴或到期時間過短；限定風險價差較能降低時間價值與波動率回落風險。"
         )
         return {'choice': '價差單', 'color': '#ffc107', 'reason': reason, 'iv_ratio': iv_ratio}
-    if probability >= 0.42 and liquidity in ('高', '中'):
+    if probability >= 0.42 and liquidity in ('高', '中') and float(directional_quote.get('payoff_ratio', 0) or 0) >= 1.25:
         reason = (
             f"模型到期獲利機率約 {_format_compact_number(probability * 100, 1)}%，且流動性為{liquidity}；"
             f"目前以{directional_quote['moneyness']} {directional_quote['right']} 快進快出較合適。"
@@ -4945,21 +5024,25 @@ def build_txo_payoff_chart(option_quote, plan, is_spread=False):
             marker_lanes.append(value)
         else:
             marker_lanes[lane] = value
-        fig.add_vline(x=value, line_color=color, line_dash='dot', line_width=1)
+        fig.add_vline(x=value, line_color=color, line_dash='dot', line_width=1.4)
         fig.add_annotation(
-            x=value, y=1.02 + lane * 0.105, yref='paper',
+            x=value, y=0.98, yref='paper',
             text=f"{label} {value:,.0f}",
-            showarrow=False, xanchor='center', yanchor='bottom',
+            showarrow=True, arrowhead=0, arrowwidth=1.4, arrowcolor=color,
+            ax=0, ay=-(28 + lane * 27), xanchor='center', yanchor='bottom',
             bgcolor='rgba(16,21,29,.88)', bordercolor=color, borderwidth=1,
-            borderpad=2, font=dict(size=10, color=color),
+            borderpad=3, font=dict(size=12, color=color),
         )
     fig.update_layout(
-        template='plotly_dark', height=390, margin=dict(l=35, r=20, t=92, b=54),
-        title=dict(text='到期損益曲線（每口／每組）', font=dict(size=16)),
+        template='plotly_dark', height=430,
+        margin=dict(l=45, r=24, t=118 + max(0, len(marker_lanes) - 2) * 18, b=62),
+        title=dict(text='到期損益曲線（每口／每組）', font=dict(size=17)),
         xaxis_title='到期結算指數', yaxis_title='損益（元）',
-        legend=dict(orientation='h', y=-0.18, x=1, xanchor='right', font=dict(size=10)),
+        legend=dict(orientation='h', y=-0.20, x=1, xanchor='right', font=dict(size=11)),
         hovermode='x unified',
     )
+    fig.update_xaxes(title_font=dict(size=13), tickfont=dict(size=12), automargin=True)
+    fig.update_yaxes(title_font=dict(size=13), tickfont=dict(size=12), automargin=True)
     return fig
 
 
@@ -6483,9 +6566,9 @@ _GOODINFO_URL = (
     "&INDUSTRY_CAT=%E7%B4%AF%E8%A8%88%E6%88%90%E4%BA%A4%E9%87%8F%E9%80%B1%E8%BD%89%E7%8E%87%28%E7%95%B6%E6%97%A5%29"
     "%40%40%E7%B4%AF%E8%A8%88%E6%88%90%E4%BA%A4%E9%87%8F%E9%80%B1%E8%BD%89%E7%8E%87%40%40%E7%95%B6%E6%97%A5"
 )
-_GOODINFO_USER_AGENT = (
+_GOODINFO_FALLBACK_USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    "(KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"
 )
 
 
@@ -6615,6 +6698,51 @@ def _parse_goodinfo_table_html(table_html_list):
     return max(candidates, key=lambda table: table.shape[0] * table.shape[1]) if candidates else None
 
 
+def _parse_goodinfo_legacy_page(markup):
+    """Compatibility path for the original Goodinfo 15-second whole-page flow.
+
+    Goodinfo has changed between ``th``/``td`` headers and nested tables.  The
+    original scraper succeeded by selecting the largest completed data table;
+    keep that behavior, but still require stock codes plus the turnover label so
+    a menu or challenge table cannot be returned as a ranking.
+    """
+    if '週轉率' not in str(markup or ''):
+        return None
+    try:
+        tables = pd.read_html(io.StringIO(str(markup)), flavor='lxml')
+    except (ValueError, TypeError, ImportError):
+        return None
+    candidates = []
+    for dataframe in tables:
+        if dataframe.shape[0] <= 10 or dataframe.shape[1] <= 5:
+            continue
+        cleaned = dataframe.copy()
+        if isinstance(cleaned.columns, pd.MultiIndex):
+            normalized_columns = []
+            for column in cleaned.columns:
+                parts = []
+                for item in column:
+                    text = _goodinfo_normalize_text(item)
+                    if text and not text.startswith('Unnamed') and text not in parts:
+                        parts.append(text)
+                normalized_columns.append('_'.join(parts))
+            cleaned.columns = normalized_columns
+        else:
+            cleaned.columns = [_goodinfo_normalize_text(column) for column in cleaned.columns]
+        header_text = '|'.join(map(str, cleaned.columns))
+        if '代號' not in header_text or '名稱' not in header_text:
+            continue
+        code_column = next((column for column in cleaned.columns if '代號' in str(column)), None)
+        if code_column is None:
+            continue
+        valid_codes = cleaned[code_column].astype(str).str.extract(
+            r'(?<!\d)(\d{4,6})(?!\d)', expand=False,
+        ).notna()
+        if int(valid_codes.sum()) >= 10:
+            candidates.append(cleaned.dropna(how='all').reset_index(drop=True))
+    return max(candidates, key=lambda table: table.shape[0] * table.shape[1]) if candidates else None
+
+
 def _goodinfo_rank_table_html(driver):
     """Return completed Goodinfo ranking-table markup, excluding menus and challenge pages."""
     try:
@@ -6668,30 +6796,28 @@ def fetch_goodinfo_data():
     chrome_options.add_argument("--window-size=1920x1080")
     chrome_options.add_argument("--disable-software-rasterizer")
     chrome_options.add_argument("--lang=zh-TW")
-    chrome_options.add_argument(f"--user-agent={_GOODINFO_USER_AGENT}")
     chrome_options.add_argument("--disable-blink-features=AutomationControlled")
     chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
     chrome_options.add_experimental_option('useAutomationExtension', False)
     chrome_options.page_load_strategy = 'eager'
 
     chrome_options.binary_location = "/usr/bin/chromium"
-    request_started_at = time.monotonic()
-    deadline = request_started_at + 15
-    acquired = _GOODINFO_BROWSER_SEMAPHORE.acquire(timeout=15)
+    acquired = _GOODINFO_BROWSER_SEMAPHORE.acquire(timeout=20)
     if not acquired:
         return None
     driver = None
     reloaded = False
     try:
-        if time.monotonic() >= deadline:
-            return None
         service = Service("/usr/bin/chromedriver")
         driver = webdriver.Chrome(service=service, options=chrome_options)
-        remaining = max(1, deadline - time.monotonic())
-        driver.set_page_load_timeout(max(1, min(7, remaining)))
+        driver.set_page_load_timeout(12)
         try:
+            detected_user_agent = driver.execute_script('return navigator.userAgent')
+            detected_user_agent = str(detected_user_agent or _GOODINFO_FALLBACK_USER_AGENT).replace(
+                'HeadlessChrome', 'Chrome',
+            )
             driver.execute_cdp_cmd("Network.setUserAgentOverride", {
-                "userAgent": _GOODINFO_USER_AGENT,
+                "userAgent": detected_user_agent,
                 "acceptLanguage": "zh-TW,zh;q=0.9,en;q=0.8",
                 "platform": "Linux x86_64",
             })
@@ -6707,6 +6833,10 @@ def fetch_goodinfo_data():
             driver.get(_GOODINFO_URL)
         except (TimeoutException, UnexpectedAlertPresentException):
             pass
+
+        # The historical working flow waited 15 seconds *after navigation*.
+        # Chromium startup and semaphore time must not consume this data budget.
+        deadline = time.monotonic() + 15
 
         while time.monotonic() < deadline:
             try:
@@ -6760,6 +6890,8 @@ def fetch_goodinfo_data():
             if time.monotonic() + 2 >= deadline:
                 try:
                     ranking = _parse_goodinfo_table_html([driver.page_source])
+                    if ranking is None:
+                        ranking = _parse_goodinfo_legacy_page(driver.page_source)
                 except (WebDriverException, UnexpectedAlertPresentException):
                     ranking = None
                 if ranking is not None:
@@ -10260,33 +10392,26 @@ def render_stock_strategy_explanation():
     """股票戰略室的靜態說明，與操作設定分開並預設折疊。"""
     with st.expander("📖 股票戰略室說明", expanded=False):
         st.markdown("""
-- **怎麼操作**：先在「選股資料來源與快速查詢」載入週轉率資料或輸入個股，再按「執行分析」；已有結果時資料來源區會收合，直接看主表即可。
-- **怎麼看資料**：主表保留原始週轉率排序與戰略備註；開啟附加分析層後，優先看「訊號狀態、進場信心、支撐壓力、進出場預判」；需要完整欄位時可關閉精簡主表。
-- **怎麼進場**：不以預判價直接下單。先等訊號為「已觸發／回測確認」、價格靠近預判進場區、支撐壓力與原戰略備註方向一致，再自行確認量能與盤勢；條件失效則依「停」退出觀察。
-- **原選股順序不變**：維持週轉率排行及原本的戰略備註；附加分析只補充支撐壓力、進出場點位與信心判讀。
-- **ATR**衡量正常波動幅度，不判斷多空；乖離越大，越不適合追價或追空。
-- **VWAP**是盤中成交量加權平均成本。當沖時，價格在 VWAP 上方偏多、下方偏空，並搭配 09:00–09:15 開盤區間及量能確認。
-- **開盤首 15 分鐘**按「更新盤中資料與當沖條件」後，會以 Shioaji 即時串流＋1 分 K 顯示形成中的高低點與動能；09:15 後自動改用 5 分 K 與完整開盤區間。
-- **系統自動方向**會逐檔判斷，不會把整張表固定成同一方向：當沖優先比較分 K 的 VWAP、開盤區間支撐／壓力、量能與開盤價；隔日／波段比較日 K 的 5／20 日線、均線斜率、前高前低與 K 棒位置。表格會顯示「建議方向」及「方向依據」，也可手動改選多或空。
-- **進／停／目**分別為條件成立後的觀察進場、策略失效離場與第一目標。信心分是條件一致度，不是勝率。
-- **表格「處置／注意」訊號**：`🟡 注意 1` 代表官方名單目前累計 1 次注意，仍可觀察但風險分會降低；`🔴 注意 2`（或更高）代表累計至少 2 次注意，預設「封鎖注意累計 ≥ 2」會排除；櫃買的「注意累計異常」也會至少標為注意 2。
-- `🚫 處置中` 代表已列入處置名單，直接排除；`🟢 官方名單未列示` 代表本次查核未列名；`⚪ 未查核` 代表官方來源尚未完整讀取，不會被誤當成安全。
-- 這些訊號只反映官方名單與本系統風險門檻，不預測漲跌方向。即時價格與漲跌幅需登入 Shioaji；盤中取最新快照，盤後保留最後成交價與漲跌幅。
-- 若股票有一般股期或小型股期，會依股票表順序自動附加到期貨戰略室排行之後。
+- **① 載入**：抓 Goodinfo 排行、上傳檔案，或直接輸入股票；再按「執行分析」。
+- **② 先看四欄**：`訊號狀態`、`進場信心`、`支撐壓力`、`進出場預判`。信心分代表條件是否一致，**不是勝率**。
+- **③ 等條件成立**：`✅ 已觸發` 或 `🔵 回測確認` 才進一步評估；`進／停／目` 是觀察進場、失效離場、第一目標，不會自動下單。
+- **🔴 多／🟢 空**：當沖看分 K、VWAP、開盤區間與量能；隔日／波段看日 K、5／20 日線與前高前低。方向依據只列最重要的兩項。
+- **🔴買／🟢賣**：顯示最佳買賣價；買賣價差跳數越少，通常越容易成交。`—` 代表目前沒有即時報價。
+- **ATR**：最近常見的波動幅度。乖離太大時不追價；**VWAP**：盤中平均成本，站上偏多、跌破偏空。
+- **⚠️ 注意／處置**：`注意 1` 是累計 1 次；`注意 2+` 是至少 2 次，預設排除；`🚫 處置中` 直接排除；`⚪ 未查核` 代表官方資料尚未讀完。
+- 原本的週轉率排序與戰略備註不變；附加分析只提供判讀與風險提醒。
         """)
 
 def render_futures_strategy_explanation():
     """期貨戰略室的靜態說明，預設折疊避免占用表格空間。"""
     with st.expander("📖 期貨戰略室說明", expanded=False):
         st.markdown("""
-- **怎麼操作**：主表先依成交口數排序。需要盤中／夜盤資訊時登入 Shioaji，按「即時更新成交量排行」或「即時更新報價與分析」；篩選、週期與方向可在上方設定區調整。
-- **怎麼看資料**：先看「成交價、漲跌幅、方向、訊號狀態、進場信心、支撐壓力、進出場點位」；完整表可查看保證金、未平倉量、交易時段與資料狀態。
-- **怎麼進場**：只在觸發條件成立後，讓最新價接近「進」且方向與市場一致時再評估；「停」是策略失效點，「目」是第一觀察目標，均為提示，不會自動下單。
-- 主排行以**當日累計成交口數**由大到小排列；期交所 OpenAPI 是盤後正式資料，登入 Shioaji 後可手動取得盤中／夜盤快照提前重排。
-- **自動方向**依目前價格強弱判定；偏多只觀察突破壓力，偏空只觀察跌破支撐。進、停、目均為條件式觀察點位，不會自動下單。
-- **進場信心**綜合觸發位置、成交量、未平倉量、買賣價差、資料新鮮度與市場方向；不是歷史勝率。
-- 股票戰略室有對應股期時，會依「A 股期、A 小型股期、B 股期、B 小型股期」順序附加於排行後方；隱藏條件仍會生效。
-- 「即時更新報價與分析」更新目前表格；「即時更新成交量排行」批次更新可解析契約後重新排序。夜盤商品會採夜盤快照的最新價、漲跌幅與累計量。
+- **① 選商品**：主表預設按當日成交口數排序；「只顯示小型股票期貨」只保留小型個股期，不含小台、微台與 ETF 期貨。
+- **② 更新**：盤後資料按「更新成交量／保證金」；盤中或夜盤先登入 Shioaji，再按「即時更新報價與分析」。
+- **③ 看訊號**：`🔴 偏多` 等突破壓力，`🟢 偏空` 等跌破支撐；`進／停／目` 是觀察進場、失效離場、第一目標。
+- **成交與風險**：成交量、未平倉量高，且買賣價差較小，通常較容易進出。進場信心是條件一致度，**不是勝率**。
+- **交易時段**：`日盤+夜盤` 表示商品有夜盤；策略只採查詢當下的同一時段資料，避免把兩段行情混成一根 K 棒。
+- 股票戰略室中的股期會依股票順序附加在排行後方；隱藏與月份篩選仍會套用。
         """)
 
 @st.cache_data(ttl=300, max_entries=1)
@@ -10764,27 +10889,132 @@ def fetch_futures_strategy_universe():
         'errors': errors,
     }
 
+SHIOAJI_FUTURES_ROOT_ALIASES = {
+    # TAIFEX OpenAPI product codes differ from Shioaji roots for these indices.
+    'TX': 'TXF', 'MTX': 'MXF', 'TE': 'EXF', 'TF': 'FXF',
+}
+FUTURES_MONTH_CODE = {
+    1: 'A', 2: 'B', 3: 'C', 4: 'D', 5: 'E', 6: 'F',
+    7: 'G', 8: 'H', 9: 'I', 10: 'J', 11: 'K', 12: 'L',
+}
+
+
+def shioaji_futures_root_candidates(root):
+    normalized = str(root or '').strip().upper()
+    candidates = [SHIOAJI_FUTURES_ROOT_ALIASES.get(normalized), normalized]
+    return [value for index, value in enumerate(candidates) if value and value not in candidates[:index]]
+
+
+def expected_shioaji_futures_code(root, contract_month):
+    match = re.search(r'(\d{4})(\d{2})', str(contract_month or ''))
+    if not match:
+        return ''
+    year, month = int(match.group(1)), int(match.group(2))
+    month_code = FUTURES_MONTH_CODE.get(month)
+    roots = shioaji_futures_root_candidates(root)
+    return f'{roots[0]}{month_code}{year % 10}' if roots and month_code else ''
+
+
+def is_small_stock_futures_record(record):
+    """True only for mini single-stock futures (not index/ETF mini futures)."""
+    product_type = str(record.get('商品類型', '') or '').strip()
+    return (
+        bool(record.get('小型期貨', False))
+        and product_type == '股票'
+        and not bool(record.get('指數期貨', False))
+        and not bool(record.get('ETF期貨', False))
+    )
+
+
+def _contract_delivery_month(contract):
+    value = getattr(contract, 'delivery_month', None) or getattr(contract, 'delivery_date', '')
+    match = re.search(r'\d{6}', str(value).replace('-', '').replace('/', ''))
+    return match.group() if match else ''
+
+
+def _is_actual_futures_contract(contract):
+    code = str(getattr(contract, 'code', '') or '').upper()
+    return bool(code) and not code.endswith(('R1', 'R2')) and '/' not in code
+
+
+def _list_shioaji_futures_contracts(api):
+    """Load the Shioaji 1.7 lazy futures catalog, with legacy compatibility."""
+    if api is None:
+        return []
+    contracts = []
+    try:
+        security_type = sj.SecurityType.Futures if sj is not None else 'FUT'
+        contracts.extend(list(api.contracts.list(security_type) or []))
+    except (AttributeError, TypeError, ValueError):
+        pass
+    if not contracts:
+        try:
+            for category in api.Contracts.Futures:
+                try:
+                    contracts.extend(list(category))
+                except TypeError:
+                    continue
+        except (AttributeError, TypeError):
+            pass
+    unique = {}
+    for contract in contracts:
+        code = str(getattr(contract, 'code', '') or '').upper()
+        if code:
+            unique.setdefault(code, contract)
+    return list(unique.values())
+
+
 def resolve_shioaji_futures_contract(api, root, contract_month):
-    """依商品代碼與年月尋找 Shioaji 實際契約，支援日盤與夜盤快照。"""
+    """依商品代碼與年月尋找 Shioaji 實際契約，支援 1.7 延遲載入。"""
     if api is None:
         return None
+    target_month_match = re.search(r'\d{6}', str(contract_month or ''))
+    target_month = target_month_match.group() if target_month_match else ''
+    if not target_month:
+        return None
+    roots = shioaji_futures_root_candidates(root)
     candidates = []
-    try:
-        for category in api.Contracts.Futures:
+
+    # Shioaji 1.7 no longer downloads the whole futures catalog at login.
+    # Querying the root is both faster and reliable on a fresh mobile session.
+    for query_root in roots:
+        try:
             try:
-                contracts = list(category)
+                found = api.contracts.futures(query_root, delivery_month=target_month)
             except TypeError:
+                found = api.contracts.futures(query_root)
+            candidates.extend(list(found or []))
+        except (AttributeError, KeyError, TypeError, ValueError):
+            continue
+
+    # Older SDK/session objects still expose category attributes.
+    if not candidates:
+        for query_root in roots:
+            try:
+                candidates.extend(list(getattr(api.Contracts.Futures, query_root)))
+            except (AttributeError, KeyError, TypeError):
                 continue
-            for contract in contracts:
-                code = str(getattr(contract, 'code', '')).upper()
-                delivery = str(getattr(contract, 'delivery_month', getattr(contract, 'delivery_date', ''))).replace('-', '').replace('/', '')
-                if code.startswith(str(root).upper()) and str(contract_month) in delivery[:6] and code[-2:] not in ('R1', 'R2'):
-                    candidates.append(contract)
-        if candidates:
-            return min(candidates, key=lambda item: str(getattr(item, 'delivery_date', getattr(item, 'delivery_month', '999999'))))
-    except Exception:
-        pass
-    return None
+    if not candidates:
+        candidates = _list_shioaji_futures_contracts(api)
+
+    matched = [
+        contract for contract in candidates
+        if _is_actual_futures_contract(contract)
+        and _contract_delivery_month(contract) == target_month
+        and (
+            str(getattr(contract, 'root', '') or '').upper() in roots
+            or any(str(getattr(contract, 'code', '') or '').upper().startswith(item) for item in roots)
+        )
+    ]
+    if not matched:
+        return None
+    return min(
+        matched,
+        key=lambda item: str(
+            getattr(item, 'delivery_date', None) or getattr(item, 'last_trading_date', None)
+            or getattr(item, 'delivery_month', '999999')
+        ),
+    )
 
 def calculate_futures_strategy_levels(row, strategy_mode='當沖', direction_choice='自動', kbars=None):
     """計算期貨支撐壓力與條件式進出場點位；無即時 K 棒時採官方日行情備援。"""
@@ -11043,6 +11273,7 @@ def update_futures_live_rows(rows, api, strategy_mode, direction_choice, include
         contract = resolve_shioaji_futures_contract(api, row['期貨代碼'], row['契約月份'])
         if contract is not None:
             resolved.append((index, contract))
+    updated.attrs['resolved_contract_count'] = len(resolved)
     if not resolved:
         return updated, 0
 
@@ -11107,25 +11338,37 @@ def update_futures_universe_live(rows, api):
     updated = rows.copy()
     roots = sorted(set(updated['期貨代碼'].astype(str).str.upper()), key=len, reverse=True)
     contract_map = {}
-    try:
-        for category in api.Contracts.Futures:
-            try:
-                contracts = list(category)
-            except TypeError:
-                continue
-            for contract in contracts:
-                code = str(getattr(contract, 'code', '')).upper()
-                if not code or code[-2:] in ('R1', 'R2'):
-                    continue
-                delivery = str(
-                    getattr(contract, 'delivery_month', getattr(contract, 'delivery_date', ''))
-                ).replace('-', '').replace('/', '')
-                month_match = re.search(r'\d{6}', delivery)
-                root = next((candidate for candidate in roots if code.startswith(candidate)), None)
-                if root and month_match:
-                    contract_map.setdefault((root, month_match.group()), contract)
-    except Exception:
-        return updated, 0
+    available_contracts = _list_shioaji_futures_contracts(api)
+    contracts_by_code = {
+        str(getattr(contract, 'code', '') or '').upper(): contract
+        for contract in available_contracts if getattr(contract, 'code', None)
+    }
+    # api.contracts.list() intentionally returns compact Contract objects without
+    # delivery_month.  Their actual code still deterministically identifies the
+    # month, so map official rows before inspecting richer FuturesInfo objects.
+    for _, row in updated.iterrows():
+        root = str(row['期貨代碼']).upper()
+        month = str(row['契約月份'])
+        expected_code = expected_shioaji_futures_code(root, month)
+        if expected_code in contracts_by_code:
+            contract_map[(root, month)] = contracts_by_code[expected_code]
+
+    for contract in available_contracts:
+        code = str(getattr(contract, 'code', '')).upper()
+        if not _is_actual_futures_contract(contract):
+            continue
+        month = _contract_delivery_month(contract)
+        contract_root = str(getattr(contract, 'root', '') or '').upper()
+        root = next(
+            (
+                candidate for candidate in roots
+                if contract_root in shioaji_futures_root_candidates(candidate)
+                or any(code.startswith(alias) for alias in shioaji_futures_root_candidates(candidate))
+            ),
+            None,
+        )
+        if root and month:
+            contract_map.setdefault((root, month), contract)
 
     resolved = [
         (index, contract_map.get((str(row['期貨代碼']).upper(), str(row['契約月份']))))
@@ -12961,6 +13204,14 @@ def fmt_price(v):
         return f"{float(v):.2f}".rstrip('0').rstrip('.')
     except: return str(v)
 
+
+def format_bid_ask_pair(bid, ask):
+    """Compact quote text; icons keep buy/sell readable even without cell colors."""
+    bid_value, ask_value = _safe_number(bid), _safe_number(ask)
+    if bid_value is None and ask_value is None:
+        return '—'
+    return f"🔴買 {fmt_price(bid_value) or '—'}｜🟢賣 {fmt_price(ask_value) or '—'}"
+
 def calculate_note_width(series, font_size):
     def get_width(s):
         w = 0
@@ -13730,8 +13981,8 @@ def render_futures_strategy_room():
                 hide_index = st.checkbox("隱藏指數期貨", value=True, key="futures_hide_index")
                 hide_etf = st.checkbox("隱藏 ETF 期貨", value=False, key="futures_hide_etf")
                 only_small = st.checkbox(
-                    "只顯示小型期貨", value=False, key="futures_only_small",
-                    help="依目前成交口數由高到低保留小型／微型期貨；一般期貨與其他商品暫時隱藏。"
+                    "只顯示小型股票期貨", value=False, key="futures_only_small",
+                    help="只保留小型個股期貨，依成交口數由高到低排序；一般股票期貨、指數期貨與 ETF 期貨都會隱藏。"
                 )
                 hide_small = st.checkbox("隱藏小型期貨", value=False, key="futures_hide_small")
                 hide_next = st.checkbox("隱藏次月期貨", value=True, key="futures_hide_next")
@@ -13924,7 +14175,9 @@ def render_futures_strategy_room():
 
     filtered = universe.copy()
     if only_small:
-        filtered = filtered[filtered['小型期貨']]
+        filtered = filtered[
+            filtered.apply(is_small_stock_futures_record, axis=1)
+        ].sort_values('當日成交口數', ascending=False)
     else:
         if hide_index:
             filtered = filtered[~filtered['指數期貨']]
@@ -13941,7 +14194,9 @@ def render_futures_strategy_room():
     # 將股票戰略室內有股期的標的依股票原順序附加：A 股期、A 小型股期、B 股期、B 小型股期。
     linked_pool = universe.copy()
     if only_small:
-        linked_pool = linked_pool[linked_pool['小型期貨']]
+        linked_pool = linked_pool[
+            linked_pool.apply(is_small_stock_futures_record, axis=1)
+        ].sort_values('當日成交口數', ascending=False)
     else:
         if hide_index:
             linked_pool = linked_pool[~linked_pool['指數期貨']]
@@ -14037,7 +14292,11 @@ def render_futures_strategy_room():
                 st.toast(f"已更新 {updated_count} 檔期貨報價與分析", icon="✅")
                 st.rerun()
             else:
-                st.warning("未取得實際契約快照；請確認 Shioaji 連線與契約是否仍有效。")
+                resolved_count = int(updated_rows.attrs.get('resolved_contract_count', 0) or 0)
+                if resolved_count:
+                    st.warning("已找到實際契約，但目前沒有可用報價；請稍候數秒再更新，或使用快速重新登入。")
+                else:
+                    st.warning("找不到目前月份的實際契約；已重新讀取 Shioaji 契約檔，請確認合約月份仍在交易。")
 
     if enhanced_layer:
         display_rows = enrich_futures_strategy_rows(display_rows, strategy_mode, market_bias)
@@ -14085,8 +14344,36 @@ def render_futures_strategy_room():
                 styles[position] = 'color:#ff4b4b;font-weight:bold;' if change > 0 else ('color:#00c853;font-weight:bold;' if change < 0 else '')
             elif column == '方向':
                 styles[position] = 'color:#ff4b4b;font-weight:bold;' if direction == '偏多' else ('color:#00c853;font-weight:bold;' if direction == '偏空' else '')
-            elif column == '當日成交口數':
+            elif column == '支撐壓力':
+                styles[position] = 'color:#4fc3f7;font-weight:600;'
+            elif column in ('進出場點位', '觸發條件'):
+                value = str(row.get(column, ''))
+                if any(keyword in value for keyword in ('資料不足', '不建立', '等待')):
+                    styles[position] = 'color:#ffd166;'
+                elif direction == '偏多':
+                    styles[position] = 'color:#ff6b6b;'
+                elif direction == '偏空':
+                    styles[position] = 'color:#35d07f;'
+            elif column == '當日漲停價':
+                styles[position] = 'color:#ff4b4b;font-weight:bold;'
+            elif column == '當日跌停價':
+                styles[position] = 'color:#00e676;font-weight:bold;'
+            elif column in ('當日成交口數', '未平倉量'):
                 styles[position] = 'color:#ff9800;font-weight:bold;'
+            elif column in ('所需保證金', '維持保證金'):
+                styles[position] = 'color:#90caf9;'
+            elif column == '買賣價差':
+                spread_text = str(row.get('買賣價差', ''))
+                try:
+                    spread_ticks = float(re.search(r'[\d.]+', spread_text).group())
+                except (AttributeError, TypeError, ValueError):
+                    spread_ticks = None
+                styles[position] = (
+                    'color:#4fc3f7;' if spread_ticks is not None and spread_ticks <= 2
+                    else ('color:#ffd166;' if spread_ticks is not None else 'color:#94a3b8;')
+                )
+            elif column == '交易時段':
+                styles[position] = 'color:#c4b5fd;'
             elif column == '訊號狀態':
                 if signal_state.startswith('✅'):
                     styles[position] = 'color:#ff4b4b;font-weight:bold;'
@@ -14980,6 +15267,7 @@ with stock_strategy_container:
                 df_display.at[i, '支撐壓力'] = build_stock_support_resistance(row, is_daytrade_mode)
                 df_display.at[i, '市場一致'] = market_alignment
                 df_display.at[i, '資料狀態'] = data_health
+                df_display.at[i, '買賣價'] = format_bid_ask_pair(bid, ask)
                 df_display.at[i, '買賣價差'] = f'{spread_ticks:.0f}跳' if spread_ticks is not None else '—'
                 df_display.at[i, '_risk_eligible'] = eligible_with_score
                 df_display.at[i, '_附加可記錄'] = (
@@ -15001,13 +15289,13 @@ with stock_strategy_container:
             if stock_compact_table:
                 input_cols = [
                     "移除", "代號", "名稱", "戰略備註", "收盤價", "漲跌幅",
-                    "建議方向", "方向依據", "支撐壓力", "進出場預判", "5日線價差", "信心分", "信心判讀",
+                    "買賣價", "建議方向", "方向依據", "支撐壓力", "進出場預判", "5日線價差", "信心分", "信心判讀",
                     "訊號狀態", "市場一致", "風險", "資料狀態"
                 ]
             elif is_daytrade_mode:
-                input_cols = ["移除", "代號", "名稱", "戰略備註", "收盤價", "漲跌幅", "建議方向", "方向依據", "狀態", "成交價價差", "5日線價差", "風險", "VWAP 狀態", "開盤區間", "量能", "信心分", "信心判讀", "支撐壓力", "盤中觸發", "進出場預判", "訊號狀態", "市場一致", "當日漲停價", "當日跌停價", "期貨", "資料狀態", "買賣價差"]
+                input_cols = ["移除", "代號", "名稱", "戰略備註", "收盤價", "漲跌幅", "買賣價", "建議方向", "方向依據", "狀態", "成交價價差", "5日線價差", "風險", "VWAP 狀態", "開盤區間", "量能", "信心分", "信心判讀", "支撐壓力", "盤中觸發", "進出場預判", "訊號狀態", "市場一致", "當日漲停價", "當日跌停價", "期貨", "資料狀態", "買賣價差"]
             else:
-                input_cols = ["移除", "代號", "名稱", "戰略備註", "收盤價", "漲跌幅", "建議方向", "方向依據", "狀態", "成交價價差", "5日線價差", "風險", "信心分", "信心判讀", "乖離", "支撐壓力", "隔日規則", "進出場預判", "訊號狀態", "市場一致", "當日漲停價", "當日跌停價", "期貨", "資料狀態", "買賣價差"]
+                input_cols = ["移除", "代號", "名稱", "戰略備註", "收盤價", "漲跌幅", "買賣價", "建議方向", "方向依據", "狀態", "成交價價差", "5日線價差", "風險", "信心分", "信心判讀", "乖離", "支撐壓力", "隔日規則", "進出場預判", "訊號狀態", "市場一致", "當日漲停價", "當日跌停價", "期貨", "資料狀態", "買賣價差"]
         else:
             input_cols = ["移除", "代號", "名稱", "戰略備註", "收盤價", "漲跌幅", "狀態", "成交價價差", "5日線價差", "當日漲停價", "當日跌停價", "期貨"]
         for col in input_cols:
@@ -15092,6 +15380,28 @@ with stock_strategy_container:
                         styles[idx] = 'color:#ff4b4b;font-weight:bold;'
                     elif '空' in direction_text:
                         styles[idx] = 'color:#00e676;font-weight:bold;'
+                elif col == "方向依據":
+                    direction_text = str(row.get('建議方向', ''))
+                    styles[idx] = (
+                        'color:#ff6b6b;' if '多' in direction_text
+                        else ('color:#35d07f;' if '空' in direction_text else 'color:#cbd5e1;')
+                    )
+                elif col == "支撐壓力":
+                    styles[idx] = 'color:#4fc3f7;font-weight:600;'
+                elif col in ("盤中觸發", "隔日規則", "進出場預判"):
+                    value = str(row.get(col, ''))
+                    if any(keyword in value for keyword in ('資料不足', '不建立', '觀察：', '等待')):
+                        styles[idx] = 'color:#ffd166;'
+                    elif '多' in str(row.get('建議方向', '')):
+                        styles[idx] = 'color:#ff6b6b;'
+                    elif '空' in str(row.get('建議方向', '')):
+                        styles[idx] = 'color:#35d07f;'
+                elif col == "買賣價":
+                    styles[idx] = 'color:#e2e8f0;font-weight:600;'
+                elif col == "當日漲停價":
+                    styles[idx] = 'color:#ff4b4b;font-weight:bold;'
+                elif col == "當日跌停價":
+                    styles[idx] = 'color:#00e676;font-weight:bold;'
                 elif col in ["成交價價差", "5日線價差"]:
                     val = row[col]
                     try:
@@ -15162,6 +15472,10 @@ with stock_strategy_container:
                 "買賣價差": st.column_config.TextColumn(
                     width=stock_content_width('買賣價差', 56, 96), disabled=True,
                     help="即時最佳賣價與最佳買價的距離，換算為跳動單位；跳數越少通常代表報價較連續、進出成本較低。無即時買賣價時顯示「—」。"
+                ),
+                "買賣價": st.column_config.TextColumn(
+                    width=stock_content_width('買賣價', 96, 150), disabled=True,
+                    help="🔴買是最佳買價，🟢賣是最佳賣價；顯示 — 代表目前沒有即時五檔報價。"
                 ),
                 "信心分": st.column_config.ProgressColumn("進場信心", min_value=0, max_value=100, format="%d", width=82, help="綜合方向條件、觸發位置、市場一致與資料狀態；代表條件一致度，不是勝率。"),
                 "信心判讀": st.column_config.TextColumn(width=stock_content_width('信心判讀', 48, 96), disabled=True, help="高／中高／中／低；追離進場點、條件失效或資料過期時會降級。"),
@@ -15692,6 +16006,7 @@ with stock_strategy_container:
                         df_indep.at[i, '信心判讀'] = confidence['label']
                         df_indep.at[i, '市場一致'] = market_alignment
                         df_indep.at[i, '資料狀態'] = data_health
+                        df_indep.at[i, '買賣價'] = format_bid_ask_pair(bid, ask)
                         df_indep.at[i, '買賣價差'] = f'{spread_ticks:.0f}跳' if spread_ticks is not None else '—'
                         df_indep.at[i, '_indep_eligible'] = (
                             bool(trade_plan.get('valid')) and result['eligible']
@@ -15704,9 +16019,9 @@ with stock_strategy_container:
                             st.warning("目前沒有符合門檻的候選；可降低最低評分、放寬最大乖離，或改看完整結果。")
 
                     if indep_is_daytrade:
-                        input_cols = ["代號", "名稱", "戰略備註", "收盤價", "漲跌幅", "建議方向", "方向依據", "成交價價差", "5日線價差", "風險", "VWAP 狀態", "開盤區間", "量能", "訊號狀態", "信心分", "信心判讀", "支撐壓力", "盤中觸發", "進出場預判", "市場一致", "當日漲停價", "當日跌停價", "期貨", "資料狀態", "買賣價差"]
+                        input_cols = ["代號", "名稱", "戰略備註", "收盤價", "漲跌幅", "買賣價", "建議方向", "方向依據", "成交價價差", "5日線價差", "風險", "VWAP 狀態", "開盤區間", "量能", "訊號狀態", "信心分", "信心判讀", "支撐壓力", "盤中觸發", "進出場預判", "市場一致", "當日漲停價", "當日跌停價", "期貨", "資料狀態", "買賣價差"]
                     else:
-                        input_cols = ["代號", "名稱", "戰略備註", "收盤價", "漲跌幅", "建議方向", "方向依據", "成交價價差", "5日線價差", "風險", "訊號狀態", "信心分", "信心判讀", "乖離", "支撐壓力", "隔日規則", "進出場預判", "市場一致", "當日漲停價", "當日跌停價", "期貨", "資料狀態", "買賣價差"]
+                        input_cols = ["代號", "名稱", "戰略備註", "收盤價", "漲跌幅", "買賣價", "建議方向", "方向依據", "成交價價差", "5日線價差", "風險", "訊號狀態", "信心分", "信心判讀", "乖離", "支撐壓力", "隔日規則", "進出場預判", "市場一致", "當日漲停價", "當日跌停價", "期貨", "資料狀態", "買賣價差"]
                 else:
                     input_cols = ["代號", "名稱", "戰略備註", "收盤價", "漲跌幅", "成交價價差", "5日線價差", "當日漲停價", "當日跌停價", "期貨"]
                 for col in input_cols:
@@ -15795,6 +16110,10 @@ with stock_strategy_container:
                         "買賣價差": st.column_config.TextColumn(
                             width=indep_content_width('買賣價差', 56, 96),
                             help="即時最佳賣價與最佳買價的距離，換算為跳動單位。"
+                        ),
+                        "買賣價": st.column_config.TextColumn(
+                            width=indep_content_width('買賣價', 96, 150),
+                            help="🔴買是最佳買價，🟢賣是最佳賣價。"
                         ),
                         "狀態": None, # 設定為 None 隱藏獨立計算結果的狀態欄位
                         "戰略備註": st.column_config.TextColumn("戰略備註", width=note_width_px)
@@ -17353,12 +17672,13 @@ with tab_fibo:
                     f"方向：{'BC／Call' if option_direction == '偏多' else 'BP／Put'}｜"
                     f"報價更新：{option_cache['updated_at'].strftime('%H:%M:%S')}｜資料只在本分頁開啟或按更新時載入。"
                 )
-                with st.expander("模型勝率與損益怎麼算"):
+                with st.expander("🧮 模型數字怎麼看"):
                     st.markdown(
-                        "- **模型勝率**：以最佳賣價反推 Black–Scholes 隱含波動率，估算到期超越損益兩平點的市場隱含機率；無法反推時改用近 20 日實現波動率。\n"
-                        "- **目標／停損損益**：假設快進快出後仍剩目前約 65% 的存續時間、波動率不變，重新評價權利金；未含手續費與稅。\n"
-                        "- **模型期望損益**：用模型勝率加權目標與停損兩種情境，屬情境比較，不是歷史回測績效。\n"
-                        "- 夜盤現貨不交易，模型以最新期貨作為臺指選標的代理，期現價差會造成估算誤差。"
+                        "- **模型機率**：估算到期時跨過損益兩平點的機率，不是歷史勝率。\n"
+                        "- **目標／停損情境**：假設快進快出後仍有約 65% 剩餘時間，估算當時權利金；未含手續費與稅。\n"
+                        "- **模型估值差**：理論價減保守買進價。負值常反映買賣價差，不代表這筆交易的期望報酬。\n"
+                        "- **單買門檻**：目標需越過損益兩平、目標情境為正、報酬風險比至少 1.25，且機率與流動性達標；否則顯示等待或價差單。\n"
+                        "- 夜盤以最新期貨代替現貨，期現價差可能造成估算誤差。"
                     )
 
                 display_spread = option_mode.startswith("價差單") or (
@@ -17380,7 +17700,7 @@ with tab_fibo:
                         ("單組最大風險", f"${_format_compact_number(option_quote['max_loss'], 0)}", '#00c853'),
                         ("損益兩平", _format_compact_number(option_quote['breakeven'], 2) if option_quote['breakeven'] is not None else "報價不足", '#f5f5f5'),
                         ("模型勝率", f"{_format_compact_number(option_quote['model_probability'] * 100, 2)}%" if option_quote['model_probability'] is not None else "無法估算", '#29b6f6'),
-                        ("模型期望損益", f"${_format_compact_number(option_quote['expected_pnl'], 0, signed=True)}" if option_quote['expected_pnl'] is not None else "無法估算", '#f5f5f5'),
+                        ("模型估值差", f"${_format_compact_number(option_quote['expected_pnl'], 0, signed=True)}" if option_quote['expected_pnl'] is not None else "無法估算", '#cbd5e1'),
                     ])
                     premium_detail = "即時買賣價不足，最大風險先以履約價差 × 50 元估算。"
                     if option_quote['short_premium'] is not None and option_quote['long_premium'] is not None:
@@ -17398,7 +17718,7 @@ with tab_fibo:
                     option_title = f"{option_quote['name']}｜{option_quote['delivery_month']}｜{option_quote['expiry'].strftime('%Y/%m/%d')} 到期（剩 {option_quote['dte']} 天）"
                     st.markdown(f"**{option_title}**")
                     render_option_metric_cards("契約與成交", [
-                        ("建議買進", f"{_format_compact_number(option_quote['strike'], 0)} {option_quote['right']}", '#f5f5f5'),
+                        ("候選履約價" if not option_quote.get('trade_ready', False) else "建議買進", f"{_format_compact_number(option_quote['strike'], 0)} {option_quote['right']}", '#f5f5f5'),
                         ("買進參考價", f"{_format_compact_number(option_quote['premium'], 2)} 點" if option_quote['premium'] is not None else "報價不足", '#ffb300'),
                         ("價內外", f"{option_quote['moneyness']}｜距現價 {_format_compact_number(option_quote['distance_points'], 0)} 點", '#29b6f6'),
                         ("買賣價差", f"{_format_compact_number(option_quote['spread'], 2)} 點" if option_quote['spread'] is not None else "報價不足", '#f5f5f5'),
@@ -17409,14 +17729,22 @@ with tab_fibo:
                         ("損益兩平", _format_compact_number(option_quote['breakeven'], 2) if option_quote['breakeven'] is not None else "報價不足", '#f5f5f5'),
                         ("模型勝率", f"{_format_compact_number(option_quote['model_probability'] * 100, 2)}%" if option_quote['model_probability'] is not None else "無法估算", '#29b6f6'),
                         ("模型波動率", f"{_format_compact_number(option_quote['model_volatility'] * 100, 2)}%", '#f5f5f5'),
-                        ("模型期望損益", f"${_format_compact_number(option_quote['expected_pnl'], 0, signed=True)}" if option_quote['expected_pnl'] is not None else "無法估算", '#f5f5f5'),
+                        ("模型估值差", f"${_format_compact_number(option_quote['model_value_gap'], 0, signed=True)}" if option_quote.get('model_value_gap') is not None else "無法估算", '#cbd5e1'),
+                        ("報酬／風險", _format_compact_number(option_quote.get('payoff_ratio'), 2) if option_quote.get('payoff_ratio') is not None else "無法估算", '#29b6f6'),
                         ("目標情境損益", f"${_format_compact_number(option_quote['target_pnl'], 0, signed=True)}", '#ff4b4b'),
                         ("停損情境損益", f"${_format_compact_number(option_quote['stop_pnl'], 0, signed=True)}", '#00c853'),
                     ])
-                    st.warning(
-                        f"風險指標：{option_quote['risk_level']}。此為 {option_quote['name']} 的快進快出方案；"
-                        "僅在 5 分 K 確認後進場，標的觸及日線失效點或權利金回落約 40% 時優先退出。"
-                    )
+                    if option_quote.get('trade_ready', False):
+                        st.warning(
+                            f"⚠️ 風險：{option_quote['risk_level']}。只在 5 分 K 確認後進場；"
+                            "標的碰到失效點，或權利金回落約 40%，優先退出。"
+                        )
+                    else:
+                        st.warning(
+                            "⏸️ 本候選未達單買門檻："
+                            + "、".join(option_quote.get('quality_notes') or ['條件不足'])
+                            + "。先等待，不以候選價直接進場。"
+                        )
                     st.caption(
                         f"報價依據：{option_quote.get('premium_basis', '最後成交價')}。單口權利金成本 = 參考價 × 50 元，"
                         "未含手續費與交易稅；買方最大風險即已付權利金。"
@@ -17444,7 +17772,9 @@ with tab_fibo:
                                 "買進價": _format_compact_number(candidate['premium'], 2),
                                 "模型勝率": f"{_format_compact_number(candidate['model_probability'] * 100, 2)}%" if candidate['model_probability'] is not None else "—",
                                 "IV／模型波動率": f"{_format_compact_number(candidate['model_volatility'] * 100, 2)}%",
-                                "期望損益": f"${_format_compact_number(candidate['expected_pnl'], 0, signed=True)}" if candidate['expected_pnl'] is not None else "—",
+                                "模型估值差": f"${_format_compact_number(candidate['model_value_gap'], 0, signed=True)}" if candidate.get('model_value_gap') is not None else "—",
+                                "報酬／風險": _format_compact_number(candidate.get('payoff_ratio'), 2) if candidate.get('payoff_ratio') is not None else "—",
+                                "單買門檻": "✅ 通過" if candidate.get('trade_ready') else "⏸️ 等待",
                                 "目標損益": f"${_format_compact_number(candidate['target_pnl'], 0, signed=True)}",
                                 "停損損益": f"${_format_compact_number(candidate['stop_pnl'], 0, signed=True)}",
                                 "流動性": candidate['liquidity'],

@@ -341,6 +341,84 @@ def test_goodinfo_parser_promotes_td_header_after_title_row():
     assert "週轉率(%)" in parsed.columns
 
 
+def test_goodinfo_legacy_parser_restores_original_large_table_flow():
+    symbols = load_app_symbols(
+        "_goodinfo_normalize_text", "_parse_goodinfo_legacy_page",
+    )
+    rows = ''.join(
+        f"<tr><td>{index + 1}</td><td>{2400 + index}</td><td>股票{index}</td>"
+        f"<td>{100 + index}</td><td>{1000 + index}</td><td>{index + 1}.2%</td></tr>"
+        for index in range(12)
+    )
+    markup = (
+        "<html><body><div>累計成交量週轉率（當日）</div>"
+        "<table><tr><th>排名</th><th>股票代號</th><th>名稱</th><th>成交價</th>"
+        "<th>成交張數</th><th>週轉率</th></tr>"
+        f"{rows}</table></body></html>"
+    )
+    parsed = symbols["_parse_goodinfo_legacy_page"](markup)
+    assert parsed is not None
+    assert len(parsed) == 12
+    assert "股票代號" in parsed.columns
+
+
+def test_shioaji_futures_resolver_uses_v17_lazy_root_api():
+    symbols = load_app_symbols(
+        "SHIOAJI_FUTURES_ROOT_ALIASES", "FUTURES_MONTH_CODE",
+        "shioaji_futures_root_candidates", "expected_shioaji_futures_code",
+        "_contract_delivery_month", "_is_actual_futures_contract",
+        "resolve_shioaji_futures_contract",
+    )
+
+    class Contract:
+        def __init__(self, code, root, month):
+            self.code = code
+            self.root = root
+            self.delivery_month = month
+            self.delivery_date = date(2026, 9, 16)
+
+    class LazyContracts:
+        def __init__(self):
+            self.calls = []
+
+        def futures(self, root, delivery_month=None):
+            self.calls.append((root, delivery_month))
+            if root == "MXF" and delivery_month == "202609":
+                return [Contract("MXFI6", "MXF", "202609")]
+            return []
+
+    class API:
+        def __init__(self):
+            self.contracts = LazyContracts()
+
+    api = API()
+    contract = symbols["resolve_shioaji_futures_contract"](api, "MTX", "202609")
+    assert contract.code == "MXFI6"
+    assert api.contracts.calls[0] == ("MXF", "202609")
+    assert symbols["expected_shioaji_futures_code"]("MTX", "202608") == "MXFH6"
+    assert symbols["expected_shioaji_futures_code"]("CDF", "202609") == "CDFI6"
+
+
+def test_only_small_stock_futures_excludes_index_and_etf_products():
+    predicate = load_app_symbols("is_small_stock_futures_record")["is_small_stock_futures_record"]
+    assert predicate({"商品類型": "股票", "小型期貨": True, "指數期貨": False, "ETF期貨": False})
+    assert not predicate({"商品類型": "指數", "小型期貨": True, "指數期貨": True, "ETF期貨": False})
+    assert not predicate({"商品類型": "ETF", "小型期貨": True, "指數期貨": False, "ETF期貨": True})
+    assert not predicate({"商品類型": "股票", "小型期貨": False, "指數期貨": False, "ETF期貨": False})
+
+
+def test_directional_option_quality_rejects_negative_or_unreachable_trades():
+    evaluate = load_app_symbols("evaluate_txo_directional_quality")["evaluate_txo_directional_quality"]
+    good = evaluate(100, 3500, -2000, 0.48, 8, "中", True)
+    assert good["trade_ready"]
+    assert good["payoff_ratio"] >= 1.25
+
+    poor = evaluate(100, -500, -2000, 0.32, 22, "低", False)
+    assert not poor["trade_ready"]
+    assert "目標情境仍未獲利" in poor["quality_notes"]
+    assert "買賣價差過寬" in poor["quality_notes"]
+
+
 def test_stock_limit_context_switches_display_reference_at_1430():
     symbols = load_app_symbols(
         "_safe_number", "get_tick_size", "calculate_limits", "stock_limit_context"
