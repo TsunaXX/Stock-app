@@ -10,7 +10,9 @@ search_cache.json
 cal_preferences.json
 company_event_snapshot.json
 strategy_signal_log.json
+strategy_signal_tombstones.json
 fibo_tags.json
+futures_strategy_cache.json
 cal_override.json
 .pytest_cache/
 

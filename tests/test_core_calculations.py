@@ -120,6 +120,72 @@ def test_futures_limit_color_requires_actual_equality():
     assert state("90", 100, 90) == "down"
 
 
+def test_small_futures_detection_handles_short_stock_future_names():
+    symbols = load_app_symbols("is_small_futures_product")
+    is_small = symbols["is_small_futures_product"]
+    assert is_small("小台積電期貨", "CDF", "股票")
+    assert is_small("微型臺指期貨", "TMF", "指數")
+    assert is_small("小型台指期貨", "MTX", "指數")
+    # Generic commodity names are not classified by the stock/ETF shorthand.
+    assert not is_small("小麥期貨", "WTF", "未知")
+    assert not is_small("台積電期貨", "CDF", "股票")
+
+
+def test_futures_intraday_levels_are_clamped_to_daily_limits():
+    symbols = load_app_symbols(
+        "_safe_number", "round_futures_price", "clamp_futures_intraday_levels",
+    )
+    clamp = symbols["clamp_futures_intraday_levels"]
+    assert clamp(101, 80, 130, 120, 90, 1) == (101.0, 90.0, 120.0)
+    assert clamp(101, 80, 130, None, None, 1) == (101, 80, 130)
+
+
+def test_futures_official_snapshot_keeps_last_known_good_values_for_partial_same_day():
+    symbols = load_app_symbols(
+        "_safe_number", "merge_futures_official_snapshot",
+    )
+    merge = symbols["merge_futures_official_snapshot"]
+    previous = pd.DataFrame([{
+        "契約鍵": "CDF:202609", "當日成交口數": 1234,
+        "收盤價": 1050, "所需保證金": 180000, "資料日期": "20260819",
+    }])
+    current = pd.DataFrame([{
+        "契約鍵": "CDF:202609", "當日成交口數": 0,
+        "收盤價": None, "所需保證金": 0, "資料日期": "20260819",
+    }])
+    merged, meta = merge(
+        current, previous, {"updated": "20260819", "margin_date": "20260819"},
+        {"updated": "20260819", "margin_date": "20260819"},
+    )
+    row = merged.iloc[0]
+    assert row["當日成交口數"] == 1234
+    assert row["收盤價"] == 1050
+    assert row["所需保證金"] == 180000
+    assert meta["last_known_good"] is True
+
+
+def test_new_market_day_does_not_clear_last_good_margin_when_margin_feed_is_partial():
+    symbols = load_app_symbols("_safe_number", "merge_futures_official_snapshot")
+    previous = pd.DataFrame([{
+        "契約鍵": "CDF:202609", "當日成交口數": 1234,
+        "收盤價": 1050, "所需保證金": 180000, "維持保證金": 138000,
+    }])
+    current = pd.DataFrame([{
+        "契約鍵": "CDF:202609", "當日成交口數": 1500,
+        "收盤價": 1060, "所需保證金": None, "維持保證金": 0,
+    }])
+    merged, meta = symbols["merge_futures_official_snapshot"](
+        current, previous,
+        {"updated": "20260820", "margin_date": "20260820"},
+        {"updated": "20260819", "margin_date": "20260819"},
+    )
+    row = merged.iloc[0]
+    assert row["收盤價"] == 1060
+    assert row["所需保證金"] == 180000
+    assert row["維持保證金"] == 138000
+    assert meta["margin_date"] == "20260819"
+
+
 def test_stock_limit_color_requires_actual_equality_not_stale_status():
     symbols = load_app_symbols("_safe_number", "get_tick_size", "stock_limit_state")
     state = symbols["stock_limit_state"]
@@ -223,7 +289,7 @@ def test_finmind_monthly_revenue_fallback_converts_july_data():
 
 
 def test_goodinfo_table_requires_real_turnover_rows():
-    symbols = load_app_symbols("_clean_goodinfo_table")
+    symbols = load_app_symbols("_goodinfo_normalize_text", "_clean_goodinfo_table")
     clean = symbols["_clean_goodinfo_table"]
     valid = pd.DataFrame({
         "股票代號": [f"{2300 + index}" for index in range(12)],
@@ -236,7 +302,9 @@ def test_goodinfo_table_requires_real_turnover_rows():
 
 
 def test_goodinfo_parser_uses_only_verified_ranking_table_html():
-    symbols = load_app_symbols("_clean_goodinfo_table", "_parse_goodinfo_table_html")
+    symbols = load_app_symbols(
+        "_goodinfo_normalize_text", "_clean_goodinfo_table", "_parse_goodinfo_table_html"
+    )
     row_html = ''.join(
         f"<tr><td>{2300 + index}</td><td>股票{index}</td><td>{index + 1}.2%</td></tr>"
         for index in range(12)
@@ -252,6 +320,38 @@ def test_goodinfo_parser_uses_only_verified_ranking_table_html():
     parsed = symbols["_parse_goodinfo_table_html"]([whole_page])
     assert parsed is not None
     assert len(parsed) == 12
+
+
+def test_goodinfo_parser_promotes_td_header_after_title_row():
+    symbols = load_app_symbols(
+        "_goodinfo_normalize_text", "_clean_goodinfo_table", "_parse_goodinfo_table_html"
+    )
+    rows = ''.join(
+        f"<tr><td>{2400 + index}</td><td>股票{index}</td><td>{index + 2}.5%</td></tr>"
+        for index in range(12)
+    )
+    markup = (
+        "<table><tr><td colspan='3'>累計成交量週轉率（當日）</td></tr>"
+        "<tr><td>股票代號</td><td>名稱</td><td>週轉率(%)</td></tr>"
+        f"{rows}</table>"
+    )
+    parsed = symbols["_parse_goodinfo_table_html"]([markup])
+    assert parsed is not None
+    assert len(parsed) == 12
+    assert "週轉率(%)" in parsed.columns
+
+
+def test_stock_limit_context_switches_display_reference_at_1430():
+    symbols = load_app_symbols(
+        "_safe_number", "get_tick_size", "calculate_limits", "stock_limit_context"
+    )
+    context = symbols["stock_limit_context"]
+    before = context(100, 105, datetime(2026, 8, 20, 14, 29, tzinfo=pytz.timezone("Asia/Taipei")))
+    after = context(100, 105, datetime(2026, 8, 20, 14, 30, tzinfo=pytz.timezone("Asia/Taipei")))
+    assert (before["today_up"], before["today_down"]) == (110.0, 90.0)
+    assert (before["display_up"], before["display_down"]) == (110.0, 90.0)
+    assert (after["today_up"], after["today_down"]) == (110.0, 90.0)
+    assert (after["display_up"], after["display_down"]) == (115.5, 94.5)
 
 
 def test_stock_direction_basis_is_compact_but_keeps_key_signals():
@@ -488,10 +588,30 @@ def test_nested_google_sheet_payload_restores_fibo_tags():
     assert symbols["_extract_fibo_tags"](backup) == tags
 
 
+def test_newer_fibo_backup_wins_over_valid_but_stale_primary_tags():
+    symbols = load_app_symbols("_valid_fibo_tags", "_extract_fibo_tags")
+    old_tags = ["A", "B", "C", "D", "E"]
+    new_tags = ["南亞科(2408)", "台積電(2330)", "鴻海(2317)", "聯發科(2454)", "和椿(6215)"]
+    payload = {
+        "fibo_tags": old_tags,
+        "fibo_tags_updated_at": "2026-08-20T09:00:00+08:00",
+        "fibo_tags_backup": {
+            "tags": new_tags,
+            "updated_at": "2026-08-20T09:05:00+08:00",
+        },
+    }
+    assert symbols["_extract_fibo_tags"](payload) == new_tags
+
+
 def test_cache_merge_preserves_remote_device_sections():
     symbols = load_app_symbols(
         "_json_safe", "_valid_fibo_tags", "_merge_unique_records",
         "_merge_unique_values", "merge_strategy_signal_state", "_cache_payload_timestamp",
+        "_state_updated_at", "_newer_timestamped_state", "_extract_fibo_tags",
+        "_fibo_tag_timestamp", "_newer_fibo_tag_payload",
+        "_safe_number", "merge_futures_official_snapshot", "_parse_futures_state_time",
+        "_prefer_futures_state_section", "_merge_futures_strategy_state",
+        "compact_futures_strategy_state",
         "empty_company_event_snapshot",
         "normalize_company_event_snapshot", "_newer_company_event_snapshot",
         "_merge_data_cache_payload",
@@ -527,16 +647,23 @@ def test_cache_merge_can_replace_cloud_stock_snapshot_without_resurrecting_old_r
     symbols = load_app_symbols(
         "_json_safe", "_valid_fibo_tags", "_merge_unique_records",
         "_merge_unique_values", "merge_strategy_signal_state", "_cache_payload_timestamp",
+        "_state_updated_at", "_newer_timestamped_state", "_extract_fibo_tags",
+        "_fibo_tag_timestamp", "_newer_fibo_tag_payload",
+        "_safe_number", "merge_futures_official_snapshot", "_parse_futures_state_time",
+        "_prefer_futures_state_section", "_merge_futures_strategy_state",
+        "compact_futures_strategy_state",
         "empty_company_event_snapshot",
         "normalize_company_event_snapshot", "_newer_company_event_snapshot",
         "_merge_data_cache_payload",
     )
     remote = {
         "stock_data": [{"代號": "2330", "收盤價": 100}],
+        "stock_data_updated_at": "2026-08-20T09:00:00+08:00",
         "fibo_tags": ["A", "B", "C", "D", "E"],
     }
     local = {
         "stock_data": [{"代號": "2408", "收盤價": 60}],
+        "stock_data_updated_at": "2026-08-20T09:05:00+08:00",
         "fibo_tags": ["1", "2", "3", "4", "5"],
     }
     merged = symbols["_merge_data_cache_payload"](
@@ -550,6 +677,11 @@ def test_cache_merge_keeps_newer_remote_snapshot_when_local_session_is_stale():
     symbols = load_app_symbols(
         "_json_safe", "_valid_fibo_tags", "_merge_unique_records",
         "_merge_unique_values", "merge_strategy_signal_state", "_cache_payload_timestamp",
+        "_state_updated_at", "_newer_timestamped_state", "_extract_fibo_tags",
+        "_fibo_tag_timestamp", "_newer_fibo_tag_payload",
+        "_safe_number", "merge_futures_official_snapshot", "_parse_futures_state_time",
+        "_prefer_futures_state_section", "_merge_futures_strategy_state",
+        "compact_futures_strategy_state",
         "empty_company_event_snapshot", "normalize_company_event_snapshot",
         "_newer_company_event_snapshot", "_merge_data_cache_payload",
     )
@@ -586,6 +718,30 @@ def test_newer_local_cache_snapshot_is_not_replaced_by_delayed_cloud_read():
     assert selected["stock_data"][0]["收盤價"] == 105
 
 
+def test_unversioned_local_stock_snapshot_cannot_replace_versioned_cloud_snapshot():
+    symbols = load_app_symbols(
+        "_cache_payload_timestamp", "_prefer_newer_cache_payload",
+        "_json_safe", "_valid_fibo_tags", "_merge_unique_records",
+        "_merge_unique_values", "merge_strategy_signal_state",
+        "_state_updated_at", "_newer_timestamped_state", "_extract_fibo_tags",
+        "_fibo_tag_timestamp", "_newer_fibo_tag_payload", "_safe_number",
+        "merge_futures_official_snapshot", "_parse_futures_state_time",
+        "_prefer_futures_state_section", "_merge_futures_strategy_state",
+        "compact_futures_strategy_state",
+        "empty_company_event_snapshot", "normalize_company_event_snapshot",
+        "_newer_company_event_snapshot", "_merge_data_cache_payload",
+    )
+    remote = {
+        "stock_data": [{"代號": "2330", "收盤價": 105}],
+        "stock_data_updated_at": "2026-08-20T09:05:00+08:00",
+    }
+    local = {"stock_data": [{"代號": "2330", "收盤價": 90}]}
+    merged = symbols["_merge_data_cache_payload"](
+        remote, local, replace_stock_data=True,
+    )
+    assert merged["stock_data"][0]["收盤價"] == 105
+
+
 def test_stock_snapshot_verification_checks_all_saved_strategy_fields():
     symbols = load_app_symbols("_json_safe", "_stock_rows_signature", "_stock_snapshot_matches")
     expected = {
@@ -598,10 +754,14 @@ def test_stock_snapshot_verification_checks_all_saved_strategy_fields():
     assert not symbols["_stock_snapshot_matches"](stale, expected)
 
 
-def test_only_explicit_save_replaces_fibo_tags_and_keeps_recovery_copy():
+def test_timestamped_fibo_save_survives_failed_cloud_write_and_keeps_recovery_copy():
     symbols = load_app_symbols(
         "_json_safe", "_valid_fibo_tags", "_merge_unique_records",
         "_merge_unique_values", "merge_strategy_signal_state", "_cache_payload_timestamp",
+        "_state_updated_at", "_newer_timestamped_state", "_fibo_tag_timestamp",
+        "_newer_fibo_tag_payload", "_safe_number", "merge_futures_official_snapshot",
+        "_parse_futures_state_time", "_prefer_futures_state_section",
+        "_merge_futures_strategy_state", "compact_futures_strategy_state",
         "empty_company_event_snapshot",
         "normalize_company_event_snapshot", "_newer_company_event_snapshot",
         "_merge_data_cache_payload", "_extract_fibo_tags",
@@ -613,7 +773,8 @@ def test_only_explicit_save_replaces_fibo_tags_and_keeps_recovery_copy():
         "fibo_tags_updated_at": "2026-08-13T10:00:00+08:00",
     }
     ordinary = symbols["_merge_data_cache_payload"](remote, local)
-    assert ordinary["fibo_tags"] == []
+    assert ordinary["fibo_tags"] == local["fibo_tags"]
+    assert ordinary["fibo_tags_backup"]["tags"] == local["fibo_tags"]
     explicit = symbols["_merge_data_cache_payload"](
         remote, local, explicit_fibo_tag_save=True,
     )
@@ -621,6 +782,124 @@ def test_only_explicit_save_replaces_fibo_tags_and_keeps_recovery_copy():
     assert explicit["fibo_tags_backup"]["tags"] == local["fibo_tags"]
     damaged_primary = dict(explicit, fibo_tags=[])
     assert symbols["_extract_fibo_tags"](damaged_primary) == local["fibo_tags"]
+
+
+def test_untimestamped_default_tags_cannot_replace_empty_cloud_section():
+    symbols = load_app_symbols(
+        "_valid_fibo_tags", "_extract_fibo_tags", "_fibo_tag_timestamp",
+        "_newer_fibo_tag_payload",
+    )
+    local_defaults = {"fibo_tags": ["A", "B", "C", "D", "E"]}
+    assert symbols["_newer_fibo_tag_payload"](
+        {"stock_data": []}, local_defaults,
+    ) == {}
+
+
+def test_futures_state_uses_its_own_timestamp_during_device_merge():
+    symbols = load_app_symbols(
+        "_json_safe", "_valid_fibo_tags", "_merge_unique_records",
+        "_merge_unique_values", "merge_strategy_signal_state", "_cache_payload_timestamp",
+        "_state_updated_at", "_newer_timestamped_state", "_extract_fibo_tags",
+        "_fibo_tag_timestamp", "_newer_fibo_tag_payload",
+        "_safe_number", "merge_futures_official_snapshot", "_parse_futures_state_time",
+        "_prefer_futures_state_section", "_merge_futures_strategy_state",
+        "compact_futures_strategy_state",
+        "empty_company_event_snapshot", "normalize_company_event_snapshot",
+        "_newer_company_event_snapshot", "_merge_data_cache_payload",
+    )
+    remote = {
+        "stock_data": [], "fibo_tags": ["A", "B", "C", "D", "E"],
+        "futures_strategy_state": {
+            "updated_at": "2026-08-20T09:05:00+08:00",
+            "rank_time": "2026/08/20 09:05:00",
+            "rank_cache": {"MTX": {"當日成交口數": 12345}},
+            "live_time": "2026/08/20 09:00:00",
+            "live_cache": {"MTX": {"收盤價": 100}},
+        },
+    }
+    local = {
+        "stock_data": [],
+        "futures_strategy_state": {
+            "updated_at": "2026-08-20T09:00:00+08:00",
+            "rank_time": "2026/08/20 09:00:00",
+            "rank_cache": {"MTX": {"當日成交口數": 100}},
+            "live_time": "2026/08/20 09:06:00",
+            "live_cache": {"MTX": {"收盤價": 105}},
+        },
+    }
+    merged = symbols["_merge_data_cache_payload"](remote, local)
+    assert merged["futures_strategy_state"]["rank_cache"]["MTX"]["當日成交口數"] == 12345
+    assert merged["futures_strategy_state"]["live_cache"]["MTX"]["收盤價"] == 105
+
+
+def test_newer_empty_futures_cache_is_a_tombstone_not_resurrected_data():
+    symbols = load_app_symbols(
+        "_json_safe", "_safe_number", "_state_updated_at", "_newer_timestamped_state",
+        "merge_futures_official_snapshot", "_parse_futures_state_time",
+        "_prefer_futures_state_section", "_merge_futures_strategy_state",
+        "compact_futures_strategy_state",
+    )
+    remote = {
+        "updated_at": "2026-08-20T09:00:00+08:00",
+        "rank_updated_at": "2026-08-20T09:00:00+08:00",
+        "rank_time": "2026/08/20 09:00:00",
+        "rank_cache": {"MTX": {"當日成交口數": 12345}},
+    }
+    local = {
+        "updated_at": "2026-08-20T09:05:00+08:00",
+        "rank_updated_at": "2026-08-20T09:05:00+08:00",
+        "rank_time": None,
+        "rank_cache": {},
+    }
+    merged = symbols["_merge_futures_strategy_state"](remote, local)
+    assert merged["rank_cache"] == {}
+    assert merged["rank_time"] is None
+
+
+def test_futures_cloud_snapshot_is_bounded_for_single_cell_storage():
+    symbols = load_app_symbols("_json_safe", "_safe_number", "compact_futures_strategy_state")
+    universe = [
+        {
+            "契約鍵": f"SSF:{index}", "期貨代碼": f"S{index}", "名稱": f"測試期貨{index}",
+            "契約月份": "202609", "當日成交口數": 2000 - index,
+            "收盤價": 100 + index, "進出場點位": "進100｜停95｜目110",
+        }
+        for index in range(1811)
+    ]
+    state = {
+        "universe": universe,
+        "rank_cache": {
+            row["契約鍵"]: {"當日成交口數": row["當日成交口數"], "收盤價": row["收盤價"]}
+            for row in universe
+        },
+        "live_cache": {}, "manual": ["SSF:1800"], "ignored": [],
+        "updated_at": "2026-08-20T09:00:00+08:00",
+    }
+    compact = symbols["compact_futures_strategy_state"](state)
+    assert len(json.dumps(compact, ensure_ascii=False)) <= 14000
+    assert "SSF:1800" in compact["manual"]
+    assert len(compact["universe"]) < len(universe)
+
+
+def test_full_cloud_payload_compacts_logs_without_dropping_stock_indicators():
+    symbols = load_app_symbols(
+        "_json_safe", "_safe_number", "compact_futures_strategy_state",
+        "_compact_cloud_data_cache_payload",
+    )
+    stock_rows = [{"代號": "2330", "收盤價": 100, "方向": "多頭", "信心分": 80}]
+    payload = {
+        "stock_data": stock_rows,
+        "strategy_signal_log": [
+            {"dedupe_key": f"signal-{index}", "detail": "測試訊號" * 20}
+            for index in range(2000)
+        ],
+        "futures_strategy_state": {},
+        "company_event_snapshot": {"events": []},
+    }
+    compact = symbols["_compact_cloud_data_cache_payload"](payload)
+    assert compact["stock_data"] == stock_rows
+    assert len(compact["strategy_signal_log"]) < 2000
+    assert len(json.dumps(compact, ensure_ascii=False, separators=(",", ":"))) < 45100
 
 
 def test_deleted_strategy_signal_wins_over_stale_cloud_copy():
@@ -681,3 +960,25 @@ def test_daytrade_plan_keeps_normal_breakout_when_space_is_sufficient():
     assert plan["valid"] is True
     assert plan["reward_risk"] >= 1.3
     assert "RR" in plan["summary"]
+
+
+def test_daytrade_breakout_at_daily_limit_is_rejected_instead_of_moved_backwards():
+    symbols = load_app_symbols(
+        "get_taiwan_tick_size", "round_to_tick", "get_tick_size", "move_tick",
+        "_safe_number", "_as_float", "fmt_price", "build_trade_plan",
+    )
+    common = {
+        "_daytrade_vwap": 100, "_daytrade_or_high": 110,
+        "_daytrade_or_low": 90, "_daytrade_close": 110,
+        "_daytrade_phase": "開盤區間完成",
+        "_交易日漲停價": 110, "_交易日跌停價": 90,
+    }
+    long_plan = symbols["build_trade_plan"](
+        common, "多頭", True, {"eligible": True, "rule": "觸發"},
+    )
+    short_plan = symbols["build_trade_plan"](
+        dict(common, _daytrade_close=90), "空頭", True,
+        {"eligible": True, "rule": "觸發"},
+    )
+    assert long_plan["valid"] is False and long_plan["blocking_reason"] == "已到漲停"
+    assert short_plan["valid"] is False and short_plan["blocking_reason"] == "已到跌停"
