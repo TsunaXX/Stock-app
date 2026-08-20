@@ -3,7 +3,7 @@
 ## 資料來源與口徑
 
 - Goodinfo 週轉率排行必須維持「上市＋上櫃、依當日累積成交量週轉率排序」的口徑，不能用證交所或櫃買中心的單一市場排行取代。
-- Goodinfo 維持原始上市＋上櫃排行 DOM，不改用不同口徑資料。抓取使用 `Chrome/124.0.0.0` Windows UA、1920×1080、繁中 Accept-Language，並在新頁面覆寫 `webdriver`、`chrome.runtime`、plugins 與 languages。載入後以「代號」表頭顯式等待最長 20 秒，出現後再等待 2 秒讓表格完成渲染，再由整份 `page_source` 選出列數大於 10、欄數大於 5且面積最大的表格。不得使用持續 Chrome profile、Cookie 判斷、重載或不同資料來源；失敗不得覆蓋上次成功資料，也不得以其他官方排行冒充 Goodinfo。
+- Goodinfo 維持原始上市＋上櫃排行 DOM，不改用不同口徑資料。抓取使用 `Chrome/124.0.0.0` Windows UA、1920×1080、繁中 Accept-Language，並在新頁面覆寫 `webdriver`、`chrome.runtime`、plugins 與 languages。預設使用 `--headless=new`；部署環境設定 `GOODINFO_HEADED=1` 時改為不加 headless，僅適用於有圖形顯示器或 Xvfb 的主機。載入後以「代號」表頭顯式等待最長 20 秒，出現後再等待 2 秒讓表格完成渲染，再由整份 `page_source` 選出列數大於 10、欄數大於 5且面積最大的表格。不得使用持續 Chrome profile、Cookie 判斷、重載或不同資料來源；失敗不得覆蓋上次成功資料，也不得以其他官方排行冒充 Goodinfo。
 - 股票名稱與代號優先讀取 `stock_names.csv`；快速標籤統一保存為 `名稱(代號)`。
 - 期貨成交量、結算行情與保證金以期交所 OpenAPI 為主。官方來源暫時失敗時顯示最後一次成功資料與日期，不得把未知保證金顯示為 0。
 - 台股月營收數值以 MOPS 為主；公告日期優先採 FinMind 或可驗證的公司／公開報導來源，並保留人工校正。

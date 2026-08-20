@@ -6935,7 +6935,9 @@ def fetch_goodinfo_data():
         'state': 'loading', 'reason': '', 'elapsed': 0.0,
     }
     chrome_options = Options()
-    chrome_options.add_argument("--headless=new")
+    headed_mode = os.environ.get("GOODINFO_HEADED") == "1"
+    if not headed_mode:
+        chrome_options.add_argument("--headless=new")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--disable-gpu")
@@ -7003,11 +7005,13 @@ def fetch_goodinfo_data():
             fetch_goodinfo_data.last_status = {
                 'state': 'success', 'reason': '', 'rows': len(ranking),
                 'elapsed': round(time.monotonic() - started_at, 2),
+                'headed_mode': headed_mode,
             }
             return ranking
         fetch_goodinfo_data.last_status = {
             'state': 'failed', 'reason': 'legacy_table_missing',
             'elapsed': round(time.monotonic() - started_at, 2),
+            'headed_mode': headed_mode,
         }
     except Exception as exc:
         logger.exception('Goodinfo original fetch failed: %s', type(exc).__name__)
@@ -7015,6 +7019,7 @@ def fetch_goodinfo_data():
             'state': 'failed', 'reason': 'browser_error',
             'error_type': type(exc).__name__,
             'elapsed': round(time.monotonic() - started_at, 2),
+            'headed_mode': headed_mode,
         }
     finally:
         if driver is not None:

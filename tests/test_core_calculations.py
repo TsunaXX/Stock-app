@@ -451,6 +451,9 @@ def test_goodinfo_fetch_uses_explicit_wait_and_browser_identity_flow():
         if isinstance(node.func, ast.Attribute) and node.func.attr == "Chrome"
     ]
     assert len(chrome_constructions) == 1
+    assert 'os.environ.get("GOODINFO_HEADED") == "1"' in function_source
+    assert 'if not headed_mode:' in function_source
+    assert 'chrome_options.add_argument("--headless=new")' in function_source
     assert '--window-size=1920x1080' in function_source
     assert 'AutomationControlled' in function_source
     assert 'Chrome/124.0.0.0' in function_source
