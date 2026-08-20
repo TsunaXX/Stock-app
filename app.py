@@ -6929,7 +6929,7 @@ def _parse_goodinfo_turnover_table(page_html):
 
 
 def fetch_goodinfo_data():
-    """完整使用最初可用的固定 UA、等待 20 秒與最大表格流程。"""
+    """以固定 UA、顯式表格等待與瀏覽器指紋設定讀取 Goodinfo。"""
     started_at = time.monotonic()
     fetch_goodinfo_data.last_status = {
         'state': 'loading', 'reason': '', 'elapsed': 0.0,
@@ -6946,8 +6946,9 @@ def fetch_goodinfo_data():
     chrome_options.add_argument(
         "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/114.0.0.0 Safari/537.36"
+        "Chrome/124.0.0.0 Safari/537.36"
     )
+    chrome_options.add_argument("--accept-lang=zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7")
     if os.path.exists('/usr/bin/chromium'):
         chrome_options.binary_location = '/usr/bin/chromium'
 
@@ -6969,13 +6970,33 @@ def fetch_goodinfo_data():
         driver = webdriver.Chrome(service=service, options=chrome_options)
         driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
             "source": """
-                Object.defineProperty(navigator, 'webdriver', {
-                    get: () => undefined
-                })
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                window.navigator.chrome = { runtime: {} };
+                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+                Object.defineProperty(navigator, 'languages', {
+                    get: () => ['zh-TW', 'zh', 'en-US', 'en']
+                });
             """
         })
         driver.get(_GOODINFO_URL)
-        time.sleep(20)
+
+        # Goodinfo 的表格由前端動態產生；等到實際欄位出現，再保留短暫
+        # 渲染時間，不必無條件阻塞 20 秒。
+        try:
+            from selenium.webdriver.support.ui import WebDriverWait
+            from selenium.webdriver.support import expected_conditions as EC
+
+            WebDriverWait(driver, 20).until(
+                EC.presence_of_element_located((
+                    By.XPATH,
+                    "//table//th[contains(text(), '代號')] "
+                    "| //table//nobr[contains(text(), '代號')]",
+                ))
+            )
+            time.sleep(2)
+        except TimeoutException:
+            # 超時時仍交由原始整頁解析器判斷，保留延遲載入頁面的機會。
+            pass
 
         ranking = _parse_goodinfo_original_page(driver.page_source)
         if ranking is not None:

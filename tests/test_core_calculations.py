@@ -433,7 +433,7 @@ def test_goodinfo_turnover_parser_recovers_mojibake_code_and_name_columns():
     assert parsed["名稱"].eq("").all()
 
 
-def test_goodinfo_fetch_uses_only_original_fixed_wait_flow():
+def test_goodinfo_fetch_uses_explicit_wait_and_browser_identity_flow():
     tree = ast.parse(APP_PATH.read_text(encoding="utf-8"))
     function = next(
         node for node in tree.body
@@ -453,11 +453,17 @@ def test_goodinfo_fetch_uses_only_original_fixed_wait_flow():
     assert len(chrome_constructions) == 1
     assert '--window-size=1920x1080' in function_source
     assert 'AutomationControlled' in function_source
-    assert 'Chrome/114.0.0.0' in function_source
+    assert 'Chrome/124.0.0.0' in function_source
     assert 'Windows NT 10.0; Win64; x64' in function_source
+    assert '--accept-lang=zh-TW' in function_source
     assert '--user-data-dir=' not in function_source
     assert '_configure_goodinfo_browser_identity' not in function_source
-    assert 'time.sleep(20)' in function_source
+    assert 'WebDriverWait(driver, 20)' in function_source
+    assert "contains(text(), '代號')" in function_source
+    assert "window.navigator.chrome = { runtime: {} }" in function_source
+    assert "navigator, 'plugins'" in function_source
+    assert "navigator, 'languages'" in function_source
+    assert 'time.sleep(2)' in function_source
     assert 'refresh' not in called_attributes
     assert 'find_elements' not in called_attributes
     assert '_parse_goodinfo_original_page' in function_source
