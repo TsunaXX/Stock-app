@@ -6757,6 +6757,69 @@ def _parse_goodinfo_original_page(markup):
     return target.dropna(how='all').reset_index(drop=True)
 
 
+def _promote_uploaded_stock_header(dataframe, search_rows=30):
+    """Find a stock-code/name header row in exported CSV-like tables."""
+    if dataframe is None or dataframe.empty:
+        return None
+    scan_limit = min(max(int(search_rows), 1), len(dataframe))
+    for row_index in range(scan_limit):
+        labels = [
+            _goodinfo_normalize_text(value)
+            for value in dataframe.iloc[row_index].tolist()
+        ]
+        if not any('代號' in label for label in labels):
+            continue
+        if not any('名稱' in label for label in labels):
+            continue
+        unique_labels = []
+        used_labels = set()
+        for column_index, label in enumerate(labels):
+            base_label = label or f'欄位{column_index + 1}'
+            final_label = base_label
+            suffix = 2
+            while final_label in used_labels:
+                final_label = f'{base_label}_{suffix}'
+                suffix += 1
+            used_labels.add(final_label)
+            unique_labels.append(final_label)
+        promoted = dataframe.iloc[row_index + 1:].copy()
+        promoted.columns = unique_labels
+        promoted = promoted.replace(r'^\s*$', np.nan, regex=True).dropna(how='all')
+        return promoted.reset_index(drop=True)
+    return None
+
+
+def _read_uploaded_stock_csv(uploaded_file):
+    """Read Goodinfo/manual CSV exports with preamble and encoding tolerance."""
+    if uploaded_file is None:
+        return pd.DataFrame()
+    if hasattr(uploaded_file, 'getvalue'):
+        raw_data = uploaded_file.getvalue()
+    else:
+        raw_data = uploaded_file.read()
+    if isinstance(raw_data, str):
+        raw_data = raw_data.encode('utf-8')
+    if not raw_data:
+        return pd.DataFrame()
+
+    last_error = None
+    for encoding in ('cp950', 'utf-8-sig', 'utf-8', 'big5'):
+        try:
+            raw_table = pd.read_csv(
+                io.BytesIO(raw_data), dtype=str, encoding=encoding,
+                header=None, sep=None, engine='python', keep_default_na=False,
+            )
+        except (UnicodeDecodeError, pd.errors.ParserError, ValueError) as exc:
+            last_error = exc
+            continue
+        promoted = _promote_uploaded_stock_header(raw_table)
+        if promoted is not None:
+            return promoted
+    raise ValueError(
+        '檔案內找不到「代號／名稱」標題，請確認下載的是 Goodinfo 排行 CSV。'
+    ) from last_error
+
+
 def _parse_goodinfo_legacy_page(markup):
     """Compatibility path for the original Goodinfo 15-second whole-page flow.
 
@@ -10754,6 +10817,10 @@ def render_stock_external_resources():
                     'browser_error': '瀏覽器啟動、網站驗證或頁面解析失敗。',
                 }.get(status.get('reason'), '抓取失敗或查無資料。')
                 st.error(reason_text)
+                st.info(
+                    "🛟 備援方式：開啟右側 Goodinfo 排行，在網站完成驗證並匯出 CSV；"
+                    "回到上方「本機」上傳該檔案，再按「執行分析」。"
+                )
                 if 'goodinfo_df' in st.session_state:
                     st.warning("本次沒有覆蓋先前成功暫存，可先沿用並留意資料時間。")
 
@@ -10776,10 +10843,12 @@ def render_stock_external_resources():
             )
     with resource_col2:
         st.link_button(
-            "🌐 Goodinfo 週轉率排行",
+            "🌐 開啟 Goodinfo／下載 CSV",
             _GOODINFO_URL,
+            help="由你的瀏覽器完成 Goodinfo 驗證；載入排行後使用網站的匯出功能下載 CSV。",
             width='stretch'
         )
+        st.caption("下載後回到「本機」上傳 CSV；不需要再等伺服器爬取。")
     with resource_col3:
         st.link_button(
             "🚨 上市處置公告", "https://www.twse.com.tw/zh/announcement/punish.html",
@@ -15241,11 +15310,17 @@ with stock_strategy_container:
         
         src_tab1, src_tab2 = st.tabs(["📂 本機", "☁️ 雲端"])
         with src_tab1:
-            uploaded_file = st.file_uploader("上傳檔案 (CSV/XLS/HTML)", type=['xlsx', 'csv', 'html', 'xls'], label_visibility="collapsed")
+            uploaded_file = st.file_uploader(
+                "上傳 Goodinfo 下載檔或其他選股檔案",
+                type=['xlsx', 'csv', 'html', 'xls'],
+                help="支援 Goodinfo 匯出的 CSV；會自動辨識 CP950／UTF-8 與前置說明列。",
+                key='stock_source_upload',
+            )
             selected_sheet = 0
             if uploaded_file:
+                st.caption(f"✅ 已選擇 {uploaded_file.name}；下方按「執行分析」即可。")
                 try:
-                    if not uploaded_file.name.endswith('.csv'):
+                    if not uploaded_file.name.lower().endswith('.csv'):
                         xl_file = pd.ExcelFile(uploaded_file)
                         sheet_options = xl_file.sheet_names
                         default_idx = sheet_options.index("週轉率") if "週轉率" in sheet_options else 0
@@ -15302,10 +15377,7 @@ with stock_strategy_container:
                 uploaded_file.seek(0)
                 fname = uploaded_file.name.lower()
                 if fname.endswith('.csv'):
-                    try: df_up = pd.read_csv(uploaded_file, dtype=str, encoding='cp950')
-                    except: 
-                        uploaded_file.seek(0)
-                        df_up = pd.read_csv(uploaded_file, dtype=str)
+                    df_up = _read_uploaded_stock_csv(uploaded_file)
                 elif fname.endswith('.html') or fname.endswith('.htm') or fname.endswith('.xls'):
                     try: dfs = pd.read_html(uploaded_file, encoding='cp950')
                     except:

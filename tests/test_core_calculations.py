@@ -433,6 +433,38 @@ def test_goodinfo_turnover_parser_recovers_mojibake_code_and_name_columns():
     assert parsed["名稱"].eq("").all()
 
 
+def test_goodinfo_manual_csv_backup_promotes_cp950_embedded_header():
+    symbols = load_app_symbols(
+        "_goodinfo_normalize_text",
+        "_promote_uploaded_stock_header",
+        "_read_uploaded_stock_csv",
+    )
+    content = (
+        "Goodinfo累計成交量週轉率排行,,\r\n"
+        "資料時間,2026/08/21,\r\n"
+        "代號,名稱,週轉率\r\n"
+        '=\"2330\",台積電,1.25%\r\n'
+        '=\"2408\",南亞科,9.8%\r\n'
+    ).encode("cp950")
+    parsed = symbols["_read_uploaded_stock_csv"](io.BytesIO(content))
+    assert list(parsed.columns) == ["代號", "名稱", "週轉率"]
+    assert parsed["代號"].tolist() == ['="2330"', '="2408"']
+    assert parsed["名稱"].tolist() == ["台積電", "南亞科"]
+
+
+def test_goodinfo_manual_csv_backup_accepts_utf8_bom_standard_header():
+    symbols = load_app_symbols(
+        "_goodinfo_normalize_text",
+        "_promote_uploaded_stock_header",
+        "_read_uploaded_stock_csv",
+    )
+    content = "代號,名稱,週轉率\n2330,台積電,1.25%\n".encode("utf-8-sig")
+    parsed = symbols["_read_uploaded_stock_csv"](io.BytesIO(content))
+    assert parsed.iloc[0].to_dict() == {
+        "代號": "2330", "名稱": "台積電", "週轉率": "1.25%",
+    }
+
+
 def test_goodinfo_fetch_uses_crawl4ai_two_stage_undetected_session():
     source = APP_PATH.read_text(encoding="utf-8")
     tree = ast.parse(source)
