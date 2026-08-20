@@ -3,7 +3,9 @@
 ## 資料來源與口徑
 
 - Goodinfo 週轉率排行必須維持「上市＋上櫃、依當日累積成交量週轉率排序」的口徑，不能用證交所或櫃買中心的單一市場排行取代。
-- Goodinfo 維持原始上市＋上櫃排行 DOM，不改用不同口徑資料。抓取使用 Scrapling 0.4.12 `StealthyFetcher`、Patchright 與 `solve_cloudflare=True`，並指定系統 `/usr/bin/chromium`、繁中語系、台北時區、WebRTC 防漏與 canvas 指紋雜訊。依官方建議給 Cloudflare solver 65 秒，等待同時含「代號／週轉率」的排行表格後再解析；將 `retries` 設為套件允許的最低值 1，避免 Streamlit 重複啟動瀏覽器超出負荷。`GOODINFO_HEADED=1` 仍可切換可視模式，但只適用於有圖形顯示器或 Xvfb 的主機。不得換用不同資料來源；失敗不得覆蓋上次成功資料，也不得以其他官方排行冒充 Goodinfo。
+- Goodinfo 維持原始上市＋上櫃排行，不改用不同口徑資料。一般抓取先用 Patchright 開啟原排行頁，最多 15 秒接收該頁自動送出的同源 `StockListRank/StockList.asp?STEP=DATA` POST（`RANK_RANGE=300`），沿用瀏覽器自行建立的 `CLIENT_KEY`，禁止把開發者工具複製出的 `cf_clearance`、`CLIENT_KEY` 或其他 Cookie 寫入程式、設定檔或雲端。快速模式失敗時，才由使用者明確按「加強驗證重試」啟用 Scrapling 0.4.12 `StealthyFetcher`、Patchright 與 `solve_cloudflare=True`，最多 65 秒；`retries=1`，避免自動重複啟動 Chromium。`GOODINFO_HEADED=1` 仍可切換可視模式，但只適用於有圖形顯示器或 Xvfb 的主機。失敗不得覆蓋上次成功資料，也不得以其他官方排行冒充 Goodinfo。
+- 2026 CPI／大非農已有完整且核對過的 BLS 官方排程；該年直接合併此排程與 TradingView 備援，不可先對容易封鎖雲端 IP 的 BLS 頁面做三輪重試。其他年份仍依序查 BLS ICS、年度總表與個別發布頁。這是首次載入的重要效能界線，不能用移除行事曆資料換速度。
+- 盤前跨市場批次不可向 Yahoo 查 `TWF=F`（該代號在 Yahoo 不存在，會固定 404 並拖慢首次載入）；台指夜盤只使用已登入的 Shioaji 實際近月契約，未登入時顯示該來源未取得，不以錯誤商品代號冒充。
 - 股票名稱與代號優先讀取 `stock_names.csv`；快速標籤統一保存為 `名稱(代號)`。
 - 期貨成交量、結算行情與保證金以期交所 OpenAPI 為主。官方來源暫時失敗時顯示最後一次成功資料與日期，不得把未知保證金顯示為 0。
 - 台股月營收數值以 MOPS 為主；公告日期優先採 FinMind 或可驗證的公司／公開報導來源，並保留人工校正。

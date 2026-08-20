@@ -1297,6 +1297,12 @@ def fetch_fomc_events(year):
 def fetch_bls_cpi_events(year):
     """CPI 以免金鑰經濟日曆為主，BLS 官方來源作交叉備援。"""
     fallback_events = _tradingview_macro_events(year, "cpi")
+    verified_events = _verified_bls_2026_events(year, "cpi")
+    if verified_events:
+        # BLS frequently rate-limits cloud servers.  The complete 2026 official
+        # schedule is already verified below, so retrying three blocked BLS
+        # pages adds roughly ten seconds without improving the result.
+        return _merge_macro_events(fallback_events, verified_events)
     official_events = _parse_bls_release_ics(
         _calendar_get(BLS_RELEASE_ICS_URL), year, "Consumer Price Index", "美國 CPI 公布"
     )
@@ -1309,9 +1315,6 @@ def fetch_bls_cpi_events(year):
         official_events = _parse_official_release_schedule(
             _calendar_get(BLS_CPI_URL), year, "美國 CPI 公布", "U.S. Bureau of Labor Statistics"
         )
-    official_events = _merge_macro_events(
-        _verified_bls_2026_events(year, "cpi"), official_events
-    )
     return _merge_macro_events(fallback_events, official_events)
 
 
@@ -1502,6 +1505,11 @@ def _parse_bls_cps_employment_calendar(response, year):
 def fetch_bls_employment_events(year):
     """BLS Employment Situation：市場俗稱大非農，同時公布失業率。"""
     fallback_events = _tradingview_macro_events(year, "nfp")
+    verified_events = _verified_bls_2026_events(year, "employment")
+    if verified_events:
+        # Same as CPI: use the already verified full-year official schedule and
+        # avoid serial retries against BLS from Streamlit's cloud IP.
+        return _merge_macro_events(fallback_events, verified_events)
     official_events = _parse_bls_employment_ics(_calendar_get(BLS_RELEASE_ICS_URL), year)
     if not official_events:
         official_events = _parse_bls_year_schedule(
@@ -1515,9 +1523,6 @@ def fetch_bls_employment_events(year):
         )
     if not official_events:
         official_events = _parse_bls_cps_employment_calendar(_calendar_get(BLS_CPS_CALENDAR_URL), year)
-    official_events = _merge_macro_events(
-        _verified_bls_2026_events(year, "employment"), official_events
-    )
     return _merge_macro_events(fallback_events, official_events)
 
 
@@ -6656,6 +6661,16 @@ _GOODINFO_URL = (
     "&INDUSTRY_CAT=%E7%B4%AF%E8%A8%88%E6%88%90%E4%BA%A4%E9%87%8F%E9%80%B1%E8%BD%89%E7%8E%87%28%E7%95%B6%E6%97%A5%29"
     "%40%40%E7%B4%AF%E8%A8%88%E6%88%90%E4%BA%A4%E9%87%8F%E9%80%B1%E8%BD%89%E7%8E%87%40%40%E7%95%B6%E6%97%A5"
 )
+_GOODINFO_DATA_URL = (
+    "https://goodinfo.tw/tw/StockListRank/StockList.asp?STEP=DATA"
+    "&MARKET_CAT=%E7%86%B1%E9%96%80%E6%8E%92%E8%A1%8C"
+    "&INDUSTRY_CAT=%E7%B4%AF%E8%A8%88%E6%88%90%E4%BA%A4%E9%87%8F%E9%80%B1%E8%BD%89%E7%8E%87%28%E7%95%B6%E6%97%A5%29"
+    "%40%40%E7%B4%AF%E8%A8%88%E6%88%90%E4%BA%A4%E9%87%8F%E9%80%B1%E8%BD%89%E7%8E%87%40%40%E7%95%B6%E6%97%A5"
+    "&SHEET=%E6%BC%B2%E8%B7%8C%E5%8F%8A%E6%88%90%E4%BA%A4%E7%B5%B1%E8%A8%88"
+    "&SHEET2=%E7%B4%AF%E8%A8%88%E6%88%90%E4%BA%A4%E9%87%8F%E9%80%B1%E8%BD%89%E7%8E%87%E7%B5%B1%E8%A8%88"
+    "&RPT_TIME=%E6%9C%80%E6%96%B0%E8%B3%87%E6%96%99&RANK_RANGE=300&IS_RELOAD_REPORT=T"
+)
+_GOODINFO_FAST_DEADLINE_SECONDS = 15.0
 
 
 def _goodinfo_normalize_text(value):
@@ -6949,85 +6964,183 @@ def _scrapling_response_markup(response):
     return str(response)
 
 
-def fetch_goodinfo_data():
-    """Use Scrapling's stealth browser and Cloudflare solver for Goodinfo."""
+def fetch_goodinfo_data(use_cloudflare_solver=False):
+    """Fetch Goodinfo's browser-generated POST, with an explicit slow fallback.
+
+    Goodinfo first initializes a browser session (including ``CLIENT_KEY``),
+    then sends a same-origin POST to ``StockListRank/StockList.asp``.  Capturing
+    that page request avoids running a 60-second Cloudflare solver on every
+    click.  The solver remains available as an explicit retry, and no copied
+    browser cookie is persisted or shared with the server.
+    """
     started_at = time.monotonic()
     fetch_goodinfo_data.last_status = {
         'state': 'loading', 'reason': '', 'elapsed': 0.0,
     }
     headed_mode = os.environ.get("GOODINFO_HEADED") == "1"
 
-    try:
-        from scrapling.fetchers import StealthyFetcher
-    except (ImportError, ModuleNotFoundError) as exc:
-        logger.exception('Scrapling fetcher dependency is unavailable: %s', type(exc).__name__)
-        fetch_goodinfo_data.last_status = {
-            'state': 'failed', 'reason': 'scrapling_dependency_missing',
-            'error_type': type(exc).__name__,
-            'elapsed': round(time.monotonic() - started_at, 2),
-            'headed_mode': headed_mode,
-            'fetcher': 'scrapling',
-        }
-        return None
-
-    acquired = _GOODINFO_BROWSER_SEMAPHORE.acquire(timeout=65)
+    acquired = _GOODINFO_BROWSER_SEMAPHORE.acquire(
+        timeout=65 if use_cloudflare_solver else 3
+    )
     if not acquired:
-        logger.warning('Goodinfo Scrapling browser is busy; skipped duplicate launch')
+        logger.warning('Goodinfo browser is busy; skipped duplicate launch')
         fetch_goodinfo_data.last_status = {
             'state': 'failed', 'reason': 'browser_busy',
             'elapsed': round(time.monotonic() - started_at, 2),
             'headed_mode': headed_mode,
-            'fetcher': 'scrapling',
+            'fetcher': 'scrapling' if use_cloudflare_solver else 'patchright',
         }
         return None
     try:
-        fetch_options = {
-            'headless': not headed_mode,
-            'solve_cloudflare': True,
-            'block_webrtc': True,
-            'hide_canvas': True,
-            'allow_webgl': True,
-            'google_search': True,
-            'locale': 'zh-TW',
-            'timezone_id': 'Asia/Taipei',
-            'timeout': 65_000,
-            'wait': 2_000,
-            'wait_selector': 'table:has-text("代號"):has-text("週轉率")',
-            'wait_selector_state': 'attached',
-            'load_dom': True,
-            'retries': 1,
-            'extra_flags': ['--no-sandbox', '--disable-dev-shm-usage'],
-            'additional_args': {'viewport': {'width': 1920, 'height': 1080}},
-        }
-        if os.path.exists('/usr/bin/chromium'):
-            fetch_options['executable_path'] = '/usr/bin/chromium'
+        if use_cloudflare_solver:
+            try:
+                from scrapling.fetchers import StealthyFetcher
+            except (ImportError, ModuleNotFoundError) as exc:
+                logger.exception(
+                    'Scrapling fetcher dependency is unavailable: %s', type(exc).__name__,
+                )
+                fetch_goodinfo_data.last_status = {
+                    'state': 'failed', 'reason': 'scrapling_dependency_missing',
+                    'error_type': type(exc).__name__,
+                    'elapsed': round(time.monotonic() - started_at, 2),
+                    'headed_mode': headed_mode, 'fetcher': 'scrapling',
+                }
+                return None
 
-        response = StealthyFetcher.fetch(_GOODINFO_URL, **fetch_options)
-        ranking = _parse_goodinfo_original_page(
-            _scrapling_response_markup(response)
-        )
+            fetch_options = {
+                'headless': not headed_mode,
+                'solve_cloudflare': True,
+                'block_webrtc': True,
+                'hide_canvas': True,
+                'allow_webgl': True,
+                'google_search': True,
+                'locale': 'zh-TW',
+                'timezone_id': 'Asia/Taipei',
+                'timeout': 65_000,
+                'wait': 2_000,
+                'wait_selector': 'table:has-text("代號"):has-text("週轉率")',
+                'wait_selector_state': 'attached',
+                'load_dom': True,
+                'retries': 1,
+                'extra_flags': ['--no-sandbox', '--disable-dev-shm-usage'],
+                'additional_args': {'viewport': {'width': 1920, 'height': 1080}},
+            }
+            if os.path.exists('/usr/bin/chromium'):
+                fetch_options['executable_path'] = '/usr/bin/chromium'
+            response = StealthyFetcher.fetch(_GOODINFO_URL, **fetch_options)
+            markup = _scrapling_response_markup(response)
+            fetcher_name = 'scrapling'
+        else:
+            try:
+                from patchright.sync_api import (
+                    sync_playwright,
+                    TimeoutError as PatchrightTimeoutError,
+                )
+            except (ImportError, ModuleNotFoundError) as exc:
+                logger.exception(
+                    'Patchright browser dependency is unavailable: %s', type(exc).__name__,
+                )
+                fetch_goodinfo_data.last_status = {
+                    'state': 'failed', 'reason': 'patchright_dependency_missing',
+                    'error_type': type(exc).__name__,
+                    'elapsed': round(time.monotonic() - started_at, 2),
+                    'headed_mode': headed_mode, 'fetcher': 'patchright',
+                }
+                return None
+
+            markup = ''
+            browser = None
+            with sync_playwright() as playwright:
+                launch_options = {
+                    'headless': not headed_mode,
+                    'args': ['--no-sandbox', '--disable-dev-shm-usage'],
+                }
+                if os.path.exists('/usr/bin/chromium'):
+                    launch_options['executable_path'] = '/usr/bin/chromium'
+                browser = playwright.chromium.launch(**launch_options)
+                try:
+                    context = browser.new_context(
+                        locale='zh-TW', timezone_id='Asia/Taipei',
+                        viewport={'width': 1920, 'height': 1080},
+                    )
+                    page = context.new_page()
+                    ranking_responses = []
+
+                    def remember_ranking_response(response):
+                        request = response.request
+                        if (
+                            request.method == 'POST'
+                            and response.url.startswith(
+                                _GOODINFO_DATA_URL.split('?', 1)[0]
+                            )
+                            and 'STEP=DATA' in response.url
+                        ):
+                            ranking_responses.append(response)
+
+                    page.on('response', remember_ranking_response)
+                    remaining_ms = max(
+                        1,
+                        int(
+                            (_GOODINFO_FAST_DEADLINE_SECONDS
+                             - (time.monotonic() - started_at)) * 1000
+                        ),
+                    )
+                    try:
+                        page.goto(
+                            _GOODINFO_URL,
+                            wait_until='domcontentloaded',
+                            timeout=min(10_000, remaining_ms),
+                        )
+                    except PatchrightTimeoutError:
+                        # Ads may keep navigation open while the ranking POST is
+                        # already running. Continue until the shared deadline.
+                        pass
+
+                    while (
+                        not ranking_responses
+                        and time.monotonic() - started_at
+                        < _GOODINFO_FAST_DEADLINE_SECONDS
+                    ):
+                        page.wait_for_timeout(100)
+                    if ranking_responses:
+                        try:
+                            markup = ranking_responses[-1].text()
+                        except Exception:
+                            markup = ''
+                    if not markup and time.monotonic() - started_at < _GOODINFO_FAST_DEADLINE_SECONDS:
+                        markup = page.content()
+                finally:
+                    if browser is not None:
+                        browser.close()
+            fetcher_name = 'patchright'
+
+        ranking = _parse_goodinfo_original_page(markup)
         if ranking is not None:
             fetch_goodinfo_data.last_status = {
                 'state': 'success', 'reason': '', 'rows': len(ranking),
                 'elapsed': round(time.monotonic() - started_at, 2),
                 'headed_mode': headed_mode,
-                'fetcher': 'scrapling',
+                'fetcher': fetcher_name,
             }
             return ranking
         fetch_goodinfo_data.last_status = {
-            'state': 'failed', 'reason': 'legacy_table_missing',
+            'state': 'failed',
+            'reason': (
+                'legacy_table_missing' if use_cloudflare_solver
+                else 'fast_ranking_timeout'
+            ),
             'elapsed': round(time.monotonic() - started_at, 2),
             'headed_mode': headed_mode,
-            'fetcher': 'scrapling',
+            'fetcher': fetcher_name,
         }
     except Exception as exc:
-        logger.exception('Goodinfo Scrapling fetch failed: %s', type(exc).__name__)
+        logger.exception('Goodinfo browser fetch failed: %s', type(exc).__name__)
         fetch_goodinfo_data.last_status = {
             'state': 'failed', 'reason': 'browser_error',
             'error_type': type(exc).__name__,
             'elapsed': round(time.monotonic() - started_at, 2),
             'headed_mode': headed_mode,
-            'fetcher': 'scrapling',
+            'fetcher': 'scrapling' if use_cloudflare_solver else 'patchright',
         }
     finally:
         _GOODINFO_BROWSER_SEMAPHORE.release()
@@ -10651,23 +10764,33 @@ def render_stock_external_resources():
     """Render stock data-source links alongside upload/quick-search controls."""
     st.markdown("#### 外部資源")
 
-    def perform_goodinfo_fetch():
-        with st.spinner("正在使用 Scrapling 通過網站驗證並載入排行，最多約 65 秒..."):
-            result = fetch_goodinfo_data()
+    def perform_goodinfo_fetch(use_cloudflare_solver=False):
+        spinner_text = (
+            "正在使用加強驗證載入排行，最多約 65 秒..."
+            if use_cloudflare_solver
+            else "正在建立瀏覽器工作階段並載入排行，最多約 15 秒..."
+        )
+        with st.spinner(spinner_text):
+            result = fetch_goodinfo_data(
+                use_cloudflare_solver=use_cloudflare_solver,
+            )
             status = dict(getattr(fetch_goodinfo_data, 'last_status', {}) or {})
             if result is not None and not result.empty:
                 st.session_state['goodinfo_df'] = result.astype(str)
                 st.session_state['goodinfo_fetch_failed'] = False
                 st.success(
-                    f"抓取成功，共 {len(result)} 筆；已載入暫存，回到股票分析按執行即可。"
+                    f"抓取成功，共 {len(result)} 筆（{status.get('elapsed', 0):g} 秒）；"
+                    "已載入暫存，回到股票分析按執行即可。"
                 )
             else:
                 st.session_state['goodinfo_fetch_failed'] = True
                 reason_text = {
                     'browser_busy': '另一個頁面正在抓取，請稍後再按一次。',
                     'scrapling_dependency_missing': 'Streamlit 尚未安裝完整 Scrapling 瀏覽器套件。',
+                    'patchright_dependency_missing': 'Streamlit 尚未安裝完整瀏覽器套件。',
+                    'fast_ranking_timeout': '15 秒內未收到完整排行，可再快速重試或改用加強驗證。',
                     'legacy_table_missing': 'Scrapling 已取得頁面，但沒有找到完整排行表格。',
-                    'browser_error': 'Scrapling 瀏覽器啟動、網站驗證或頁面解析失敗。',
+                    'browser_error': '瀏覽器啟動、網站驗證或頁面解析失敗。',
                 }.get(status.get('reason'), '抓取失敗或查無資料。')
                 st.error(reason_text)
                 if 'goodinfo_df' in st.session_state:
@@ -10677,13 +10800,19 @@ def render_stock_external_resources():
     with resource_col1:
         if st.button(
             "📥 抓取 Goodinfo 週轉率排行",
-            help="使用 Scrapling StealthyFetcher 與 Cloudflare solver，等待完整週轉率排行後解析。",
+            help="先建立 Goodinfo 瀏覽器工作階段，再接收頁面送出的原始排行 POST；最多約 15 秒。",
             width='stretch', key='fetch_goodinfo_in_stock_room'
         ):
             perform_goodinfo_fetch()
         if st.session_state.get('goodinfo_fetch_failed', False):
-            if st.button("🔄 重新抓取", width='stretch', key='retry_goodinfo_btn'):
+            if st.button("🔄 快速重試", width='stretch', key='retry_goodinfo_btn'):
                 perform_goodinfo_fetch()
+            if st.button(
+                "🛡️ 加強驗證重試",
+                help="只有快速模式仍被 Cloudflare 阻擋時使用；可能需要約 65 秒。",
+                width='stretch', key='retry_goodinfo_solver_btn',
+            ):
+                perform_goodinfo_fetch(use_cloudflare_solver=True)
         if 'goodinfo_df' in st.session_state:
             st.download_button(
                 "💾 下載 Report.csv",
@@ -11882,7 +12011,7 @@ OPENING_SIGNAL_WEIGHTS = {
     'NQ_FUT': 12, 'YM_FUT': 8,
     'NIKKEI': 10, 'KOSPI': 10,
 }
-OPENING_SIGNAL_CACHE_VERSION = 5
+OPENING_SIGNAL_CACHE_VERSION = 6
 
 NASDAQ_MARKET_HEADERS = {
     'User-Agent': (
@@ -12220,7 +12349,7 @@ def fetch_opening_overseas_signals(trading_date_text, cutoff_text):
 
     try:
         downloaded = yf.download(
-            [item[1] for item in intraday_symbols.values()] + ['TWF=F'],
+            [item[1] for item in intraday_symbols.values()],
             period='5d', interval='5m', group_by='ticker', auto_adjust=False,
             prepost=True, progress=False, threads=False,
         )
@@ -12232,12 +12361,6 @@ def fetch_opening_overseas_signals(trading_date_text, cutoff_text):
                     'key': key, 'label': label, 'group': group, **measured,
                     'weight': OPENING_SIGNAL_WEIGHTS[key], 'source': 'Yahoo Finance 5分線',
                 })
-        tx_measured = _opening_night_change(_extract_yfinance_close(downloaded, 'TWF=F'), cutoff_at)
-        if tx_measured:
-            rows.append({
-                'key': 'TX_NIGHT', 'label': '台指期夜盤', 'group': '台指夜盤', **tx_measured,
-                'weight': OPENING_SIGNAL_WEIGHTS['TX_NIGHT'], 'source': 'Yahoo Finance 5分線備援',
-            })
     except Exception as exc:
         errors.append(f'盤前即時市場：{exc}')
     if not rows and not errors:

@@ -450,7 +450,7 @@ def test_scrapling_response_markup_accepts_body_bytes_and_text_aliases():
     assert helper(None) == ""
 
 
-def test_goodinfo_fetch_uses_scrapling_cloudflare_flow():
+def test_goodinfo_fetch_uses_browser_post_fast_path_and_explicit_solver_fallback():
     tree = ast.parse(APP_PATH.read_text(encoding="utf-8"))
     function = next(
         node for node in tree.body
@@ -463,6 +463,11 @@ def test_goodinfo_fetch_uses_scrapling_cloudflare_flow():
     function_source = ast.get_source_segment(
         APP_PATH.read_text(encoding="utf-8"), function,
     )
+    assert 'use_cloudflare_solver=False' in function_source
+    assert 'from patchright.sync_api import' in function_source
+    assert "page.on('response', remember_ranking_response)" in function_source
+    assert "request.method == 'POST'" in function_source
+    assert "_GOODINFO_DATA_URL.split('?', 1)[0]" in function_source
     assert 'from scrapling.fetchers import StealthyFetcher' in function_source
     assert 'StealthyFetcher.fetch' in function_source
     assert 'os.environ.get("GOODINFO_HEADED") == "1"' in function_source
@@ -472,8 +477,51 @@ def test_goodinfo_fetch_uses_scrapling_cloudflare_flow():
     assert "'retries': 1" in function_source
     assert "fetch_options['executable_path'] = '/usr/bin/chromium'" in function_source
     assert '_scrapling_response_markup' in function_source
+    assert 'add_cookies' not in function_source
     assert 'refresh' not in called_attributes
     assert '_parse_goodinfo_original_page' in function_source
+
+
+def test_goodinfo_data_endpoint_keeps_the_observed_300_row_post_contract():
+    source = APP_PATH.read_text(encoding="utf-8")
+    assert 'StockListRank/StockList.asp?STEP=DATA' in source
+    assert 'RANK_RANGE=300&IS_RELOAD_REPORT=T' in source
+    assert '_GOODINFO_FAST_DEADLINE_SECONDS = 15.0' in source
+
+
+def test_verified_2026_bls_schedules_skip_blocked_network_retries():
+    source = APP_PATH.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    for function_name, release_type in (
+        ("fetch_bls_cpi_events", "cpi"),
+        ("fetch_bls_employment_events", "employment"),
+    ):
+        function = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == function_name
+        )
+        function_source = ast.get_source_segment(source, function)
+        verified_position = function_source.index(
+            f'_verified_bls_2026_events(year, "{release_type}")'
+        )
+        calendar_get_position = function_source.index('_calendar_get(')
+        assert verified_position < calendar_get_position
+        assert 'if verified_events:' in function_source
+        assert 'return _merge_macro_events(fallback_events, verified_events)' in function_source
+
+
+def test_opening_yahoo_batch_does_not_request_nonexistent_twf_symbol():
+    source = APP_PATH.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    function = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "fetch_opening_overseas_signals"
+    )
+    function_source = ast.get_source_segment(source, function)
+    assert "['TWF=F']" not in function_source
+    assert "_extract_yfinance_close(downloaded, 'TWF=F')" not in function_source
+    assert "[item[1] for item in intraday_symbols.values()]" in function_source
 
 
 def test_scrapling_fetcher_dependency_is_pinned():
