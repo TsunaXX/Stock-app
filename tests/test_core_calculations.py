@@ -411,36 +411,74 @@ def test_goodinfo_original_parser_keeps_historical_largest_table_behavior():
     assert parsed.iloc[0]["代號欄"] == 2400
 
 
-def test_goodinfo_fetch_uses_only_original_fixed_wait_flow():
+def test_goodinfo_turnover_parser_restores_legacy_completed_table_check():
+    parser = load_app_symbols("_parse_goodinfo_turnover_table")[
+        "_parse_goodinfo_turnover_table"
+    ]
+    rows = "".join(
+        f"<tr><td>{index + 1}</td><td>{2400 + index}</td><td>股票{index}</td>"
+        f"<td>{100 + index}</td><td>{1000 + index}</td><td>{index + 1}.2%</td></tr>"
+        for index in range(12)
+    )
+    markup = (
+        "<html><body><table><tr><th>排名</th><th>股票代號</th><th>名稱</th>"
+        "<th>成交價</th><th>成交量</th><th>週轉率</th></tr>"
+        f"{rows}</table></body></html>"
+    )
+    parsed = parser(markup)
+    assert parsed is not None
+    assert len(parsed) == 12
+    assert parser("<html><body>驗證中，請稍候</body></html>") is None
+
+
+def test_goodinfo_turnover_parser_recovers_mojibake_code_and_name_columns():
+    parser = load_app_symbols("_parse_goodinfo_turnover_table")[
+        "_parse_goodinfo_turnover_table"
+    ]
+    rows = "".join(
+        f"<tr><td>{index + 1}</td><td>{3000 + index}</td><td>�Ѳ�{index}</td>"
+        f"<td>{50 + index}</td><td>{500 + index}</td><td>{index + 2}.1%</td></tr>"
+        for index in range(12)
+    )
+    markup = (
+        "<table><tr><th>�ƦW</th><th>�N��</th><th>�W��</th>"
+        "<th>����</th><th>����q</th><th>�g��v</th></tr>"
+        f"{rows}</table>"
+    )
+    parsed = parser(markup)
+    assert parsed is not None
+    assert len(parsed) == 12
+    assert parsed["代號"].astype(str).iloc[0] == "3000"
+    assert parsed["名稱"].eq("").all()
+
+
+def test_goodinfo_fetch_keeps_legacy_cookie_and_antiblock_flow():
     tree = ast.parse(APP_PATH.read_text(encoding="utf-8"))
     function = next(
         node for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name == "fetch_goodinfo_data"
     )
     calls = [node for node in ast.walk(function) if isinstance(node, ast.Call)]
-    called_names = {
-        node.func.id for node in calls if isinstance(node.func, ast.Name)
-    }
     called_attributes = {
         node.func.attr for node in calls if isinstance(node.func, ast.Attribute)
     }
-    sleep_values = [
-        node.args[0].value
-        for node in calls
-        if isinstance(node.func, ast.Attribute)
-        and node.func.attr == "sleep"
-        and node.args
-        and isinstance(node.args[0], ast.Constant)
+    function_source = ast.get_source_segment(
+        APP_PATH.read_text(encoding="utf-8"), function,
+    )
+    chrome_constructions = [
+        node for node in calls
+        if isinstance(node.func, ast.Attribute) and node.func.attr == "Chrome"
     ]
-    assert sleep_values == [15]
-    assert "read_html" in called_attributes
+    assert len(chrome_constructions) == 1
+    assert 'page_load_strategy = "none"' in function_source
+    assert '--disable-extensions' in function_source
+    assert 'profile.managed_default_content_settings.images' in function_source
+    assert 'AutomationControlled' in function_source
+    assert 'RETRY_TS' in function_source
+    assert 'time.monotonic' in function_source
+    assert 'find_elements' in called_attributes
+    assert '_parse_goodinfo_turnover_table' in function_source
     assert "refresh" not in called_attributes
-    assert not {
-        "_parse_goodinfo_table_html",
-        "_parse_goodinfo_legacy_page",
-        "_parse_goodinfo_original_page",
-        "_goodinfo_rank_table_html",
-    }.intersection(called_names)
 
 
 def test_shioaji_futures_resolver_uses_v17_lazy_root_api():

@@ -6930,17 +6930,117 @@ def _goodinfo_rank_table_html(driver):
         return []
 
 
-def fetch_goodinfo_data():
-    """使用曾成功的原始單一路徑：固定等待 15 秒後解析整頁最大表格。"""
+def _parse_goodinfo_turnover_table(page_html):
+    """挑出 Goodinfo 週轉率排行表，並拒絕阻擋頁或尚未載入的空表。"""
+    try:
+        tables = pd.read_html(io.StringIO(str(page_html or '')), flavor='lxml')
+    except (ValueError, TypeError, ImportError):
+        return None
+
+    candidates = []
+    for table in tables:
+        if table.shape[0] < 10 or table.shape[1] < 5:
+            continue
+        normalized = table.copy()
+        if isinstance(normalized.columns, pd.MultiIndex):
+            new_columns = []
+            for column in normalized.columns:
+                cleaned_parts = []
+                for item in column:
+                    item_text = re.sub(r"\s+", "", str(item)).strip()
+                    if item_text and not item_text.startswith('Unnamed'):
+                        if not cleaned_parts or cleaned_parts[-1] != item_text:
+                            cleaned_parts.append(item_text)
+                new_columns.append('_'.join(cleaned_parts))
+            normalized.columns = new_columns
+        else:
+            normalized.columns = [
+                re.sub(r"\s+", "", str(column)).strip()
+                for column in normalized.columns
+            ]
+
+        column_text = '|'.join(map(str, normalized.columns))
+        code_column = next(
+            (column for column in normalized.columns if '代號' in str(column)),
+            None,
+        )
+        name_column = next(
+            (column for column in normalized.columns if '名稱' in str(column)),
+            None,
+        )
+
+        # Goodinfo 的動態排行偶爾以 Big5 傳送，卻仍宣告 UTF-8。Chrome
+        # 會把中文欄名解成 �N�� 等亂碼；此時不能再靠「代號／名稱」文字，
+        # 改以每欄實際包含的 4～6 碼股票代號數量辨認原排行欄。
+        if code_column is None or name_column is None:
+            code_counts = []
+            for position, column in enumerate(normalized.columns):
+                code_count = int(
+                    normalized.iloc[:, position].astype(str)
+                    .str.extract(r'(?<!\d)(\d{4,6})(?!\d)', expand=False)
+                    .notna().sum()
+                )
+                code_counts.append((code_count, position, column))
+            valid_codes, code_position, code_column = max(
+                code_counts,
+                key=lambda item: item[0],
+                default=(0, -1, None),
+            )
+            if valid_codes < 10 or code_position + 1 >= normalized.shape[1]:
+                continue
+            name_position = code_position + 1
+            name_column = normalized.columns[name_position]
+            renamed_columns = list(normalized.columns)
+            renamed_columns[code_position] = '代號'
+            renamed_columns[name_position] = '名稱'
+            normalized.columns = renamed_columns
+            code_column = '代號'
+            name_column = '名稱'
+            # 已被瀏覽器替換成 U+FFFD 的公司名稱無法無損還原，留空讓後續
+            # 使用 stock_names.csv／線上名稱表依股票代號補回，避免顯示亂碼。
+            garbled_names = normalized[name_column].astype(str).str.contains(
+                '\ufffd', regex=False,
+            )
+            if int(garbled_names.sum()) >= max(1, len(normalized) // 2):
+                normalized[name_column] = ''
+
+        valid_codes = int(
+            normalized[code_column].astype(str)
+            .str.extract(r'(?<!\d)(\d{4,6})(?!\d)', expand=False).notna().sum()
+        )
+        if valid_codes < 10:
+            continue
+        column_text = '|'.join(map(str, normalized.columns))
+        score = sum(
+            keyword in column_text
+            for keyword in ('代號', '名稱', '週轉', '成交')
+        )
+        candidates.append((
+            score,
+            valid_codes,
+            normalized.shape[0] * normalized.shape[1],
+            normalized,
+        ))
+
+    if not candidates:
+        return None
+    target_df = max(candidates, key=lambda item: (item[0], item[1], item[2]))[3]
+    return target_df.dropna(how='all').reset_index(drop=True)
+
+
+def fetch_goodinfo_data(max_attempts=2, total_wait_seconds=22):
+    """沿用舊版防堵流程，以同一瀏覽器保留 Cookie 並等待完整排行。"""
     chrome_options = Options()
+    chrome_options.page_load_strategy = "none"
     chrome_options.add_argument("--headless=new")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--disable-gpu")
     chrome_options.add_argument("--window-size=1920x1080")
-    chrome_options.add_argument("--single-process")
-    chrome_options.add_argument("--no-zygote")
-    chrome_options.add_argument("--disable-software-rasterizer")
+    chrome_options.add_argument("--disable-extensions")
+    chrome_options.add_experimental_option(
+        "prefs", {"profile.managed_default_content_settings.images": 2}
+    )
     chrome_options.add_argument("--disable-blink-features=AutomationControlled")
     chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
     chrome_options.add_experimental_option('useAutomationExtension', False)
@@ -6948,59 +7048,100 @@ def fetch_goodinfo_data():
         "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
     )
-    chrome_options.binary_location = "/usr/bin/chromium"
+    chrome_options.set_capability('unhandledPromptBehavior', 'dismiss')
+    if os.path.exists('/usr/bin/chromium'):
+        chrome_options.binary_location = '/usr/bin/chromium'
     driver = None
+    last_error = None
     try:
-        service = Service("/usr/bin/chromedriver")
-        driver = webdriver.Chrome(service=service, options=chrome_options)
-        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
-            "source": """
-                Object.defineProperty(navigator, 'webdriver', {
-                    get: () => undefined
-                })
-            """
-        })
-        driver.get(_GOODINFO_URL)
-        time.sleep(15)
-        page_html = driver.page_source
-        tables = pd.read_html(io.StringIO(page_html))
+        with _GOODINFO_BROWSER_SEMAPHORE:
+            service = (
+                Service('/usr/bin/chromedriver')
+                if os.path.exists('/usr/bin/chromedriver')
+                else Service()
+            )
+            driver = webdriver.Chrome(service=service, options=chrome_options)
+            driver.set_page_load_timeout(12)
+            driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
+                'source': """
+                    Object.defineProperty(navigator, 'webdriver', {
+                        get: () => undefined
+                    })
+                """
+            })
 
-        target_df = None
-        for dataframe in tables:
-            if dataframe.shape[0] > 10 and dataframe.shape[1] > 5:
-                if target_df is None or (
-                    dataframe.shape[0] * dataframe.shape[1]
-                    > target_df.shape[0] * target_df.shape[1]
-                ):
-                    target_df = dataframe
+            attempt_count = max(1, int(max_attempts))
+            overall_deadline = time.monotonic() + max(3, float(total_wait_seconds))
+            best_result = None
+            for attempt in range(attempt_count):
+                try:
+                    remaining = overall_deadline - time.monotonic()
+                    if remaining <= 0.5:
+                        break
+                    attempts_left = attempt_count - attempt
+                    attempt_budget = (
+                        remaining if attempts_left == 1
+                        else max(8, remaining * 0.75)
+                    )
+                    driver.set_page_load_timeout(max(3, min(12, attempt_budget)))
+                    request_url = (
+                        _GOODINFO_URL if attempt == 0
+                        else f'{_GOODINFO_URL}&RETRY_TS={int(time.time() * 1000)}'
+                    )
+                    try:
+                        driver.get(request_url)
+                    except (TimeoutException, WebDriverException) as navigation_error:
+                        last_error = navigation_error
 
-        if target_df is not None:
-            if isinstance(target_df.columns, pd.MultiIndex):
-                new_columns = []
-                for column in target_df.columns:
-                    cleaned_parts = []
-                    for item in column:
-                        item_text = str(item).replace(' ', '').strip()
-                        if item_text and not item_text.startswith('Unnamed'):
-                            if not cleaned_parts or cleaned_parts[-1] != item_text:
-                                cleaned_parts.append(item_text)
-                    new_columns.append('_'.join(cleaned_parts))
-                target_df.columns = new_columns
-            else:
-                target_df.columns = [
-                    str(column).replace(' ', '').strip()
-                    for column in target_df.columns
-                ]
-            return target_df
+                    attempt_deadline = min(
+                        overall_deadline,
+                        time.monotonic() + attempt_budget,
+                    )
+                    last_parsed_row_count = -1
+                    while time.monotonic() < attempt_deadline:
+                        try:
+                            page_html = driver.page_source
+                            row_count = len(driver.find_elements(By.TAG_NAME, 'tr'))
+                        except UnexpectedAlertPresentException as alert_error:
+                            last_error = alert_error
+                            try:
+                                driver.switch_to.alert.dismiss()
+                            except (NoAlertPresentException, WebDriverException):
+                                pass
+                            break
+
+                        if row_count >= 20 and row_count != last_parsed_row_count:
+                            last_parsed_row_count = row_count
+                            result = _parse_goodinfo_turnover_table(page_html)
+                            if result is not None and not result.empty:
+                                if best_result is None or len(result) > len(best_result):
+                                    best_result = result
+                                if len(result) >= 100:
+                                    return result
+                        time.sleep(min(
+                            0.4,
+                            max(0.05, attempt_deadline - time.monotonic()),
+                        ))
+                except (TimeoutException, WebDriverException, ValueError) as exc:
+                    last_error = exc
+                if attempt + 1 < attempt_count and time.monotonic() < overall_deadline:
+                    time.sleep(0.25)
+
+            if best_result is not None and not best_result.empty:
+                return best_result
     except Exception as exc:
-        logger.exception('Goodinfo original flow failed: %s', type(exc).__name__)
-        return None
+        last_error = exc
     finally:
         if driver is not None:
             try:
                 driver.quit()
-            except Exception:
+            except WebDriverException:
                 pass
+    if last_error is not None:
+        logger.warning(
+            'Goodinfo legacy anti-block flow failed: %s',
+            type(last_error).__name__,
+        )
     return None
 
 # ==========================================
@@ -10622,7 +10763,7 @@ def render_stock_external_resources():
     st.markdown("#### 外部資源")
 
     def perform_goodinfo_fetch():
-        with st.spinner("正在使用舊版流程載入排行，請完整等待約 15 秒..."):
+        with st.spinner("正在沿用舊版防堵流程載入排行，最多約 22 秒..."):
             result = fetch_goodinfo_data()
             if result is not None and not result.empty:
                 st.session_state['goodinfo_df'] = result.astype(str)
@@ -10636,7 +10777,7 @@ def render_stock_external_resources():
     with resource_col1:
         if st.button(
             "📥 抓取 Goodinfo 週轉率排行",
-            help="完全使用曾成功的舊版流程：開啟頁面、固定等待 15 秒，再解析完整上市＋上櫃排行。",
+            help="沿用曾成功的舊版流程：保留同一瀏覽器 Cookie，等待 Goodinfo 完成導向並自動重試一次。",
             width='stretch', key='fetch_goodinfo_in_stock_room'
         ):
             perform_goodinfo_fetch()
