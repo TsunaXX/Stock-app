@@ -561,6 +561,70 @@ def test_calendar_sources_are_bounded_and_keep_partial_results():
     assert selected_errors == ["CPI: TimeoutError"]
 
 
+def test_calendar_source_failure_keeps_each_last_success_feed():
+    merge = load_app_symbols("merge_calendar_last_success")["merge_calendar_last_success"]
+    previous = {
+        "FOMC": [{"date": "2026-09-17"}],
+        "CPI": [{"date": "2026-09-11"}],
+    }
+    merged, retained = merge(
+        {"FOMC": [], "CPI": [{"date": "2026-10-14"}]}, previous,
+    )
+    assert merged["FOMC"] == previous["FOMC"]
+    assert merged["CPI"] == [{"date": "2026-10-14"}]
+    assert retained == ["FOMC"]
+
+
+def test_taiex_history_fetches_months_independently_and_in_parallel():
+    symbols = load_app_symbols("fetch_twse_taiex_daily_history")
+    calls = []
+
+    def fake_month(month_text, refresh_bucket=None):
+        calls.append((month_text, refresh_bucket))
+        year, month = int(month_text[:4]), int(month_text[4:6])
+        return [{
+            "ts": pd.Timestamp(year=year, month=month, day=15),
+            "Open": 100.0, "High": 102.0, "Low": 99.0,
+            "Close": 101.0, "Volume": np.nan,
+        }]
+
+    symbols["fetch_twse_taiex_month"] = fake_month
+    result = symbols["fetch_twse_taiex_daily_history"](lookback_days=60)
+    assert not result.empty
+    assert {"Open", "High", "Low", "Close", "Volume"}.issubset(result.columns)
+    assert 2 <= len(calls) <= 4
+    assert sum(bucket is not None for _month, bucket in calls) == 1
+
+
+def test_index_history_empty_refresh_keeps_stale_nonempty_data():
+    symbols = load_app_symbols("get_cached_market_temperature_data")
+
+    class FakeStreamlit:
+        session_state = {
+            "sj_logged_in": False,
+            "sj_api": None,
+            "_market_temperature_history_cache": {
+                ("^TWII", 180, False, None): {
+                    "saved_at": 0.0,
+                    "df": pd.DataFrame(
+                        [{"Open": 100, "High": 102, "Low": 99, "Close": 101}],
+                        index=[pd.Timestamp("2026-08-20")],
+                    ),
+                    "attrs": {},
+                    "source": "證交所官方歷史日K",
+                }
+            },
+        }
+
+    symbols["st"] = FakeStreamlit()
+    symbols["fetch_market_temperature_data"] = lambda *_args, **_kwargs: (
+        pd.DataFrame(), "",
+    )
+    data, source = symbols["get_cached_market_temperature_data"]("^TWII")
+    assert not data.empty
+    assert "暫時沿用" in source
+
+
 def test_heavy_hidden_sources_require_an_active_keyed_tab():
     source = APP_PATH.read_text(encoding="utf-8")
     assert 'key="main_workspace_active_tab", on_change="rerun"' in source
@@ -578,6 +642,26 @@ def test_heavy_hidden_sources_require_an_active_keyed_tab():
 def test_streamlit_magic_ast_rewrite_is_disabled_for_large_app():
     config = (APP_PATH.parent / ".streamlit" / "config.toml").read_text(encoding="utf-8")
     assert "magicEnabled = false" in config
+
+
+def test_calendar_http_has_a_short_single_attempt_deadline():
+    source = APP_PATH.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    calendar_get = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_calendar_get"
+    )
+    calendar_source = ast.get_source_segment(source, calendar_get)
+    assert "timeout=(3, 8)" in calendar_source
+    assert "range(3)" not in calendar_source
+    tradingview = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "fetch_tradingview_us_calendar"
+    )
+    tradingview_source = ast.get_source_segment(source, tradingview)
+    assert "max_workers=4" in tradingview_source
+    assert "timeout=(3, 9)" in tradingview_source
 
 
 def test_daily_risk_refresh_skips_redundant_live_quote_fetches():
@@ -655,7 +739,23 @@ def test_verified_2026_bls_schedules_skip_blocked_network_retries():
         calendar_get_position = function_source.index('_calendar_get(')
         assert verified_position < calendar_get_position
         assert 'if verified_events:' in function_source
-        assert 'return _merge_macro_events(fallback_events, verified_events)' in function_source
+        assert 'return verified_events' in function_source
+
+
+def test_current_bea_schedule_uses_full_official_page_before_fallback():
+    source = APP_PATH.read_text(encoding="utf-8")
+    assert 'BEA_RELEASE_SCHEDULE_URL = "https://www.bea.gov/news/schedule/full"' in source
+    tree = ast.parse(source)
+    for function_name in ("fetch_bea_gdp_events", "fetch_bea_core_pce_events"):
+        function = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == function_name
+        )
+        function_source = ast.get_source_segment(source, function)
+        assert function_source.index("_parse_bea_release_schedule") < function_source.index(
+            "_tradingview_macro_events"
+        )
+        assert "if official_events and year >= current_year" in function_source
 
 
 def test_opening_yahoo_batch_does_not_request_nonexistent_twf_symbol():

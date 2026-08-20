@@ -684,46 +684,72 @@ def get_taiex_contract(api):
     return None
 
 
-@st.cache_data(ttl=600, max_entries=4, show_spinner=False)
+@st.cache_data(ttl=60 * 60 * 6, max_entries=48, show_spinner=False)
+def fetch_twse_taiex_month(month_text, refresh_bucket=None):
+    """Fetch one official TWSE TAIEX month; failures are not cached."""
+    headers = {'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json'}
+    response = requests.get(
+        'https://www.twse.com.tw/indicesReport/MI_5MINS_HIST',
+        params={'response': 'json', 'date': str(month_text)},
+        headers=headers,
+        timeout=(3, 7),
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if str(payload.get('stat', '')).upper() != 'OK':
+        raise ValueError(f"TWSE index status: {payload.get('stat')}")
+    records = []
+    for row in payload.get('data', []):
+        if len(row) < 5:
+            continue
+        date_parts = str(row[0]).strip().split('/')
+        if len(date_parts) != 3:
+            continue
+        trade_date = pd.Timestamp(
+            year=int(date_parts[0]) + 1911,
+            month=int(date_parts[1]), day=int(date_parts[2]),
+        )
+        values = [float(str(value).replace(',', '').strip()) for value in row[1:5]]
+        records.append({
+            'ts': trade_date, 'Open': values[0], 'High': values[1],
+            'Low': values[2], 'Close': values[3], 'Volume': np.nan,
+        })
+    if not records:
+        raise ValueError('TWSE index month returned no rows')
+    return records
+
+
 def fetch_twse_taiex_daily_history(lookback_days=180):
-    """Fetch official TWSE monthly TAIEX OHLC history (no Yahoo fallback)."""
+    """Fetch official TAIEX history in parallel, reusing successful months."""
     tz_tw = pytz.timezone('Asia/Taipei')
     end_date = pd.Timestamp(datetime.now(tz_tw).date())
     start_date = end_date - pd.Timedelta(days=lookback_days)
-    months = pd.period_range(start=start_date.to_period('M'), end=end_date.to_period('M'), freq='M')
+    months = list(pd.period_range(
+        start=start_date.to_period('M'), end=end_date.to_period('M'), freq='M',
+    ))
     records = []
-    headers = {'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json'}
 
-    for month in months:
+    def fetch_month(month):
         try:
-            response = requests.get(
-                'https://www.twse.com.tw/indicesReport/MI_5MINS_HIST',
-                params={'response': 'json', 'date': month.start_time.strftime('%Y%m%d')},
-                headers=headers,
-                timeout=10,
+            is_current_month = month == end_date.to_period('M')
+            refresh_bucket = int(time.time() // 180) if is_current_month else None
+            return fetch_twse_taiex_month(
+                month.start_time.strftime('%Y%m%d'), refresh_bucket,
             )
-            payload = response.json()
-            rows = payload.get('data', [])
-            for row in rows:
-                if len(row) < 5:
-                    continue
-                date_parts = str(row[0]).strip().split('/')
-                if len(date_parts) != 3:
-                    continue
-                trade_date = pd.Timestamp(year=int(date_parts[0]) + 1911, month=int(date_parts[1]), day=int(date_parts[2]))
-                if trade_date < start_date or trade_date > end_date:
-                    continue
-                values = [float(str(value).replace(',', '').strip()) for value in row[1:5]]
-                records.append({
-                    'ts': trade_date, 'Open': values[0], 'High': values[1],
-                    'Low': values[2], 'Close': values[3], 'Volume': np.nan,
-                })
         except (requests.RequestException, ValueError, TypeError, KeyError):
-            continue
+            return []
+
+    with ThreadPoolExecutor(max_workers=min(4, len(months))) as executor:
+        for month_records in executor.map(fetch_month, months):
+            records.extend(month_records)
 
     if not records:
         return pd.DataFrame()
-    return pd.DataFrame(records).drop_duplicates(subset=['ts'], keep='last').set_index('ts').sort_index()
+    result = pd.DataFrame(records)
+    result = result[(result['ts'] >= start_date) & (result['ts'] <= end_date)]
+    if result.empty:
+        return pd.DataFrame()
+    return result.drop_duplicates(subset=['ts'], keep='last').set_index('ts').sort_index()
 
 
 @st.cache_data(ttl=60 * 60 * 24 * 30, max_entries=400, show_spinner=False)
@@ -856,21 +882,20 @@ BLS_CPS_CALENDAR_URL = "https://www.bls.gov/cps/publications/release-calendar.ht
 ADP_EMPLOYMENT_DATA_URL = "https://adpemploymentreport.com/ner_production.json"
 ADP_EMPLOYMENT_PAGE_URL = "https://adpemploymentreport.com/"
 TRADINGVIEW_CALENDAR_URL = "https://economic-calendar.tradingview.com/events"
-BEA_RELEASE_SCHEDULE_URL = "https://www.bea.gov/news/schedule"
+BEA_RELEASE_SCHEDULE_URL = "https://www.bea.gov/news/schedule/full"
 ISM_RELEASE_CALENDAR_URL = "https://www.ismworld.org/supply-management-news-and-reports/reports/rob-report-calendar/"
 
 
 def _calendar_get(url):
-    """取得公開行事曆來源；失敗時回傳 None，讓既有行事曆仍可使用。"""
-    for attempt in range(3):
-        try:
-            response = requests.get(url, headers=CALENDAR_HTTP_HEADERS, timeout=(6, 18))
-            response.raise_for_status()
-            return response
-        except requests.RequestException:
-            if attempt < 2:
-                time.sleep(0.5 * (attempt + 1))
-    return None
+    """取得公開行事曆來源；單次短截止，失敗由快取／手動更新接手。"""
+    try:
+        response = requests.get(
+            url, headers=CALENDAR_HTTP_HEADERS, timeout=(3, 8),
+        )
+        response.raise_for_status()
+        return response
+    except requests.RequestException:
+        return None
 
 
 def _twse_announcement_detail(row, fallback):
@@ -917,22 +942,20 @@ def fetch_tradingview_us_calendar(year):
             "to": f"{year}-{end_month:02}-{end_day:02}T23:59:59.999Z",
             "countries": "US",
         }
-        for attempt in range(2):
-            try:
-                response = requests.get(
-                    TRADINGVIEW_CALENDAR_URL, params=params, headers=headers, timeout=(6, 25)
-                )
-                response.raise_for_status()
-                payload = response.json()
-                rows = payload.get("result", []) if isinstance(payload, dict) else []
-                return rows if isinstance(rows, list) else []
-            except (requests.RequestException, ValueError, TypeError):
-                if attempt == 0:
-                    time.sleep(0.5)
-        return []
+        try:
+            response = requests.get(
+                TRADINGVIEW_CALENDAR_URL, params=params, headers=headers,
+                timeout=(3, 9),
+            )
+            response.raise_for_status()
+            payload = response.json()
+            rows = payload.get("result", []) if isinstance(payload, dict) else []
+            return rows if isinstance(rows, list) else []
+        except (requests.RequestException, ValueError, TypeError):
+            return []
 
     combined = {}
-    with ThreadPoolExecutor(max_workers=2) as executor:
+    with ThreadPoolExecutor(max_workers=4) as executor:
         for quarter_rows in executor.map(fetch_quarter, quarter_ranges):
             for row in quarter_rows:
                 row_key = str(row.get("id") or f"{row.get('title')}|{row.get('date')}")
@@ -1032,10 +1055,15 @@ def _parse_bea_release_schedule(page_html, year, release_type):
     time_pattern = re.compile(r"^(\d{1,2}):(\d{2})\s*(AM|PM)$", re.I)
     event_title = "美國 GDP 公布" if release_type == "gdp" else "美國核心 PCE 公布"
     events, seen = [], set()
-    for row in soup.select("tr"):
-        release_title_node = row.select_one(".release-title")
-        release_date_node = row.select_one(".release-date")
-        release_time_node = row.select_one(".scheduled-date small")
+    # Direct class lookup is substantially faster than compiling three CSS
+    # selectors for every row on BEA's large schedule page.
+    for row in soup.find_all("tr"):
+        release_title_node = row.find(class_="release-title")
+        release_date_node = row.find(class_="release-date")
+        scheduled_date_node = row.find(class_="scheduled-date")
+        release_time_node = (
+            scheduled_date_node.find("small") if scheduled_date_node else None
+        )
         if not (release_title_node and release_date_node and release_time_node):
             continue
         release_title = release_title_node.get_text(" ", strip=True)
@@ -1078,23 +1106,28 @@ def _parse_bea_release_schedule(page_html, year, release_type):
 @st.cache_data(ttl=60 * 60 * 12, max_entries=12, show_spinner=False)
 def fetch_bea_gdp_events(year):
     """GDP 以 BEA 官方排程為準，TradingView 補足官方頁未保留的歷史發布日期。"""
-    fallback_events = _tradingview_macro_events(year, "gdp")
     official_events = _parse_bea_release_schedule(fetch_bea_release_schedule_html(), year, "gdp")
+    current_year = datetime.now(pytz.timezone('Asia/Taipei')).year
+    if official_events and year >= current_year:
+        return sorted(official_events, key=lambda event: str(event.get('date', '')))
+    fallback_events = _tradingview_macro_events(year, "gdp")
     return _merge_macro_events(fallback_events, official_events)
 
 
 @st.cache_data(ttl=60 * 60 * 12, max_entries=12, show_spinner=False)
 def fetch_bea_core_pce_events(year):
     """核心 PCE 隨 BEA Personal Income and Outlays 發布，並以 TradingView 補歷史日期。"""
-    fallback_events = _tradingview_macro_events(year, "core_pce")
     official_events = _parse_bea_release_schedule(fetch_bea_release_schedule_html(), year, "core_pce")
+    current_year = datetime.now(pytz.timezone('Asia/Taipei')).year
+    if official_events and year >= current_year:
+        return sorted(official_events, key=lambda event: str(event.get('date', '')))
+    fallback_events = _tradingview_macro_events(year, "core_pce")
     return _merge_macro_events(fallback_events, official_events)
 
 
 @st.cache_data(ttl=60 * 60 * 12, max_entries=12, show_spinner=False)
 def fetch_ism_manufacturing_events(year):
     """擷取 ISM 製造業 PMI；僅接受明確的 ISM Manufacturing PMI 主指標。"""
-    fallback_events = _tradingview_macro_events(year, "ism_manufacturing")
     official_events = []
     # ISM 頁面可能對伺服器回傳驗證頁；保留已由官方 2026 日曆核對的完整日期，補足年底尚未進入備援 API 的月份。
     verified_official_dates = {
@@ -1148,7 +1181,9 @@ def fetch_ism_manufacturing_events(year):
             "source": "Institute for Supply Management",
             "impact": "high",
         })
-    return _merge_macro_events(fallback_events, official_events)
+    if official_events:
+        return sorted(official_events, key=lambda event: str(event.get('date', '')))
+    return _tradingview_macro_events(year, "ism_manufacturing")
 
 
 @st.cache_data(ttl=60 * 60 * 6, max_entries=12, show_spinner=False)
@@ -1289,13 +1324,13 @@ def fetch_fomc_events(year):
 @st.cache_data(ttl=60 * 60 * 12, max_entries=12, show_spinner=False)
 def fetch_bls_cpi_events(year):
     """CPI 以免金鑰經濟日曆為主，BLS 官方來源作交叉備援。"""
-    fallback_events = _tradingview_macro_events(year, "cpi")
     verified_events = _verified_bls_2026_events(year, "cpi")
     if verified_events:
         # BLS frequently rate-limits cloud servers.  The complete 2026 official
         # schedule is already verified below, so retrying three blocked BLS
         # pages adds roughly ten seconds without improving the result.
-        return _merge_macro_events(fallback_events, verified_events)
+        return verified_events
+    fallback_events = _tradingview_macro_events(year, "cpi")
     official_events = _parse_bls_release_ics(
         _calendar_get(BLS_RELEASE_ICS_URL), year, "Consumer Price Index", "美國 CPI 公布"
     )
@@ -1308,7 +1343,9 @@ def fetch_bls_cpi_events(year):
         official_events = _parse_official_release_schedule(
             _calendar_get(BLS_CPI_URL), year, "美國 CPI 公布", "U.S. Bureau of Labor Statistics"
         )
-    return _merge_macro_events(fallback_events, official_events)
+    if official_events:
+        return sorted(official_events, key=lambda event: str(event.get('date', '')))
+    return _tradingview_macro_events(year, "ism_manufacturing")
 
 
 def _parse_official_release_schedule(response, year, event_title, source):
@@ -1497,12 +1534,12 @@ def _parse_bls_cps_employment_calendar(response, year):
 @st.cache_data(ttl=60 * 60 * 12, max_entries=12, show_spinner=False)
 def fetch_bls_employment_events(year):
     """BLS Employment Situation：市場俗稱大非農，同時公布失業率。"""
-    fallback_events = _tradingview_macro_events(year, "nfp")
     verified_events = _verified_bls_2026_events(year, "employment")
     if verified_events:
         # Same as CPI: use the already verified full-year official schedule and
         # avoid serial retries against BLS from Streamlit's cloud IP.
-        return _merge_macro_events(fallback_events, verified_events)
+        return verified_events
+    fallback_events = _tradingview_macro_events(year, "nfp")
     official_events = _parse_bls_employment_ics(_calendar_get(BLS_RELEASE_ICS_URL), year)
     if not official_events:
         official_events = _parse_bls_year_schedule(
@@ -1522,8 +1559,16 @@ def fetch_bls_employment_events(year):
 @st.cache_data(ttl=60 * 60 * 12, max_entries=12, show_spinner=False)
 def fetch_adp_employment_events(year):
     """由 ADP 官方資料端點取得每月小非農日期，固定 08:15 ET 發布。"""
-    response = _calendar_get(ADP_EMPLOYMENT_DATA_URL)
+    official_fallback_dates = {
+        # ADP 2026 年官方 Calendar；補回端點會因日期已過而移除的歷史月份。
+        2026: [(1, 7), (2, 4), (3, 4), (4, 1), (5, 6), (6, 3), (7, 1),
+               (8, 5), (9, 2), (9, 30), (11, 4), (12, 2)],
+    }
     report_date_texts = []
+    response = (
+        None if year in official_fallback_dates
+        else _calendar_get(ADP_EMPLOYMENT_DATA_URL)
+    )
 
     if response:
         try:
@@ -1538,7 +1583,11 @@ def fetch_adp_employment_events(year):
         except (TypeError, ValueError, AttributeError):
             pass
     # JSON 欄位改版或只保留未來日期時，再讀 ADP 官方首頁的 Calendar 文字。
-    page_response = _calendar_get(ADP_EMPLOYMENT_PAGE_URL)
+    page_response = (
+        _calendar_get(ADP_EMPLOYMENT_PAGE_URL)
+        if year not in official_fallback_dates and not report_date_texts
+        else None
+    )
     if page_response:
         page_text = BeautifulSoup(page_response.text, 'html.parser').get_text(' ', strip=True)
         calendar_match = re.search(
@@ -1554,11 +1603,6 @@ def fetch_adp_employment_events(year):
         r"(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2}),\s*(\d{4})",
         re.I,
     )
-    official_fallback_dates = {
-        # ADP 2026 年官方 Calendar；補回端點會因日期已過而移除的歷史月份。
-        2026: [(1, 7), (2, 4), (3, 4), (4, 1), (5, 6), (6, 3), (7, 1),
-               (8, 5), (9, 2), (9, 30), (11, 4), (12, 2)],
-    }
     parsed_dates = []
     for report_text in report_date_texts:
         for match in pattern.finditer(str(report_text)):
@@ -3230,6 +3274,24 @@ def fetch_selected_calendar_sources(year, selected_event_types, taiwan_closed_da
     return ordered_results, ordered_errors
 
 
+def merge_calendar_last_success(current_sources, previous_sources):
+    """Keep each calendar feed's last non-empty result on transient failure."""
+    previous = previous_sources if isinstance(previous_sources, dict) else {}
+    merged = {}
+    retained = []
+    for label, events in (current_sources or {}).items():
+        event_list = list(events or [])
+        prior_events = list(previous.get(label, []) or [])
+        if event_list:
+            merged[label] = event_list
+        elif prior_events:
+            merged[label] = prior_events
+            retained.append(label)
+        else:
+            merged[label] = []
+    return merged, retained
+
+
 def render_company_event_snapshot(snapshot):
     """在獨立分頁顯示財報與營收明細；此函式不執行任何網路查詢。"""
     earnings_result = snapshot.get("earnings", {})
@@ -3752,13 +3814,28 @@ def get_cached_market_temperature_data(code, lookback_days=180, max_age_seconds=
         return df, cached['source']
 
     df, source = fetch_market_temperature_data(code, lookback_days=lookback_days)
-    cache[cache_key] = {
-        'saved_at': now,
-        'df': df.copy(deep=True),
-        'attrs': dict(df.attrs),
-        'source': source,
-    }
+    if not df.empty:
+        cache[cache_key] = {
+            'saved_at': now,
+            'df': df.copy(deep=True),
+            'attrs': dict(df.attrs),
+            'source': source,
+        }
+        return df, source
+    # A transient upstream failure must not replace the last complete history
+    # with an empty dataframe. Stale data stays explicitly labelled.
+    if cached and isinstance(cached.get('df'), pd.DataFrame) and not cached['df'].empty:
+        stale_df = cached['df'].copy(deep=True)
+        stale_df.attrs.update(cached.get('attrs', {}))
+        stale_source = str(cached.get('source', '') or '上次成功資料')
+        return stale_df, f"{stale_source}（暫時沿用）"
     return df, source
+
+
+def clear_index_market_data_cache():
+    """Clear only index-room history so a failed first load can retry cleanly."""
+    st.session_state.pop('_market_temperature_history_cache', None)
+    fetch_twse_taiex_month.clear()
 
 
 def calculate_market_temperature(df):
@@ -12295,7 +12372,9 @@ def fetch_yahoo_us_index_close_signals(trading_day, expected_date, requested_key
             parsed = []
             for timestamp, close in zip(timestamps, closes):
                 try:
-                    trade_date = datetime.utcfromtimestamp(float(timestamp)).date()
+                    trade_date = datetime.fromtimestamp(
+                        float(timestamp), tz=pytz.utc,
+                    ).date()
                 except (TypeError, ValueError, OverflowError, OSError):
                     continue
                 close = _safe_number(close)
@@ -18037,6 +18116,12 @@ with tab_fibo:
         )
         if plan is None:
             st.warning("目前缺少足夠的加權或期貨日 K，暫時無法建立操作計畫。")
+            if st.button(
+                "🔄 重新載入指數日 K", key="retry_index_trade_plan_history",
+                width='stretch',
+            ):
+                clear_index_market_data_cache()
+                st.rerun()
         else:
             display_direction, direction_color = {
                 '偏多': ('偏多', '#ff4b4b'),
@@ -18629,7 +18714,12 @@ with tab_fibo:
             st.subheader("臺灣加權／期貨溫度計")
             st.caption("以 60 日位置、RSI、均線趨勢與 5 日動能合成 0–100 分；期貨納入夜盤至次日日盤的未完成交易日 K。")
         with refresh_col:
-            st.button("🔄 更新", key="refresh_market_temperature", width='stretch')
+            refresh_market_temperature = st.button(
+                "🔄 更新", key="refresh_market_temperature", width='stretch'
+            )
+        if refresh_market_temperature:
+            clear_index_market_data_cache()
+            st.rerun()
 
         gauge_cols = st.columns(2)
         summary_rows = []
@@ -19435,6 +19525,15 @@ with tab3:
         fetch_calendar_base_sources(sel_year)
         if calendar_network_active else ({}, [])
     )
+    calendar_last_success = st.session_state.setdefault(
+        '_calendar_source_last_success', {}
+    )
+    calendar_year_cache = calendar_last_success.setdefault(str(sel_year), {})
+    calendar_base_sources, retained_base_sources = merge_calendar_last_success(
+        calendar_base_sources, calendar_year_cache.get('base', {}),
+    )
+    if any(calendar_base_sources.values()):
+        calendar_year_cache['base'] = calendar_base_sources
     twse_holiday_events = calendar_base_sources.get('holidays', [])
     twse_temporary_events = calendar_base_sources.get('temporary', [])
     current_holidays = {
@@ -19469,12 +19568,23 @@ with tab3:
             sel_year, selected_event_types, taiwan_closed_dates,
         ) if calendar_network_active else ({}, [])
     )
+    selected_calendar_sources, retained_selected_sources = merge_calendar_last_success(
+        selected_calendar_sources, calendar_year_cache.get('selected', {}),
+    )
+    if any(selected_calendar_sources.values()):
+        calendar_year_cache['selected'] = selected_calendar_sources
     for source_label, source_events in selected_calendar_sources.items():
         add_network_source(source_label, source_events)
     if calendar_base_errors or selected_calendar_errors:
         logger.warning(
             'Calendar source refresh was partial: %s',
             calendar_base_errors + selected_calendar_errors,
+        )
+    if retained_base_sources or retained_selected_sources:
+        st.caption(
+            "部分行事曆來源暫時無回應，已沿用本次工作階段的最後成功資料："
+            + "、".join(retained_base_sources + retained_selected_sources)
+            + "。"
         )
 
     company_snapshot = normalize_company_event_snapshot(st.session_state.company_event_snapshot)
