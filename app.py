@@ -32,7 +32,6 @@ import numpy as np
 import streamlit.components.v1 as components
 import pdfplumber
 import fitz  # PyMuPDF 用於將 PDF 轉為圖片
-from PIL import Image
 
 logger = logging.getLogger(__name__)
 
@@ -3123,6 +3122,39 @@ def save_company_event_snapshot(
     ] = bool(sync_ok)
 
     return sync_ok
+
+
+COMPANY_SYNC_MAX_TICKERS = 12
+
+
+def fetch_company_event_sections(ticker_symbols):
+    """Fetch independent company sections concurrently with a fixed worker cap."""
+    symbols = tuple(dict.fromkeys(
+        str(value).strip().upper() for value in ticker_symbols
+        if str(value).strip()
+    ))[:COMPANY_SYNC_MAX_TICKERS]
+    jobs = {
+        'earnings': fetch_earnings_events,
+        'taiwan_revenue': fetch_taiwan_monthly_revenue_events,
+        'us_revenue': fetch_us_revenue_events,
+    }
+    results = {}
+    errors = []
+    with ThreadPoolExecutor(max_workers=len(jobs)) as executor:
+        future_map = {
+            executor.submit(fetcher, symbols): section
+            for section, fetcher in jobs.items()
+        }
+        for future in as_completed(future_map):
+            section = future_map[future]
+            try:
+                result = future.result()
+                if not isinstance(result, dict):
+                    raise ValueError('資料格式不是物件')
+                results[section] = result
+            except Exception as exc:
+                errors.append(f'{section}: {type(exc).__name__}')
+    return results, errors, symbols
 
 
 def render_company_event_snapshot(snapshot):
@@ -6575,17 +6607,12 @@ def fetch_and_parse_pdf(pdf_url):
         images = []
         try:
             doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-            # 記憶體優化：最多只轉譯前 2 頁，並將解析度降到 72 dpi，防止大檔撐爆記憶體
+            # 最多轉譯前 2 頁；直接輸出壓縮 JPEG，避免 PNG 與 PIL
+            # 中間副本在 Streamlit rerun 時同時佔用大量記憶體。
             for page_idx in range(min(len(doc), 2)):
                 page = doc[page_idx]
                 pix = page.get_pixmap(dpi=100)
-                img_bytes = io.BytesIO(pix.tobytes("png"))
-                img_obj = Image.open(img_bytes)
-                img_obj.load()
-                buf = io.BytesIO()
-                img_obj.save(buf, format='PNG')
-                images.append(buf.getvalue())
-                del img_obj
+                images.append(pix.tobytes('jpeg', jpg_quality=84))
             doc.close()  
         except Exception as e:
             pass
@@ -6820,6 +6847,18 @@ def _read_uploaded_stock_csv(uploaded_file):
     ) from last_error
 
 
+def _is_goodinfo_block_page(markup, status_code=None):
+    """Recognize a Cloudflare/challenge response so the app can fail fast."""
+    if status_code in {401, 403, 429, 503}:
+        return True
+    normalized = str(markup or '').lower()
+    markers = (
+        'cf-chl-', 'challenge-platform', 'just a moment',
+        'cloudflare ray id', 'attention required! | cloudflare',
+    )
+    return any(marker in normalized for marker in markers)
+
+
 def _parse_goodinfo_legacy_page(markup):
     """Compatibility path for the original Goodinfo 15-second whole-page flow.
 
@@ -7049,12 +7088,27 @@ async def _crawl_goodinfo_with_crawl4ai(headed_mode=False):
                 delay_before_return_html=0.2,
             ),
         )
+        initial_html = str(
+            initial_result.html
+            or initial_result.fit_html
+            or initial_result.cleaned_html
+            or ''
+        )
+        initial_reinit = 'REINIT=' in str(
+            getattr(initial_result, 'redirected_url', '') or ''
+        )
+        blocked = (
+            not initial_reinit
+            and _is_goodinfo_block_page(
+                initial_html, getattr(initial_result, 'status_code', None),
+            )
+        )
         crawl_deadline = time.monotonic() + 28.0
         ranking_result = initial_result
         ranking_html = ''
         ranking_attempts = 0
         attempt_states = []
-        while ranking_attempts < 3:
+        while ranking_attempts < 3 and not blocked:
             remaining_ms = int((crawl_deadline - time.monotonic()) * 1000)
             if remaining_ms < 1_000:
                 break
@@ -7088,6 +7142,11 @@ async def _crawl_goodinfo_with_crawl4ai(headed_mode=False):
                 'html_length': len(ranking_html),
                 'error': str(ranking_result.error_message or '')[:240],
             })
+            if _is_goodinfo_block_page(
+                ranking_html, getattr(ranking_result, 'status_code', None),
+            ):
+                blocked = True
+                break
             if len(ranking_html) >= 10_000 and '週轉率' in ranking_html:
                 break
             await asyncio.sleep(0.35)
@@ -7095,9 +7154,8 @@ async def _crawl_goodinfo_with_crawl4ai(headed_mode=False):
         'html': ranking_html,
         'success': bool(ranking_result.success),
         'error': str(ranking_result.error_message or ''),
-        'initial_reinit': 'REINIT=' in str(
-            getattr(initial_result, 'redirected_url', '') or ''
-        ),
+        'initial_reinit': initial_reinit,
+        'blocked': blocked,
         'status_code': getattr(ranking_result, 'status_code', None),
         'ranking_attempts': ranking_attempts,
         'attempt_states': attempt_states,
@@ -7152,7 +7210,10 @@ def fetch_goodinfo_data():
             return ranking
         fetch_goodinfo_data.last_status = {
             'state': 'failed',
-            'reason': 'crawl4ai_table_missing',
+            'reason': (
+                'cloudflare_blocked'
+                if crawl_result.get('blocked') else 'crawl4ai_table_missing'
+            ),
             'elapsed': round(time.monotonic() - started_at, 2),
             'headed_mode': headed_mode,
             'fetcher': 'crawl4ai-undetected',
@@ -10813,6 +10874,7 @@ def render_stock_external_resources():
                 reason_text = {
                     'browser_busy': '另一個頁面正在抓取，請稍後再按一次。',
                     'crawl4ai_dependency_missing': 'Streamlit 尚未安裝完整 Crawl4AI 瀏覽器套件。',
+                    'cloudflare_blocked': 'Goodinfo 已阻擋這台 Streamlit 伺服器；請改用下方手動 CSV 備援。',
                     'crawl4ai_table_missing': 'Crawl4AI 已完成初始化，但沒有收到完整排行表格。',
                     'browser_error': '瀏覽器啟動、網站驗證或頁面解析失敗。',
                 }.get(status.get('reason'), '抓取失敗或查無資料。')
@@ -12627,7 +12689,7 @@ def fetch_market_risk_lists():
         last_error = None
 
         try:
-            for attempt in range(3):
+            for attempt in range(2):
                 try:
                     response = session.get(
                         url,
@@ -13056,6 +13118,32 @@ def fetch_market_risk_lists():
         sorted(disposition_tomorrow_codes),
         errors,
     )
+
+
+def merge_market_risk_refresh(
+    previous_state, attention, disposition, disposition_tomorrow, errors,
+    attempted_at=None,
+):
+    """Keep the last complete official lists when a manual refresh is partial."""
+    attempted_at = attempted_at or datetime.now(
+        pytz.timezone('Asia/Taipei')
+    ).strftime('%Y/%m/%d %H:%M:%S')
+    previous = dict(previous_state or {})
+    error_list = list(errors or [])
+    if error_list and previous.get('updated'):
+        previous['errors'] = error_list
+        previous['last_attempt'] = attempted_at
+        previous['using_last_success'] = True
+        return previous
+    return {
+        'attention': dict(attention or {}),
+        'disposition': list(disposition or []),
+        'disposition_tomorrow': list(disposition_tomorrow or []),
+        'updated': attempted_at,
+        'last_attempt': attempted_at,
+        'errors': error_list,
+        'using_last_success': False,
+    }
 
 def _as_float(value, default=None):
     try:
@@ -13931,7 +14019,11 @@ def generate_note_from_points(points, manual_note, show_3d):
         return f"{auto_note}{manual_note}", auto_note
     return auto_note, auto_note
 
-def fetch_stock_data_raw(code, name_hint="", extra_data=None, futures_set=None, saved_notes_dict=None, name_map_dict=None, sj_logged_in=False, sj_api=None):
+def fetch_stock_data_raw(
+    code, name_hint="", extra_data=None, futures_set=None,
+    saved_notes_dict=None, name_map_dict=None, sj_logged_in=False,
+    sj_api=None, include_live_quote=True,
+):
     code = str(code).strip()
     hist = pd.DataFrame()
     source_used = "none"
@@ -13944,7 +14036,7 @@ def fetch_stock_data_raw(code, name_hint="", extra_data=None, futures_set=None, 
         if not sj_df.empty:
             hist = sj_df
             source_used = "shioaji"
-        if re.fullmatch(r'\d{4,6}', code):
+        if include_live_quote and re.fullmatch(r'\d{4,6}', code):
             try:
                 stock_contract = sj_api.Contracts.Stocks[code]
                 stock_snapshots = get_stream_quotes(sj_api, [stock_contract])
@@ -14006,7 +14098,7 @@ def fetch_stock_data_raw(code, name_hint="", extra_data=None, futures_set=None, 
             pass
 
     # 僅當未使用永豐 API，且需獲取即時資訊時，才透過 twstock.realtime 補足今日最新
-    if source_used != "shioaji" and live_quote_price is None:
+    if include_live_quote and source_used != "shioaji" and live_quote_price is None:
         try:
             rt_data = twstock.realtime.get(code)
             if rt_data['success'] and rt_data['realtime']['latest_trade_price'] not in ['-', None, '']:
@@ -14075,7 +14167,7 @@ def fetch_stock_data_raw(code, name_hint="", extra_data=None, futures_set=None, 
     if hist.empty: return None
 
     # 修正夜盤基準：若是期貨，透過快照直接擷取官方基準價 (日盤 13:45 收盤價)
-    if sj_logged_in and sj_api is not None and code in ["TWF=F", "TMF=F"]:
+    if include_live_quote and sj_logged_in and sj_api is not None and code in ["TWF=F", "TMF=F"]:
         try:
             contract = None
             if code == "TWF=F":
@@ -14364,7 +14456,10 @@ def refresh_risk_metrics_for_codes(stock_data, futures_set, saved_notes_dict, na
         code, name = task
         try:
             time.sleep(API_REQUEST_GAP_SECONDS)
-            result = fetch_stock_data_raw(code, name, None, futures_copy, notes_copy, name_copy, sj_logged_in, sj_api)
+            result = fetch_stock_data_raw(
+                code, name, None, futures_copy, notes_copy, name_copy,
+                sj_logged_in, sj_api, include_live_quote=False,
+            )
             if result:
                 return code, {column: result.get(column) for column in RISK_METRIC_COLUMNS}
         except Exception:
@@ -14410,6 +14505,43 @@ def fetch_stock_snapshot_map(api, codes):
         }
     except Exception:
         return {}
+
+
+def merge_realtime_stock_snapshots(stock_data, snapshot_map, points_map=None, quote_time=None):
+    """Apply one batched Shioaji snapshot response to the stock table."""
+    if not isinstance(stock_data, pd.DataFrame) or stock_data.empty:
+        return stock_data, 0
+    refreshed = stock_data.copy()
+    quote_time = quote_time or datetime.now(
+        pytz.timezone('Asia/Taipei')
+    ).strftime('%Y/%m/%d %H:%M:%S')
+    updated_count = 0
+    for row_index, row in refreshed.iterrows():
+        code = str(row.get('代號', '')).strip()
+        snapshot = (snapshot_map or {}).get(code)
+        if snapshot is None:
+            continue
+        price = _safe_number(getattr(snapshot, 'close', None))
+        if price is None or price <= 0:
+            continue
+        change_rate = snapshot_change_rate(snapshot, price)
+        refreshed.at[row_index, '收盤價'] = price
+        if change_rate is not None:
+            refreshed.at[row_index, '漲跌幅'] = change_rate
+        refreshed.at[row_index, '成交價價差'] = price_change_amount(price, change_rate)
+        refreshed.at[row_index, '_quote_bid'] = _safe_number(
+            getattr(snapshot, 'buy_price', None)
+        )
+        refreshed.at[row_index, '_quote_ask'] = _safe_number(
+            getattr(snapshot, 'sell_price', None)
+        )
+        refreshed.at[row_index, '_quote_time'] = quote_time
+        if points_map is not None:
+            refreshed.at[row_index, '狀態'] = recalculate_row(
+                refreshed.loc[row_index], points_map,
+            )
+        updated_count += 1
+    return refreshed, updated_count
 
 
 def refresh_daytrade_metrics_for_codes(stock_data, sj_logged_in=False, sj_api=None):
@@ -14521,9 +14653,6 @@ if 'pending_unignore' in st.session_state and st.session_state.pending_unignore:
     st.session_state.stock_strategy_editor_revision += 1
     st.rerun()
 
-
-# 強制釋放不再使用的記憶體與執行緒資源
-gc.collect()
 
 def render_futures_strategy_room():
     """期貨成交量排行、即時分析、忽略遞補與獨立計算介面。"""
@@ -15241,10 +15370,11 @@ tab1, tab_fibo, tab2, tab_db, tab_company, tab3 = st.tabs([
     "📚 戰略資料庫",
     "🏢 公司營收與財報",
     "📅 股市行事曆",
-])
+], key="main_workspace_active_tab", on_change="rerun")
 
 with tab1:
-    render_opening_direction_prompt()
+    if tab1.open:
+        render_opening_direction_prompt()
     stock_strategy_tab, futures_strategy_tab, validation_strategy_tab = st.tabs([
         "📈 股票戰略室", "🧭 期貨戰略室", "📊 策略驗證"
     ])
@@ -15751,13 +15881,10 @@ with stock_strategy_container:
                         fetch_market_risk_lists.clear()
                         with st.spinner("正在更新上市／上櫃注意與處置名單..."):
                             attention, disposition, disposition_tomorrow, errors = fetch_market_risk_lists()
-                        st.session_state.risk_filter_market_data = {
-                            'attention': attention,
-                            'disposition': disposition,
-                            'disposition_tomorrow': disposition_tomorrow,
-                            'updated': datetime.now(pytz.timezone('Asia/Taipei')).strftime('%Y/%m/%d %H:%M:%S'),
-                            'errors': errors
-                        }
+                        st.session_state.risk_filter_market_data = merge_market_risk_refresh(
+                            st.session_state.get('risk_filter_market_data', {}),
+                            attention, disposition, disposition_tomorrow, errors,
+                        )
                         st.session_state['_reopen_stock_strategy_settings'] = True
                         st.rerun()
 
@@ -15768,7 +15895,13 @@ with stock_strategy_container:
                 if market_risk_data.get('updated') and not market_risk_data.get('errors'):
                     st.caption(f"上市／上櫃注意與處置名單更新：{market_risk_data['updated']}。")
                 elif market_risk_data.get('errors'):
-                    st.warning("注意／處置名單暫時無法完整更新；本次不會將未查核資料誤標為安全。")
+                    if market_risk_data.get('using_last_success'):
+                        st.warning(
+                            f"本次名單未完整取得，沿用 {market_risk_data.get('updated')} 的最後成功資料；"
+                            "不會以空名單覆蓋。"
+                        )
+                    else:
+                        st.warning("注意／處置名單暫時無法完整更新；本次不會將未查核資料誤標為安全。")
                 else:
                     st.info("尚未更新上市／上櫃注意與處置名單；資料未查核時不會被誤判為安全。")
 
@@ -16296,42 +16429,16 @@ with stock_strategy_container:
         if btn_rt_update:
             if st.session_state.get('sj_logged_in', False) and st.session_state.get('sj_api'):
                 sj_api = st.session_state.sj_api
-                updated = False
                 with st.spinner("正在透過永豐API更新報價..."):
-                    for i, row in st.session_state.stock_data.iterrows():
-                        code = str(row['代號'])
-                        try:
-                            contract = None
-                            if code in ["TWF=F", "TMF=F"]:
-                                if code == "TWF=F":
-                                    contract = min([c for c in sj_api.Contracts.Futures.TXF if c.code[-2:] not in ["R1", "R2"] and '/' not in c.code], key=lambda c: getattr(c, 'delivery_date', '999999'))
-                                else:
-                                    contract = sj_api.Contracts.Futures.TMF.TMFR1
-                            else:
-                                try: contract = sj_api.Contracts.Stocks[code]
-                                except: pass
-                            
-                            if contract:
-                                snap = get_stream_quotes(sj_api, [contract])
-                                if snap and len(snap) > 0:
-                                    snapshot = snap[0]
-                                    rt_price = snapshot.close
-                                    if rt_price > 0:
-                                        rt_change_rate = snapshot_change_rate(snapshot, rt_price)
-                                        st.session_state.stock_data.at[i, '收盤價'] = rt_price
-                                        if rt_change_rate is not None:
-                                            st.session_state.stock_data.at[i, '漲跌幅'] = rt_change_rate
-                                        st.session_state.stock_data.at[i, '成交價價差'] = price_change_amount(
-                                            rt_price, rt_change_rate
-                                        )
-                                        st.session_state.stock_data.at[i, '_quote_bid'] = _safe_number(getattr(snapshot, 'buy_price', None))
-                                        st.session_state.stock_data.at[i, '_quote_ask'] = _safe_number(getattr(snapshot, 'sell_price', None))
-                                        st.session_state.stock_data.at[i, '_quote_time'] = datetime.now(pytz.timezone('Asia/Taipei')).strftime('%Y/%m/%d %H:%M:%S')
-                                        st.session_state.stock_data.at[i, '狀態'] = recalculate_row(st.session_state.stock_data.iloc[i], points_map)
-                                        updated = True
-                        except Exception:
-                            pass
-                if updated:
+                    quote_codes = st.session_state.stock_data['代號'].astype(str).tolist()
+                    snapshot_map = fetch_stock_snapshot_map(sj_api, quote_codes)
+                    refreshed_quotes, updated_count = merge_realtime_stock_snapshots(
+                        st.session_state.stock_data,
+                        snapshot_map,
+                        points_map=points_map,
+                    )
+                if updated_count:
+                    st.session_state.stock_data = refreshed_quotes
                     tz_tw = pytz.timezone('Asia/Taipei')
                     st.session_state.last_rt_update_time = datetime.now(tz_tw).strftime("%Y/%m/%d %H:%M:%S")
                     update_strategy_signal_outcomes({
@@ -16340,6 +16447,7 @@ with stock_strategy_container:
                     })
                     save_data_cache(st.session_state.stock_data, st.session_state.ignored_stocks, st.session_state.all_candidates, st.session_state.saved_notes)
                     st.session_state.stock_strategy_editor_revision += 1
+                    st.toast(f"已用單一批次更新 {updated_count} 檔報價。", icon="⏱️")
                     st.rerun()
                 else:
                     st.warning("目前未取得任何有效即時報價，原表格資料未變更。")
@@ -16410,13 +16518,10 @@ with stock_strategy_container:
                     fetch_market_risk_lists.clear()
                     with st.spinner("正在更新上市／上櫃注意與處置名單..."):
                         attention, disposition, disposition_tomorrow, errors = fetch_market_risk_lists()
-                    st.session_state.risk_filter_market_data = {
-                        'attention': attention,
-                        'disposition': disposition,
-                        'disposition_tomorrow': disposition_tomorrow,
-                        'updated': datetime.now(pytz.timezone('Asia/Taipei')).strftime('%Y/%m/%d %H:%M:%S'),
-                        'errors': errors
-                    }
+                    st.session_state.risk_filter_market_data = merge_market_risk_refresh(
+                        st.session_state.get('risk_filter_market_data', {}),
+                        attention, disposition, disposition_tomorrow, errors,
+                    )
             if indep_strategy_mode == "當沖":
                 st.caption("VWAP 判讀：偏多＝站上 VWAP（紅色）；偏空＝跌破 VWAP（綠色）。09:00–09:15 使用快照＋1 分 K，之後使用 5 分 K。")
         col_q1, col_q2 = st.columns([5, 1.5])
@@ -17813,7 +17918,9 @@ with tab_fibo:
     ]
     thermometer_data = []
     # Streamlit tabs 仍會執行隱藏分頁程式；只在實際開啟需要的分頁時下載兩組溫度資料。
-    if tab_trade_plan.open or tab_option_plan.open or tab_fibo_thermometer.open:
+    if tab_fibo.open and (
+        tab_trade_plan.open or tab_option_plan.open or tab_fibo_thermometer.open
+    ):
         for label, code in thermometer_specs:
             temp_df, source = get_cached_market_temperature_data(code)
             result = calculate_market_temperature(temp_df)
@@ -18692,7 +18799,10 @@ with tab_fibo:
 
 
 with tab_db:
-    sub_tab1, sub_tab2, sub_tab3 = st.tabs(["三大法人買賣超", "台指期籌碼快訊", "處置股"])
+    sub_tab1, sub_tab2, sub_tab3 = st.tabs(
+        ["三大法人買賣超", "台指期籌碼快訊", "處置股"],
+        key="strategy_database_active_tab", on_change="rerun",
+    )
     
     with sub_tab1:
         st.markdown("#### 📊 台股三大法人每日買賣超統計")
@@ -18710,8 +18820,12 @@ with tab_db:
         date_str = selected_date.strftime("%Y%m%d")
         
         # 加入安全攔截，若發生錯誤則預設為 None
+        database_institutional_active = bool(tab_db.open and sub_tab1.open)
         try:
-            df_inst = get_major_institutional_data(date_str)
+            df_inst = (
+                get_major_institutional_data(date_str)
+                if database_institutional_active else None
+            )
         except Exception:
             df_inst = None
             
@@ -18740,27 +18854,33 @@ with tab_db:
             with col_tbl:
                 st.dataframe(styled_df, width='stretch', hide_index=True)
             st.caption("數據來源：[台灣證券交易所 (TWSE)](https://www.twse.com.tw/zh/trading/foreign/bfi82u.html)")
-        else:
+        elif database_institutional_active:
             st.warning("該日期目前無資料（可能尚未開市或為休假日或證交所 API 觸發防護防阻）。")
                 
         st.markdown("---")
         st.markdown("#### 📈 法人當日買賣超個股")
-        inst_tabs = st.tabs(["外資當日買賣超", "投信當日買賣超", "自營商當日買賣超"])
+        inst_tabs = st.tabs(
+            ["外資當日買賣超", "投信當日買賣超", "自營商當日買賣超"],
+            key="institutional_ranking_active_tab", on_change="rerun",
+        )
         with inst_tabs[0]:
-            components.html(
-                fetch_fubon_html("https://fubon-ebrokerdj.fbs.com.tw/Z/ZG/ZGK_D.djhtm"),
-                height=1185, width=800, scrolling=True,
-            )
+            if database_institutional_active and inst_tabs[0].open:
+                components.html(
+                    fetch_fubon_html("https://fubon-ebrokerdj.fbs.com.tw/Z/ZG/ZGK_D.djhtm"),
+                    height=1185, width=800, scrolling=True,
+                )
         with inst_tabs[1]:
-            components.html(
-                fetch_fubon_html("https://fubon-ebrokerdj.fbs.com.tw/Z/ZG/ZGK_DD.djhtm"),
-                height=1185, width=800, scrolling=True,
-            )
+            if database_institutional_active and inst_tabs[1].open:
+                components.html(
+                    fetch_fubon_html("https://fubon-ebrokerdj.fbs.com.tw/Z/ZG/ZGK_DD.djhtm"),
+                    height=1185, width=800, scrolling=True,
+                )
         with inst_tabs[2]:
-            components.html(
-                fetch_fubon_html("https://fubon-ebrokerdj.fbs.com.tw/Z/ZG/ZGK_DB.djhtm"),
-                height=1185, width=800, scrolling=True,
-            )
+            if database_institutional_active and inst_tabs[2].open:
+                components.html(
+                    fetch_fubon_html("https://fubon-ebrokerdj.fbs.com.tw/Z/ZG/ZGK_DB.djhtm"),
+                    height=1185, width=800, scrolling=True,
+                )
         
     with sub_tab2:
         st.markdown("#### 📑 永豐期貨盤後籌碼自動化工具")
@@ -18770,10 +18890,12 @@ with tab_db:
             fetch_and_parse_pdf.clear()   # 只清 PDF 快取
             st.rerun()
 
-        reports = get_report_list()
+        reports_active = bool(tab_db.open and sub_tab2.open)
+        reports = get_report_list() if reports_active else []
 
         if not reports:
-            st.warning("目前找不到相關報告，請檢查官網是否變動或稍後再試。")
+            if reports_active:
+                st.warning("目前找不到相關報告，請檢查官網是否變動或稍後再試。")
         else:
             latest_report = reports[0]
             st.markdown(f"### 🔥 最新快訊: {latest_report['日期']} | {latest_report['title']}")
@@ -18837,11 +18959,12 @@ with tab_db:
         # 將計數器加入網址參數，藉由改變網址強制 iframe 重新載入
         refresh_url = f"https://cmfaren.github.io/dispositionforecast/?t={st.session_state.disposal_refresh_idx}"
         
-        st.iframe(
-            refresh_url,
-            height=800,
-            width='stretch',
-        )
+        if tab_db.open and sub_tab3.open:
+            st.iframe(
+                refresh_url,
+                height=800,
+                width='stretch',
+            )
 
 with tab3:
     # ==========================================
@@ -19219,9 +19342,15 @@ with tab3:
     with col_next: st.button("▶️", on_click=change_month, args=(1,), width='stretch')
     with col_header: st.markdown(f"<div class='calendar-header'>{sel_year}/{sel_month:02}</div>", unsafe_allow_html=True)
 
-    # 每次切換月份都以 TWSE 年度資料重新建立交易日判定；網路暫不可用才退回既有固定表。
-    twse_holiday_events = fetch_twse_holiday_events(sel_year)
-    twse_temporary_events = fetch_twse_temporary_closure_events()
+    # 主分頁切換會觸發 rerun；只有行事曆實際開啟時才讀網路來源，
+    # 避免股票／期貨按鈕每次 rerun 都連帶執行整套行事曆請求。
+    calendar_network_active = bool(tab3.open)
+    twse_holiday_events = (
+        fetch_twse_holiday_events(sel_year) if calendar_network_active else []
+    )
+    twse_temporary_events = (
+        fetch_twse_temporary_closure_events() if calendar_network_active else []
+    )
     current_holidays = {
         (pd.Timestamp(event["date"]).month, pd.Timestamp(event["date"]).day): event["title"]
         for event in twse_holiday_events if event["closed"]
@@ -19247,32 +19376,32 @@ with tab3:
         calendar_source_counts[label] = len(event_list)
         network_events.extend(event_list)
 
-    if "台股開休市" in selected_event_types:
+    if calendar_network_active and "台股開休市" in selected_event_types:
         add_network_source('台股開休市', twse_holiday_events)
-    if "FOMC 利率決議" in selected_event_types:
+    if calendar_network_active and "FOMC 利率決議" in selected_event_types:
         add_network_source('FOMC', fetch_fomc_events(sel_year))
-    if "美國 CPI" in selected_event_types:
+    if calendar_network_active and "美國 CPI" in selected_event_types:
         add_network_source('CPI', fetch_bls_cpi_events(sel_year))
-    if "美國核心 PCE" in selected_event_types:
+    if calendar_network_active and "美國核心 PCE" in selected_event_types:
         add_network_source('核心 PCE', fetch_bea_core_pce_events(sel_year))
-    if "美國 GDP" in selected_event_types:
+    if calendar_network_active and "美國 GDP" in selected_event_types:
         add_network_source('GDP', fetch_bea_gdp_events(sel_year))
-    if "美國 ISM 製造業指數" in selected_event_types:
+    if calendar_network_active and "美國 ISM 製造業指數" in selected_event_types:
         add_network_source('ISM 製造業', fetch_ism_manufacturing_events(sel_year))
-    if "美國大非農" in selected_event_types:
+    if calendar_network_active and "美國大非農" in selected_event_types:
         add_network_source('大非農', fetch_bls_employment_events(sel_year))
-    if "美國小非農 ADP" in selected_event_types:
+    if calendar_network_active and "美國小非農 ADP" in selected_event_types:
         add_network_source('小非農 ADP', fetch_adp_employment_events(sel_year))
-    if "美國初領失業金" in selected_event_types:
+    if calendar_network_active and "美國初領失業金" in selected_event_types:
         add_network_source('初領失業金', build_us_initial_claims_events(sel_year))
-    if "美股四巫日" in selected_event_types:
+    if calendar_network_active and "美股四巫日" in selected_event_types:
         add_network_source('美股四巫日', build_us_quadruple_witching_events(sel_year))
-    if "富台指期結算" in selected_event_types:
+    if calendar_network_active and "富台指期結算" in selected_event_types:
         add_network_source(
             '富台指期結算',
             build_sgx_ftse_taiwan_settlement_events(sel_year, taiwan_closed_dates),
         )
-    if "MSCI 季度調整" in selected_event_types:
+    if calendar_network_active and "MSCI 季度調整" in selected_event_types:
         add_network_source(
             'MSCI 季調',
             build_msci_quarterly_rebalance_events(sel_year, taiwan_closed_dates),
@@ -19691,12 +19820,20 @@ with tab_company:
             st.caption(f"最近同步：{current_snapshot['updated_at']}｜{current_snapshot.get('tickers', '')}")
         else:
             st.caption("尚未建立快照；行事曆目前不會顯示公司事件。")
+    company_sync_notice = st.session_state.pop('_company_sync_notice', '')
+    if company_sync_notice:
+        st.warning(company_sync_notice)
 
     if sync_company_data:
-        ticker_symbols = tuple(item.upper() for item in preview_inputs)
+        ticker_symbols = tuple(dict.fromkeys(item.upper() for item in preview_inputs))
         if not ticker_symbols:
             st.warning("請至少輸入一家公司或代碼。")
         else:
+            if len(ticker_symbols) > COMPANY_SYNC_MAX_TICKERS:
+                st.warning(
+                    f"為避免雲端記憶體超載，本次只同步前 {COMPANY_SYNC_MAX_TICKERS} 家；"
+                    "其餘請分批同步。"
+                )
             fetch_earnings_events.clear()
             fetch_twse_monthly_revenue_rows.clear()
             fetch_mops_company_monthly_revenue.clear()
@@ -19706,9 +19843,21 @@ with tab_company:
             fetch_taiwan_monthly_revenue_events.clear()
             fetch_us_revenue_events.clear()
             with st.spinner("正在同步財報日期與營收資料；完成後行事曆會直接讀取快照……"):
-                earnings_result = fetch_earnings_events(ticker_symbols)
-                taiwan_revenue_result = fetch_taiwan_monthly_revenue_events(ticker_symbols)
-                us_revenue_result = fetch_us_revenue_events(ticker_symbols)
+                company_sections, company_sync_errors, used_tickers = (
+                    fetch_company_event_sections(ticker_symbols)
+                )
+            previous_snapshot = normalize_company_event_snapshot(
+                st.session_state.company_event_snapshot
+            )
+            earnings_result = company_sections.get(
+                'earnings', previous_snapshot.get('earnings', {'events': []})
+            )
+            taiwan_revenue_result = company_sections.get(
+                'taiwan_revenue', previous_snapshot.get('taiwan_revenue', {'events': []})
+            )
+            us_revenue_result = company_sections.get(
+                'us_revenue', previous_snapshot.get('us_revenue', {'events': []})
+            )
             combined_events = (
                 earnings_result.get("events", [])
                 + taiwan_revenue_result.get("events", [])
@@ -19742,8 +19891,13 @@ with tab_company:
                 company_ticker_input,
                 selected_event_types,
             )
+            if company_sync_errors:
+                st.session_state['_company_sync_notice'] = (
+                    "部分來源未完成，已保留該區塊上次成功資料："
+                    + "；".join(company_sync_errors)
+                )
             st.toast(
-                "公司資料已同步，行事曆摘要快照已更新。"
+                f"公司資料已同步 {len(used_tickers)} 家，行事曆摘要快照已更新。"
                 + ("已同步 Google Sheet。" if company_sync_ok and get_app_secret('gsheet_api_url') else ""),
                 icon="✅",
             )

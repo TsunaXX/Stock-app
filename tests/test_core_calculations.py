@@ -8,7 +8,7 @@ import json
 import math
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, time as dt_time, timedelta
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP
 from email.utils import parsedate_to_datetime
@@ -57,6 +57,7 @@ def load_app_symbols(*names):
         "re": re,
         "time": time,
         "ThreadPoolExecutor": ThreadPoolExecutor,
+        "as_completed": as_completed,
         "urljoin": urljoin,
     }
     module = ast.fix_missing_locations(ast.Module(body=selected, type_ignores=[]))
@@ -465,6 +466,104 @@ def test_goodinfo_manual_csv_backup_accepts_utf8_bom_standard_header():
     }
 
 
+def test_goodinfo_cloudflare_block_is_detected_without_waiting_for_table():
+    detector = load_app_symbols("_is_goodinfo_block_page")["_is_goodinfo_block_page"]
+    assert detector("<title>Just a moment...</title>") is True
+    assert detector("<div id='cf-chl-widget'>Checking your browser</div>") is True
+    assert detector("", status_code=403) is True
+    assert detector("<table><th>代號</th><th>週轉率</th></table>", 200) is False
+
+
+def test_realtime_stock_snapshots_merge_one_batch_without_network_calls():
+    symbols = load_app_symbols(
+        "_safe_number", "snapshot_change_rate", "price_change_amount",
+        "merge_realtime_stock_snapshots",
+    )
+
+    class Snapshot:
+        close = 110
+        change_rate = 10
+        buy_price = 109.5
+        sell_price = 110
+
+    source = pd.DataFrame([{"代號": "2330", "收盤價": 100, "漲跌幅": 0}])
+    merged, count = symbols["merge_realtime_stock_snapshots"](
+        source, {"2330": Snapshot()}, quote_time="2026/08/21 10:00:00",
+    )
+    assert count == 1
+    assert merged.at[0, "收盤價"] == 110
+    assert merged.at[0, "漲跌幅"] == 10
+    assert merged.at[0, "_quote_time"] == "2026/08/21 10:00:00"
+
+
+def test_partial_market_risk_refresh_keeps_last_complete_lists():
+    merge = load_app_symbols("merge_market_risk_refresh")["merge_market_risk_refresh"]
+    previous = {
+        "attention": {"2330": 2}, "disposition": ["2408"],
+        "disposition_tomorrow": [], "updated": "2026/08/21 09:00:00",
+        "errors": [],
+    }
+    result = merge(
+        previous, {}, [], [], ["上市注意: timeout"],
+        attempted_at="2026/08/21 10:00:00",
+    )
+    assert result["attention"] == {"2330": 2}
+    assert result["disposition"] == ["2408"]
+    assert result["updated"] == "2026/08/21 09:00:00"
+    assert result["last_attempt"] == "2026/08/21 10:00:00"
+    assert result["using_last_success"] is True
+
+
+def test_company_sync_is_deduplicated_capped_and_section_bounded():
+    symbols = load_app_symbols(
+        "COMPANY_SYNC_MAX_TICKERS", "fetch_company_event_sections",
+    )
+    calls = []
+
+    def fake_fetcher(values):
+        calls.append(tuple(values))
+        return {"events": [{"ticker": values[0]}]}
+
+    symbols["fetch_earnings_events"] = fake_fetcher
+    symbols["fetch_taiwan_monthly_revenue_events"] = fake_fetcher
+    symbols["fetch_us_revenue_events"] = fake_fetcher
+    inputs = [f"{index:04d}" for index in range(20)] + ["0001"]
+    results, errors, used = symbols["fetch_company_event_sections"](inputs)
+    assert set(results) == {"earnings", "taiwan_revenue", "us_revenue"}
+    assert errors == []
+    assert len(used) == 12
+    assert len(calls) == 3
+    assert all(call == used for call in calls)
+
+
+def test_heavy_hidden_sources_require_an_active_keyed_tab():
+    source = APP_PATH.read_text(encoding="utf-8")
+    assert 'key="main_workspace_active_tab", on_change="rerun"' in source
+    assert 'key="strategy_database_active_tab", on_change="rerun"' in source
+    assert 'if tab_fibo.open and (' in source
+    assert 'database_institutional_active = bool(tab_db.open and sub_tab1.open)' in source
+    assert 'reports_active = bool(tab_db.open and sub_tab2.open)' in source
+    assert 'calendar_network_active = bool(tab3.open)' in source
+
+
+def test_daily_risk_refresh_skips_redundant_live_quote_fetches():
+    source = APP_PATH.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    raw_fetch = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "fetch_stock_data_raw"
+    )
+    risk_refresh = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "refresh_risk_metrics_for_codes"
+    )
+    raw_source = ast.get_source_segment(source, raw_fetch)
+    risk_source = ast.get_source_segment(source, risk_refresh)
+    assert "include_live_quote=True" in raw_source
+    assert "include_live_quote and re.fullmatch" in raw_source
+    assert "include_live_quote=False" in risk_source
+
+
 def test_goodinfo_fetch_uses_crawl4ai_two_stage_undetected_session():
     source = APP_PATH.read_text(encoding="utf-8")
     tree = ast.parse(source)
@@ -483,7 +582,7 @@ def test_goodinfo_fetch_uses_crawl4ai_two_stage_undetected_session():
     assert crawler_source.count('await crawler.arun(') == 2
     assert "'session_id': session_id" in crawler_source
     assert "'REINIT='" in crawler_source
-    assert 'while ranking_attempts < 3' in crawler_source
+    assert 'while ranking_attempts < 3 and not blocked' in crawler_source
     assert 'crawl_deadline = time.monotonic() + 28.0' in crawler_source
     assert 'wait_for_timeout=min(12_000, remaining_ms)' in crawler_source
     assert 'includes(\"週轉率\")' in crawler_source
@@ -500,6 +599,7 @@ def test_goodinfo_fetch_uses_crawl4ai_two_stage_undetected_session():
     assert '_crawl_goodinfo_with_crawl4ai' in wrapper_source
     assert '_parse_goodinfo_original_page' in wrapper_source
     assert 'crawl4ai_dependency_missing' in wrapper_source
+    assert 'cloudflare_blocked' in wrapper_source
     assert 'scrapling' not in wrapper_source.lower()
 
 
