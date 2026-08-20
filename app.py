@@ -6928,105 +6928,108 @@ def _parse_goodinfo_turnover_table(page_html):
     return target_df.dropna(how='all').reset_index(drop=True)
 
 
+def _scrapling_response_markup(response):
+    """Extract rendered HTML from Scrapling without depending on one response alias."""
+    if response is None:
+        return ''
+    for attribute in ('body', 'html', 'text'):
+        value = getattr(response, attribute, None)
+        if value is None or callable(value):
+            continue
+        if isinstance(value, bytes):
+            for encoding in ('utf-8', 'big5', 'cp950'):
+                try:
+                    return value.decode(encoding)
+                except UnicodeDecodeError:
+                    continue
+            return value.decode('utf-8', errors='replace')
+        text = str(value)
+        if text.strip():
+            return text
+    return str(response)
+
+
 def fetch_goodinfo_data():
-    """以固定 UA、顯式表格等待與瀏覽器指紋設定讀取 Goodinfo。"""
+    """Use Scrapling's stealth browser and Cloudflare solver for Goodinfo."""
     started_at = time.monotonic()
     fetch_goodinfo_data.last_status = {
         'state': 'loading', 'reason': '', 'elapsed': 0.0,
     }
-    chrome_options = Options()
     headed_mode = os.environ.get("GOODINFO_HEADED") == "1"
-    if not headed_mode:
-        chrome_options.add_argument("--headless=new")
-    chrome_options.add_argument("--no-sandbox")
-    chrome_options.add_argument("--disable-dev-shm-usage")
-    chrome_options.add_argument("--disable-gpu")
-    chrome_options.add_argument("--window-size=1920x1080")
-    chrome_options.add_argument("--disable-blink-features=AutomationControlled")
-    chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
-    chrome_options.add_experimental_option('useAutomationExtension', False)
-    chrome_options.add_argument(
-        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    )
-    chrome_options.add_argument("--accept-lang=zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7")
-    if os.path.exists('/usr/bin/chromium'):
-        chrome_options.binary_location = '/usr/bin/chromium'
 
-    acquired = _GOODINFO_BROWSER_SEMAPHORE.acquire(timeout=25)
+    try:
+        from scrapling.fetchers import StealthyFetcher
+    except (ImportError, ModuleNotFoundError) as exc:
+        logger.exception('Scrapling fetcher dependency is unavailable: %s', type(exc).__name__)
+        fetch_goodinfo_data.last_status = {
+            'state': 'failed', 'reason': 'scrapling_dependency_missing',
+            'error_type': type(exc).__name__,
+            'elapsed': round(time.monotonic() - started_at, 2),
+            'headed_mode': headed_mode,
+            'fetcher': 'scrapling',
+        }
+        return None
+
+    acquired = _GOODINFO_BROWSER_SEMAPHORE.acquire(timeout=65)
     if not acquired:
-        logger.warning('Goodinfo browser is busy; skipped duplicate launch')
+        logger.warning('Goodinfo Scrapling browser is busy; skipped duplicate launch')
         fetch_goodinfo_data.last_status = {
             'state': 'failed', 'reason': 'browser_busy',
             'elapsed': round(time.monotonic() - started_at, 2),
+            'headed_mode': headed_mode,
+            'fetcher': 'scrapling',
         }
         return None
-    driver = None
     try:
-        service = (
-            Service('/usr/bin/chromedriver')
-            if os.path.exists('/usr/bin/chromedriver')
-            else Service()
+        fetch_options = {
+            'headless': not headed_mode,
+            'solve_cloudflare': True,
+            'block_webrtc': True,
+            'hide_canvas': True,
+            'allow_webgl': True,
+            'google_search': True,
+            'locale': 'zh-TW',
+            'timezone_id': 'Asia/Taipei',
+            'timeout': 65_000,
+            'wait': 2_000,
+            'wait_selector': 'table:has-text("代號"):has-text("週轉率")',
+            'wait_selector_state': 'attached',
+            'load_dom': True,
+            'retries': 1,
+            'extra_flags': ['--no-sandbox', '--disable-dev-shm-usage'],
+            'additional_args': {'viewport': {'width': 1920, 'height': 1080}},
+        }
+        if os.path.exists('/usr/bin/chromium'):
+            fetch_options['executable_path'] = '/usr/bin/chromium'
+
+        response = StealthyFetcher.fetch(_GOODINFO_URL, **fetch_options)
+        ranking = _parse_goodinfo_original_page(
+            _scrapling_response_markup(response)
         )
-        driver = webdriver.Chrome(service=service, options=chrome_options)
-        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
-            "source": """
-                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                window.navigator.chrome = { runtime: {} };
-                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-                Object.defineProperty(navigator, 'languages', {
-                    get: () => ['zh-TW', 'zh', 'en-US', 'en']
-                });
-            """
-        })
-        driver.get(_GOODINFO_URL)
-
-        # Goodinfo 的表格由前端動態產生；等到實際欄位出現，再保留短暫
-        # 渲染時間，不必無條件阻塞 20 秒。
-        try:
-            from selenium.webdriver.support.ui import WebDriverWait
-            from selenium.webdriver.support import expected_conditions as EC
-
-            WebDriverWait(driver, 20).until(
-                EC.presence_of_element_located((
-                    By.XPATH,
-                    "//table//th[contains(text(), '代號')] "
-                    "| //table//nobr[contains(text(), '代號')]",
-                ))
-            )
-            time.sleep(2)
-        except TimeoutException:
-            # 超時時仍交由原始整頁解析器判斷，保留延遲載入頁面的機會。
-            pass
-
-        ranking = _parse_goodinfo_original_page(driver.page_source)
         if ranking is not None:
             fetch_goodinfo_data.last_status = {
                 'state': 'success', 'reason': '', 'rows': len(ranking),
                 'elapsed': round(time.monotonic() - started_at, 2),
                 'headed_mode': headed_mode,
+                'fetcher': 'scrapling',
             }
             return ranking
         fetch_goodinfo_data.last_status = {
             'state': 'failed', 'reason': 'legacy_table_missing',
             'elapsed': round(time.monotonic() - started_at, 2),
             'headed_mode': headed_mode,
+            'fetcher': 'scrapling',
         }
     except Exception as exc:
-        logger.exception('Goodinfo original fetch failed: %s', type(exc).__name__)
+        logger.exception('Goodinfo Scrapling fetch failed: %s', type(exc).__name__)
         fetch_goodinfo_data.last_status = {
             'state': 'failed', 'reason': 'browser_error',
             'error_type': type(exc).__name__,
             'elapsed': round(time.monotonic() - started_at, 2),
             'headed_mode': headed_mode,
+            'fetcher': 'scrapling',
         }
     finally:
-        if driver is not None:
-            try:
-                driver.quit()
-            except WebDriverException:
-                pass
         _GOODINFO_BROWSER_SEMAPHORE.release()
     return None
 
@@ -10649,7 +10652,7 @@ def render_stock_external_resources():
     st.markdown("#### 外部資源")
 
     def perform_goodinfo_fetch():
-        with st.spinner("正在使用最初舊版流程載入排行，約需 20 秒..."):
+        with st.spinner("正在使用 Scrapling 通過網站驗證並載入排行，最多約 65 秒..."):
             result = fetch_goodinfo_data()
             status = dict(getattr(fetch_goodinfo_data, 'last_status', {}) or {})
             if result is not None and not result.empty:
@@ -10662,8 +10665,9 @@ def render_stock_external_resources():
                 st.session_state['goodinfo_fetch_failed'] = True
                 reason_text = {
                     'browser_busy': '另一個頁面正在抓取，請稍後再按一次。',
-                    'legacy_table_missing': '舊版流程已載入頁面，但沒有找到完整排行表格。',
-                    'browser_error': 'Streamlit 上的 Chrome 啟動、導向或解析失敗。',
+                    'scrapling_dependency_missing': 'Streamlit 尚未安裝完整 Scrapling 瀏覽器套件。',
+                    'legacy_table_missing': 'Scrapling 已取得頁面，但沒有找到完整排行表格。',
+                    'browser_error': 'Scrapling 瀏覽器啟動、網站驗證或頁面解析失敗。',
                 }.get(status.get('reason'), '抓取失敗或查無資料。')
                 st.error(reason_text)
                 if 'goodinfo_df' in st.session_state:
@@ -10673,7 +10677,7 @@ def render_stock_external_resources():
     with resource_col1:
         if st.button(
             "📥 抓取 Goodinfo 週轉率排行",
-            help="完整使用最初可用流程：固定 Chrome 114／Windows 識別，等待 20 秒後解析最大表格。",
+            help="使用 Scrapling StealthyFetcher 與 Cloudflare solver，等待完整週轉率排行後解析。",
             width='stretch', key='fetch_goodinfo_in_stock_room'
         ):
             perform_goodinfo_fetch()
