@@ -411,6 +411,38 @@ def test_goodinfo_original_parser_keeps_historical_largest_table_behavior():
     assert parsed.iloc[0]["代號欄"] == 2400
 
 
+def test_goodinfo_fetch_uses_only_original_fixed_wait_flow():
+    tree = ast.parse(APP_PATH.read_text(encoding="utf-8"))
+    function = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "fetch_goodinfo_data"
+    )
+    calls = [node for node in ast.walk(function) if isinstance(node, ast.Call)]
+    called_names = {
+        node.func.id for node in calls if isinstance(node.func, ast.Name)
+    }
+    called_attributes = {
+        node.func.attr for node in calls if isinstance(node.func, ast.Attribute)
+    }
+    sleep_values = [
+        node.args[0].value
+        for node in calls
+        if isinstance(node.func, ast.Attribute)
+        and node.func.attr == "sleep"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+    ]
+    assert sleep_values == [15]
+    assert "read_html" in called_attributes
+    assert "refresh" not in called_attributes
+    assert not {
+        "_parse_goodinfo_table_html",
+        "_parse_goodinfo_legacy_page",
+        "_parse_goodinfo_original_page",
+        "_goodinfo_rank_table_html",
+    }.intersection(called_names)
+
+
 def test_shioaji_futures_resolver_uses_v17_lazy_root_api():
     symbols = load_app_symbols(
         "SHIOAJI_FUTURES_ROOT_ALIASES", "FUTURES_MONTH_CODE",
@@ -831,6 +863,75 @@ def test_newer_fibo_backup_wins_over_valid_but_stale_primary_tags():
         },
     }
     assert symbols["_extract_fibo_tags"](payload) == new_tags
+
+
+def test_fibo_scope_readback_must_match_exact_saved_tags():
+    symbols = load_app_symbols(
+        "_valid_fibo_tags", "_extract_fibo_tags", "_json_safe",
+        "_remote_scope_payload_matches",
+    )
+    symbols["GOOGLE_SCOPE_FIBO"] = "fibo_strategy"
+    symbols["normalize_fibo_quick_tag"] = lambda value: str(value).strip()
+    expected = {
+        "fibo_tags": ["南亞科(2408)", "台積電(2330)", "鴻海(2317)", "聯發科(2454)", "和椿(6215)"],
+        "fibo_tags_updated_at": "2026-08-20T10:00:00+08:00",
+    }
+    same = dict(expected, _scope_updated_at="2026-08-20T10:00:00+08:00")
+    stale = dict(expected, fibo_tags=["A", "B", "C", "D", "E"])
+    matches = symbols["_remote_scope_payload_matches"]
+    assert matches("fibo_strategy", expected, same)
+    assert not matches("fibo_strategy", expected, stale)
+
+
+def test_forced_fibo_cloud_import_never_falls_back_to_local_tags():
+    symbols = load_app_symbols("load_fibo_tags_from_cloud")
+
+    class FakeStreamlit:
+        session_state = {}
+
+    local_calls = []
+    symbols.update({
+        "st": FakeStreamlit(),
+        "DEFAULT_FIBO_TAGS": ["預設1", "預設2", "預設3", "預設4", "預設5"],
+        "GOOGLE_SCOPE_FIBO": "fibo_strategy",
+        "get_app_secret": lambda key: "https://example.invalid/exec",
+        "_fetch_remote_scope": lambda *args, **kwargs: (None, "Timeout"),
+        "load_fibo_tag_cache": lambda: local_calls.append(True) or ["本機1", "本機2", "本機3", "本機4", "本機5"],
+        "load_config": lambda: {"fibo_tags": ["設定1", "設定2", "設定3", "設定4", "設定5"]},
+        "_valid_fibo_tags": lambda tags: list(tags[:5]) if isinstance(tags, list) and len(tags) >= 5 else [],
+        "_extract_fibo_tags": lambda payload: [],
+        "_fibo_tag_timestamp": lambda payload: None,
+        "normalize_fibo_quick_tag": lambda value: str(value),
+    })
+    assert symbols["load_fibo_tags_from_cloud"](force=True) == []
+    assert local_calls == []
+    assert symbols["st"].session_state["_fibo_cloud_load_error"] == "Timeout"
+
+
+def test_normal_fibo_startup_keeps_device_local_tags_before_cloud():
+    symbols = load_app_symbols("load_fibo_tags_from_cloud")
+
+    class FakeStreamlit:
+        session_state = {}
+
+    remote_calls = []
+    local_tags = ["手機1", "手機2", "手機3", "手機4", "手機5"]
+    symbols.update({
+        "st": FakeStreamlit(),
+        "DEFAULT_FIBO_TAGS": ["預設1", "預設2", "預設3", "預設4", "預設5"],
+        "GOOGLE_SCOPE_FIBO": "fibo_strategy",
+        "get_app_secret": lambda key: "https://example.invalid/exec",
+        "_fetch_remote_scope": lambda *args, **kwargs: remote_calls.append(True) or ({}, None),
+        "load_fibo_tag_cache": lambda: local_tags,
+        "load_config": lambda: {},
+        "_valid_fibo_tags": lambda tags: list(tags[:5]) if isinstance(tags, list) and len(tags) >= 5 else [],
+        "_extract_fibo_tags": lambda payload: [],
+        "_fibo_tag_timestamp": lambda payload: None,
+        "normalize_fibo_quick_tag": lambda value: str(value),
+    })
+    assert symbols["load_fibo_tags_from_cloud"]() == local_tags
+    assert remote_calls == []
+    assert symbols["st"].session_state["_fibo_tags_source"] == "local_tag_cache"
 
 
 def test_cache_merge_preserves_remote_device_sections():

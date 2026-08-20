@@ -6931,21 +6931,13 @@ def _goodinfo_rank_table_html(driver):
 
 
 def fetch_goodinfo_data():
-    """以歷史上可用的整頁流程優先抓取 Goodinfo 綜合週轉率排行。
-
-    Goodinfo 的表格載入常不會穩定地掛在同一個 DOM 節點。舊版做法是
-    導向完成後固定等 15 秒，再解析完整 ``page_source``；這條路徑現在
-    必須是第一優先，避免尚未完成的骨架 DOM 先攔截回傳失敗。只有舊版
-    整頁解析失敗時，才使用目前的嚴格 DOM 表格解析與同頁備援。
-    """
+    """使用曾成功的原始單一路徑：固定等待 15 秒後解析整頁最大表格。"""
     chrome_options = Options()
     chrome_options.add_argument("--headless=new")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--disable-gpu")
     chrome_options.add_argument("--window-size=1920x1080")
-    # These two flags and the fixed UA are retained because they are part of
-    # the last deployed Goodinfo flow confirmed to work on Streamlit Cloud.
     chrome_options.add_argument("--single-process")
     chrome_options.add_argument("--no-zygote")
     chrome_options.add_argument("--disable-software-rasterizer")
@@ -6956,113 +6948,59 @@ def fetch_goodinfo_data():
         "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
     )
-    # 保留歷史流程的完整導向行為；等待 15 秒從 driver.get() 結束後才
-    # 開始計算，不能讓 Chromium 啟動或頁面導向時間吃掉資料載入額度。
-    chrome_options.page_load_strategy = 'normal'
-
     chrome_options.binary_location = "/usr/bin/chromium"
-    acquired = _GOODINFO_BROWSER_SEMAPHORE.acquire(timeout=20)
-    if not acquired:
-        return None
     driver = None
-    reloaded = False
     try:
         service = Service("/usr/bin/chromedriver")
         driver = webdriver.Chrome(service=service, options=chrome_options)
         driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
             "source": """
-                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => undefined
+                })
             """
         })
-        try:
-            driver.get(_GOODINFO_URL)
-        except (TimeoutException, UnexpectedAlertPresentException):
-            # The page can continue rendering after Selenium's navigation
-            # timeout; preserve the historical post-navigation wait below.
-            pass
-
-        # Historical first-priority flow: wait the full 15 seconds *after*
-        # navigation, then parse the complete page.  Do not poll a skeleton DOM
-        # first, because that was the regression causing repeated empty results.
+        driver.get(_GOODINFO_URL)
         time.sleep(15)
+        page_html = driver.page_source
+        tables = pd.read_html(io.StringIO(page_html))
 
-        try:
-            alert = driver.switch_to.alert
-            alert_text = alert.text
-            alert.accept()
-            logger.warning('Goodinfo alert after legacy wait: %s', alert_text)
-        except NoAlertPresentException:
-            pass
-        except (WebDriverException, TypeError):
-            pass
+        target_df = None
+        for dataframe in tables:
+            if dataframe.shape[0] > 10 and dataframe.shape[1] > 5:
+                if target_df is None or (
+                    dataframe.shape[0] * dataframe.shape[1]
+                    > target_df.shape[0] * target_df.shape[1]
+                ):
+                    target_df = dataframe
 
-        page_markup = None
-        try:
-            page_markup = driver.page_source
-        except (WebDriverException, UnexpectedAlertPresentException):
-            page_markup = None
-
-        # Exact original parser first: after the fixed wait, choose the largest
-        # completed table before applying any newer DOM/schema assumptions.
-        ranking = _parse_goodinfo_original_page(page_markup) if page_markup else None
-        if ranking is not None:
-            return ranking
-
-        ranking = _parse_goodinfo_legacy_page(page_markup) if page_markup else None
-        if ranking is not None:
-            return ranking
-
-        # DOM/schema-aware fallback for newer Goodinfo wrappers.  It is never
-        # allowed to pre-empt the historical parser above.
-        ranking = _parse_goodinfo_table_html(
-            _goodinfo_rank_table_html(driver),
-        )
-        if ranking is not None:
-            return ranking
-        if page_markup:
-            ranking = _parse_goodinfo_table_html([page_markup])
-            if ranking is not None:
-                return ranking
-
-        # A blocked/alerted first page may recover after one refresh.  Keep this
-        # as a bounded fallback only; the old 15-second flow remains first.
-        if not reloaded:
-            reloaded = True
-            try:
-                driver.set_page_load_timeout(10)
-                driver.refresh()
-            except (TimeoutException, UnexpectedAlertPresentException):
-                pass
-            time.sleep(5)
-            try:
-                alert = driver.switch_to.alert
-                alert.accept()
-            except (NoAlertPresentException, WebDriverException, TypeError):
-                pass
-            try:
-                refreshed_markup = driver.page_source
-            except (WebDriverException, UnexpectedAlertPresentException):
-                refreshed_markup = None
-            ranking = _parse_goodinfo_original_page(refreshed_markup) if refreshed_markup else None
-            if ranking is None:
-                ranking = _parse_goodinfo_legacy_page(refreshed_markup) if refreshed_markup else None
-            if ranking is None:
-                ranking = _parse_goodinfo_table_html(
-                    _goodinfo_rank_table_html(driver),
-                )
-            if ranking is None and refreshed_markup:
-                ranking = _parse_goodinfo_table_html([refreshed_markup])
-            if ranking is not None:
-                return ranking
-    except (WebDriverException, OSError, ValueError) as exc:
-        logger.exception('Goodinfo fetch failed: %s', type(exc).__name__)
+        if target_df is not None:
+            if isinstance(target_df.columns, pd.MultiIndex):
+                new_columns = []
+                for column in target_df.columns:
+                    cleaned_parts = []
+                    for item in column:
+                        item_text = str(item).replace(' ', '').strip()
+                        if item_text and not item_text.startswith('Unnamed'):
+                            if not cleaned_parts or cleaned_parts[-1] != item_text:
+                                cleaned_parts.append(item_text)
+                    new_columns.append('_'.join(cleaned_parts))
+                target_df.columns = new_columns
+            else:
+                target_df.columns = [
+                    str(column).replace(' ', '').strip()
+                    for column in target_df.columns
+                ]
+            return target_df
+    except Exception as exc:
+        logger.exception('Goodinfo original flow failed: %s', type(exc).__name__)
+        return None
     finally:
         if driver is not None:
             try:
                 driver.quit()
-            except WebDriverException:
+            except Exception:
                 pass
-        _GOODINFO_BROWSER_SEMAPHORE.release()
     return None
 
 # ==========================================
@@ -8986,7 +8924,12 @@ def _fetch_remote_scope(
         response = requests.get(
             gsheet_api_url,
             params={
-                'scope': scope
+                'scope': scope,
+                '_ts': int(time.time() * 1000),
+            },
+            headers={
+                'Cache-Control': 'no-cache, no-store, max-age=0',
+                'Pragma': 'no-cache',
             },
             timeout=timeout,
         )
@@ -9084,13 +9027,52 @@ def _save_remote_scope(gsheet_api_url, scope, payload, updated_at=None, timeout=
         response.raise_for_status()
         result = response.json()
 
-        if isinstance(result, dict) and result.get('success') is False:
+        if not isinstance(result, dict) or result.get('success') is not True:
             return False, None
+
+        if verify:
+            for attempt in range(2):
+                saved_payload, read_error = _fetch_remote_scope(
+                    gsheet_api_url,
+                    scope,
+                    timeout=timeout,
+                )
+                if _remote_scope_payload_matches(scope, payload, saved_payload):
+                    return True, saved_payload
+                if attempt == 0:
+                    time.sleep(0.25)
+            logger.warning(
+                'Google Sheet scope verification failed: %s (%s)',
+                scope,
+                read_error or 'payload mismatch',
+            )
+            return False, saved_payload
 
         return True, payload
 
     except (requests.RequestException, ValueError, TypeError):
         return False, None
+
+
+def _remote_scope_payload_matches(scope, expected, actual):
+    """Verify that Apps Script persisted the requested independent scope."""
+    if not isinstance(expected, dict) or not isinstance(actual, dict):
+        return False
+    if str(scope or '').strip() == GOOGLE_SCOPE_FIBO:
+        expected_tags = [
+            normalize_fibo_quick_tag(tag)
+            for tag in _extract_fibo_tags(expected)
+        ]
+        actual_tags = [
+            normalize_fibo_quick_tag(tag)
+            for tag in _extract_fibo_tags(actual)
+        ]
+        return len(expected_tags) >= 5 and actual_tags == expected_tags
+    expected_value = _json_safe(expected)
+    actual_value = _json_safe(actual)
+    if isinstance(actual_value, dict):
+        actual_value.pop('_scope_updated_at', None)
+    return actual_value == expected_value
 
 
 def _read_json_cache_file(
@@ -10082,9 +10064,9 @@ def load_fibo_tags_from_cloud(
     force=False
 ):
     """
-    只讀取 fibo_strategy。
+    一般啟動以裝置本機標籤為優先；手動匯入時只接受 fibo_strategy。
 
-    儲存與還原完全獨立於股票戰略室。
+    ``force=True`` 絕不退回本機或預設值，避免雲端失敗卻誤報匯入成功。
     """
     if (
         not force
@@ -10108,43 +10090,38 @@ def load_fibo_tags_from_cloud(
 
     tags = []
     source = 'default'
+    cloud_error = ''
 
-    if gsheet_api_url:
-        payload, error = (
-            _fetch_remote_scope(
+    if force:
+        if not gsheet_api_url:
+            cloud_error = '未設定 Google Sheet 同步網址'
+        else:
+            payload, error = _fetch_remote_scope(
                 gsheet_api_url,
                 GOOGLE_SCOPE_FIBO,
-                timeout=8,
+                timeout=10,
             )
-        )
+            if isinstance(payload, dict):
+                tags = _extract_fibo_tags(payload)
+                if len(tags) >= 5:
+                    tags = [normalize_fibo_quick_tag(tag) for tag in tags]
+                    source = 'google_sheet'
+                    timestamp = _fibo_tag_timestamp(payload)
+                    updated_at = timestamp.isoformat() if timestamp is not None else ''
+                    if updated_at:
+                        st.session_state['_fibo_tags_updated_at'] = updated_at
+                else:
+                    cloud_error = 'fibo_strategy 內沒有五組有效標籤'
+            else:
+                cloud_error = error or 'Google Sheet 未回傳 fibo_strategy'
 
-        if isinstance(
-            payload,
-            dict
-        ):
-            tags = _extract_fibo_tags(payload)
-
-            if len(tags) >= 5:
-                tags = [
-                    normalize_fibo_quick_tag(
-                        tag
-                    )
-                    for tag in tags
-                ]
-
-                source = (
-                    'google_sheet'
-                )
-
-                timestamp = _fibo_tag_timestamp(payload)
-                updated_at = timestamp.isoformat() if timestamp is not None else ''
-
-                if updated_at:
-                    st.session_state[
-                        '_fibo_tags_updated_at'
-                    ] = updated_at
-
-    if len(tags) < 5:
+        st.session_state['_fibo_cloud_load_error'] = cloud_error
+        st.session_state['_fibo_cloud_loaded'] = True
+        if len(tags) < 5:
+            return []
+    else:
+        # 手機與電腦各自保留本機操作；只有明確按「從 Google Sheet
+        # 重新載入」時，才讓另一裝置保存的標籤覆蓋本機 widget。
         tags = _valid_fibo_tags(
             load_fibo_tag_cache()
         )
@@ -10161,25 +10138,39 @@ def load_fibo_tags_from_cloud(
                 'local_tag_cache'
             )
 
-    if len(tags) < 5:
-        config = load_config()
+        if len(tags) < 5:
+            config = load_config()
 
-        config_tags = _valid_fibo_tags(
-            config.get(
-                'fibo_tags',
-                []
-            )
-        )
-
-        if len(config_tags) >= 5:
-            tags = [
-                normalize_fibo_quick_tag(
-                    tag
+            config_tags = _valid_fibo_tags(
+                config.get(
+                    'fibo_tags',
+                    []
                 )
-                for tag in config_tags
-            ]
+            )
 
-            source = 'config'
+            if len(config_tags) >= 5:
+                tags = [
+                    normalize_fibo_quick_tag(tag)
+                    for tag in config_tags
+                ]
+                source = 'config'
+
+        if len(tags) < 5 and gsheet_api_url:
+            payload, error = _fetch_remote_scope(
+                gsheet_api_url,
+                GOOGLE_SCOPE_FIBO,
+                timeout=8,
+            )
+            if isinstance(payload, dict):
+                tags = _extract_fibo_tags(payload)
+                if len(tags) >= 5:
+                    tags = [normalize_fibo_quick_tag(tag) for tag in tags]
+                    source = 'google_sheet'
+                    timestamp = _fibo_tag_timestamp(payload)
+                    if timestamp is not None:
+                        st.session_state['_fibo_tags_updated_at'] = timestamp.isoformat()
+            if len(tags) < 5:
+                cloud_error = error or 'fibo_strategy 內沒有五組有效標籤'
 
     if len(tags) < 5:
         tags = list(
@@ -10200,6 +10191,8 @@ def load_fibo_tags_from_cloud(
         '_fibo_cloud_loaded'
     ] = True
 
+    st.session_state['_fibo_cloud_load_error'] = cloud_error
+
     return list(tags)
 
 
@@ -10217,8 +10210,14 @@ def reload_fibo_tags_from_cloud():
     if not tags or len(tags) < 5:
         return (
             False,
-            '雲端尚無五組快速標籤'
+            st.session_state.get(
+                '_fibo_cloud_load_error',
+                '雲端尚無五組快速標籤',
+            )
         )
+
+    if st.session_state.get('_fibo_tags_source') != 'google_sheet':
+        return False, 'Google Sheet 未回傳可用的 fibo_strategy 標籤'
 
     st.session_state[
         'fibo_tags'
@@ -10623,7 +10622,7 @@ def render_stock_external_resources():
     st.markdown("#### 外部資源")
 
     def perform_goodinfo_fetch():
-        with st.spinner("正在依舊版流程載入排行，請完整等待約 15 秒；失敗後會自動使用備援..."):
+        with st.spinner("正在使用舊版流程載入排行，請完整等待約 15 秒..."):
             result = fetch_goodinfo_data()
             if result is not None and not result.empty:
                 st.session_state['goodinfo_df'] = result.astype(str)
@@ -10637,7 +10636,7 @@ def render_stock_external_resources():
     with resource_col1:
         if st.button(
             "📥 抓取 Goodinfo 週轉率排行",
-            help="先使用曾成功的舊版 15 秒整頁流程抓取上市＋上櫃排行；若失敗，再於同一輪使用新版解析備援。",
+            help="完全使用曾成功的舊版流程：開啟頁面、固定等待 15 秒，再解析完整上市＋上櫃排行。",
             width='stretch', key='fetch_goodinfo_in_stock_room'
         ):
             perform_goodinfo_fetch()
