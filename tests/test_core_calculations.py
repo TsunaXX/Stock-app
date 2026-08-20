@@ -433,60 +433,42 @@ def test_goodinfo_turnover_parser_recovers_mojibake_code_and_name_columns():
     assert parsed["名稱"].eq("").all()
 
 
-def test_scrapling_response_markup_accepts_body_bytes_and_text_aliases():
-    helper = load_app_symbols("_scrapling_response_markup")[
-        "_scrapling_response_markup"
-    ]
+def test_goodinfo_fetch_uses_crawl4ai_two_stage_undetected_session():
+    source = APP_PATH.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    crawler = next(
+        node for node in tree.body
+        if isinstance(node, ast.AsyncFunctionDef)
+        and node.name == "_crawl_goodinfo_with_crawl4ai"
+    )
+    crawler_source = ast.get_source_segment(source, crawler)
+    assert 'from crawl4ai import (' in crawler_source
+    assert 'UndetectedAdapter' in crawler_source
+    assert 'AsyncPlaywrightCrawlerStrategy' in crawler_source
+    assert "enable_stealth=True" in crawler_source
+    assert "user_agent_mode='random'" in crawler_source
+    assert "session_id = f'goodinfo-{time.time_ns()}'" in crawler_source
+    assert crawler_source.count('await crawler.arun(') == 2
+    assert "'session_id': session_id" in crawler_source
+    assert "'REINIT='" in crawler_source
+    assert 'while ranking_attempts < 3' in crawler_source
+    assert 'crawl_deadline = time.monotonic() + 28.0' in crawler_source
+    assert 'wait_for_timeout=min(12_000, remaining_ms)' in crawler_source
+    assert 'includes(\"週轉率\")' in crawler_source
+    assert 'cookies=' not in crawler_source
+    assert "CRAWL4_AI_BASE_DIRECTORY" in crawler_source
+    assert "browser_args['executable_path'] = '/usr/bin/chromium'" in crawler_source
 
-    class BytesResponse:
-        body = "代號｜週轉率".encode("utf-8")
-
-    class TextResponse:
-        body = None
-        text = "代號｜週轉率"
-
-    assert helper(BytesResponse()) == "代號｜週轉率"
-    assert helper(TextResponse()) == "代號｜週轉率"
-    assert helper(None) == ""
-
-
-def test_goodinfo_fetch_uses_browser_post_fast_path_and_explicit_solver_fallback():
-    tree = ast.parse(APP_PATH.read_text(encoding="utf-8"))
-    function = next(
+    wrapper = next(
         node for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name == "fetch_goodinfo_data"
     )
-    calls = [node for node in ast.walk(function) if isinstance(node, ast.Call)]
-    called_attributes = {
-        node.func.attr for node in calls if isinstance(node.func, ast.Attribute)
-    }
-    function_source = ast.get_source_segment(
-        APP_PATH.read_text(encoding="utf-8"), function,
-    )
-    assert 'use_cloudflare_solver=False' in function_source
-    assert 'from patchright.sync_api import' in function_source
-    assert "page.on('response', remember_ranking_response)" in function_source
-    assert "request.method == 'POST'" in function_source
-    assert "_GOODINFO_DATA_URL.split('?', 1)[0]" in function_source
-    assert 'from scrapling.fetchers import StealthyFetcher' in function_source
-    assert 'StealthyFetcher.fetch' in function_source
-    assert 'os.environ.get("GOODINFO_HEADED") == "1"' in function_source
-    assert "'solve_cloudflare': True" in function_source
-    assert "'timeout': 65_000" in function_source
-    assert "'wait_selector': 'table:has-text(\"代號\"):has-text(\"週轉率\")'" in function_source
-    assert "'retries': 1" in function_source
-    assert "fetch_options['executable_path'] = '/usr/bin/chromium'" in function_source
-    assert '_scrapling_response_markup' in function_source
-    assert 'add_cookies' not in function_source
-    assert 'refresh' not in called_attributes
-    assert '_parse_goodinfo_original_page' in function_source
-
-
-def test_goodinfo_data_endpoint_keeps_the_observed_300_row_post_contract():
-    source = APP_PATH.read_text(encoding="utf-8")
-    assert 'StockListRank/StockList.asp?STEP=DATA' in source
-    assert 'RANK_RANGE=300&IS_RELOAD_REPORT=T' in source
-    assert '_GOODINFO_FAST_DEADLINE_SECONDS = 15.0' in source
+    wrapper_source = ast.get_source_segment(source, wrapper)
+    assert 'asyncio.run(' in wrapper_source
+    assert '_crawl_goodinfo_with_crawl4ai' in wrapper_source
+    assert '_parse_goodinfo_original_page' in wrapper_source
+    assert 'crawl4ai_dependency_missing' in wrapper_source
+    assert 'scrapling' not in wrapper_source.lower()
 
 
 def test_verified_2026_bls_schedules_skip_blocked_network_retries():
@@ -524,9 +506,14 @@ def test_opening_yahoo_batch_does_not_request_nonexistent_twf_symbol():
     assert "[item[1] for item in intraday_symbols.values()]" in function_source
 
 
-def test_scrapling_fetcher_dependency_is_pinned():
+def test_crawl4ai_dependency_and_cloud_browser_setup_are_pinned():
     requirements = (APP_PATH.parent / "requirements.txt").read_text(encoding="utf-8")
-    assert "scrapling[fetchers]==0.4.12" in requirements
+    packages = (APP_PATH.parent / "packages.txt").read_text(encoding="utf-8")
+    assert "crawl4ai==0.9.2" in requirements
+    assert "websockets==16.0" in requirements
+    assert "scrapling" not in requirements.lower()
+    assert "selenium" not in requirements.lower()
+    assert packages.splitlines() == ["chromium"]
 
 
 def test_shioaji_futures_resolver_uses_v17_lazy_root_api():

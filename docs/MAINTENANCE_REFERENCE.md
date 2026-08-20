@@ -3,7 +3,7 @@
 ## 資料來源與口徑
 
 - Goodinfo 週轉率排行必須維持「上市＋上櫃、依當日累積成交量週轉率排序」的口徑，不能用證交所或櫃買中心的單一市場排行取代。
-- Goodinfo 維持原始上市＋上櫃排行，不改用不同口徑資料。一般抓取先用 Patchright 開啟原排行頁，最多 15 秒接收該頁自動送出的同源 `StockListRank/StockList.asp?STEP=DATA` POST（`RANK_RANGE=300`），沿用瀏覽器自行建立的 `CLIENT_KEY`，禁止把開發者工具複製出的 `cf_clearance`、`CLIENT_KEY` 或其他 Cookie 寫入程式、設定檔或雲端。快速模式失敗時，才由使用者明確按「加強驗證重試」啟用 Scrapling 0.4.12 `StealthyFetcher`、Patchright 與 `solve_cloudflare=True`，最多 65 秒；`retries=1`，避免自動重複啟動 Chromium。`GOODINFO_HEADED=1` 仍可切換可視模式，但只適用於有圖形顯示器或 Xvfb 的主機。失敗不得覆蓋上次成功資料，也不得以其他官方排行冒充 Goodinfo。
+- Goodinfo 維持原始上市＋上櫃排行，不改用不同口徑資料。抓取使用 Crawl4AI 0.9.2、`UndetectedAdapter`、Stealth 與同一 `session_id` 的分階段流程：第一輪接受 Goodinfo 用來建立 `CLIENT_KEY` 的 `REINIT` 片段，後續最多三輪沿用該分頁／Cookie，取得完整排行即停止，總等待上限約 28 秒。Crawl4AI 快取目錄固定導向可寫的系統暫存區；Streamlit Cloud 使用 `packages.txt` 的 `/usr/bin/chromium`，並在 Crawl4AI 0.9.2 的 browser manager 注入 `executable_path`（升級 Crawl4AI 時必須重驗此相容層）。禁止把開發者工具複製出的 `cf_clearance`、`CLIENT_KEY` 或其他 Cookie 寫入程式、設定檔或雲端。`GOODINFO_HEADED=1` 仍可切換可視模式，但只適用於有圖形顯示器或 Xvfb 的主機。失敗不得覆蓋上次成功資料，也不得以其他官方排行冒充 Goodinfo。
 - 2026 CPI／大非農已有完整且核對過的 BLS 官方排程；該年直接合併此排程與 TradingView 備援，不可先對容易封鎖雲端 IP 的 BLS 頁面做三輪重試。其他年份仍依序查 BLS ICS、年度總表與個別發布頁。這是首次載入的重要效能界線，不能用移除行事曆資料換速度。
 - 盤前跨市場批次不可向 Yahoo 查 `TWF=F`（該代號在 Yahoo 不存在，會固定 404 並拖慢首次載入）；台指夜盤只使用已登入的 Shioaji 實際近月契約，未登入時顯示該來源未取得，不以錯誤商品代號冒充。
 - 股票名稱與代號優先讀取 `stock_names.csv`；快速標籤統一保存為 `名稱(代號)`。

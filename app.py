@@ -3,8 +3,10 @@ import pandas as pd
 import yfinance as yf
 import requests
 from bs4 import BeautifulSoup
+from lxml.etree import XMLSyntaxError
 import math
 import time
+import asyncio
 import threading
 import os
 import itertools
@@ -31,14 +33,6 @@ import streamlit.components.v1 as components
 import pdfplumber
 import fitz  # PyMuPDF 用於將 PDF 轉為圖片
 from PIL import Image
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.by import By
-from selenium.common.exceptions import (
-    NoAlertPresentException, TimeoutException, UnexpectedAlertPresentException,
-    WebDriverException,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -6661,18 +6655,6 @@ _GOODINFO_URL = (
     "&INDUSTRY_CAT=%E7%B4%AF%E8%A8%88%E6%88%90%E4%BA%A4%E9%87%8F%E9%80%B1%E8%BD%89%E7%8E%87%28%E7%95%B6%E6%97%A5%29"
     "%40%40%E7%B4%AF%E8%A8%88%E6%88%90%E4%BA%A4%E9%87%8F%E9%80%B1%E8%BD%89%E7%8E%87%40%40%E7%95%B6%E6%97%A5"
 )
-_GOODINFO_DATA_URL = (
-    "https://goodinfo.tw/tw/StockListRank/StockList.asp?STEP=DATA"
-    "&MARKET_CAT=%E7%86%B1%E9%96%80%E6%8E%92%E8%A1%8C"
-    "&INDUSTRY_CAT=%E7%B4%AF%E8%A8%88%E6%88%90%E4%BA%A4%E9%87%8F%E9%80%B1%E8%BD%89%E7%8E%87%28%E7%95%B6%E6%97%A5%29"
-    "%40%40%E7%B4%AF%E8%A8%88%E6%88%90%E4%BA%A4%E9%87%8F%E9%80%B1%E8%BD%89%E7%8E%87%40%40%E7%95%B6%E6%97%A5"
-    "&SHEET=%E6%BC%B2%E8%B7%8C%E5%8F%8A%E6%88%90%E4%BA%A4%E7%B5%B1%E8%A8%88"
-    "&SHEET2=%E7%B4%AF%E8%A8%88%E6%88%90%E4%BA%A4%E9%87%8F%E9%80%B1%E8%BD%89%E7%8E%87%E7%B5%B1%E8%A8%88"
-    "&RPT_TIME=%E6%9C%80%E6%96%B0%E8%B3%87%E6%96%99&RANK_RANGE=300&IS_RELOAD_REPORT=T"
-)
-_GOODINFO_FAST_DEADLINE_SECONDS = 15.0
-
-
 def _goodinfo_normalize_text(value):
     """Normalize Goodinfo's nbsp/newline-heavy labels before schema checks."""
     return re.sub(r"\s+", "", str(value or "").replace("\xa0", "")).strip()
@@ -6734,13 +6716,16 @@ def _parse_goodinfo_original_page(markup):
     largest table after the fixed 15-second wait.  The stricter parser remains
     available as a fallback after this compatibility path.
     """
+    markup_text = str(markup or '').strip()
+    if not markup_text:
+        return None
     tables = []
     for read_kwargs in ({}, {'flavor': 'lxml'}):
         try:
-            tables = pd.read_html(io.StringIO(str(markup or '')), **read_kwargs)
+            tables = pd.read_html(io.StringIO(markup_text), **read_kwargs)
             if tables:
                 break
-        except (ValueError, TypeError, ImportError):
+        except (ValueError, TypeError, ImportError, XMLSyntaxError):
             tables = []
     target = None
     for dataframe in tables:
@@ -6827,22 +6812,6 @@ def _parse_goodinfo_legacy_page(markup):
         if int(valid_codes.sum()) >= 10:
             candidates.append(cleaned.dropna(how='all').reset_index(drop=True))
     return max(candidates, key=lambda table: table.shape[0] * table.shape[1]) if candidates else None
-
-
-def _goodinfo_rank_table_html(driver):
-    """Return completed Goodinfo ranking-table markup, excluding menus and challenge pages."""
-    try:
-        return driver.execute_script("""
-            return Array.from(document.querySelectorAll('table')).filter((table) => {
-                const text = (table.innerText || '').replace(/\\s/g, '');
-                return table.rows.length >= 11
-                    && /(股票)?代號/.test(text)
-                    && text.includes('名稱')
-                    && text.includes('週轉率');
-            }).map((table) => table.outerHTML);
-        """) or []
-    except (WebDriverException, TypeError):
-        return []
 
 
 def _parse_goodinfo_turnover_table(page_html):
@@ -6943,204 +6912,205 @@ def _parse_goodinfo_turnover_table(page_html):
     return target_df.dropna(how='all').reset_index(drop=True)
 
 
-def _scrapling_response_markup(response):
-    """Extract rendered HTML from Scrapling without depending on one response alias."""
-    if response is None:
-        return ''
-    for attribute in ('body', 'html', 'text'):
-        value = getattr(response, attribute, None)
-        if value is None or callable(value):
-            continue
-        if isinstance(value, bytes):
-            for encoding in ('utf-8', 'big5', 'cp950'):
-                try:
-                    return value.decode(encoding)
-                except UnicodeDecodeError:
-                    continue
-            return value.decode('utf-8', errors='replace')
-        text = str(value)
-        if text.strip():
-            return text
-    return str(response)
+async def _crawl_goodinfo_with_crawl4ai(headed_mode=False):
+    """Initialize Goodinfo, then reload it in the same Crawl4AI session.
 
-
-def fetch_goodinfo_data(use_cloudflare_solver=False):
-    """Fetch Goodinfo's browser-generated POST, with an explicit slow fallback.
-
-    Goodinfo first initializes a browser session (including ``CLIENT_KEY``),
-    then sends a same-origin POST to ``StockListRank/StockList.asp``.  Capturing
-    that page request avoids running a 60-second Cloudflare solver on every
-    click.  The solver remains available as an explicit retry, and no copied
-    browser cookie is persisted or shared with the server.
+    Goodinfo's first response intentionally redirects to a small ``REINIT``
+    fragment after setting ``CLIENT_KEY``.  Crawl4AI correctly regards that
+    fragment as incomplete HTML, but the browser session remains usable.  The
+    following crawls reuse the same page/cookies until the real 300-row ranking
+    appears or the shared 28-second deadline expires.  No copied cookie or
+    persistent browser profile is used.
     """
+    os.environ.setdefault('CRAWL4_AI_BASE_DIRECTORY', tempfile.gettempdir())
+    from crawl4ai import (
+        AsyncWebCrawler, BrowserConfig, CacheMode, CrawlerRunConfig,
+        UndetectedAdapter,
+    )
+    from crawl4ai.async_crawler_strategy import AsyncPlaywrightCrawlerStrategy
+
+    browser_config = BrowserConfig(
+        browser_type='chromium',
+        headless=not headed_mode,
+        viewport_width=1920,
+        viewport_height=1080,
+        enable_stealth=True,
+        user_agent_mode='random',
+        avoid_ads=True,
+        verbose=False,
+        extra_args=['--no-sandbox', '--disable-dev-shm-usage'],
+    )
+    crawler_strategy = AsyncPlaywrightCrawlerStrategy(
+        browser_config=browser_config,
+        browser_adapter=UndetectedAdapter(),
+    )
+    if os.path.exists('/usr/bin/chromium'):
+        # Crawl4AI 0.9.2 does not expose Playwright's executable_path through
+        # BrowserConfig.  Streamlit Cloud installs Chromium via packages.txt,
+        # so inject that supported launch argument into this pinned version's
+        # browser manager instead of downloading another 300+ MB browser.
+        original_build_browser_args = (
+            crawler_strategy.browser_manager._build_browser_args
+        )
+
+        def build_system_chromium_args():
+            browser_args = original_build_browser_args()
+            browser_args['executable_path'] = '/usr/bin/chromium'
+            return browser_args
+
+        crawler_strategy.browser_manager._build_browser_args = (
+            build_system_chromium_args
+        )
+    session_id = f'goodinfo-{time.time_ns()}'
+    common_config = {
+        'cache_mode': CacheMode.BYPASS,
+        'session_id': session_id,
+        'wait_until': 'domcontentloaded',
+        'locale': 'zh-TW',
+        'timezone_id': 'Asia/Taipei',
+        'exclude_all_images': True,
+        'verbose': False,
+    }
+    async with AsyncWebCrawler(
+        crawler_strategy=crawler_strategy,
+        config=browser_config,
+    ) as crawler:
+        # Stage 1: expected to be marked unsuccessful because Goodinfo's REINIT
+        # response is an HTML fragment without <body>; it still establishes the
+        # browser cookies needed by the second request.
+        initial_result = await crawler.arun(
+            url=_GOODINFO_URL,
+            config=CrawlerRunConfig(
+                **common_config,
+                page_timeout=10_000,
+                delay_before_return_html=0.2,
+            ),
+        )
+        crawl_deadline = time.monotonic() + 28.0
+        ranking_result = initial_result
+        ranking_html = ''
+        ranking_attempts = 0
+        attempt_states = []
+        while ranking_attempts < 3:
+            remaining_ms = int((crawl_deadline - time.monotonic()) * 1000)
+            if remaining_ms < 1_000:
+                break
+            ranking_attempts += 1
+            ranking_result = await crawler.arun(
+                url=_GOODINFO_URL,
+                config=CrawlerRunConfig(
+                    **common_config,
+                    page_timeout=min(14_000, remaining_ms),
+                    wait_for_timeout=min(12_000, remaining_ms),
+                    wait_for=(
+                        'js:() => Array.from(document.querySelectorAll("table"))'
+                        '.some(t => t.rows.length >= 11 && '
+                        '(t.innerText || "").includes("週轉率"))'
+                    ),
+                    delay_before_return_html=0.2,
+                ),
+            )
+            ranking_html = str(
+                ranking_result.html
+                or ranking_result.fit_html
+                or ranking_result.cleaned_html
+                or ''
+            )
+            attempt_states.append({
+                'success': bool(ranking_result.success),
+                'status_code': getattr(ranking_result, 'status_code', None),
+                'redirected_url': str(
+                    getattr(ranking_result, 'redirected_url', '') or ''
+                )[-160:],
+                'html_length': len(ranking_html),
+                'error': str(ranking_result.error_message or '')[:240],
+            })
+            if len(ranking_html) >= 10_000 and '週轉率' in ranking_html:
+                break
+            await asyncio.sleep(0.35)
+    return {
+        'html': ranking_html,
+        'success': bool(ranking_result.success),
+        'error': str(ranking_result.error_message or ''),
+        'initial_reinit': 'REINIT=' in str(
+            getattr(initial_result, 'redirected_url', '') or ''
+        ),
+        'status_code': getattr(ranking_result, 'status_code', None),
+        'ranking_attempts': ranking_attempts,
+        'attempt_states': attempt_states,
+    }
+
+
+def fetch_goodinfo_data():
+    """Fetch Goodinfo with Crawl4AI's undetected, two-stage browser session."""
     started_at = time.monotonic()
     fetch_goodinfo_data.last_status = {
         'state': 'loading', 'reason': '', 'elapsed': 0.0,
     }
     headed_mode = os.environ.get("GOODINFO_HEADED") == "1"
 
-    acquired = _GOODINFO_BROWSER_SEMAPHORE.acquire(
-        timeout=65 if use_cloudflare_solver else 3
-    )
+    acquired = _GOODINFO_BROWSER_SEMAPHORE.acquire(timeout=3)
     if not acquired:
         logger.warning('Goodinfo browser is busy; skipped duplicate launch')
         fetch_goodinfo_data.last_status = {
             'state': 'failed', 'reason': 'browser_busy',
             'elapsed': round(time.monotonic() - started_at, 2),
             'headed_mode': headed_mode,
-            'fetcher': 'scrapling' if use_cloudflare_solver else 'patchright',
+            'fetcher': 'crawl4ai-undetected',
         }
         return None
     try:
-        if use_cloudflare_solver:
-            try:
-                from scrapling.fetchers import StealthyFetcher
-            except (ImportError, ModuleNotFoundError) as exc:
-                logger.exception(
-                    'Scrapling fetcher dependency is unavailable: %s', type(exc).__name__,
-                )
-                fetch_goodinfo_data.last_status = {
-                    'state': 'failed', 'reason': 'scrapling_dependency_missing',
-                    'error_type': type(exc).__name__,
-                    'elapsed': round(time.monotonic() - started_at, 2),
-                    'headed_mode': headed_mode, 'fetcher': 'scrapling',
-                }
-                return None
-
-            fetch_options = {
-                'headless': not headed_mode,
-                'solve_cloudflare': True,
-                'block_webrtc': True,
-                'hide_canvas': True,
-                'allow_webgl': True,
-                'google_search': True,
-                'locale': 'zh-TW',
-                'timezone_id': 'Asia/Taipei',
-                'timeout': 65_000,
-                'wait': 2_000,
-                'wait_selector': 'table:has-text("代號"):has-text("週轉率")',
-                'wait_selector_state': 'attached',
-                'load_dom': True,
-                'retries': 1,
-                'extra_flags': ['--no-sandbox', '--disable-dev-shm-usage'],
-                'additional_args': {'viewport': {'width': 1920, 'height': 1080}},
+        try:
+            crawl_result = asyncio.run(
+                _crawl_goodinfo_with_crawl4ai(headed_mode=headed_mode)
+            )
+        except (ImportError, ModuleNotFoundError) as exc:
+            logger.exception(
+                'Crawl4AI dependency is unavailable: %s', type(exc).__name__,
+            )
+            fetch_goodinfo_data.last_status = {
+                'state': 'failed', 'reason': 'crawl4ai_dependency_missing',
+                'error_type': type(exc).__name__,
+                'elapsed': round(time.monotonic() - started_at, 2),
+                'headed_mode': headed_mode, 'fetcher': 'crawl4ai-undetected',
             }
-            if os.path.exists('/usr/bin/chromium'):
-                fetch_options['executable_path'] = '/usr/bin/chromium'
-            response = StealthyFetcher.fetch(_GOODINFO_URL, **fetch_options)
-            markup = _scrapling_response_markup(response)
-            fetcher_name = 'scrapling'
-        else:
-            try:
-                from patchright.sync_api import (
-                    sync_playwright,
-                    TimeoutError as PatchrightTimeoutError,
-                )
-            except (ImportError, ModuleNotFoundError) as exc:
-                logger.exception(
-                    'Patchright browser dependency is unavailable: %s', type(exc).__name__,
-                )
-                fetch_goodinfo_data.last_status = {
-                    'state': 'failed', 'reason': 'patchright_dependency_missing',
-                    'error_type': type(exc).__name__,
-                    'elapsed': round(time.monotonic() - started_at, 2),
-                    'headed_mode': headed_mode, 'fetcher': 'patchright',
-                }
-                return None
+            return None
 
-            markup = ''
-            browser = None
-            with sync_playwright() as playwright:
-                launch_options = {
-                    'headless': not headed_mode,
-                    'args': ['--no-sandbox', '--disable-dev-shm-usage'],
-                }
-                if os.path.exists('/usr/bin/chromium'):
-                    launch_options['executable_path'] = '/usr/bin/chromium'
-                browser = playwright.chromium.launch(**launch_options)
-                try:
-                    context = browser.new_context(
-                        locale='zh-TW', timezone_id='Asia/Taipei',
-                        viewport={'width': 1920, 'height': 1080},
-                    )
-                    page = context.new_page()
-                    ranking_responses = []
-
-                    def remember_ranking_response(response):
-                        request = response.request
-                        if (
-                            request.method == 'POST'
-                            and response.url.startswith(
-                                _GOODINFO_DATA_URL.split('?', 1)[0]
-                            )
-                            and 'STEP=DATA' in response.url
-                        ):
-                            ranking_responses.append(response)
-
-                    page.on('response', remember_ranking_response)
-                    remaining_ms = max(
-                        1,
-                        int(
-                            (_GOODINFO_FAST_DEADLINE_SECONDS
-                             - (time.monotonic() - started_at)) * 1000
-                        ),
-                    )
-                    try:
-                        page.goto(
-                            _GOODINFO_URL,
-                            wait_until='domcontentloaded',
-                            timeout=min(10_000, remaining_ms),
-                        )
-                    except PatchrightTimeoutError:
-                        # Ads may keep navigation open while the ranking POST is
-                        # already running. Continue until the shared deadline.
-                        pass
-
-                    while (
-                        not ranking_responses
-                        and time.monotonic() - started_at
-                        < _GOODINFO_FAST_DEADLINE_SECONDS
-                    ):
-                        page.wait_for_timeout(100)
-                    if ranking_responses:
-                        try:
-                            markup = ranking_responses[-1].text()
-                        except Exception:
-                            markup = ''
-                    if not markup and time.monotonic() - started_at < _GOODINFO_FAST_DEADLINE_SECONDS:
-                        markup = page.content()
-                finally:
-                    if browser is not None:
-                        browser.close()
-            fetcher_name = 'patchright'
-
-        ranking = _parse_goodinfo_original_page(markup)
+        ranking = _parse_goodinfo_original_page(crawl_result.get('html', ''))
         if ranking is not None:
             fetch_goodinfo_data.last_status = {
                 'state': 'success', 'reason': '', 'rows': len(ranking),
                 'elapsed': round(time.monotonic() - started_at, 2),
                 'headed_mode': headed_mode,
-                'fetcher': fetcher_name,
+                'fetcher': 'crawl4ai-undetected',
+                'initial_reinit': bool(crawl_result.get('initial_reinit')),
+                'ranking_attempts': crawl_result.get('ranking_attempts', 0),
             }
             return ranking
         fetch_goodinfo_data.last_status = {
             'state': 'failed',
-            'reason': (
-                'legacy_table_missing' if use_cloudflare_solver
-                else 'fast_ranking_timeout'
-            ),
+            'reason': 'crawl4ai_table_missing',
             'elapsed': round(time.monotonic() - started_at, 2),
             'headed_mode': headed_mode,
-            'fetcher': fetcher_name,
+            'fetcher': 'crawl4ai-undetected',
+            'initial_reinit': bool(crawl_result.get('initial_reinit')),
+            'crawl_success': bool(crawl_result.get('success')),
+            'status_code': crawl_result.get('status_code'),
+            'ranking_attempts': crawl_result.get('ranking_attempts', 0),
+            'attempt_states': crawl_result.get('attempt_states', []),
         }
+        logger.warning(
+            'Goodinfo Crawl4AI returned no ranking table: %s',
+            crawl_result.get('attempt_states', []),
+        )
     except Exception as exc:
-        logger.exception('Goodinfo browser fetch failed: %s', type(exc).__name__)
+        logger.exception('Goodinfo Crawl4AI fetch failed: %s', type(exc).__name__)
         fetch_goodinfo_data.last_status = {
             'state': 'failed', 'reason': 'browser_error',
             'error_type': type(exc).__name__,
             'elapsed': round(time.monotonic() - started_at, 2),
             'headed_mode': headed_mode,
-            'fetcher': 'scrapling' if use_cloudflare_solver else 'patchright',
+            'fetcher': 'crawl4ai-undetected',
         }
     finally:
         _GOODINFO_BROWSER_SEMAPHORE.release()
@@ -10764,16 +10734,9 @@ def render_stock_external_resources():
     """Render stock data-source links alongside upload/quick-search controls."""
     st.markdown("#### 外部資源")
 
-    def perform_goodinfo_fetch(use_cloudflare_solver=False):
-        spinner_text = (
-            "正在使用加強驗證載入排行，最多約 65 秒..."
-            if use_cloudflare_solver
-            else "正在建立瀏覽器工作階段並載入排行，最多約 15 秒..."
-        )
-        with st.spinner(spinner_text):
-            result = fetch_goodinfo_data(
-                use_cloudflare_solver=use_cloudflare_solver,
-            )
+    def perform_goodinfo_fetch():
+        with st.spinner("正在用 Crawl4AI 初始化工作階段並載入排行，約 15～30 秒..."):
+            result = fetch_goodinfo_data()
             status = dict(getattr(fetch_goodinfo_data, 'last_status', {}) or {})
             if result is not None and not result.empty:
                 st.session_state['goodinfo_df'] = result.astype(str)
@@ -10786,10 +10749,8 @@ def render_stock_external_resources():
                 st.session_state['goodinfo_fetch_failed'] = True
                 reason_text = {
                     'browser_busy': '另一個頁面正在抓取，請稍後再按一次。',
-                    'scrapling_dependency_missing': 'Streamlit 尚未安裝完整 Scrapling 瀏覽器套件。',
-                    'patchright_dependency_missing': 'Streamlit 尚未安裝完整瀏覽器套件。',
-                    'fast_ranking_timeout': '15 秒內未收到完整排行，可再快速重試或改用加強驗證。',
-                    'legacy_table_missing': 'Scrapling 已取得頁面，但沒有找到完整排行表格。',
+                    'crawl4ai_dependency_missing': 'Streamlit 尚未安裝完整 Crawl4AI 瀏覽器套件。',
+                    'crawl4ai_table_missing': 'Crawl4AI 已完成初始化，但沒有收到完整排行表格。',
                     'browser_error': '瀏覽器啟動、網站驗證或頁面解析失敗。',
                 }.get(status.get('reason'), '抓取失敗或查無資料。')
                 st.error(reason_text)
@@ -10800,19 +10761,13 @@ def render_stock_external_resources():
     with resource_col1:
         if st.button(
             "📥 抓取 Goodinfo 週轉率排行",
-            help="先建立 Goodinfo 瀏覽器工作階段，再接收頁面送出的原始排行 POST；最多約 15 秒。",
+            help="使用 Crawl4AI Undetected 瀏覽器；第一輪建立 Goodinfo 驗證狀態，第二輪載入完整排行。",
             width='stretch', key='fetch_goodinfo_in_stock_room'
         ):
             perform_goodinfo_fetch()
         if st.session_state.get('goodinfo_fetch_failed', False):
-            if st.button("🔄 快速重試", width='stretch', key='retry_goodinfo_btn'):
+            if st.button("🔄 重新抓取", width='stretch', key='retry_goodinfo_btn'):
                 perform_goodinfo_fetch()
-            if st.button(
-                "🛡️ 加強驗證重試",
-                help="只有快速模式仍被 Cloudflare 阻擋時使用；可能需要約 65 秒。",
-                width='stretch', key='retry_goodinfo_solver_btn',
-            ):
-                perform_goodinfo_fetch(use_cloudflare_solver=True)
         if 'goodinfo_df' in st.session_state:
             st.download_button(
                 "💾 下載 Report.csv",
