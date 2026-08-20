@@ -1,0 +1,5 @@
+[runner]
+# app.py is a large explicit Streamlit application and does not use bare
+# expression "magic". Disabling the AST rewrite removes several seconds from
+# every cold script compilation without changing any rendered element.
+magicEnabled = false

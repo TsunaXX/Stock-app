@@ -3157,6 +3157,79 @@ def fetch_company_event_sections(ticker_symbols):
     return results, errors, symbols
 
 
+def fetch_calendar_base_sources(year):
+    """Fetch the two independent TWSE calendar sources concurrently."""
+    jobs = {
+        'holidays': fetch_twse_holiday_events,
+        'temporary': fetch_twse_temporary_closure_events,
+    }
+    results = {'holidays': [], 'temporary': []}
+    errors = []
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        future_map = {
+            executor.submit(fetcher, year) if label == 'holidays'
+            else executor.submit(fetcher): label
+            for label, fetcher in jobs.items()
+        }
+        for future in as_completed(future_map):
+            label = future_map[future]
+            try:
+                results[label] = list(future.result() or [])
+            except Exception as exc:
+                errors.append(f'{label}: {type(exc).__name__}')
+    return results, errors
+
+
+def fetch_selected_calendar_sources(year, selected_event_types, taiwan_closed_dates):
+    """Fetch selected independent calendar feeds with a bounded worker pool."""
+    selected = set(selected_event_types or [])
+    closed_dates = set(taiwan_closed_dates or set())
+    jobs = []
+
+    def add(option, label, fetcher):
+        if option in selected:
+            jobs.append((label, fetcher))
+
+    add('FOMC 利率決議', 'FOMC', lambda: fetch_fomc_events(year))
+    add('美國 CPI', 'CPI', lambda: fetch_bls_cpi_events(year))
+    add('美國核心 PCE', '核心 PCE', lambda: fetch_bea_core_pce_events(year))
+    add('美國 GDP', 'GDP', lambda: fetch_bea_gdp_events(year))
+    add('美國 ISM 製造業指數', 'ISM 製造業', lambda: fetch_ism_manufacturing_events(year))
+    add('美國大非農', '大非農', lambda: fetch_bls_employment_events(year))
+    add('美國小非農 ADP', '小非農 ADP', lambda: fetch_adp_employment_events(year))
+    add('美國初領失業金', '初領失業金', lambda: build_us_initial_claims_events(year))
+    add('美股四巫日', '美股四巫日', lambda: build_us_quadruple_witching_events(year))
+    add(
+        '富台指期結算', '富台指期結算',
+        lambda: build_sgx_ftse_taiwan_settlement_events(year, closed_dates),
+    )
+    add(
+        'MSCI 季度調整', 'MSCI 季調',
+        lambda: build_msci_quarterly_rebalance_events(year, closed_dates),
+    )
+    if not jobs:
+        return {}, []
+    results = {}
+    errors_by_label = {}
+    with ThreadPoolExecutor(max_workers=min(6, len(jobs))) as executor:
+        future_map = {executor.submit(fetcher): label for label, fetcher in jobs}
+        for future in as_completed(future_map):
+            label = future_map[future]
+            try:
+                results[label] = list(future.result() or [])
+            except Exception as exc:
+                results[label] = []
+                errors_by_label[label] = f'{label}: {type(exc).__name__}'
+    ordered_results = {
+        label: results.get(label, []) for label, _fetcher in jobs
+    }
+    ordered_errors = [
+        errors_by_label[label] for label, _fetcher in jobs
+        if label in errors_by_label
+    ]
+    return ordered_results, ordered_errors
+
+
 def render_company_event_snapshot(snapshot):
     """在獨立分頁顯示財報與營收明細；此函式不執行任何網路查詢。"""
     earnings_result = snapshot.get("earnings", {})
@@ -15377,13 +15450,15 @@ with tab1:
         render_opening_direction_prompt()
     stock_strategy_tab, futures_strategy_tab, validation_strategy_tab = st.tabs([
         "📈 股票戰略室", "🧭 期貨戰略室", "📊 策略驗證"
-    ])
+    ], key="strategy_room_active_tab", on_change="rerun")
     with stock_strategy_tab:
         stock_strategy_container = st.container()
     with futures_strategy_tab:
-        render_futures_strategy_room()
+        if tab1.open and futures_strategy_tab.open:
+            render_futures_strategy_room()
     with validation_strategy_tab:
-        render_strategy_validation_room()
+        if tab1.open and validation_strategy_tab.open:
+            render_strategy_validation_room()
 
 with stock_strategy_container:
     if st.session_state.pop('_stock_cache_refresh_pending', False):
@@ -16848,7 +16923,10 @@ with stock_strategy_container:
                     )
 
 with tab2:
-    tab2_1, tab2_2, tab2_3 = st.tabs(["當沖損益室", "波段信用室", "期權交易室"])
+    tab2_1, tab2_2, tab2_3 = st.tabs(
+        ["當沖損益室", "波段信用室", "期權交易室"],
+        key="profit_room_active_tab", on_change="rerun",
+    )
     
     with tab2_1:
         c1, c2, c3, c4, c5 = st.columns(5)
@@ -17266,6 +17344,7 @@ with tab2:
                 )
 
     with tab2_3:
+        options_profit_active = bool(tab2.open and tab2_3.open)
         st.markdown("""
         <style>
         .opt-card {
@@ -17439,14 +17518,21 @@ with tab2:
 
         if 'taifex_margin_data' not in st.session_state:
             st.session_state.taifex_margin_data = {}
-            sync_taifex_margin()
+            if options_profit_active:
+                sync_taifex_margin()
         
         # 確保期貨清單有被載入 (穩定來源)
-        if 'futures_list' not in st.session_state or not st.session_state.futures_list:
+        if options_profit_active and (
+            'futures_list' not in st.session_state or not st.session_state.futures_list
+        ):
             st.session_state.futures_list = fetch_futures_list()
 
         # 取得 API 保證金與小型股期資料
-        ssf_margin_map, ssf_maint_map, ssf_group_level_map, has_small_set, ssf_sync_date = fetch_ssf_margin_info()
+        if options_profit_active:
+            ssf_margin_map, ssf_maint_map, ssf_group_level_map, has_small_set, ssf_sync_date = fetch_ssf_margin_info()
+        else:
+            ssf_margin_map, ssf_maint_map = {}, {}
+            ssf_group_level_map, has_small_set, ssf_sync_date = {}, set(), ''
 
         c_map_opt, _ = load_local_stock_names()
         sf_opts = []
@@ -19345,12 +19431,12 @@ with tab3:
     # 主分頁切換會觸發 rerun；只有行事曆實際開啟時才讀網路來源，
     # 避免股票／期貨按鈕每次 rerun 都連帶執行整套行事曆請求。
     calendar_network_active = bool(tab3.open)
-    twse_holiday_events = (
-        fetch_twse_holiday_events(sel_year) if calendar_network_active else []
+    calendar_base_sources, calendar_base_errors = (
+        fetch_calendar_base_sources(sel_year)
+        if calendar_network_active else ({}, [])
     )
-    twse_temporary_events = (
-        fetch_twse_temporary_closure_events() if calendar_network_active else []
-    )
+    twse_holiday_events = calendar_base_sources.get('holidays', [])
+    twse_temporary_events = calendar_base_sources.get('temporary', [])
     current_holidays = {
         (pd.Timestamp(event["date"]).month, pd.Timestamp(event["date"]).day): event["title"]
         for event in twse_holiday_events if event["closed"]
@@ -19378,33 +19464,17 @@ with tab3:
 
     if calendar_network_active and "台股開休市" in selected_event_types:
         add_network_source('台股開休市', twse_holiday_events)
-    if calendar_network_active and "FOMC 利率決議" in selected_event_types:
-        add_network_source('FOMC', fetch_fomc_events(sel_year))
-    if calendar_network_active and "美國 CPI" in selected_event_types:
-        add_network_source('CPI', fetch_bls_cpi_events(sel_year))
-    if calendar_network_active and "美國核心 PCE" in selected_event_types:
-        add_network_source('核心 PCE', fetch_bea_core_pce_events(sel_year))
-    if calendar_network_active and "美國 GDP" in selected_event_types:
-        add_network_source('GDP', fetch_bea_gdp_events(sel_year))
-    if calendar_network_active and "美國 ISM 製造業指數" in selected_event_types:
-        add_network_source('ISM 製造業', fetch_ism_manufacturing_events(sel_year))
-    if calendar_network_active and "美國大非農" in selected_event_types:
-        add_network_source('大非農', fetch_bls_employment_events(sel_year))
-    if calendar_network_active and "美國小非農 ADP" in selected_event_types:
-        add_network_source('小非農 ADP', fetch_adp_employment_events(sel_year))
-    if calendar_network_active and "美國初領失業金" in selected_event_types:
-        add_network_source('初領失業金', build_us_initial_claims_events(sel_year))
-    if calendar_network_active and "美股四巫日" in selected_event_types:
-        add_network_source('美股四巫日', build_us_quadruple_witching_events(sel_year))
-    if calendar_network_active and "富台指期結算" in selected_event_types:
-        add_network_source(
-            '富台指期結算',
-            build_sgx_ftse_taiwan_settlement_events(sel_year, taiwan_closed_dates),
-        )
-    if calendar_network_active and "MSCI 季度調整" in selected_event_types:
-        add_network_source(
-            'MSCI 季調',
-            build_msci_quarterly_rebalance_events(sel_year, taiwan_closed_dates),
+    selected_calendar_sources, selected_calendar_errors = (
+        fetch_selected_calendar_sources(
+            sel_year, selected_event_types, taiwan_closed_dates,
+        ) if calendar_network_active else ({}, [])
+    )
+    for source_label, source_events in selected_calendar_sources.items():
+        add_network_source(source_label, source_events)
+    if calendar_base_errors or selected_calendar_errors:
+        logger.warning(
+            'Calendar source refresh was partial: %s',
+            calendar_base_errors + selected_calendar_errors,
         )
 
     company_snapshot = normalize_company_event_snapshot(st.session_state.company_event_snapshot)

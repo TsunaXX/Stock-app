@@ -536,14 +536,48 @@ def test_company_sync_is_deduplicated_capped_and_section_bounded():
     assert all(call == used for call in calls)
 
 
+def test_calendar_sources_are_bounded_and_keep_partial_results():
+    symbols = load_app_symbols(
+        "fetch_calendar_base_sources", "fetch_selected_calendar_sources",
+    )
+    symbols["fetch_twse_holiday_events"] = lambda year: [{"date": f"{year}-01-01"}]
+    symbols["fetch_twse_temporary_closure_events"] = lambda: [{"date": "2026-08-21"}]
+    base, base_errors = symbols["fetch_calendar_base_sources"](2026)
+    assert base_errors == []
+    assert base["holidays"] == [{"date": "2026-01-01"}]
+    assert base["temporary"] == [{"date": "2026-08-21"}]
+
+    symbols["fetch_fomc_events"] = lambda year: [{"title": "FOMC", "year": year}]
+
+    def failed_cpi(_year):
+        raise TimeoutError("test")
+
+    symbols["fetch_bls_cpi_events"] = failed_cpi
+    selected, selected_errors = symbols["fetch_selected_calendar_sources"](
+        2026, {"FOMC 利率決議", "美國 CPI"}, set(),
+    )
+    assert selected["FOMC"] == [{"title": "FOMC", "year": 2026}]
+    assert selected["CPI"] == []
+    assert selected_errors == ["CPI: TimeoutError"]
+
+
 def test_heavy_hidden_sources_require_an_active_keyed_tab():
     source = APP_PATH.read_text(encoding="utf-8")
     assert 'key="main_workspace_active_tab", on_change="rerun"' in source
     assert 'key="strategy_database_active_tab", on_change="rerun"' in source
+    assert 'key="strategy_room_active_tab", on_change="rerun"' in source
+    assert 'if tab1.open and futures_strategy_tab.open' in source
+    assert 'key="profit_room_active_tab", on_change="rerun"' in source
+    assert 'options_profit_active = bool(tab2.open and tab2_3.open)' in source
     assert 'if tab_fibo.open and (' in source
     assert 'database_institutional_active = bool(tab_db.open and sub_tab1.open)' in source
     assert 'reports_active = bool(tab_db.open and sub_tab2.open)' in source
     assert 'calendar_network_active = bool(tab3.open)' in source
+
+
+def test_streamlit_magic_ast_rewrite_is_disabled_for_large_app():
+    config = (APP_PATH.parent / ".streamlit" / "config.toml").read_text(encoding="utf-8")
+    assert "magicEnabled = false" in config
 
 
 def test_daily_risk_refresh_skips_redundant_live_quote_fetches():
