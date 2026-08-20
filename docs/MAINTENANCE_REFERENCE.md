@@ -3,7 +3,7 @@
 ## 資料來源與口徑
 
 - Goodinfo 週轉率排行必須維持「上市＋上櫃、依當日累積成交量週轉率排序」的口徑，不能用證交所或櫃買中心的單一市場排行取代。
-- Goodinfo 只使用附件中可用的舊版路徑：實際 Chrome UA、`--lang=zh-TW`、`navigator.languages`、`page_load_strategy=eager`、隱藏 webdriver，並讓 `CLIENT_KEY`／`REINIT` 導向完整進行。整次 DOM 與整頁 schema 驗證共用 15 秒期限，中途不得 refresh；不得加入 Big5／代號密度推斷、其他解析器或其他資料來源。
+- Goodinfo 維持原始上市＋上櫃排行 DOM，不改用不同口徑資料。Streamlit 的 Chrome 必須動態把相同版本 UA 中的 `HeadlessChrome` 改為 `Chrome`，並使用 `--lang=zh-TW`、台北時區、`navigator.languages`、`page_load_strategy=eager`、隱藏 webdriver 與程序內持續 profile，讓 `cf_clearance`、`CLIENT_KEY`／`REINIT` 導向完整進行。整次驗證共用 15 秒期限，中途不得 refresh。先驗證原始中文 schema；若 Goodinfo 把 Big5 動態表格誤解為 UTF-8，只能對同一 DOM 以 4～6 碼股票代號密度辨認排行欄，不得換資料來源。DOM 列數改變時才解析，至少 100 筆才提前完成，避免固定空等或誤收形成中的表格。失敗時只顯示 Cookie 名稱是否存在、列數與分類，不得洩露 Cookie 值或 Selenium stack；若 Cloudflare 未核准 Streamlit Cloud 機房 IP，改由使用者一般瀏覽器下載 Report.csv 後上傳，不以不同官方排行冒充 Goodinfo。
 - 股票名稱與代號優先讀取 `stock_names.csv`；快速標籤統一保存為 `名稱(代號)`。
 - 期貨成交量、結算行情與保證金以期交所 OpenAPI 為主。官方來源暫時失敗時顯示最後一次成功資料與日期，不得把未知保證金顯示為 0。
 - 台股月營收數值以 MOPS 為主；公告日期優先採 FinMind 或可驗證的公司／公開報導來源，並保留人工校正。
