@@ -470,15 +470,16 @@ def test_goodinfo_fetch_keeps_legacy_cookie_and_antiblock_flow():
         if isinstance(node.func, ast.Attribute) and node.func.attr == "Chrome"
     ]
     assert len(chrome_constructions) == 1
-    assert 'page_load_strategy = "none"' in function_source
-    assert '--disable-extensions' in function_source
-    assert 'profile.managed_default_content_settings.images' in function_source
+    assert "page_load_strategy = 'eager'" in function_source
+    assert '--lang=zh-TW' in function_source
+    assert '--disable-software-rasterizer' in function_source
     assert 'AutomationControlled' in function_source
-    assert 'RETRY_TS' in function_source
+    assert "['zh-TW', 'zh', 'en-US', 'en']" in function_source
+    assert 'user-agent=' not in function_source
     assert 'time.monotonic' in function_source
-    assert 'find_elements' in called_attributes
+    assert 'refresh' in called_attributes
+    assert 'accept' in called_attributes
     assert '_parse_goodinfo_turnover_table' in function_source
-    assert "refresh" not in called_attributes
 
 
 def test_shioaji_futures_resolver_uses_v17_lazy_root_api():

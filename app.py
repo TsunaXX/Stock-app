@@ -6656,12 +6656,6 @@ _GOODINFO_URL = (
     "&INDUSTRY_CAT=%E7%B4%AF%E8%A8%88%E6%88%90%E4%BA%A4%E9%87%8F%E9%80%B1%E8%BD%89%E7%8E%87%28%E7%95%B6%E6%97%A5%29"
     "%40%40%E7%B4%AF%E8%A8%88%E6%88%90%E4%BA%A4%E9%87%8F%E9%80%B1%E8%BD%89%E7%8E%87%40%40%E7%95%B6%E6%97%A5"
 )
-_GOODINFO_FALLBACK_USER_AGENT = (
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"
-)
-
-
 def _goodinfo_normalize_text(value):
     """Normalize Goodinfo's nbsp/newline-heavy labels before schema checks."""
     return re.sub(r"\s+", "", str(value or "").replace("\xa0", "")).strip()
@@ -7028,120 +7022,97 @@ def _parse_goodinfo_turnover_table(page_html):
     return target_df.dropna(how='all').reset_index(drop=True)
 
 
-def fetch_goodinfo_data(max_attempts=2, total_wait_seconds=22):
-    """沿用舊版防堵流程，以同一瀏覽器保留 Cookie 並等待完整排行。"""
+def fetch_goodinfo_data():
+    """使用已驗證的舊版防堵流程，並保留同一瀏覽器 Cookie 重試。"""
     chrome_options = Options()
-    chrome_options.page_load_strategy = "none"
     chrome_options.add_argument("--headless=new")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--disable-gpu")
     chrome_options.add_argument("--window-size=1920x1080")
-    chrome_options.add_argument("--disable-extensions")
-    chrome_options.add_experimental_option(
-        "prefs", {"profile.managed_default_content_settings.images": 2}
-    )
+    chrome_options.add_argument("--disable-software-rasterizer")
+    chrome_options.add_argument("--lang=zh-TW")
     chrome_options.add_argument("--disable-blink-features=AutomationControlled")
     chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
     chrome_options.add_experimental_option('useAutomationExtension', False)
-    chrome_options.add_argument(
-        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
-    )
-    chrome_options.set_capability('unhandledPromptBehavior', 'dismiss')
+    # 已驗證的舊版使用實際瀏覽器 UA，不固定成舊 Chrome 版本。
+    chrome_options.page_load_strategy = 'eager'
     if os.path.exists('/usr/bin/chromium'):
         chrome_options.binary_location = '/usr/bin/chromium'
+
+    acquired = _GOODINFO_BROWSER_SEMAPHORE.acquire(timeout=15)
+    if not acquired:
+        logger.warning('Goodinfo browser is busy; skipped duplicate launch')
+        return None
     driver = None
-    last_error = None
     try:
-        with _GOODINFO_BROWSER_SEMAPHORE:
-            service = (
-                Service('/usr/bin/chromedriver')
-                if os.path.exists('/usr/bin/chromedriver')
-                else Service()
-            )
-            driver = webdriver.Chrome(service=service, options=chrome_options)
-            driver.set_page_load_timeout(12)
-            driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
-                'source': """
-                    Object.defineProperty(navigator, 'webdriver', {
-                        get: () => undefined
-                    })
-                """
-            })
+        service = (
+            Service('/usr/bin/chromedriver')
+            if os.path.exists('/usr/bin/chromedriver')
+            else Service()
+        )
+        driver = webdriver.Chrome(service=service, options=chrome_options)
+        driver.set_page_load_timeout(7)
+        driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
+            'source': """
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                Object.defineProperty(navigator, 'languages', {
+                    get: () => ['zh-TW', 'zh', 'en-US', 'en']
+                });
+            """
+        })
 
-            attempt_count = max(1, int(max_attempts))
-            overall_deadline = time.monotonic() + max(3, float(total_wait_seconds))
-            best_result = None
-            for attempt in range(attempt_count):
+        for attempt in range(2):
+            try:
+                if attempt == 0:
+                    driver.get(_GOODINFO_URL)
+                else:
+                    # 沿用同一瀏覽器與 CLIENT_KEY Cookie，不能另開新 Chrome。
+                    driver.refresh()
+            except (TimeoutException, UnexpectedAlertPresentException):
+                pass
+
+            # CLIENT_KEY 初始化後會以 REINIT 重新導向；舊版實測約 12 秒
+            # 才出現排行，因此每輪完整等待 16 秒，中途不強制重載。
+            attempt_deadline = time.monotonic() + 16
+            full_page_checked = False
+            while time.monotonic() < attempt_deadline:
                 try:
-                    remaining = overall_deadline - time.monotonic()
-                    if remaining <= 0.5:
-                        break
-                    attempts_left = attempt_count - attempt
-                    attempt_budget = (
-                        remaining if attempts_left == 1
-                        else max(8, remaining * 0.75)
+                    alert = driver.switch_to.alert
+                    alert_text = alert.text
+                    alert.accept()
+                    logger.warning(
+                        'Goodinfo alert on attempt %s: %s',
+                        attempt + 1,
+                        alert_text,
                     )
-                    driver.set_page_load_timeout(max(3, min(12, attempt_budget)))
-                    request_url = (
-                        _GOODINFO_URL if attempt == 0
-                        else f'{_GOODINFO_URL}&RETRY_TS={int(time.time() * 1000)}'
-                    )
-                    try:
-                        driver.get(request_url)
-                    except (TimeoutException, WebDriverException) as navigation_error:
-                        last_error = navigation_error
+                    break
+                except NoAlertPresentException:
+                    pass
 
-                    attempt_deadline = min(
-                        overall_deadline,
-                        time.monotonic() + attempt_budget,
-                    )
-                    last_parsed_row_count = -1
-                    while time.monotonic() < attempt_deadline:
-                        try:
-                            page_html = driver.page_source
-                            row_count = len(driver.find_elements(By.TAG_NAME, 'tr'))
-                        except UnexpectedAlertPresentException as alert_error:
-                            last_error = alert_error
-                            try:
-                                driver.switch_to.alert.dismiss()
-                            except (NoAlertPresentException, WebDriverException):
-                                pass
-                            break
+                ranking = _parse_goodinfo_table_html(
+                    _goodinfo_rank_table_html(driver)
+                )
+                if ranking is not None:
+                    return ranking
 
-                        if row_count >= 20 and row_count != last_parsed_row_count:
-                            last_parsed_row_count = row_count
-                            result = _parse_goodinfo_turnover_table(page_html)
-                            if result is not None and not result.empty:
-                                if best_result is None or len(result) > len(best_result):
-                                    best_result = result
-                                if len(result) >= 100:
-                                    return result
-                        time.sleep(min(
-                            0.4,
-                            max(0.05, attempt_deadline - time.monotonic()),
-                        ))
-                except (TimeoutException, WebDriverException, ValueError) as exc:
-                    last_error = exc
-                if attempt + 1 < attempt_count and time.monotonic() < overall_deadline:
-                    time.sleep(0.25)
-
-            if best_result is not None and not best_result.empty:
-                return best_result
-    except Exception as exc:
-        last_error = exc
+                # 保留附件的整頁後備解析時機；另使用已驗證的代號密度辨識，
+                # 處理 Goodinfo 將 Big5 表格誤標 UTF-8 所造成的中文亂碼。
+                if not full_page_checked and time.monotonic() + 4 >= attempt_deadline:
+                    full_page_checked = True
+                    ranking = _parse_goodinfo_turnover_table(driver.page_source)
+                    if ranking is not None:
+                        return ranking
+                time.sleep(min(0.5, max(0, attempt_deadline - time.monotonic())))
+    except (WebDriverException, OSError, ValueError) as exc:
+        logger.exception('Goodinfo legacy fetch failed: %s', type(exc).__name__)
     finally:
         if driver is not None:
             try:
                 driver.quit()
             except WebDriverException:
                 pass
-    if last_error is not None:
-        logger.warning(
-            'Goodinfo legacy anti-block flow failed: %s',
-            type(last_error).__name__,
-        )
+        _GOODINFO_BROWSER_SEMAPHORE.release()
     return None
 
 # ==========================================
@@ -10763,7 +10734,7 @@ def render_stock_external_resources():
     st.markdown("#### 外部資源")
 
     def perform_goodinfo_fetch():
-        with st.spinner("正在沿用舊版防堵流程載入排行，最多約 22 秒..."):
+        with st.spinner("正在沿用舊版防堵流程載入排行，最多約 32 秒..."):
             result = fetch_goodinfo_data()
             if result is not None and not result.empty:
                 st.session_state['goodinfo_df'] = result.astype(str)
@@ -10777,7 +10748,7 @@ def render_stock_external_resources():
     with resource_col1:
         if st.button(
             "📥 抓取 Goodinfo 週轉率排行",
-            help="沿用曾成功的舊版流程：保留同一瀏覽器 Cookie，等待 Goodinfo 完成導向並自動重試一次。",
+            help="沿用已驗證的舊版流程：使用實際瀏覽器識別、繁中語系，保留同一瀏覽器 Cookie 並自動重試一次。",
             width='stretch', key='fetch_goodinfo_in_stock_room'
         ):
             perform_goodinfo_fetch()
