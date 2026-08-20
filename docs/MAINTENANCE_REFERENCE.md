@@ -3,7 +3,7 @@
 ## 資料來源與口徑
 
 - Goodinfo 週轉率排行必須維持「上市＋上櫃、依當日累積成交量週轉率排序」的口徑，不能用證交所或櫃買中心的單一市場排行取代。
-- Goodinfo 只使用已驗證可用的舊版防堵路徑：實際 Chrome UA、`--lang=zh-TW`、`navigator.languages`、`page_load_strategy=eager`、隱藏 webdriver，並在同一個瀏覽器保留 `CLIENT_KEY`／`REINIT` Cookie。每輪連續等待 16 秒，中途不可重載；第二輪才以同一瀏覽器 `refresh()`，最多約 32 秒。Goodinfo 若把 Big5 動態表格誤標成 UTF-8，欄名會變成亂碼，必須改以 4～6 碼股票代號密度辨認代號欄，名稱則交由本地名稱表補回。不得在重試間建立新瀏覽器，也不得改用官方單一市場排行或其他來源備援。
+- Goodinfo 只使用附件中可用的舊版路徑：實際 Chrome UA、`--lang=zh-TW`、`navigator.languages`、`page_load_strategy=eager`、隱藏 webdriver，並讓 `CLIENT_KEY`／`REINIT` 導向完整進行。整次 DOM 與整頁 schema 驗證共用 15 秒期限，中途不得 refresh；不得加入 Big5／代號密度推斷、其他解析器或其他資料來源。
 - 股票名稱與代號優先讀取 `stock_names.csv`；快速標籤統一保存為 `名稱(代號)`。
 - 期貨成交量、結算行情與保證金以期交所 OpenAPI 為主。官方來源暫時失敗時顯示最後一次成功資料與日期，不得把未知保證金顯示為 0。
 - 台股月營收數值以 MOPS 為主；公告日期優先採 FinMind 或可驗證的公司／公開報導來源，並保留人工校正。

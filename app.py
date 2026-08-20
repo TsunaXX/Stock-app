@@ -6668,63 +6668,24 @@ def _clean_goodinfo_table(dataframe):
         for column in cleaned.columns:
             parts = []
             for item in column:
-                text = _goodinfo_normalize_text(item)
+                text = str(item).replace(' ', '').strip()
                 if text and not text.startswith('Unnamed') and text not in parts:
                     parts.append(text)
             new_columns.append('_'.join(parts))
         cleaned.columns = new_columns
     else:
-        cleaned.columns = [_goodinfo_normalize_text(column) for column in cleaned.columns]
-
-    # Some Goodinfo responses use td cells for the header (instead of th), or
-    # prepend a two-row title before the actual header.  pandas then treats the
-    # first row as data and the schema is invisible in ``columns``.  Promote the
-    # first matching row so we can still validate the real ranking table.
+        cleaned.columns = [str(column).replace(' ', '').strip() for column in cleaned.columns]
     header_text = '|'.join(map(str, cleaned.columns))
-    if not all(keyword in header_text for keyword in ('代號', '名稱', '週轉率')):
-        header_row_index = None
-        scan_limit = min(len(cleaned), 8)
-        for row_index in range(scan_limit):
-            row_text = '|'.join(
-                _goodinfo_normalize_text(value)
-                for value in cleaned.iloc[row_index].tolist()
-            )
-            if (
-                ('代號' in row_text or '股票代號' in row_text or '證券代號' in row_text)
-                and '名稱' in row_text and '週轉率' in row_text
-            ):
-                header_row_index = row_index
-                break
-        if header_row_index is not None:
-            promoted = cleaned.iloc[header_row_index + 1:].copy()
-            promoted.columns = [
-                _goodinfo_normalize_text(value)
-                for value in cleaned.iloc[header_row_index].tolist()
-            ]
-            cleaned = promoted.reset_index(drop=True)
-
-    header_text = '|'.join(map(str, cleaned.columns))
-    has_code = any(keyword in header_text for keyword in ('代號', '股票代號', '證券代號', '代碼'))
+    has_code = any(keyword in header_text for keyword in ('代號', '股票代號'))
     has_name = '名稱' in header_text
     has_turnover = '週轉率' in header_text
     if len(cleaned) < 10 or not (has_code and has_name and has_turnover):
         return None
-    code_column = next(
-        (column for column in cleaned.columns if any(
-            keyword in str(column) for keyword in ('代號', '股票代號', '證券代號', '代碼')
-        )),
-        None,
-    )
+    code_column = next((column for column in cleaned.columns if '代號' in str(column)), None)
     turnover_column = next((column for column in cleaned.columns if '週轉率' in str(column)), None)
-    if code_column is None or turnover_column is None:
-        return None
     valid_codes = cleaned[code_column].astype(str).str.extract(r'(\d{4,6})', expand=False).notna()
     turnover_values = pd.to_numeric(
-        cleaned[turnover_column].astype(str)
-        .str.replace('%', '', regex=False)
-        .str.replace(',', '', regex=False)
-        .str.replace('％', '', regex=False)
-        .str.replace('—', '', regex=False),
+        cleaned[turnover_column].astype(str).str.replace('%', '', regex=False).str.replace(',', '', regex=False),
         errors='coerce',
     )
     if int((valid_codes & turnover_values.notna()).sum()) < 10:
@@ -6733,48 +6694,13 @@ def _clean_goodinfo_table(dataframe):
 
 
 def _parse_goodinfo_table_html(table_html_list):
-    """Parse only DOM tables that match Goodinfo's combined ranking schema."""
+    """Parse only DOM tables that already match Goodinfo's ranking schema."""
     candidates = []
     for table_html in table_html_list or []:
-        markup = str(table_html or '')
-        if not markup.strip():
-            continue
         try:
-            tables = pd.read_html(io.StringIO(markup), flavor="lxml")
+            tables = pd.read_html(io.StringIO(str(table_html)), flavor="lxml")
         except (ValueError, TypeError, ImportError):
-            # Keep the parser working on Streamlit images where lxml is not
-            # installed (html5lib is not a safe fallback because it may also be
-            # absent).  This small HTML parser only handles table rows, which is
-            # exactly what the browser DOM fallback supplies.
-            tables = []
-            try:
-                soup = BeautifulSoup(markup, 'html.parser')
-                for table in soup.find_all('table'):
-                    parsed_rows = []
-                    for row in table.find_all('tr'):
-                        cells = row.find_all(['th', 'td'])
-                        if cells:
-                            parsed_rows.append([
-                                _goodinfo_normalize_text(cell.get_text(' ', strip=True))
-                                for cell in cells
-                            ])
-                    if len(parsed_rows) >= 2:
-                        header_idx = next(
-                            (
-                                idx for idx, row in enumerate(parsed_rows[:8])
-                                if ('代號' in '|'.join(row) or '股票代號' in '|'.join(row))
-                                and '名稱' in '|'.join(row)
-                                and '週轉率' in '|'.join(row)
-                            ),
-                            0,
-                        )
-                        if header_idx < len(parsed_rows) - 1:
-                            tables.append(pd.DataFrame(
-                                parsed_rows[header_idx + 1:],
-                                columns=parsed_rows[header_idx],
-                            ))
-            except (AttributeError, TypeError, ValueError):
-                tables = []
+            continue
         candidates.extend(
             cleaned for cleaned in (_clean_goodinfo_table(table) for table in tables)
             if cleaned is not None
@@ -6890,37 +6816,15 @@ def _goodinfo_rank_table_html(driver):
     """Return completed Goodinfo ranking-table markup, excluding menus and challenge pages."""
     try:
         return driver.execute_script("""
-            const roots = [document];
-            // Goodinfo has used both a direct #tblStockList table and an
-            // iframe-backed #divStockList over time.  Same-origin frame access
-            // is safe here; cross-origin frames are simply skipped.
-            for (const frame of document.querySelectorAll('iframe')) {
-                try { if (frame.contentDocument) roots.push(frame.contentDocument); } catch (_) {}
-            }
-            const seen = new Set();
-            const result = [];
-            const add = (table, force) => {
-                if (!table || seen.has(table)) return;
+            return Array.from(document.querySelectorAll('table')).filter((table) => {
                 const text = (table.innerText || '').replace(/\\s/g, '');
-                const looksLikeRankTable =
-                    /(股票|證券)?代號/.test(text)
+                return table.rows.length >= 11
+                    && /(股票)?代號/.test(text)
                     && text.includes('名稱')
                     && text.includes('週轉率');
-                if ((force || looksLikeRankTable) && table.rows.length >= 2) {
-                    seen.add(table);
-                    result.push(table.outerHTML);
-                }
-            };
-            for (const root of roots) {
-                for (const table of root.querySelectorAll('#tblStockList, #divStockList table, table')) {
-                    const force = table.id === 'tblStockList'
-                        || table.closest('#divStockList') !== null;
-                    add(table, force);
-                }
-            }
-            return result;
+            }).map((table) => table.outerHTML);
         """) or []
-    except (WebDriverException, TypeError, UnexpectedAlertPresentException):
+    except (WebDriverException, TypeError):
         return []
 
 
@@ -7023,7 +6927,7 @@ def _parse_goodinfo_turnover_table(page_html):
 
 
 def fetch_goodinfo_data():
-    """使用已驗證的舊版防堵流程，並保留同一瀏覽器 Cookie 重試。"""
+    """完整沿用附件中的 Goodinfo DOM 驗證流程，總等待不超過 15 秒。"""
     chrome_options = Options()
     chrome_options.add_argument("--headless=new")
     chrome_options.add_argument("--no-sandbox")
@@ -7062,48 +6966,39 @@ def fetch_goodinfo_data():
             """
         })
 
-        for attempt in range(2):
+        try:
+            driver.get(_GOODINFO_URL)
+        except (TimeoutException, UnexpectedAlertPresentException):
+            pass
+
+        # 舊版會讓 CLIENT_KEY／REINIT 導向完整跑完；總等待限制為 15 秒，
+        # 中途不 refresh、不切換解析器，也不加入後續的欄位推斷。
+        attempt_deadline = time.monotonic() + 15
+        full_page_checked = False
+        while time.monotonic() < attempt_deadline:
             try:
-                if attempt == 0:
-                    driver.get(_GOODINFO_URL)
-                else:
-                    # 沿用同一瀏覽器與 CLIENT_KEY Cookie，不能另開新 Chrome。
-                    driver.refresh()
-            except (TimeoutException, UnexpectedAlertPresentException):
+                alert = driver.switch_to.alert
+                alert_text = alert.text
+                alert.accept()
+                logger.warning('Goodinfo alert: %s', alert_text)
+                break
+            except NoAlertPresentException:
                 pass
 
-            # CLIENT_KEY 初始化後會以 REINIT 重新導向；舊版實測約 12 秒
-            # 才出現排行，因此每輪完整等待 16 秒，中途不強制重載。
-            attempt_deadline = time.monotonic() + 16
-            full_page_checked = False
-            while time.monotonic() < attempt_deadline:
-                try:
-                    alert = driver.switch_to.alert
-                    alert_text = alert.text
-                    alert.accept()
-                    logger.warning(
-                        'Goodinfo alert on attempt %s: %s',
-                        attempt + 1,
-                        alert_text,
-                    )
-                    break
-                except NoAlertPresentException:
-                    pass
+            ranking = _parse_goodinfo_table_html(
+                _goodinfo_rank_table_html(driver)
+            )
+            if ranking is not None:
+                return ranking
 
-                ranking = _parse_goodinfo_table_html(
-                    _goodinfo_rank_table_html(driver)
-                )
+            # 完整使用附件原本的整頁 schema 解析，不呼叫後續新增的
+            # Big5／代號密度推斷或其他來源。
+            if not full_page_checked and time.monotonic() + 4 >= attempt_deadline:
+                full_page_checked = True
+                ranking = _parse_goodinfo_table_html([driver.page_source])
                 if ranking is not None:
                     return ranking
-
-                # 保留附件的整頁後備解析時機；另使用已驗證的代號密度辨識，
-                # 處理 Goodinfo 將 Big5 表格誤標 UTF-8 所造成的中文亂碼。
-                if not full_page_checked and time.monotonic() + 4 >= attempt_deadline:
-                    full_page_checked = True
-                    ranking = _parse_goodinfo_turnover_table(driver.page_source)
-                    if ranking is not None:
-                        return ranking
-                time.sleep(min(0.5, max(0, attempt_deadline - time.monotonic())))
+            time.sleep(min(0.5, max(0, attempt_deadline - time.monotonic())))
     except (WebDriverException, OSError, ValueError) as exc:
         logger.exception('Goodinfo legacy fetch failed: %s', type(exc).__name__)
     finally:
@@ -10734,7 +10629,7 @@ def render_stock_external_resources():
     st.markdown("#### 外部資源")
 
     def perform_goodinfo_fetch():
-        with st.spinner("正在沿用舊版防堵流程載入排行，最多約 32 秒..."):
+        with st.spinner("正在沿用舊版防堵流程載入排行，最多約 15 秒..."):
             result = fetch_goodinfo_data()
             if result is not None and not result.empty:
                 st.session_state['goodinfo_df'] = result.astype(str)
@@ -10748,7 +10643,7 @@ def render_stock_external_resources():
     with resource_col1:
         if st.button(
             "📥 抓取 Goodinfo 週轉率排行",
-            help="沿用已驗證的舊版流程：使用實際瀏覽器識別、繁中語系，保留同一瀏覽器 Cookie 並自動重試一次。",
+            help="完整使用附件中的舊版流程：實際瀏覽器識別、繁中語系與原始 DOM 表格驗證；最多等待 15 秒。",
             width='stretch', key='fetch_goodinfo_in_stock_room'
         ):
             perform_goodinfo_fetch()

@@ -322,25 +322,6 @@ def test_goodinfo_parser_uses_only_verified_ranking_table_html():
     assert len(parsed) == 12
 
 
-def test_goodinfo_parser_promotes_td_header_after_title_row():
-    symbols = load_app_symbols(
-        "_goodinfo_normalize_text", "_clean_goodinfo_table", "_parse_goodinfo_table_html"
-    )
-    rows = ''.join(
-        f"<tr><td>{2400 + index}</td><td>股票{index}</td><td>{index + 2}.5%</td></tr>"
-        for index in range(12)
-    )
-    markup = (
-        "<table><tr><td colspan='3'>累計成交量週轉率（當日）</td></tr>"
-        "<tr><td>股票代號</td><td>名稱</td><td>週轉率(%)</td></tr>"
-        f"{rows}</table>"
-    )
-    parsed = symbols["_parse_goodinfo_table_html"]([markup])
-    assert parsed is not None
-    assert len(parsed) == 12
-    assert "週轉率(%)" in parsed.columns
-
-
 def test_goodinfo_legacy_parser_restores_original_large_table_flow():
     symbols = load_app_symbols(
         "_goodinfo_normalize_text", "_parse_goodinfo_legacy_page",
@@ -477,9 +458,11 @@ def test_goodinfo_fetch_keeps_legacy_cookie_and_antiblock_flow():
     assert "['zh-TW', 'zh', 'en-US', 'en']" in function_source
     assert 'user-agent=' not in function_source
     assert 'time.monotonic' in function_source
-    assert 'refresh' in called_attributes
+    assert '+ 15' in function_source
+    assert 'refresh' not in called_attributes
     assert 'accept' in called_attributes
-    assert '_parse_goodinfo_turnover_table' in function_source
+    assert '_parse_goodinfo_table_html' in function_source
+    assert '_parse_goodinfo_turnover_table' not in function_source
 
 
 def test_shioaji_futures_resolver_uses_v17_lazy_root_api():
