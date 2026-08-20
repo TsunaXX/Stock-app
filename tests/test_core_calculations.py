@@ -362,6 +362,27 @@ def test_goodinfo_legacy_parser_restores_original_large_table_flow():
     assert "股票代號" in parsed.columns
 
 
+def test_goodinfo_legacy_parser_prefers_completed_rank_table_over_menu_table():
+    symbols = load_app_symbols(
+        "_goodinfo_normalize_text", "_parse_goodinfo_legacy_page",
+    )
+    rows = ''.join(
+        f"<tr><td>{index + 1}</td><td>{3000 + index}</td><td>標的{index}</td>"
+        f"<td>{index + 2}.4%</td><td>{1000 + index}</td><td>上市</td></tr>"
+        for index in range(12)
+    )
+    markup = (
+        "<html><body><table><tr><td>選單</td><td>累計成交量週轉率</td></tr></table>"
+        "<table><tr><th>排名</th><th>股票代號</th><th>名稱</th><th>週轉率</th>"
+        "<th>成交張數</th><th>市場</th></tr>"
+        f"{rows}</table></body></html>"
+    )
+    parsed = symbols["_parse_goodinfo_legacy_page"](markup)
+    assert parsed is not None
+    assert len(parsed) == 12
+    assert parsed.iloc[0]["股票代號"] == 3000
+
+
 def test_shioaji_futures_resolver_uses_v17_lazy_root_api():
     symbols = load_app_symbols(
         "SHIOAJI_FUTURES_ROOT_ALIASES", "FUTURES_MONTH_CODE",
@@ -399,6 +420,95 @@ def test_shioaji_futures_resolver_uses_v17_lazy_root_api():
     assert symbols["expected_shioaji_futures_code"]("CDF", "202609") == "CDFI6"
 
 
+def test_futures_settlement_cutover_uses_taipei_1330_and_official_date_first():
+    symbols = load_app_symbols(
+        "get_holidays", "is_market_closed_func", "adjust_to_next_market_day",
+        "futures_expiry_date", "FUTURES_STANDARD_SETTLEMENT_TYPES",
+        "FUTURES_STANDARD_SETTLEMENT_ROOTS", "FUTURES_SETTLEMENT_CUTOFF",
+        "_normalize_futures_taipei_datetime", "is_futures_contract_settled",
+    )
+    is_settled = symbols["is_futures_contract_settled"]
+    tz_tw = pytz.timezone("Asia/Taipei")
+    before = tz_tw.localize(datetime(2026, 8, 19, 13, 29))
+    after = tz_tw.localize(datetime(2026, 8, 19, 13, 30))
+    assert not is_settled("CDF", "202608", "股票", now_dt=before)
+    assert is_settled("CDF", "202608", "股票", now_dt=after)
+    assert not is_settled("CDF", "202609", "股票", now_dt=after)
+
+    # 非第三週三商品不套錯誤的月契約估算；若官方提供最後交易日，則優先採用。
+    assert not is_settled("ABC", "202608", "商品", now_dt=after)
+    assert is_settled(
+        "ABC", "202608", "商品", actual_last_trading="2026/08/19",
+        now_dt=after,
+    )
+    # 官方只給日期或 midnight 時，結算切點仍是 13:30，不可在午夜提前刪除。
+    assert not is_settled(
+        "ABC", "202608", "商品", actual_last_trading="2026-08-19",
+        now_dt=tz_tw.localize(datetime(2026, 8, 19, 13, 29)),
+    )
+    assert is_settled(
+        "ABC", "202608", "商品", actual_last_trading="2026-08-19 00:00:00",
+        now_dt=after,
+    )
+    assert is_settled(
+        "ABC", "202608", "商品", actual_last_trading="115/08/19",
+        now_dt=after,
+    )
+
+
+def test_filter_active_futures_rows_restarts_near_month_after_settlement():
+    symbols = load_app_symbols(
+        "get_holidays", "is_market_closed_func", "adjust_to_next_market_day",
+        "futures_expiry_date", "FUTURES_STANDARD_SETTLEMENT_TYPES",
+        "FUTURES_STANDARD_SETTLEMENT_ROOTS", "FUTURES_SETTLEMENT_CUTOFF",
+        "_normalize_futures_taipei_datetime", "is_futures_contract_settled",
+        "filter_active_futures_rows",
+    )
+    rows = pd.DataFrame([
+        {"契約鍵": "CDF:202608", "期貨代碼": "CDF", "契約月份": "202608", "商品類型": "股票"},
+        {"契約鍵": "CDF:202609", "期貨代碼": "CDF", "契約月份": "202609", "商品類型": "股票"},
+        {"契約鍵": "TX:202608", "期貨代碼": "TX", "契約月份": "202608", "商品類型": "指數", "指數期貨": True},
+        {"契約鍵": "TX:202609", "期貨代碼": "TX", "契約月份": "202609", "商品類型": "指數", "指數期貨": True},
+    ])
+    tz_tw = pytz.timezone("Asia/Taipei")
+    active, removed = symbols["filter_active_futures_rows"](
+        rows, tz_tw.localize(datetime(2026, 8, 19, 13, 30)),
+    )
+    assert set(removed) == {"CDF:202608", "TX:202608"}
+    assert set(active["契約鍵"]) == {"CDF:202609", "TX:202609"}
+    assert set(active["月份順位"]) == {0}
+    assert not active["次月期貨"].any()
+
+
+def test_prune_futures_settlement_state_removes_old_rank_and_live_keys():
+    symbols = load_app_symbols(
+        "get_holidays", "is_market_closed_func", "adjust_to_next_market_day",
+        "futures_expiry_date", "FUTURES_STANDARD_SETTLEMENT_TYPES",
+        "FUTURES_STANDARD_SETTLEMENT_ROOTS", "FUTURES_SETTLEMENT_CUTOFF",
+        "_normalize_futures_taipei_datetime", "is_futures_contract_settled",
+        "filter_active_futures_rows", "prune_futures_settlement_state",
+    )
+    state = {
+        "universe": [
+            {"契約鍵": "CDF:202608", "期貨代碼": "CDF", "契約月份": "202608", "商品類型": "股票"},
+            {"契約鍵": "CDF:202609", "期貨代碼": "CDF", "契約月份": "202609", "商品類型": "股票"},
+        ],
+        "rank_cache": {"CDF:202608": {"當日成交口數": 99}, "CDF:202609": {"當日成交口數": 10}},
+        "live_cache": {"CDF:202608": {"收盤價": 99}, "CDF:202609": {"收盤價": 10}},
+        "manual": ["CDF:202608", "CDF:202609"],
+        "ignored": ["CDF:202608"],
+    }
+    tz_tw = pytz.timezone("Asia/Taipei")
+    pruned, removed = symbols["prune_futures_settlement_state"](
+        state, tz_tw.localize(datetime(2026, 8, 19, 13, 30)),
+    )
+    assert removed == ["CDF:202608"]
+    assert "CDF:202608" not in pruned["rank_cache"]
+    assert "CDF:202608" not in pruned["live_cache"]
+    assert pruned["manual"] == ["CDF:202609"]
+    assert pruned["ignored"] == []
+
+
 def test_only_small_stock_futures_excludes_index_and_etf_products():
     predicate = load_app_symbols("is_small_stock_futures_record")["is_small_stock_futures_record"]
     assert predicate({"商品類型": "股票", "小型期貨": True, "指數期貨": False, "ETF期貨": False})
@@ -413,10 +523,24 @@ def test_directional_option_quality_rejects_negative_or_unreachable_trades():
     assert good["trade_ready"]
     assert good["payoff_ratio"] >= 1.25
 
+    # 放寬版只讓仍有正目標情境、可達損益兩平且報酬／風險尚可的
+    # 候選進入小部位觀察；不會把負損益候選標成可交易。
+    small = evaluate(100, 2000, -2000, 0.35, 19, "中", True)
+    assert not small["trade_ready"]
+    assert small["small_position_ready"]
+
     poor = evaluate(100, -500, -2000, 0.32, 22, "低", False)
     assert not poor["trade_ready"]
+    assert not poor["small_position_ready"]
     assert "目標情境仍未獲利" in poor["quality_notes"]
     assert "買賣價差過寬" in poor["quality_notes"]
+
+
+def test_option_scenario_color_follows_actual_profit_sign():
+    color = load_app_symbols("_txo_scenario_color")["_txo_scenario_color"]
+    assert color(100) == "#ff4b4b"
+    assert color(-100) == "#00c853"
+    assert color(0) == "#cbd5e1"
 
 
 def test_stock_limit_context_switches_display_reference_at_1430():
