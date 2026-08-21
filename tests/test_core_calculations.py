@@ -7,6 +7,7 @@ import io
 import json
 import math
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, time as dt_time, timedelta
@@ -55,6 +56,7 @@ def load_app_symbols(*names):
         "parsedate_to_datetime": parsedate_to_datetime,
         "pytz": pytz,
         "re": re,
+        "threading": threading,
         "time": time,
         "ThreadPoolExecutor": ThreadPoolExecutor,
         "as_completed": as_completed,
@@ -685,7 +687,7 @@ def test_daily_risk_refresh_skips_redundant_live_quote_fetches():
     assert "include_live_quote=False" in risk_source
 
 
-def test_goodinfo_fetch_uses_legacy_selenium_user_agent_without_crawler_retries():
+def test_goodinfo_fetch_uses_legacy_user_agent_without_browser_or_crawler_retries():
     source = APP_PATH.read_text(encoding="utf-8")
     tree = ast.parse(source)
     wrapper = next(
@@ -693,14 +695,15 @@ def test_goodinfo_fetch_uses_legacy_selenium_user_agent_without_crawler_retries(
         if isinstance(node, ast.FunctionDef) and node.name == "fetch_goodinfo_data"
     )
     wrapper_source = ast.get_source_segment(source, wrapper)
-    assert 'webdriver.Chrome(service=service, options=chrome_options)' in wrapper_source
+    assert 'requests.Session()' in wrapper_source
     assert "_GOODINFO_LEGACY_USER_AGENT" in wrapper_source
-    assert "--headless=new" in wrapper_source
-    assert "deadline = time.monotonic() + 15.0" in wrapper_source
+    assert "total_budget = 12.0" in wrapper_source
     assert '_parse_goodinfo_original_page' in wrapper_source
     assert "rate_limited" in wrapper_source
-    assert "driver.get(_GOODINFO_URL)" in wrapper_source
-    assert "driver.refresh(" not in wrapper_source
+    assert "session.get(" in wrapper_source
+    assert "session.post(" in wrapper_source
+    assert "webdriver" not in wrapper_source
+    assert "while " not in wrapper_source
     assert "crawl4ai" not in wrapper_source.lower()
     assert 'scrapling' not in wrapper_source.lower()
 
@@ -756,13 +759,51 @@ def test_opening_yahoo_batch_does_not_request_nonexistent_twf_symbol():
     assert "[item[1] for item in intraday_symbols.values()]" in function_source
 
 
-def test_selenium_legacy_browser_dependency_is_pinned():
+def test_goodinfo_http_path_has_no_browser_dependency():
     requirements = (APP_PATH.parent / "requirements.txt").read_text(encoding="utf-8")
     packages = (APP_PATH.parent / "packages.txt").read_text(encoding="utf-8")
-    assert "selenium==4.40.0" in requirements
+    assert "selenium" not in requirements.lower()
     assert "crawl4ai" not in requirements.lower()
     assert "scrapling" not in requirements.lower()
-    assert packages.splitlines() == ["chromium", "chromium-driver"]
+    assert "chromium" not in packages.lower()
+
+
+def test_fibo_tag_slots_keep_positions_and_restore_codes():
+    symbols = load_app_symbols(
+        "DEFAULT_FIBO_TAGS", "normalize_fibo_quick_tag", "normalize_fibo_tag_slots",
+    )
+    symbols["load_local_stock_names"] = lambda: (
+        {"2330": "台積電", "2408": "南亞科", "2454": "聯發科", "6215": "和椿", "3535": "晶彩科"},
+        {"台積電": "2330", "南亞科": "2408", "聯發科": "2454", "和椿": "6215", "晶彩科": "3535"},
+    )
+    values = ["台積電", "", "南亞科", "和椿", "晶彩科"]
+    fallback = ["台積電(2330)", "南亞科(2408)", "聯發科(2454)", "和椿(6215)", "晶彩科(3535)"]
+    assert symbols["normalize_fibo_tag_slots"](values, fallback) == [
+        "台積電(2330)", "南亞科(2408)", "南亞科(2408)", "和椿(6215)", "晶彩科(3535)",
+    ]
+
+
+def test_shioaji_credentials_are_never_mixed_across_sources():
+    symbols = load_app_symbols("resolve_shioaji_credentials")
+    runtime = {"sj_key": "render-key", "sj_secret": ""}
+    symbols["get_app_secret"] = lambda key, default='': runtime.get(key, default)
+    symbols["logger"] = type("Logger", (), {"warning": staticmethod(lambda *_args: None)})()
+    assert symbols["resolve_shioaji_credentials"]({
+        "sj_key": "saved-key", "sj_secret": "saved-secret", "remember_sj": True,
+    })[:2] == ("saved-key", "saved-secret")
+    runtime["sj_secret"] = "render-secret"
+    assert symbols["resolve_shioaji_credentials"]({})[:2] == ("render-key", "render-secret")
+
+
+def test_render_uses_persistent_shioaji_env_and_cached_startup_snapshots():
+    source = APP_PATH.read_text(encoding="utf-8")
+    render_yaml = (APP_PATH.parent / "render.yaml").read_text(encoding="utf-8")
+    assert "SHIOAJI_API_KEY" in render_yaml
+    assert "SHIOAJI_SECRET_KEY" in render_yaml
+    assert "st.session_state._stock_cache_refresh_pending = False" in source
+    assert "def _fetch_remote_scope_cached" in source
+    assert "save_fibo_config(sync_cloud=False)" in source
+    assert "def fetch_fibonacci_yahoo_history" in source
 
 
 def test_shioaji_futures_resolver_uses_v17_lazy_root_api():

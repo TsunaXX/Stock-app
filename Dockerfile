@@ -6,12 +6,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# Goodinfo fallback and PDF/report tools need a real Chromium runtime on the
-# server.  The application still works when Goodinfo is unavailable; these
-# packages simply preserve the existing browser-based fallback.
+# PDF/report rendering needs CJK fonts and current certificate authorities.
+# Goodinfo uses a bounded HTTP request so the free 512 MB instance does not
+# launch a memory-heavy Chromium process during an interactive rerun.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        chromium chromium-driver fonts-noto-cjk ca-certificates \
+        fonts-noto-cjk ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt ./

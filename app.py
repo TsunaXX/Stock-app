@@ -31,15 +31,6 @@ import numpy as np
 import streamlit.components.v1 as components
 import pdfplumber
 import fitz  # PyMuPDF 用於將 PDF 轉為圖片
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from selenium.common.exceptions import (
-    NoAlertPresentException,
-    TimeoutException,
-    UnexpectedAlertPresentException,
-    WebDriverException,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -80,15 +71,26 @@ except BaseException as exc:
 
 def get_app_secret(key, default=None):
     """Read an optional Streamlit secret without crashing branch/local deployments."""
-    try:
-        value = st.secrets.get(key, None)
-        if value not in (None, ''):
-            return value
-    except Exception:
-        pass
+    aliases = {
+        'sj_key': ('sj_key', 'SHIOAJI_API_KEY'),
+        'sj_secret': ('sj_secret', 'SHIOAJI_SECRET_KEY'),
+        'gsheet_api_url': ('gsheet_api_url', 'GSHEET_API_URL'),
+    }
+    candidates = aliases.get(str(key), (str(key),))
+    for candidate in candidates:
+        try:
+            value = st.secrets.get(candidate, None)
+            if value not in (None, ''):
+                return value
+        except Exception:
+            pass
     # Render and other Git-backed deployments commonly provide secrets as
     # runtime environment variables instead of a checked-in secrets.toml.
-    return os.environ.get(str(key), default)
+    for candidate in candidates:
+        value = os.environ.get(candidate)
+        if value not in (None, ''):
+            return value
+    return default
 
 
 # ==========================================
@@ -98,6 +100,18 @@ def get_app_secret(key, default=None):
 def get_market_stream_registry():
     """Keep quote callbacks alive across Streamlit reruns without touching session_state."""
     return {}, threading.RLock()
+
+
+@st.cache_resource(show_spinner=False)
+def get_shared_market_data_cache():
+    """Share bounded market-history caches between phone and desktop sessions."""
+    return {
+        'fibonacci': {},
+        'temperature': {},
+        'intraday': {},
+        'short_wave': {},
+        'shioaji_usage': {},
+    }, threading.RLock()
 
 
 def _stream_number(value, default=None):
@@ -3011,10 +3025,10 @@ def load_company_event_snapshot(
         return local_snapshot
 
     remote_payload, remote_error = (
-        _fetch_remote_scope(
+        (_fetch_remote_scope if force else _fetch_remote_scope_cached)(
             gsheet_api_url,
             GOOGLE_SCOPE_COMPANY,
-            timeout=8,
+            timeout=6,
         )
     )
 
@@ -3636,19 +3650,22 @@ def get_cached_fibonacci_kbars(api, code, interval='1d', lookback_days=10):
         '1d': 1800, '1wk': 3600, '1mo': 3600,
     }
     ttl = ttl_by_interval.get(interval, 120)
-    cache = st.session_state.setdefault('_fibonacci_kbar_cache', {})
+    shared, cache_lock = get_shared_market_data_cache()
+    cache = shared['fibonacci']
     cache_key = (id(api), str(code), str(interval), int(lookback_days))
-    cached = cache.get(cache_key)
     now_mono = time.monotonic()
+    with cache_lock:
+        cached = cache.get(cache_key)
     if cached and now_mono - cached['saved_at'] <= ttl:
         return cached['data'].copy()
 
     data = fetch_shioaji_data(api, code, interval=interval, lookback_days=lookback_days)
     if not data.empty:
-        cache[cache_key] = {'saved_at': now_mono, 'data': data.copy()}
-        if len(cache) > 12:
-            oldest_key = min(cache, key=lambda key: cache[key]['saved_at'])
-            cache.pop(oldest_key, None)
+        with cache_lock:
+            cache[cache_key] = {'saved_at': now_mono, 'data': data.copy()}
+            if len(cache) > 12:
+                oldest_key = min(cache, key=lambda key: cache[key]['saved_at'])
+                cache.pop(oldest_key, None)
     return data.copy()
 
 # ==========================================
@@ -3813,11 +3830,17 @@ def fetch_market_temperature_data(code, lookback_days=180):
 
 def get_cached_market_temperature_data(code, lookback_days=180, max_age_seconds=180):
     """Reuse slower daily history while still merging the current streamed quote."""
-    cache = st.session_state.setdefault('_market_temperature_history_cache', {})
+    try:
+        shared, cache_lock = get_shared_market_data_cache()
+        cache = shared['temperature']
+    except NameError:  # Pure-function regression harness compatibility.
+        cache = st.session_state.setdefault('_market_temperature_history_cache', {})
+        cache_lock = threading.RLock()
     logged_in = bool(st.session_state.get('sj_logged_in', False))
     api = st.session_state.get('sj_api')
     cache_key = (code, int(lookback_days), logged_in, id(api) if api is not None else None)
-    cached = cache.get(cache_key)
+    with cache_lock:
+        cached = cache.get(cache_key)
     now = time.monotonic()
     if cached and now - cached['saved_at'] <= max_age_seconds:
         df = cached['df'].copy(deep=True)
@@ -3828,12 +3851,13 @@ def get_cached_market_temperature_data(code, lookback_days=180, max_age_seconds=
 
     df, source = fetch_market_temperature_data(code, lookback_days=lookback_days)
     if not df.empty:
-        cache[cache_key] = {
-            'saved_at': now,
-            'df': df.copy(deep=True),
-            'attrs': dict(df.attrs),
-            'source': source,
-        }
+        with cache_lock:
+            cache[cache_key] = {
+                'saved_at': now,
+                'df': df.copy(deep=True),
+                'attrs': dict(df.attrs),
+                'source': source,
+            }
         return df, source
     # A transient upstream failure must not replace the last complete history
     # with an empty dataframe. Stale data stays explicitly labelled.
@@ -3847,7 +3871,9 @@ def get_cached_market_temperature_data(code, lookback_days=180, max_age_seconds=
 
 def clear_index_market_data_cache():
     """Clear only index-room history so a failed first load can retry cleanly."""
-    st.session_state.pop('_market_temperature_history_cache', None)
+    shared, cache_lock = get_shared_market_data_cache()
+    with cache_lock:
+        shared['temperature'].clear()
     fetch_twse_taiex_month.clear()
 
 
@@ -4029,15 +4055,18 @@ def get_futures_intraday_state(api, direction):
 
 def get_cached_futures_intraday_state(api, direction, max_age_seconds=8):
     """Throttle the slower 15-minute K request; the streamed price remains live."""
-    cache = st.session_state.setdefault('_trade_plan_intraday_cache', {})
+    shared, cache_lock = get_shared_market_data_cache()
+    cache = shared['intraday']
     cache_key = (direction, id(api) if api is not None else None)
-    cached = cache.get(cache_key)
+    with cache_lock:
+        cached = cache.get(cache_key)
     now = time.monotonic()
     if cached and now - cached['saved_at'] <= max_age_seconds:
         return dict(cached['value'])
     value = get_futures_intraday_state(api, direction)
-    cache.clear()
-    cache[cache_key] = {'saved_at': now, 'value': dict(value)}
+    with cache_lock:
+        cache.clear()
+        cache[cache_key] = {'saved_at': now, 'value': dict(value)}
     return value
 
 
@@ -4351,15 +4380,18 @@ def calculate_short_wave_plan(api, direction):
 
 def get_cached_short_wave_plan(api, direction, max_age_seconds=8):
     """Reuse the 5-minute calculation briefly so one refresh does not reload all bars."""
-    cache = st.session_state.setdefault('_trade_plan_short_wave_cache', {})
+    shared, cache_lock = get_shared_market_data_cache()
+    cache = shared['short_wave']
     cache_key = (direction, id(api) if api is not None else None)
-    cached = cache.get(cache_key)
+    with cache_lock:
+        cached = cache.get(cache_key)
     now = time.monotonic()
     if cached and now - cached['saved_at'] <= max_age_seconds:
         return dict(cached['value']) if cached['value'] else None
     value = calculate_short_wave_plan(api, direction)
-    cache.clear()
-    cache[cache_key] = {'saved_at': now, 'value': dict(value) if value else None}
+    with cache_lock:
+        cache.clear()
+        cache[cache_key] = {'saved_at': now, 'value': dict(value) if value else None}
     return value
 
 
@@ -5917,6 +5949,20 @@ def fibonacci_initial_y_range(low_price, high_price, padding_ratio=0.05):
     return low_value - padding, high_value + padding
 
 
+@st.cache_data(ttl=120, max_entries=32, show_spinner=False)
+def fetch_fibonacci_yahoo_history(ticker, interval, period):
+    """Reuse Yahoo history across chart controls and browser sessions."""
+    try:
+        dataframe = yf.Ticker(str(ticker)).history(
+            interval=str(interval), period=str(period)
+        )
+        if isinstance(dataframe.columns, pd.MultiIndex):
+            dataframe.columns = dataframe.columns.droplevel(1)
+        return dataframe.copy()
+    except Exception:
+        return pd.DataFrame()
+
+
 def plot_fibonacci_chart(
     symbol, interval, lookback=60, font_size=15, ma_flags=None,
     ma_width=1.5, show_vol=True, advice_container=None,
@@ -6014,42 +6060,18 @@ def plot_fibonacci_chart(
 
         # 若永豐未登入或其他商品的永豐資料不足，才退回使用 yfinance。
         if not sj_kbars_used and not twse_taiex_used:
-            import time
-            for attempt in range(3):
-                try:
-                    stock_data = yf.Ticker(ticker)
-                    df = stock_data.history(interval=interval, period=period_map.get(interval, "max"))
-                    if isinstance(df.columns, pd.MultiIndex):
-                        df.columns = df.columns.droplevel(1)
-                    if not df.empty:
-                        break
-                    time.sleep(1) # 若遇 Rate limit 導致空資料，稍待後重試
-                except Exception as e:
-                    if attempt < 2:
-                        time.sleep(1)
-                        continue
-                    else:
-                        break
+            df = fetch_fibonacci_yahoo_history(
+                ticker, interval, period_map.get(interval, "max")
+            )
 
             # 自動處理上櫃代號
             if (df.empty or 'High' not in df.columns) and ticker.endswith(".TW"):
                 ticker_two = ticker.replace(".TW", ".TWO")
-                for attempt in range(3):
-                    try:
-                        stock_data = yf.Ticker(ticker_two)
-                        df = stock_data.history(interval=interval, period=period_map.get(interval, "max"))
-                        if isinstance(df.columns, pd.MultiIndex):
-                            df.columns = df.columns.droplevel(1)
-                        if not df.empty:
-                            ticker = ticker_two 
-                            break
-                        time.sleep(1)
-                    except Exception as e:
-                        if attempt < 2:
-                            time.sleep(1)
-                            continue
-                        else:
-                            break
+                df = fetch_fibonacci_yahoo_history(
+                    ticker_two, interval, period_map.get(interval, "max")
+                )
+                if not df.empty:
+                    ticker = ticker_two
 
            # 期貨異常保護 (移除自動替換加權指數邏輯)
             if (df.empty or 'High' not in df.columns) and (ticker == "TWF=F" or ticker == "TMF=F"):
@@ -6839,11 +6861,20 @@ def get_tw_stocker_data(direction):
         pass
     return pd.DataFrame()
 
-_GOODINFO_BROWSER_SEMAPHORE = threading.BoundedSemaphore(1)
+_GOODINFO_FETCH_SEMAPHORE = threading.BoundedSemaphore(1)
 _GOODINFO_URL = (
     "https://goodinfo.tw/tw/StockList.asp?RPT_TIME=&MARKET_CAT=%E7%86%B1%E9%96%80%E6%8E%92%E8%A1%8C"
     "&INDUSTRY_CAT=%E7%B4%AF%E8%A8%88%E6%88%90%E4%BA%A4%E9%87%8F%E9%80%B1%E8%BD%89%E7%8E%87%28%E7%95%B6%E6%97%A5%29"
     "%40%40%E7%B4%AF%E8%A8%88%E6%88%90%E4%BA%A4%E9%87%8F%E9%80%B1%E8%BD%89%E7%8E%87%40%40%E7%95%B6%E6%97%A5"
+)
+_GOODINFO_DATA_URL = (
+    "https://goodinfo.tw/tw/StockListRank/StockList.asp?STEP=DATA"
+    "&MARKET_CAT=%E7%86%B1%E9%96%80%E6%8E%92%E8%A1%8C"
+    "&INDUSTRY_CAT=%E7%B4%AF%E8%A8%88%E6%88%90%E4%BA%A4%E9%87%8F%E9%80%B1%E8%BD%89%E7%8E%87%28%E7%95%B6%E6%97%A5%29"
+    "%40%40%E7%B4%AF%E8%A8%88%E6%88%90%E4%BA%A4%E9%87%8F%E9%80%B1%E8%BD%89%E7%8E%87%40%40%E7%95%B6%E6%97%A5"
+    "&SHEET=%E6%BC%B2%E8%B7%8C%E5%8F%8A%E6%88%90%E4%BA%A4%E7%B5%B1%E8%A8%88"
+    "&SHEET2=%E7%B4%AF%E8%A8%88%E6%88%90%E4%BA%A4%E9%87%8F%E9%80%B1%E8%BD%89%E7%8E%87%E7%B5%B1%E8%A8%88"
+    "&RPT_TIME=%E6%9C%80%E6%96%B0%E8%B3%87%E6%96%99&RANK_RANGE=300&IS_RELOAD_REPORT=T"
 )
 _GOODINFO_LEGACY_USER_AGENT = (
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
@@ -7184,151 +7215,108 @@ def _parse_goodinfo_turnover_table(page_html):
 
 
 def fetch_goodinfo_data():
-    """Use the original Selenium/User-Agent path to load Goodinfo's ranking.
+    """Fetch Goodinfo with the legacy browser identity and a strict time budget.
 
-    This deliberately performs one browser visit only.  The previous crawler
-    retried/reloaded the page in the same click, which made rate-limit (429/430)
-    responses more likely and extended the screen wait.  No visitor cookie,
-    clearance token, or profile is persisted or copied into the application.
+    Render's free instance cannot reliably keep Chromium inside its 512 MB
+    memory limit.  Reuse the original User-Agent and the same two requests a
+    normal ranking page makes, but never launch a browser or retry in a loop.
+    A blocked response returns quickly so the last-known-good/CSV data remains
+    usable without making the whole Streamlit process unhealthy.
     """
     started_at = time.monotonic()
+    total_budget = 12.0
     fetch_goodinfo_data.last_status = {
         'state': 'loading', 'reason': '', 'elapsed': 0.0,
     }
-    headed_mode = os.environ.get("GOODINFO_HEADED") == "1"
-    chrome_options = Options()
-    if not headed_mode:
-        chrome_options.add_argument('--headless=new')
-    chrome_options.add_argument('--no-sandbox')
-    chrome_options.add_argument('--disable-dev-shm-usage')
-    chrome_options.add_argument('--disable-gpu')
-    chrome_options.add_argument('--disable-software-rasterizer')
-    chrome_options.add_argument('--window-size=1920x1080')
-    chrome_options.add_argument('--lang=zh-TW')
-    chrome_options.add_argument(
-        f'--user-agent={_GOODINFO_LEGACY_USER_AGENT}'
-    )
-    chrome_options.add_argument('--disable-blink-features=AutomationControlled')
-    chrome_options.add_experimental_option('excludeSwitches', ['enable-automation'])
-    chrome_options.add_experimental_option('useAutomationExtension', False)
-    chrome_options.page_load_strategy = 'eager'
-    if os.path.exists('/usr/bin/chromium'):
-        chrome_options.binary_location = '/usr/bin/chromium'
-
-    acquired = _GOODINFO_BROWSER_SEMAPHORE.acquire(timeout=3)
+    acquired = _GOODINFO_FETCH_SEMAPHORE.acquire(timeout=0.5)
     if not acquired:
-        logger.warning('Goodinfo browser is busy; skipped duplicate launch')
+        logger.warning('Goodinfo fetch is busy; skipped duplicate request')
         fetch_goodinfo_data.last_status = {
-            'state': 'failed', 'reason': 'browser_busy',
+            'state': 'failed', 'reason': 'request_busy',
             'elapsed': round(time.monotonic() - started_at, 2),
-            'headed_mode': headed_mode,
-            'fetcher': 'selenium-legacy-ua',
+            'fetcher': 'requests-legacy-ua',
         }
         return None
-    driver = None
     try:
-        try:
-            service = (
-                Service('/usr/bin/chromedriver')
-                if os.path.exists('/usr/bin/chromedriver') else Service()
+        headers = {
+            'User-Agent': _GOODINFO_LEGACY_USER_AGENT,
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7',
+            'DNT': '1',
+        }
+        with requests.Session() as session:
+            landing = session.get(
+                _GOODINFO_URL, headers=headers, timeout=(2.0, 3.0)
             )
-            driver = webdriver.Chrome(service=service, options=chrome_options)
-            driver.set_page_load_timeout(7)
-            driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
-                'source': """
-                    Object.defineProperty(navigator, 'webdriver', {
-                        get: () => undefined
-                    });
-                    Object.defineProperty(navigator, 'languages', {
-                        get: () => ['zh-TW', 'zh', 'en-US', 'en']
-                    });
-                """,
-            })
-            try:
-                driver.get(_GOODINFO_URL)
-            except (TimeoutException, UnexpectedAlertPresentException):
-                pass
+            landing_markup = landing.text
+            if _is_goodinfo_block_page(landing_markup, landing.status_code):
+                reason = 'rate_limited'
+                ranking = None
+            else:
+                ranking = _parse_goodinfo_original_page(landing_markup)
+                reason = ''
 
-            # Match the original short wait: wait for one completed page, do
-            # not refresh or create a second browser request.
-            deadline = time.monotonic() + 15.0
-            last_markup = ''
-            while time.monotonic() < deadline:
-                try:
-                    alert = driver.switch_to.alert
-                    alert_text = alert.text
-                    alert.accept()
-                    logger.warning('Goodinfo alert: %s', alert_text)
-                    alert_reason = (
-                        'rate_limited'
-                        if _is_goodinfo_block_page(alert_text)
-                        else 'site_alert'
+            if ranking is None and reason != 'rate_limited':
+                remaining = total_budget - (time.monotonic() - started_at)
+                if remaining <= 1.0:
+                    reason = 'timeout'
+                else:
+                    post_headers = dict(headers)
+                    post_headers.update({
+                        'Accept': '*/*',
+                        'Content-Type': 'application/x-www-form-urlencoded;',
+                        'Origin': 'https://goodinfo.tw',
+                        'Referer': _GOODINFO_URL,
+                        'X-Requested-With': 'XMLHttpRequest',
+                    })
+                    response = session.post(
+                        _GOODINFO_DATA_URL,
+                        headers=post_headers,
+                        data=b'',
+                        timeout=(2.0, min(4.0, max(1.0, remaining - 0.5))),
                     )
-                    fetch_goodinfo_data.last_status = {
-                        'state': 'failed', 'reason': alert_reason,
-                        'elapsed': round(time.monotonic() - started_at, 2),
-                        'headed_mode': headed_mode,
-                        'fetcher': 'selenium-legacy-ua',
-                    }
-                    return None
-                except NoAlertPresentException:
-                    pass
+                    markup = response.text
+                    if _is_goodinfo_block_page(markup, response.status_code):
+                        reason = 'rate_limited'
+                    else:
+                        ranking = _parse_goodinfo_original_page(markup)
+                        if ranking is None:
+                            reason = 'legacy_table_missing'
 
-                last_markup = driver.page_source
-                if _is_goodinfo_block_page(last_markup):
-                    fetch_goodinfo_data.last_status = {
-                        'state': 'failed', 'reason': 'rate_limited',
-                        'elapsed': round(time.monotonic() - started_at, 2),
-                        'headed_mode': headed_mode,
-                        'fetcher': 'selenium-legacy-ua',
-                    }
-                    return None
-                ranking = _parse_goodinfo_original_page(last_markup)
-                if ranking is not None:
-                    fetch_goodinfo_data.last_status = {
-                        'state': 'success', 'reason': '', 'rows': len(ranking),
-                        'elapsed': round(time.monotonic() - started_at, 2),
-                        'headed_mode': headed_mode,
-                        'fetcher': 'selenium-legacy-ua',
-                    }
-                    return ranking
-                time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
-
+            if ranking is not None:
+                fetch_goodinfo_data.last_status = {
+                    'state': 'success', 'reason': '', 'rows': len(ranking),
+                    'elapsed': round(time.monotonic() - started_at, 2),
+                    'fetcher': 'requests-legacy-ua',
+                }
+                return ranking
             fetch_goodinfo_data.last_status = {
-                'state': 'failed', 'reason': 'legacy_table_missing',
+                'state': 'failed', 'reason': reason or 'legacy_table_missing',
                 'elapsed': round(time.monotonic() - started_at, 2),
-                'headed_mode': headed_mode,
-                'fetcher': 'selenium-legacy-ua',
+                'fetcher': 'requests-legacy-ua',
             }
             logger.warning(
-                'Goodinfo legacy browser did not return a ranking table (%s bytes)',
-                len(last_markup),
+                'Goodinfo legacy HTTP flow did not return a ranking table (%s)',
+                reason or 'legacy_table_missing',
             )
-        except (WebDriverException, OSError, ValueError) as exc:
-            logger.exception('Goodinfo legacy browser failed: %s', type(exc).__name__)
-            fetch_goodinfo_data.last_status = {
-                'state': 'failed', 'reason': 'browser_error',
-                'error_type': type(exc).__name__,
-                'elapsed': round(time.monotonic() - started_at, 2),
-                'headed_mode': headed_mode,
-                'fetcher': 'selenium-legacy-ua',
-            }
-    except Exception as exc:
-        logger.exception('Goodinfo legacy fetch failed: %s', type(exc).__name__)
+    except requests.Timeout as exc:
+        logger.warning('Goodinfo legacy HTTP timed out: %s', type(exc).__name__)
         fetch_goodinfo_data.last_status = {
-            'state': 'failed', 'reason': 'browser_error',
+            'state': 'failed', 'reason': 'timeout',
             'error_type': type(exc).__name__,
             'elapsed': round(time.monotonic() - started_at, 2),
-            'headed_mode': headed_mode,
-            'fetcher': 'selenium-legacy-ua',
+            'fetcher': 'requests-legacy-ua',
+        }
+    except (requests.RequestException, ValueError, TypeError) as exc:
+        logger.warning('Goodinfo legacy HTTP failed: %s', type(exc).__name__)
+        fetch_goodinfo_data.last_status = {
+            'state': 'failed', 'reason': 'request_error',
+            'error_type': type(exc).__name__,
+            'elapsed': round(time.monotonic() - started_at, 2),
+            'fetcher': 'requests-legacy-ua',
         }
     finally:
-        if driver is not None:
-            try:
-                driver.quit()
-            except WebDriverException:
-                pass
-        _GOODINFO_BROWSER_SEMAPHORE.release()
+        _GOODINFO_FETCH_SEMAPHORE.release()
     return None
 
 # ==========================================
@@ -7536,6 +7524,28 @@ def normalize_fibo_quick_tag(value, code_map=None, name_map=None):
     return raw
 
 
+def normalize_fibo_tag_slots(tags, fallback=None):
+    """Keep five stable tag positions and guarantee each stock has a code."""
+    values = list(tags or [])
+    fallback_values = list(fallback or DEFAULT_FIBO_TAGS)
+    code_map, name_map = load_local_stock_names()
+    normalized = []
+    for index in range(5):
+        raw_value = values[index] if index < len(values) else ''
+        candidate = normalize_fibo_quick_tag(raw_value, code_map, name_map)
+        if not re.search(r'\(\d{4,6}[A-Z]?\)$', candidate, re.I):
+            fallback_value = (
+                fallback_values[index]
+                if index < len(fallback_values)
+                else DEFAULT_FIBO_TAGS[index]
+            )
+            candidate = normalize_fibo_quick_tag(
+                fallback_value, code_map, name_map
+            )
+        normalized.append(candidate or DEFAULT_FIBO_TAGS[index])
+    return normalized
+
+
 def load_config():
     with _RUNTIME_FILE_LOCK:
         if os.path.exists(CONFIG_FILE):
@@ -7546,6 +7556,23 @@ def load_config():
             except (OSError, ValueError, TypeError):
                 return {}
         return {}
+
+
+def resolve_shioaji_credentials(config=None):
+    """Resolve one complete credential pair without mixing different sources."""
+    config = config if isinstance(config, dict) else {}
+    runtime_key = str(get_app_secret('sj_key', '') or '').strip()
+    runtime_secret = str(get_app_secret('sj_secret', '') or '').strip()
+    if runtime_key and runtime_secret:
+        return runtime_key, runtime_secret, True, 'render_env'
+    if runtime_key or runtime_secret:
+        logger.warning('Ignoring incomplete Render Shioaji credential pair')
+
+    saved_key = str(config.get('sj_key', '') or '').strip()
+    saved_secret = str(config.get('sj_secret', '') or '').strip()
+    if saved_key and saved_secret:
+        return saved_key, saved_secret, bool(config.get('remember_sj', True)), 'local_config'
+    return '', '', bool(config.get('remember_sj', True)), 'manual'
 
 def save_config(font_size, limit_rows, sj_key="", sj_secret="", remember_sj=False):
     try:
@@ -7612,8 +7639,8 @@ def load_futures_strategy_state():
     if not st.session_state.get('_futures_cloud_loaded', False):
         gsheet_api_url = get_app_secret('gsheet_api_url')
         if gsheet_api_url:
-            remote_state, remote_error = _fetch_remote_scope(
-                gsheet_api_url, GOOGLE_SCOPE_FUTURES, timeout=8,
+            remote_state, remote_error = _fetch_remote_scope_cached(
+                gsheet_api_url, GOOGLE_SCOPE_FUTURES, timeout=6,
             )
             if isinstance(remote_state, dict):
                 cloud_state = remote_state
@@ -8046,10 +8073,10 @@ def _sync_strategy_signal_scope_from_cloud():
     )
 
     remote_payload, remote_error = (
-        _fetch_remote_scope(
+        _fetch_remote_scope_cached(
             gsheet_api_url,
             GOOGLE_SCOPE_SIGNALS,
-            timeout=8,
+            timeout=6,
         )
     )
 
@@ -9331,6 +9358,12 @@ def _fetch_remote_scope(
         return None, 'Google Sheet scope 回傳格式錯誤'
 
 
+@st.cache_data(ttl=60, max_entries=24, show_spinner=False)
+def _fetch_remote_scope_cached(gsheet_api_url, scope, timeout=6):
+    """Share one recent Google Sheet snapshot across phone/desktop reruns."""
+    return _fetch_remote_scope(gsheet_api_url, scope, timeout=timeout)
+
+
 def _save_remote_scope(gsheet_api_url, scope, payload, updated_at=None, timeout=8, verify=True):
     if not gsheet_api_url or not scope:
         return True, payload
@@ -9357,6 +9390,9 @@ def _save_remote_scope(gsheet_api_url, scope, payload, updated_at=None, timeout=
 
         if not isinstance(result, dict) or result.get('success') is not True:
             return False, None
+
+        # A successful write makes every cached startup read stale.
+        _fetch_remote_scope_cached.clear()
 
         if verify:
             for attempt in range(2):
@@ -9443,7 +9479,8 @@ def _read_json_cache_file(
 def _valid_fibo_tags(tags):
     if not isinstance(tags, list) or len(tags) < 5:
         return []
-    return [str(tag) for tag in tags[:5]]
+    normalized = [str(tag or '').strip() for tag in tags[:5]]
+    return normalized if all(normalized) else []
 
 
 def _extract_fibo_tags(payload):
@@ -9545,7 +9582,7 @@ def _newer_fibo_tag_payload(remote, local):
     return remote
 
 
-def save_fibo_config(save_tags=True):
+def save_fibo_config(save_tags=True, sync_cloud=True):
     config = load_config()
 
     if not save_tags:
@@ -9564,11 +9601,7 @@ def save_fibo_config(save_tags=True):
             pass
         return True
 
-    fibo_tags = [
-        normalize_fibo_quick_tag(
-            tag
-        )
-        for tag in [
+    raw_tags = [
             st.session_state.get(
                 'custom_tag_1',
                 "台積電(2330)"
@@ -9589,21 +9622,9 @@ def save_fibo_config(save_tags=True):
                 'custom_tag_5',
                 "晶彩科(3535)"
             ),
-        ]
     ]
-
-    fibo_tags = [
-        tag
-        for tag in fibo_tags
-        if tag
-    ][:5]
-
-    while len(fibo_tags) < 5:
-        fibo_tags.append(
-            DEFAULT_FIBO_TAGS[
-                len(fibo_tags)
-            ]
-        )
+    previous_tags = _valid_fibo_tags(config.get('fibo_tags', [])) or DEFAULT_FIBO_TAGS
+    fibo_tags = normalize_fibo_tag_slots(raw_tags, fallback=previous_tags)
 
     updated_at = (
         datetime.now(
@@ -9664,7 +9685,7 @@ def save_fibo_config(save_tags=True):
 
     sync_saved = True
 
-    if gsheet_api_url:
+    if gsheet_api_url and sync_cloud:
         with get_data_cache_sync_lock():
             sync_saved, _ = (
                 _save_remote_scope(
@@ -9697,13 +9718,12 @@ def save_fibo_config(save_tags=True):
         '_fibo_tags_source'
     ] = (
         'google_sheet'
-        if sync_saved and gsheet_api_url
+        if sync_saved and gsheet_api_url and sync_cloud
         else 'local_tag_cache'
     )
 
-    st.session_state[
-        '_fibo_cloud_loaded'
-    ] = True
+    if sync_cloud:
+        st.session_state['_fibo_cloud_loaded'] = True
 
     return sync_saved
 
@@ -10248,10 +10268,10 @@ def load_data_cache():
 
     if gsheet_api_url:
         remote_payload, remote_error = (
-            _fetch_remote_scope(
+            _fetch_remote_scope_cached(
                 gsheet_api_url,
                 GOOGLE_SCOPE_STOCK,
-                timeout=8,
+                timeout=6,
             )
         )
 
@@ -10484,10 +10504,10 @@ def load_fibo_tags_from_cloud(
                 source = 'config'
 
         if len(tags) < 5 and gsheet_api_url:
-            payload, error = _fetch_remote_scope(
+            payload, error = _fetch_remote_scope_cached(
                 gsheet_api_url,
                 GOOGLE_SCOPE_FIBO,
-                timeout=8,
+                timeout=6,
             )
             if isinstance(payload, dict):
                 tags = _extract_fibo_tags(payload)
@@ -10515,9 +10535,7 @@ def load_fibo_tags_from_cloud(
         '_fibo_tags_source'
     ] = source
 
-    st.session_state[
-        '_fibo_cloud_loaded'
-    ] = True
+    st.session_state['_fibo_cloud_loaded'] = True
 
     st.session_state['_fibo_cloud_load_error'] = cloud_error
 
@@ -10667,11 +10685,9 @@ if 'stock_data' not in st.session_state:
 
     st.session_state.stock_data = cached_df
 
-    # 持久化表格只保存股票符號、排序、備註；
-    # 新工作階段仍會依既有流程重新取得最新行情。
-    st.session_state._stock_cache_refresh_pending = (
-        not cached_df.empty
-    )
+    # 新工作階段先顯示最後成功快照，不在手機重連或切換分頁時
+    # 對整張表重新抓行情。使用者按「執行分析」才更新並寫回快取。
+    st.session_state._stock_cache_refresh_pending = False
 
     st.session_state.ignored_stocks = (
         cached_ignored
@@ -10799,40 +10815,55 @@ def init_shioaji_connection(api_key, secret_key):
     api.login(api_key, secret_key)
     return api
 
+
+def get_cached_shioaji_usage(api, max_age_seconds=60):
+    """Avoid two broker network calls on every Streamlit widget rerun."""
+    if api is None:
+        return None
+    shared, cache_lock = get_shared_market_data_cache()
+    cache = shared['shioaji_usage']
+    cache_key = id(api)
+    now_mono = time.monotonic()
+    with cache_lock:
+        cached = cache.get(cache_key)
+    if cached and now_mono - cached['saved_at'] <= max_age_seconds:
+        return cached['value']
+    usage = api.usage()
+    with cache_lock:
+        cache.clear()
+        cache[cache_key] = {'saved_at': now_mono, 'value': usage}
+    return usage
+
 if 'font_size' not in st.session_state: st.session_state.font_size = saved_config.get('font_size', 15)
 if 'limit_rows' not in st.session_state: st.session_state.limit_rows = saved_config.get('limit_rows', 5)
 
-# 永豐API帳密：
-secret_sj_key = get_app_secret('sj_key', '')
-secret_sj_secret = get_app_secret('sj_secret', '')
+# 永豐 API 帳密：Render 環境變數優先，且 key/secret 必須成對。
+secret_sj_key, secret_sj_secret, secret_remember_sj, sj_credential_source = (
+    resolve_shioaji_credentials(saved_config)
+)
 if 'sj_key' not in st.session_state: 
-    st.session_state.sj_key = secret_sj_key or saved_config.get('sj_key', '')
+    st.session_state.sj_key = secret_sj_key
 if 'sj_secret' not in st.session_state: 
-    st.session_state.sj_secret = secret_sj_secret or saved_config.get('sj_secret', '')
+    st.session_state.sj_secret = secret_sj_secret
 if 'remember_sj' not in st.session_state: 
-    st.session_state.remember_sj = True if secret_sj_key else saved_config.get('remember_sj', False)
+    st.session_state.remember_sj = secret_remember_sj
 
-if sj and st.session_state.remember_sj and st.session_state.sj_key and not st.session_state.get('manual_logout', False):
+if (
+    sj and not st.session_state.get('sj_logged_in', False)
+    and st.session_state.remember_sj
+    and st.session_state.sj_key and st.session_state.sj_secret
+    and not st.session_state.get('manual_logout', False)
+):
     try:
-        # 取得快取的連線物件
         api_obj = init_shioaji_connection(st.session_state.sj_key, st.session_state.sj_secret)
-        # 測試連線是否存活 (防呆：解決 AuthError: Not authenticated)
-        try:
-            api_obj.usage()
-            st.session_state.sj_api = api_obj
-            st.session_state.sj_logged_in = True
-        except BaseException as exc:
-            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
-                raise
-            # 若快取的連線已失效，則清除快取並強制重新登入
-            clear_market_stream(api_obj)
-            init_shioaji_connection.clear()
-            st.session_state.sj_api = init_shioaji_connection(st.session_state.sj_key, st.session_state.sj_secret)
-            st.session_state.sj_logged_in = True
+        st.session_state.sj_api = api_obj
+        st.session_state.sj_logged_in = True
+        st.session_state.pop('sj_connection_error', None)
     except BaseException as exc:
         if isinstance(exc, (KeyboardInterrupt, SystemExit)):
             raise
         st.session_state.sj_logged_in = False
+        st.session_state.pop('sj_api', None)
         st.session_state.sj_connection_error = type(exc).__name__
 
 @st.cache_data(ttl=300, max_entries=512)
@@ -10862,7 +10893,7 @@ with st.sidebar:
             st.success("✅ 永豐 API 已登入")
             
             try:
-                usage = st.session_state.sj_api.usage()
+                usage = get_cached_shioaji_usage(st.session_state.sj_api)
                 rem_mb = usage.remaining_bytes / (1024 * 1024)
                 st.caption(f"📊 API 今日剩餘流量: {_format_compact_number(rem_mb, 2)} MB")
             except Exception:
@@ -10919,6 +10950,10 @@ with st.sidebar:
                     st.session_state.sj_logged_in = False
                     st.rerun()
         else:
+            if sj_credential_source == 'render_env':
+                st.caption("Render 已保存 API 資訊；登入失敗時可按下方按鈕重試。")
+            else:
+                st.caption("若要在容器重啟後自動登入，請在 Render 設定 SHIOAJI_API_KEY 與 SHIOAJI_SECRET_KEY。")
             sj_api_key = st.text_input("API Key", type="password", value=st.session_state.sj_key, key="input_sj_key")
             sj_secret = st.text_input("Secret Key", type="password", value=st.session_state.sj_secret, key="input_sj_secret")
             remember_sj = st.checkbox("記住 API 資訊", value=st.session_state.remember_sj, key="input_remember_sj")
@@ -10950,7 +10985,7 @@ def render_stock_external_resources():
     st.markdown("#### 外部資源")
 
     def perform_goodinfo_fetch():
-        with st.spinner("正在以舊版瀏覽器模式載入排行，最長約 15 秒..."):
+        with st.spinner("正在以舊版瀏覽器識別載入排行，最長 15 秒..."):
             result = fetch_goodinfo_data()
             status = dict(getattr(fetch_goodinfo_data, 'last_status', {}) or {})
             if result is not None and not result.empty:
@@ -10963,11 +10998,11 @@ def render_stock_external_resources():
             else:
                 st.session_state['goodinfo_fetch_failed'] = True
                 reason_text = {
-                    'browser_busy': '另一個頁面正在抓取，請稍後再按一次。',
+                    'request_busy': '另一個頁面正在抓取，請稍後再按一次。',
                     'rate_limited': 'Goodinfo 暫時限制請求（429／430）；請稍等後再試，或改用下方手動 CSV 備援。',
-                    'site_alert': 'Goodinfo 回傳網站載入警示，請稍等後再試，或改用下方手動 CSV 備援。',
-                    'legacy_table_missing': '頁面已開啟，但 15 秒內沒有收到完整排行表格。',
-                    'browser_error': '瀏覽器啟動、網站驗證或頁面解析失敗。',
+                    'legacy_table_missing': 'Goodinfo 有回應，但沒有提供完整排行表格。',
+                    'timeout': 'Goodinfo 在 15 秒內沒有完成回應，已停止等待。',
+                    'request_error': 'Goodinfo 連線或頁面解析失敗。',
                 }.get(status.get('reason'), '抓取失敗或查無資料。')
                 st.error(reason_text)
                 st.info(
@@ -10981,7 +11016,7 @@ def render_stock_external_resources():
     with resource_col1:
         if st.button(
             "📥 抓取 Goodinfo 週轉率排行",
-            help="使用原本 Selenium＋一般瀏覽器 User-Agent 模式；每次僅請求一次，最長等待約 15 秒。",
+            help="沿用舊版一般瀏覽器 User-Agent；不啟動 Chromium、不循環重試，整輪最長 15 秒。",
             width='stretch', key='fetch_goodinfo_in_stock_room'
         ):
             perform_goodinfo_fetch()
@@ -18007,11 +18042,18 @@ with tab_fibo:
     def format_fibo_tag(key):
         val = str(st.session_state.get(key, '') or '').strip()
         if not val:
-            save_fibo_config()
+            save_fibo_config(sync_cloud=False)
+            slot_index = max(0, min(4, int(key.rsplit('_', 1)[-1]) - 1))
+            st.session_state[key] = st.session_state.fibo_tags[slot_index]
             return
 
         st.session_state[key] = normalize_fibo_quick_tag(val)
-        save_fibo_config()
+        # Editing a field only updates the fast local snapshot.  The explicit
+        # save button performs the Google Sheet round-trip once all five slots
+        # are ready, avoiding a long rerun for every mobile keystroke.
+        save_fibo_config(sync_cloud=False)
+        slot_index = max(0, min(4, int(key.rsplit('_', 1)[-1]) - 1))
+        st.session_state[key] = st.session_state.fibo_tags[slot_index]
     
     tab_trade_plan, tab_option_plan, tab_fibo_thermometer, tab_fibo_chart, tab_fibo_manual = st.tabs(
         ["🧭 指數操作計畫", "📅 選擇權操作計畫", "🌡️ 市場溫度計", "📊 費波圖表", "🧮 手動費波"],
