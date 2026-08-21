@@ -73,9 +73,14 @@ except BaseException as exc:
 def get_app_secret(key, default=None):
     """Read an optional Streamlit secret without crashing branch/local deployments."""
     try:
-        return st.secrets.get(key, default)
+        value = st.secrets.get(key, None)
+        if value not in (None, ''):
+            return value
     except Exception:
-        return default
+        pass
+    # Render and other Git-backed deployments commonly provide secrets as
+    # runtime environment variables instead of a checked-in secrets.toml.
+    return os.environ.get(str(key), default)
 
 
 # ==========================================

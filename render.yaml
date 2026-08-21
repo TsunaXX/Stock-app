@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: stock-app
+    runtime: docker
+    plan: free
+    region: singapore
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /_stcore/health
+    autoDeployTrigger: commit
+    envVars:
+      - key: gsheet_api_url
+        sync: false
+      - key: GOODINFO_HEADED
+        value: "0"
