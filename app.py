@@ -6,7 +6,6 @@ from bs4 import BeautifulSoup
 from lxml.etree import XMLSyntaxError
 import math
 import time
-import asyncio
 import threading
 import os
 import itertools
@@ -32,6 +31,15 @@ import numpy as np
 import streamlit.components.v1 as components
 import pdfplumber
 import fitz  # PyMuPDF 用於將 PDF 轉為圖片
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from selenium.common.exceptions import (
+    NoAlertPresentException,
+    TimeoutException,
+    UnexpectedAlertPresentException,
+    WebDriverException,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -6837,6 +6845,11 @@ _GOODINFO_URL = (
     "&INDUSTRY_CAT=%E7%B4%AF%E8%A8%88%E6%88%90%E4%BA%A4%E9%87%8F%E9%80%B1%E8%BD%89%E7%8E%87%28%E7%95%B6%E6%97%A5%29"
     "%40%40%E7%B4%AF%E8%A8%88%E6%88%90%E4%BA%A4%E9%87%8F%E9%80%B1%E8%BD%89%E7%8E%87%40%40%E7%95%B6%E6%97%A5"
 )
+_GOODINFO_LEGACY_USER_AGENT = (
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+    'AppleWebKit/537.36 (KHTML, like Gecko) '
+    'Chrome/114.0.0.0 Safari/537.36'
+)
 def _goodinfo_normalize_text(value):
     """Normalize Goodinfo's nbsp/newline-heavy labels before schema checks."""
     return re.sub(r"\s+", "", str(value or "").replace("\xa0", "")).strip()
@@ -7004,12 +7017,13 @@ def _read_uploaded_stock_csv(uploaded_file):
 
 def _is_goodinfo_block_page(markup, status_code=None):
     """Recognize a Cloudflare/challenge response so the app can fail fast."""
-    if status_code in {401, 403, 429, 503}:
+    if status_code in {401, 403, 429, 430, 503}:
         return True
     normalized = str(markup or '').lower()
     markers = (
         'cf-chl-', 'challenge-platform', 'just a moment',
         'cloudflare ray id', 'attention required! | cloudflare',
+        'too many requests', 'error 429', 'error 430',
     )
     return any(marker in normalized for marker in markers)
 
@@ -7169,161 +7183,37 @@ def _parse_goodinfo_turnover_table(page_html):
     return target_df.dropna(how='all').reset_index(drop=True)
 
 
-async def _crawl_goodinfo_with_crawl4ai(headed_mode=False):
-    """Initialize Goodinfo, then reload it in the same Crawl4AI session.
-
-    Goodinfo's first response intentionally redirects to a small ``REINIT``
-    fragment after setting ``CLIENT_KEY``.  Crawl4AI correctly regards that
-    fragment as incomplete HTML, but the browser session remains usable.  The
-    following crawls reuse the same page/cookies until the real 300-row ranking
-    appears or the shared 28-second deadline expires.  No copied cookie or
-    persistent browser profile is used.
-    """
-    os.environ.setdefault('CRAWL4_AI_BASE_DIRECTORY', tempfile.gettempdir())
-    from crawl4ai import (
-        AsyncWebCrawler, BrowserConfig, CacheMode, CrawlerRunConfig,
-        UndetectedAdapter,
-    )
-    from crawl4ai.async_crawler_strategy import AsyncPlaywrightCrawlerStrategy
-
-    browser_config = BrowserConfig(
-        browser_type='chromium',
-        headless=not headed_mode,
-        viewport_width=1920,
-        viewport_height=1080,
-        enable_stealth=True,
-        user_agent_mode='random',
-        avoid_ads=True,
-        verbose=False,
-        extra_args=['--no-sandbox', '--disable-dev-shm-usage'],
-    )
-    crawler_strategy = AsyncPlaywrightCrawlerStrategy(
-        browser_config=browser_config,
-        browser_adapter=UndetectedAdapter(),
-    )
-    if os.path.exists('/usr/bin/chromium'):
-        # Crawl4AI 0.9.2 does not expose Playwright's executable_path through
-        # BrowserConfig.  Streamlit Cloud installs Chromium via packages.txt,
-        # so inject that supported launch argument into this pinned version's
-        # browser manager instead of downloading another 300+ MB browser.
-        original_build_browser_args = (
-            crawler_strategy.browser_manager._build_browser_args
-        )
-
-        def build_system_chromium_args():
-            browser_args = original_build_browser_args()
-            browser_args['executable_path'] = '/usr/bin/chromium'
-            return browser_args
-
-        crawler_strategy.browser_manager._build_browser_args = (
-            build_system_chromium_args
-        )
-    session_id = f'goodinfo-{time.time_ns()}'
-    common_config = {
-        'cache_mode': CacheMode.BYPASS,
-        'session_id': session_id,
-        'wait_until': 'domcontentloaded',
-        'locale': 'zh-TW',
-        'timezone_id': 'Asia/Taipei',
-        'exclude_all_images': True,
-        'verbose': False,
-    }
-    async with AsyncWebCrawler(
-        crawler_strategy=crawler_strategy,
-        config=browser_config,
-    ) as crawler:
-        # Stage 1: expected to be marked unsuccessful because Goodinfo's REINIT
-        # response is an HTML fragment without <body>; it still establishes the
-        # browser cookies needed by the second request.
-        initial_result = await crawler.arun(
-            url=_GOODINFO_URL,
-            config=CrawlerRunConfig(
-                **common_config,
-                page_timeout=10_000,
-                delay_before_return_html=0.2,
-            ),
-        )
-        initial_html = str(
-            initial_result.html
-            or initial_result.fit_html
-            or initial_result.cleaned_html
-            or ''
-        )
-        initial_reinit = 'REINIT=' in str(
-            getattr(initial_result, 'redirected_url', '') or ''
-        )
-        blocked = (
-            not initial_reinit
-            and _is_goodinfo_block_page(
-                initial_html, getattr(initial_result, 'status_code', None),
-            )
-        )
-        crawl_deadline = time.monotonic() + 28.0
-        ranking_result = initial_result
-        ranking_html = ''
-        ranking_attempts = 0
-        attempt_states = []
-        while ranking_attempts < 3 and not blocked:
-            remaining_ms = int((crawl_deadline - time.monotonic()) * 1000)
-            if remaining_ms < 1_000:
-                break
-            ranking_attempts += 1
-            ranking_result = await crawler.arun(
-                url=_GOODINFO_URL,
-                config=CrawlerRunConfig(
-                    **common_config,
-                    page_timeout=min(14_000, remaining_ms),
-                    wait_for_timeout=min(12_000, remaining_ms),
-                    wait_for=(
-                        'js:() => Array.from(document.querySelectorAll("table"))'
-                        '.some(t => t.rows.length >= 11 && '
-                        '(t.innerText || "").includes("週轉率"))'
-                    ),
-                    delay_before_return_html=0.2,
-                ),
-            )
-            ranking_html = str(
-                ranking_result.html
-                or ranking_result.fit_html
-                or ranking_result.cleaned_html
-                or ''
-            )
-            attempt_states.append({
-                'success': bool(ranking_result.success),
-                'status_code': getattr(ranking_result, 'status_code', None),
-                'redirected_url': str(
-                    getattr(ranking_result, 'redirected_url', '') or ''
-                )[-160:],
-                'html_length': len(ranking_html),
-                'error': str(ranking_result.error_message or '')[:240],
-            })
-            if _is_goodinfo_block_page(
-                ranking_html, getattr(ranking_result, 'status_code', None),
-            ):
-                blocked = True
-                break
-            if len(ranking_html) >= 10_000 and '週轉率' in ranking_html:
-                break
-            await asyncio.sleep(0.35)
-    return {
-        'html': ranking_html,
-        'success': bool(ranking_result.success),
-        'error': str(ranking_result.error_message or ''),
-        'initial_reinit': initial_reinit,
-        'blocked': blocked,
-        'status_code': getattr(ranking_result, 'status_code', None),
-        'ranking_attempts': ranking_attempts,
-        'attempt_states': attempt_states,
-    }
-
-
 def fetch_goodinfo_data():
-    """Fetch Goodinfo with Crawl4AI's undetected, two-stage browser session."""
+    """Use the original Selenium/User-Agent path to load Goodinfo's ranking.
+
+    This deliberately performs one browser visit only.  The previous crawler
+    retried/reloaded the page in the same click, which made rate-limit (429/430)
+    responses more likely and extended the screen wait.  No visitor cookie,
+    clearance token, or profile is persisted or copied into the application.
+    """
     started_at = time.monotonic()
     fetch_goodinfo_data.last_status = {
         'state': 'loading', 'reason': '', 'elapsed': 0.0,
     }
     headed_mode = os.environ.get("GOODINFO_HEADED") == "1"
+    chrome_options = Options()
+    if not headed_mode:
+        chrome_options.add_argument('--headless=new')
+    chrome_options.add_argument('--no-sandbox')
+    chrome_options.add_argument('--disable-dev-shm-usage')
+    chrome_options.add_argument('--disable-gpu')
+    chrome_options.add_argument('--disable-software-rasterizer')
+    chrome_options.add_argument('--window-size=1920x1080')
+    chrome_options.add_argument('--lang=zh-TW')
+    chrome_options.add_argument(
+        f'--user-agent={_GOODINFO_LEGACY_USER_AGENT}'
+    )
+    chrome_options.add_argument('--disable-blink-features=AutomationControlled')
+    chrome_options.add_experimental_option('excludeSwitches', ['enable-automation'])
+    chrome_options.add_experimental_option('useAutomationExtension', False)
+    chrome_options.page_load_strategy = 'eager'
+    if os.path.exists('/usr/bin/chromium'):
+        chrome_options.binary_location = '/usr/bin/chromium'
 
     acquired = _GOODINFO_BROWSER_SEMAPHORE.acquire(timeout=3)
     if not acquired:
@@ -7332,66 +7222,112 @@ def fetch_goodinfo_data():
             'state': 'failed', 'reason': 'browser_busy',
             'elapsed': round(time.monotonic() - started_at, 2),
             'headed_mode': headed_mode,
-            'fetcher': 'crawl4ai-undetected',
+            'fetcher': 'selenium-legacy-ua',
         }
         return None
+    driver = None
     try:
         try:
-            crawl_result = asyncio.run(
-                _crawl_goodinfo_with_crawl4ai(headed_mode=headed_mode)
+            service = (
+                Service('/usr/bin/chromedriver')
+                if os.path.exists('/usr/bin/chromedriver') else Service()
             )
-        except (ImportError, ModuleNotFoundError) as exc:
-            logger.exception(
-                'Crawl4AI dependency is unavailable: %s', type(exc).__name__,
-            )
-            fetch_goodinfo_data.last_status = {
-                'state': 'failed', 'reason': 'crawl4ai_dependency_missing',
-                'error_type': type(exc).__name__,
-                'elapsed': round(time.monotonic() - started_at, 2),
-                'headed_mode': headed_mode, 'fetcher': 'crawl4ai-undetected',
-            }
-            return None
+            driver = webdriver.Chrome(service=service, options=chrome_options)
+            driver.set_page_load_timeout(7)
+            driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
+                'source': """
+                    Object.defineProperty(navigator, 'webdriver', {
+                        get: () => undefined
+                    });
+                    Object.defineProperty(navigator, 'languages', {
+                        get: () => ['zh-TW', 'zh', 'en-US', 'en']
+                    });
+                """,
+            })
+            try:
+                driver.get(_GOODINFO_URL)
+            except (TimeoutException, UnexpectedAlertPresentException):
+                pass
 
-        ranking = _parse_goodinfo_original_page(crawl_result.get('html', ''))
-        if ranking is not None:
+            # Match the original short wait: wait for one completed page, do
+            # not refresh or create a second browser request.
+            deadline = time.monotonic() + 15.0
+            last_markup = ''
+            while time.monotonic() < deadline:
+                try:
+                    alert = driver.switch_to.alert
+                    alert_text = alert.text
+                    alert.accept()
+                    logger.warning('Goodinfo alert: %s', alert_text)
+                    alert_reason = (
+                        'rate_limited'
+                        if _is_goodinfo_block_page(alert_text)
+                        else 'site_alert'
+                    )
+                    fetch_goodinfo_data.last_status = {
+                        'state': 'failed', 'reason': alert_reason,
+                        'elapsed': round(time.monotonic() - started_at, 2),
+                        'headed_mode': headed_mode,
+                        'fetcher': 'selenium-legacy-ua',
+                    }
+                    return None
+                except NoAlertPresentException:
+                    pass
+
+                last_markup = driver.page_source
+                if _is_goodinfo_block_page(last_markup):
+                    fetch_goodinfo_data.last_status = {
+                        'state': 'failed', 'reason': 'rate_limited',
+                        'elapsed': round(time.monotonic() - started_at, 2),
+                        'headed_mode': headed_mode,
+                        'fetcher': 'selenium-legacy-ua',
+                    }
+                    return None
+                ranking = _parse_goodinfo_original_page(last_markup)
+                if ranking is not None:
+                    fetch_goodinfo_data.last_status = {
+                        'state': 'success', 'reason': '', 'rows': len(ranking),
+                        'elapsed': round(time.monotonic() - started_at, 2),
+                        'headed_mode': headed_mode,
+                        'fetcher': 'selenium-legacy-ua',
+                    }
+                    return ranking
+                time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
+
             fetch_goodinfo_data.last_status = {
-                'state': 'success', 'reason': '', 'rows': len(ranking),
+                'state': 'failed', 'reason': 'legacy_table_missing',
                 'elapsed': round(time.monotonic() - started_at, 2),
                 'headed_mode': headed_mode,
-                'fetcher': 'crawl4ai-undetected',
-                'initial_reinit': bool(crawl_result.get('initial_reinit')),
-                'ranking_attempts': crawl_result.get('ranking_attempts', 0),
+                'fetcher': 'selenium-legacy-ua',
             }
-            return ranking
-        fetch_goodinfo_data.last_status = {
-            'state': 'failed',
-            'reason': (
-                'cloudflare_blocked'
-                if crawl_result.get('blocked') else 'crawl4ai_table_missing'
-            ),
-            'elapsed': round(time.monotonic() - started_at, 2),
-            'headed_mode': headed_mode,
-            'fetcher': 'crawl4ai-undetected',
-            'initial_reinit': bool(crawl_result.get('initial_reinit')),
-            'crawl_success': bool(crawl_result.get('success')),
-            'status_code': crawl_result.get('status_code'),
-            'ranking_attempts': crawl_result.get('ranking_attempts', 0),
-            'attempt_states': crawl_result.get('attempt_states', []),
-        }
-        logger.warning(
-            'Goodinfo Crawl4AI returned no ranking table: %s',
-            crawl_result.get('attempt_states', []),
-        )
+            logger.warning(
+                'Goodinfo legacy browser did not return a ranking table (%s bytes)',
+                len(last_markup),
+            )
+        except (WebDriverException, OSError, ValueError) as exc:
+            logger.exception('Goodinfo legacy browser failed: %s', type(exc).__name__)
+            fetch_goodinfo_data.last_status = {
+                'state': 'failed', 'reason': 'browser_error',
+                'error_type': type(exc).__name__,
+                'elapsed': round(time.monotonic() - started_at, 2),
+                'headed_mode': headed_mode,
+                'fetcher': 'selenium-legacy-ua',
+            }
     except Exception as exc:
-        logger.exception('Goodinfo Crawl4AI fetch failed: %s', type(exc).__name__)
+        logger.exception('Goodinfo legacy fetch failed: %s', type(exc).__name__)
         fetch_goodinfo_data.last_status = {
             'state': 'failed', 'reason': 'browser_error',
             'error_type': type(exc).__name__,
             'elapsed': round(time.monotonic() - started_at, 2),
             'headed_mode': headed_mode,
-            'fetcher': 'crawl4ai-undetected',
+            'fetcher': 'selenium-legacy-ua',
         }
     finally:
+        if driver is not None:
+            try:
+                driver.quit()
+            except WebDriverException:
+                pass
         _GOODINFO_BROWSER_SEMAPHORE.release()
     return None
 
@@ -11014,7 +10950,7 @@ def render_stock_external_resources():
     st.markdown("#### 外部資源")
 
     def perform_goodinfo_fetch():
-        with st.spinner("正在用 Crawl4AI 初始化工作階段並載入排行，約 15～30 秒..."):
+        with st.spinner("正在以舊版瀏覽器模式載入排行，最長約 15 秒..."):
             result = fetch_goodinfo_data()
             status = dict(getattr(fetch_goodinfo_data, 'last_status', {}) or {})
             if result is not None and not result.empty:
@@ -11028,9 +10964,9 @@ def render_stock_external_resources():
                 st.session_state['goodinfo_fetch_failed'] = True
                 reason_text = {
                     'browser_busy': '另一個頁面正在抓取，請稍後再按一次。',
-                    'crawl4ai_dependency_missing': 'Streamlit 尚未安裝完整 Crawl4AI 瀏覽器套件。',
-                    'cloudflare_blocked': 'Goodinfo 已阻擋這台 Streamlit 伺服器；請改用下方手動 CSV 備援。',
-                    'crawl4ai_table_missing': 'Crawl4AI 已完成初始化，但沒有收到完整排行表格。',
+                    'rate_limited': 'Goodinfo 暫時限制請求（429／430）；請稍等後再試，或改用下方手動 CSV 備援。',
+                    'site_alert': 'Goodinfo 回傳網站載入警示，請稍等後再試，或改用下方手動 CSV 備援。',
+                    'legacy_table_missing': '頁面已開啟，但 15 秒內沒有收到完整排行表格。',
                     'browser_error': '瀏覽器啟動、網站驗證或頁面解析失敗。',
                 }.get(status.get('reason'), '抓取失敗或查無資料。')
                 st.error(reason_text)
@@ -11045,7 +10981,7 @@ def render_stock_external_resources():
     with resource_col1:
         if st.button(
             "📥 抓取 Goodinfo 週轉率排行",
-            help="使用 Crawl4AI Undetected 瀏覽器；第一輪建立 Goodinfo 驗證狀態，第二輪載入完整排行。",
+            help="使用原本 Selenium＋一般瀏覽器 User-Agent 模式；每次僅請求一次，最長等待約 15 秒。",
             width='stretch', key='fetch_goodinfo_in_stock_room'
         ):
             perform_goodinfo_fetch()

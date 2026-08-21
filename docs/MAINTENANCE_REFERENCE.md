@@ -3,7 +3,7 @@
 ## 資料來源與口徑
 
 - Goodinfo 週轉率排行必須維持「上市＋上櫃、依當日累積成交量週轉率排序」的口徑，不能用證交所或櫃買中心的單一市場排行取代。
-- Goodinfo 維持原始上市＋上櫃排行，不改用不同口徑資料。抓取使用 Crawl4AI 0.9.2、`UndetectedAdapter`、Stealth 與同一 `session_id` 的分階段流程：第一輪接受 Goodinfo 用來建立 `CLIENT_KEY` 的 `REINIT` 片段，後續最多三輪沿用該分頁／Cookie，取得完整排行即停止，總等待上限約 28 秒。Crawl4AI 快取目錄固定導向可寫的系統暫存區；Streamlit Cloud 使用 `packages.txt` 的 `/usr/bin/chromium`，並在 Crawl4AI 0.9.2 的 browser manager 注入 `executable_path`（升級 Crawl4AI 時必須重驗此相容層）。禁止把開發者工具複製出的 `cf_clearance`、`CLIENT_KEY` 或其他 Cookie 寫入程式、設定檔或雲端。`GOODINFO_HEADED=1` 仍可切換可視模式，但只適用於有圖形顯示器或 Xvfb 的主機。失敗不得覆蓋上次成功資料，也不得以其他官方排行冒充 Goodinfo。
+- Goodinfo 維持原始上市＋上櫃排行，不改用不同口徑資料。抓取使用 Selenium、系統 Chromium/ChromeDriver 與固定的舊版一般瀏覽器 User-Agent；每次操作只建立一個暫時瀏覽器工作階段、最長等候約 15 秒，禁止自動重載或同一次多輪重試，以免加劇 429/430 限流。禁止把開發者工具複製出的 `cf_clearance`、`CLIENT_KEY` 或其他 Cookie 寫入程式、設定檔或雲端。`GOODINFO_HEADED=1` 仍可切換可視模式，但只適用於有圖形顯示器或 Xvfb 的主機。失敗不得覆蓋上次成功資料，也不得以其他官方排行冒充 Goodinfo。
 - 若 Streamlit 雲端 IP 仍被 Goodinfo 阻擋，正式備援流程是由使用者瀏覽器開啟同一排行頁、完成驗證並匯出 CSV，再於股票戰略室「本機」上傳後執行分析。上傳解析須支援 CP950／Big5／UTF-8、前置說明列與內嵌「代號／名稱」標題；瀏覽器基於隱私不會讓 Streamlit 自動讀取裝置的下載資料夾，因此不可宣稱下載後免上傳。
 - Goodinfo 若依雲端出口 IP 阻擋，增加瀏覽器指紋偽裝或等待時間不視為可靠修正；不可在程式內硬編使用者的 Cloudflare Cookie。完整的使用者端自動匯出／回傳需要獨立瀏覽器擴充功能或已授權的遠端瀏覽器服務，Streamlit iframe／一般 JavaScript 受跨來源與本機檔案權限限制，不能直接代替。
 - 2026 CPI／大非農已有完整且核對過的 BLS 官方排程；該年直接合併此排程與 TradingView 備援，不可先對容易封鎖雲端 IP 的 BLS 頁面做三輪重試。其他年份仍依序查 BLS ICS、年度總表與個別發布頁。這是首次載入的重要效能界線，不能用移除行事曆資料換速度。

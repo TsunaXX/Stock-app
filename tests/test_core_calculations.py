@@ -471,6 +471,9 @@ def test_goodinfo_cloudflare_block_is_detected_without_waiting_for_table():
     assert detector("<title>Just a moment...</title>") is True
     assert detector("<div id='cf-chl-widget'>Checking your browser</div>") is True
     assert detector("", status_code=403) is True
+    assert detector("", status_code=429) is True
+    assert detector("", status_code=430) is True
+    assert detector("Too many requests") is True
     assert detector("<table><th>代號</th><th>週轉率</th></table>", 200) is False
 
 
@@ -682,42 +685,23 @@ def test_daily_risk_refresh_skips_redundant_live_quote_fetches():
     assert "include_live_quote=False" in risk_source
 
 
-def test_goodinfo_fetch_uses_crawl4ai_two_stage_undetected_session():
+def test_goodinfo_fetch_uses_legacy_selenium_user_agent_without_crawler_retries():
     source = APP_PATH.read_text(encoding="utf-8")
     tree = ast.parse(source)
-    crawler = next(
-        node for node in tree.body
-        if isinstance(node, ast.AsyncFunctionDef)
-        and node.name == "_crawl_goodinfo_with_crawl4ai"
-    )
-    crawler_source = ast.get_source_segment(source, crawler)
-    assert 'from crawl4ai import (' in crawler_source
-    assert 'UndetectedAdapter' in crawler_source
-    assert 'AsyncPlaywrightCrawlerStrategy' in crawler_source
-    assert "enable_stealth=True" in crawler_source
-    assert "user_agent_mode='random'" in crawler_source
-    assert "session_id = f'goodinfo-{time.time_ns()}'" in crawler_source
-    assert crawler_source.count('await crawler.arun(') == 2
-    assert "'session_id': session_id" in crawler_source
-    assert "'REINIT='" in crawler_source
-    assert 'while ranking_attempts < 3 and not blocked' in crawler_source
-    assert 'crawl_deadline = time.monotonic() + 28.0' in crawler_source
-    assert 'wait_for_timeout=min(12_000, remaining_ms)' in crawler_source
-    assert 'includes(\"週轉率\")' in crawler_source
-    assert 'cookies=' not in crawler_source
-    assert "CRAWL4_AI_BASE_DIRECTORY" in crawler_source
-    assert "browser_args['executable_path'] = '/usr/bin/chromium'" in crawler_source
-
     wrapper = next(
         node for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name == "fetch_goodinfo_data"
     )
     wrapper_source = ast.get_source_segment(source, wrapper)
-    assert 'asyncio.run(' in wrapper_source
-    assert '_crawl_goodinfo_with_crawl4ai' in wrapper_source
+    assert 'webdriver.Chrome(service=service, options=chrome_options)' in wrapper_source
+    assert "_GOODINFO_LEGACY_USER_AGENT" in wrapper_source
+    assert "--headless=new" in wrapper_source
+    assert "deadline = time.monotonic() + 15.0" in wrapper_source
     assert '_parse_goodinfo_original_page' in wrapper_source
-    assert 'crawl4ai_dependency_missing' in wrapper_source
-    assert 'cloudflare_blocked' in wrapper_source
+    assert "rate_limited" in wrapper_source
+    assert "driver.get(_GOODINFO_URL)" in wrapper_source
+    assert "driver.refresh(" not in wrapper_source
+    assert "crawl4ai" not in wrapper_source.lower()
     assert 'scrapling' not in wrapper_source.lower()
 
 
@@ -772,14 +756,13 @@ def test_opening_yahoo_batch_does_not_request_nonexistent_twf_symbol():
     assert "[item[1] for item in intraday_symbols.values()]" in function_source
 
 
-def test_crawl4ai_dependency_and_cloud_browser_setup_are_pinned():
+def test_selenium_legacy_browser_dependency_is_pinned():
     requirements = (APP_PATH.parent / "requirements.txt").read_text(encoding="utf-8")
     packages = (APP_PATH.parent / "packages.txt").read_text(encoding="utf-8")
-    assert "crawl4ai==0.9.2" in requirements
-    assert "websockets==16.0" in requirements
+    assert "selenium==4.40.0" in requirements
+    assert "crawl4ai" not in requirements.lower()
     assert "scrapling" not in requirements.lower()
-    assert "selenium" not in requirements.lower()
-    assert packages.splitlines() == ["chromium"]
+    assert packages.splitlines() == ["chromium", "chromium-driver"]
 
 
 def test_shioaji_futures_resolver_uses_v17_lazy_root_api():
