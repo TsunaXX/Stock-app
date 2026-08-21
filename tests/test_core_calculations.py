@@ -647,6 +647,7 @@ def test_heavy_hidden_sources_require_an_active_keyed_tab():
 def test_streamlit_magic_ast_rewrite_is_disabled_for_large_app():
     config = (APP_PATH.parent / ".streamlit" / "config.toml").read_text(encoding="utf-8")
     assert "magicEnabled = false" in config
+    assert 'fileWatcherType = "none"' in config
 
 
 def test_calendar_http_has_a_short_single_attempt_deadline():

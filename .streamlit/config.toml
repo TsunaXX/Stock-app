@@ -3,3 +3,9 @@
 # expression "magic". Disabling the AST rewrite removes several seconds from
 # every cold script compilation without changing any rendered element.
 magicEnabled = false
+
+[server]
+# Render deploys immutable images, so watching /app for source changes only
+# consumes inotify handles and can trigger noisy rerun errors.
+fileWatcherType = "none"
+runOnSave = false
