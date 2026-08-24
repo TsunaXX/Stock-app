@@ -81,10 +81,6 @@ def is_warrant(code):
     if c.startswith('00'): return False
     return len(c) > 4
 
-def is_warrant(code):
-    c = str(code)
-    if c.startswith('00'): return False
-    return len(c) > 4
 
 # ==========================================
 # 永豐 API (Shioaji) 擷取核心
@@ -123,7 +119,7 @@ def fetch_shioaji_data(api, code, interval='1d', lookback_days=10):
         else:
             try:
                 contract = api.Contracts.Stocks[code]
-            except:
+            except Exception:
                 pass
 
         if not contract:
@@ -183,7 +179,7 @@ def fetch_shioaji_data(api, code, interval='1d', lookback_days=10):
                             all_vol.extend(k.Volume)
                             break
                         time.sleep(0.3)
-                    except:
+                    except Exception:
                         time.sleep(0.3)
             
             if all_ts:
@@ -469,9 +465,9 @@ def plot_fibonacci_chart(symbol, interval, lookback=60, font_size=15, ma_flags=N
                 else:
                     try: 
                         contract_snap = st.session_state.sj_api.Contracts.Stocks[raw_code]
-                    except:
+                    except Exception:
                         try: contract_snap = getattr(st.session_state.sj_api.Contracts.Stocks, raw_code, None)
-                        except: pass
+                        except Exception: pass
                 
                 if contract_snap:
                     snap = st.session_state.sj_api.snapshots([contract_snap])
@@ -491,7 +487,7 @@ def plot_fibonacci_chart(symbol, interval, lookback=60, font_size=15, ma_flags=N
                                 explicit_ref_prev_close = rt_price - float(change_val)
                             elif hasattr(contract_snap, 'reference') and contract_snap.reference > 0:
                                 explicit_ref_prev_close = float(contract_snap.reference)
-                        except:
+                        except Exception:
                             pass
                         
                         if df.index.tzinfo is not None: df.index = df.index.tz_localize(None)
@@ -1102,7 +1098,7 @@ def get_tw_stocker_data(direction):
                         'three_inst_ratio': '三大法人持股(%)'
                     })
                     return df[['代號', '名稱', '持股變化(%)', '三大法人持股(%)']]
-    except:
+    except Exception:
         pass
     return pd.DataFrame()
 
@@ -1212,7 +1208,7 @@ def load_config():
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r") as f: return json.load(f)
-        except: return {}
+        except Exception: return {}
     return {}
 
 def save_config(font_size, limit_rows, auto_update, delay_sec, sj_key="", sj_secret="", remember_sj=False):
@@ -1229,7 +1225,7 @@ def save_config(font_size, limit_rows, auto_update, delay_sec, sj_key="", sj_sec
         })
         with open(CONFIG_FILE, "w") as f: json.dump(config, f)
         return True
-    except: return False
+    except Exception: return False
 
 def save_fibo_config():
     config = load_config()
@@ -1246,7 +1242,7 @@ def save_fibo_config():
         config['ma_width'] = st.session_state.ma_w
     try:
         with open(CONFIG_FILE, "w") as f: json.dump(config, f)
-    except: pass
+    except Exception: pass
     # 同步寫入 Google Sheets
     save_data_cache(st.session_state.stock_data, st.session_state.ignored_stocks, st.session_state.all_candidates, st.session_state.saved_notes, fibo_tags)
 
@@ -1288,7 +1284,7 @@ def save_data_cache(df, ignored_set, candidates=[], saved_notes={}, fibo_tags=No
                     }
                     json_str = json.dumps(data_to_save, ensure_ascii=False)
                     requests.post(st.secrets["gsheet_api_url"], json={"action": "save", "data": json_str}, timeout=5)
-                except: pass
+                except Exception: pass
                 finally:
                     # 強制回收背景執行緒產生的巨大 JSON 與 Dict 記憶體
                     import gc
@@ -1296,7 +1292,7 @@ def save_data_cache(df, ignored_set, candidates=[], saved_notes={}, fibo_tags=No
 
             import threading
             threading.Thread(target=bg_save, args=(df_save, ignored_list, candidates, saved_notes, fibo_tags, cached_notes), daemon=True).start()
-    except: pass
+    except Exception: pass
 
 def load_data_cache():
     if "gsheet_api_url" in st.secrets:
@@ -1310,7 +1306,7 @@ def load_data_cache():
                 saved_notes = data.get('saved_notes', {}) 
                 fibo_tags = data.get('fibo_tags', [])
                 return df, ignored, candidates, saved_notes, fibo_tags, data.get('cached_notes', {})
-        except: pass
+        except Exception: pass
 
     if os.path.exists(DATA_CACHE_FILE):
         try:
@@ -1321,7 +1317,7 @@ def load_data_cache():
             saved_notes = data.get('saved_notes', {}) 
             fibo_tags = data.get('fibo_tags', [])
             return df, ignored, candidates, saved_notes, fibo_tags, data.get('cached_notes', {})
-        except: return pd.DataFrame(), set(), [], {}, [], {}
+        except Exception: return pd.DataFrame(), set(), [], {}, [], {}
     return pd.DataFrame(), set(), [], {}, [], {}
 
 def load_url_history():
@@ -1331,7 +1327,7 @@ def load_url_history():
                 data = json.load(f)
                 if "url" in data and isinstance(data["url"], str) and data["url"]: return [data["url"]]
                 return data.get("urls", [])
-        except: return []
+        except Exception: return []
     return []
 
 def save_url_history(urls):
@@ -1345,20 +1341,20 @@ def save_url_history(urls):
                 seen.add(u_clean)
         with open(URL_CACHE_FILE, "w", encoding='utf-8') as f: json.dump({"urls": unique_urls}, f)
         return True
-    except: return False
+    except Exception: return False
 
 def load_search_cache():
     if os.path.exists(SEARCH_CACHE_FILE):
         try:
             with open(SEARCH_CACHE_FILE, "r", encoding='utf-8') as f: data = json.load(f)
             return data.get("selected", [])
-        except: return []
+        except Exception: return []
     return []
 
 def save_search_cache(selected_items):
     try:
         with open(SEARCH_CACHE_FILE, "w", encoding='utf-8') as f: json.dump({"selected": selected_items}, f, ensure_ascii=False)
-    except: pass
+    except Exception: pass
 
 if 'stock_data' not in st.session_state:
     cached_df, cached_ignored, cached_candidates, cached_saved_notes, cached_fibo_tags, cached_note_dict = load_data_cache()
@@ -1460,7 +1456,7 @@ def load_local_stock_names():
                 n = str(row['name']).strip()
                 code_map[c] = n
                 name_map[n] = c
-        except: pass
+        except Exception: pass
     return code_map, name_map
 
 @st.cache_data(ttl=86400)
@@ -1502,7 +1498,7 @@ with st.sidebar:
                     try: 
                         st.session_state.sj_api.logout()
                         init_shioaji_connection.clear() 
-                    except: pass
+                    except Exception: pass
                     
                     # 保持儲存現有的 Key 與記住狀態
                     save_config(
@@ -1682,7 +1678,7 @@ def fetch_futures_list():
                 futures_dict[code] = "✅(有小型)" if len(contracts) > 1 else "✅"
             if futures_dict:
                 return futures_dict
-    except: pass
+    except Exception: pass
 
     try:
         url = "https://www.taifex.com.tw/cht/2/stockLists"
@@ -1710,12 +1706,12 @@ def fetch_futures_list():
                         elif code not in futures_dict:
                             futures_dict[code] = "✅"
             return futures_dict
-    except: pass
+    except Exception: pass
     return {}
 
 def get_tick_size(price):
     try: price = float(price)
-    except: return 0.01
+    except Exception: return 0.01
     if pd.isna(price) or price <= 0: return 0.01
     if price < 10: return 0.01
     if price < 50: return 0.05
@@ -1731,9 +1727,9 @@ def apply_tick_rules(price):
         tick = get_tick_size(p)
         rounded = (Decimal(str(p)) / Decimal(str(tick))).quantize(Decimal("1"), rounding=ROUND_HALF_UP) * Decimal(str(tick))
         return float(rounded)
-    except:
+    except Exception:
         try: return float(price)
-        except: return 0.0
+        except Exception: return 0.0
 
 def calculate_limits(price):
     try:
@@ -1746,7 +1742,7 @@ def calculate_limits(price):
         tick_down = get_tick_size(raw_down) 
         limit_down = math.ceil(raw_down / tick_down) * tick_down
         return float(f"{limit_up:.2f}"), float(f"{limit_down:.2f}")
-    except: return 0, 0
+    except Exception: return 0, 0
 
 def move_tick(price, steps):
     try:
@@ -1760,7 +1756,7 @@ def move_tick(price, steps):
                 tick = get_tick_size(curr - 0.0001)
                 curr = round(curr - tick, 2)
         return curr
-    except: return price
+    except Exception: return price
 
 def apply_sr_rules(price, base_price):
     try:
@@ -1772,13 +1768,13 @@ def apply_sr_rules(price, base_price):
         if p < base_price: return float(math.ceil(d_val / d_tick) * d_tick)
         elif p > base_price: return float(math.floor(d_val / d_tick) * d_tick)
         else: return apply_tick_rules(p)
-    except: return price
+    except Exception: return price
 
 def fmt_price(v):
     try:
         if pd.isna(v) or v == "": return ""
         return f"{float(v):.2f}".rstrip('0').rstrip('.')
-    except: return str(v)
+    except Exception: return str(v)
 
 def calculate_note_width(series, font_size):
     def get_width(s):
@@ -1812,7 +1808,7 @@ def recalculate_row(row, points_map):
         found_prices = re.findall(r'\d+\.?\d*', note_text)
         for fp in found_prices:
             try: strat_values.append(float(fp))
-            except: pass
+            except Exception: pass
             
         if l_up is not None and abs(price - l_up) < 0.01: status = "漲停"
         elif l_down is not None and abs(price - l_down) < 0.01: status = "跌停"
@@ -1827,7 +1823,7 @@ def recalculate_row(row, points_map):
                     if abs(v - price) < 0.01: hit = True; break
                 if hit: status = "命中"
         return status
-    except: return status
+    except Exception: return status
 
 def generate_note_from_points(points, manual_note, show_3d):
     # 修正：加入安全判斷，防止重整或合併時產生 NaN 導致的 TypeError
@@ -1922,14 +1918,14 @@ def fetch_stock_data_raw(code, name_hint="", extra_data=None, futures_set=None, 
                 if not df_tw.empty:
                     hist = df_tw[cols]
                     source_used = "twstock"
-        except: pass
+        except Exception: pass
 
     if hist.empty and si is not None:
         try:
             try: df_yf = si.get_data(f"{code}.TW", start_date=(datetime.now() - timedelta(days=40)))
-            except:
+            except Exception:
                 try: df_yf = si.get_data(f"{code}.TWO", start_date=(datetime.now() - timedelta(days=40)))
-                except: df_yf = pd.DataFrame()
+                except Exception: df_yf = pd.DataFrame()
             
             if not df_yf.empty:
                 rename_map = {'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'}
@@ -1938,7 +1934,7 @@ def fetch_stock_data_raw(code, name_hint="", extra_data=None, futures_set=None, 
                 if all(c in df_yf.columns for c in cols):
                     hist = df_yf[cols]
                     source_used = "yahoo_fin"
-        except: pass
+        except Exception: pass
 
     if hist.empty:
         try:
@@ -1984,7 +1980,7 @@ def fetch_stock_data_raw(code, name_hint="", extra_data=None, futures_set=None, 
                         hist.at[last_hist_date, 'Low'] = min(hist.at[last_hist_date, 'Low'], rt_low)
                         hist.at[last_hist_date, 'Volume'] = rt_vol
                         if hist.at[last_hist_date, 'Open'] == 0: hist.at[last_hist_date, 'Open'] = rt_open
-        except: pass 
+        except Exception: pass
 
     if hist.empty: return None
     if hist.index.tzinfo is not None: hist.index = hist.index.tz_localize(None)
@@ -2021,7 +2017,7 @@ def fetch_stock_data_raw(code, name_hint="", extra_data=None, futures_set=None, 
                         official_ref = rt_p - float(change_val)
                         if len(hist) >= 2:
                             hist.iloc[-2, hist.columns.get_loc('Close')] = official_ref
-        except:
+        except Exception:
             pass
 
     live_base_price = hist.iloc[-1]['Close']
@@ -2226,7 +2222,7 @@ with tab1:
                         sheet_options = xl_file.sheet_names
                         default_idx = sheet_options.index("週轉率") if "週轉率" in sheet_options else 0
                         selected_sheet = st.selectbox("選擇工作表", sheet_options, index=default_idx)
-                except: pass
+                except Exception: pass
 
         with src_tab2:
             def on_history_change(): st.session_state.cloud_url_input = st.session_state.history_selected
@@ -2266,12 +2262,12 @@ with tab1:
                 fname = uploaded_file.name.lower()
                 if fname.endswith('.csv'):
                     try: df_up = pd.read_csv(uploaded_file, dtype=str, encoding='cp950')
-                    except: 
+                    except Exception:
                         uploaded_file.seek(0)
                         df_up = pd.read_csv(uploaded_file, dtype=str)
                 elif fname.endswith('.html') or fname.endswith('.htm') or fname.endswith('.xls'):
                     try: dfs = pd.read_html(uploaded_file, encoding='cp950')
-                    except:
+                    except Exception:
                         uploaded_file.seek(0)
                         dfs = pd.read_html(uploaded_file, encoding='utf-8')
                     for df in dfs:
@@ -2292,9 +2288,9 @@ with tab1:
                 if "docs.google.com" in url and "/spreadsheets/" in url and "/edit" in url:
                     url = url.split("/edit")[0] + "/export?format=csv"
                 try: df_up = pd.read_csv(url, dtype=str)
-                except:
+                except Exception:
                     try: df_up = pd.read_excel(url, dtype=str)
-                    except: st.error("❌ 無法讀取雲端檔案。")
+                    except Exception: st.error("❌ 無法讀取雲端檔案。")
             
             # 🟢 新增：若無上傳與雲端輸入，且檢測到有 Goodinfo 暫存資料時直接讀取
             elif 'goodinfo_df' in st.session_state:
@@ -2479,12 +2475,12 @@ with tab1:
                 c_price = row.get('自訂價(可修)')
                 if pd.notna(c_price) and str(c_price).strip() != "":
                     try: df_display.at[i, '自訂價價差'] = round(float(c_price) - float(ma5_val), 2)
-                    except: pass
+                    except Exception: pass
                     
                 close_p = row.get('收盤價')
                 if pd.notna(close_p) and str(close_p).strip() != "":
                     try: df_display.at[i, '5日線價差'] = round(float(close_p) - float(ma5_val), 2)
-                    except: pass
+                    except Exception: pass
 
         input_cols = ["移除", "代號", "名稱", "戰略備註", "自訂價(可修)", "狀態", "自訂價價差", "5日線價差", "當日漲停價", "當日跌停價", "收盤價", "漲跌幅", "期貨"]
         for col in input_cols:
@@ -2504,10 +2500,10 @@ with tab1:
                     chg = float(df_display.at[i, "漲跌幅"])
                     df_display.at[i, "收盤價"] = fmt_price(p)
                     df_display.at[i, "漲跌幅"] = f"{chg:+.2f}%"
-                except:
+                except Exception:
                     df_display.at[i, "收盤價"] = fmt_price(df_display.at[i, "收盤價"])
                     try: df_display.at[i, "漲跌幅"] = f"{float(df_display.at[i, '漲跌幅']):.2f}%"
-                    except: pass
+                    except Exception: pass
 
         df_display = df_display.reset_index(drop=True)
         for col in input_cols:
@@ -2532,7 +2528,7 @@ with tab1:
             try:
                 c_val = float(str(row.get('漲跌幅', '0')).replace('%', '').replace('+', ''))
                 price_c = 'color: #ff4b4b;' if c_val > 0 else ('color: #00e676;' if c_val < 0 else '')
-            except: pass
+            except Exception: pass
             
             st_val = str(row.get('狀態', ''))
             status_c = 'color: #ff4b4b;' if st_val in ["漲停", "強"] else ('color: #00e676;' if st_val in ["跌停", "弱"] else ('color: #ffeb3b;' if st_val == "命中" else ''))
@@ -2548,7 +2544,7 @@ with tab1:
                         if f_val > 0: styles[idx] = 'color: #ff4b4b;'
                         elif f_val < 0: styles[idx] = 'color: #00e676;'
                         else: styles[idx] = 'color: white;'
-                    except: pass
+                    except Exception: pass
             return styles
             
         styled_df = df_display[input_cols].style.apply(style_tab1_df, axis=1)
@@ -2723,7 +2719,7 @@ with tab1:
                                     contract = min([c for c in sj_api.Contracts.Futures.MXF if c.code[-2:] not in ["R1", "R2"] and '/' not in c.code], key=lambda c: getattr(c, 'delivery_date', '999999'))
                             else:
                                 try: contract = sj_api.Contracts.Stocks[code]
-                                except: pass
+                                except Exception: pass
                             
                             if contract:
                                 snap = sj_api.snapshots([contract])
@@ -2843,7 +2839,7 @@ with tab1:
                         close_p = row.get('收盤價')
                         if pd.notna(close_p) and str(close_p).strip() != "":
                             try: df_indep.at[i, '5日線價差'] = round(float(close_p) - float(ma5_val), 2)
-                            except: pass
+                            except Exception: pass
 
                 input_cols = ["代號", "名稱", "戰略備註", "5日線價差", "當日漲停價", "當日跌停價", "收盤價", "漲跌幅", "期貨"]
                 for col in input_cols:
@@ -2864,10 +2860,10 @@ with tab1:
                             chg = float(df_indep.at[i, "漲跌幅"])
                             df_indep.at[i, "收盤價"] = fmt_price(p)
                             df_indep.at[i, "漲跌幅"] = f"{chg:+.2f}%"
-                        except:
+                        except Exception:
                             df_indep.at[i, "收盤價"] = fmt_price(df_indep.at[i, "收盤價"])
                             try: df_indep.at[i, "漲跌幅"] = f"{float(df_indep.at[i, '漲跌幅']):.2f}%"
-                            except: pass
+                            except Exception: pass
 
                 for col in input_cols:
                     df_indep[col] = df_indep[col].astype(str)
@@ -3378,10 +3374,10 @@ with tab2:
                                 stock_contracts[code].add(contract)
                             
                             try: margin_map[code] = float(m_val)
-                            except: pass
+                            except Exception: pass
                             maint_val = str(item.get("MaintenanceMarginRate", "0")).replace('%', '').strip()
                             try: maint_map[code] = float(maint_val)
-                            except: pass
+                            except Exception: pass
                             g_val = str(item.get("GroupLevel", "")).strip()
                             if g_val: group_level_map[code] = g_val
                         # 擷取更新日期
@@ -3394,7 +3390,7 @@ with tab2:
                     for code, contracts in stock_contracts.items():
                         if len(contracts) > 1:
                             has_small_set.add(code)
-            except: pass
+            except Exception: pass
             return margin_map, maint_map, group_level_map, has_small_set, sync_date
 
         def do_clear_opt():
@@ -3541,7 +3537,7 @@ with tab2:
                                 valid_list = [c for c in contracts if is_valid_contract(c)]
                                 if valid_list:
                                     contract = min(valid_list, key=lambda c: str(getattr(c, 'delivery_date', getattr(c, 'delivery_month', '999999'))).replace('/', '').replace('-', ''))
-                            except: pass
+                            except Exception: pass
                         elif opt_main_tab == "個股期貨":
                             code = search_stock_futures.split(" ")[0] if search_stock_futures else ""
                             if code:
@@ -3606,7 +3602,7 @@ with tab2:
                                                     else:
                                                         valid_closes = daily_closes[daily_closes.index <= curr_d]
                                                         if not valid_closes.empty: ref_p = float(valid_closes.iloc[-1])
-                                        except: pass
+                                        except Exception: pass
                                         
                                         # 若真的都抓不到，最後才回退至快取的參考價
                                         if ref_p is None or ref_p == 0:
@@ -3679,7 +3675,7 @@ with tab2:
                 config['saved_opt_fee'] = opt_fee
                 try:
                     with open(CONFIG_FILE, "w") as f: json.dump(config, f)
-                except: pass
+                except Exception: pass
 
             actual_margin_req = 0
             margin_display_val = "尚未同步或無資料"
@@ -3996,7 +3992,7 @@ with tab_fibo:
         st.write("---")
         interval_options = {"5m": "5分", "15m": "15分", "60m": "60分", "1d": "日", "1wk": "週", "1mo": "月"}
         try: default_radio_idx = list(interval_options.keys()).index(st.session_state.fibo_interval)
-        except: default_radio_idx = 0 
+        except Exception: default_radio_idx = 0
 
         selected_interval_label = st.radio(
             "⏱️ 選擇時間標籤",
@@ -4097,7 +4093,7 @@ with tab_db:
                     v = float(val)
                     yi_val = v / 100000000
                     return f"{int(v):,}  ({yi_val:+.2f}億)"
-                except:
+                except Exception:
                     return str(val)
             
             # 將自訂格式套用到買進、賣出、買賣差額三個欄位
@@ -4177,7 +4173,7 @@ with tab_db:
                         
                     if rep_date >= limit_date:
                         show_report = True
-                except:
+                except Exception:
                     # 只有在明確寫 "近期發布" 時才例外顯示
                     if report['日期'] == "近期發布":
                         show_report = True
@@ -4221,7 +4217,7 @@ with tab3:
                     if not df.empty and "日期" in df.columns:
                         df["日期"] = pd.to_datetime(df["日期"], errors='coerce').dt.date
                         return df
-            except: pass
+            except Exception: pass
         
         # 預設給予一列空白資料，並確保日期欄位擁有正確的空值型別 (NaT)
         df = pd.DataFrame([{"日期": pd.NaT, "事件名稱": "", "文字顏色": "白色"}])
@@ -4234,7 +4230,7 @@ with tab3:
             df_save = df.copy()
             df_save['日期'] = df_save['日期'].astype(str)
             df_save.to_json(CAL_OVERRIDE_FILE, orient="records", force_ascii=False)
-        except: pass
+        except Exception: pass
 
     if 'cal_overrides' not in st.session_state:
         st.session_state.cal_overrides = load_cal_overrides()
@@ -4466,7 +4462,7 @@ with tab3:
                         raw_col = str(r["文字顏色"]).strip() if pd.notna(r["文字顏色"]) else "白色"
                         col = color_map.get(raw_col, "#FFFFFF")
                         override_dict[d_obj].append(f"<div style='color:{col}; font-size:0.8em; margin-top:2px; font-weight:bold;'>{r['事件名稱']}</div>")
-            except:
+            except Exception:
                 pass
     # ---------------------------------------------
 
