@@ -3432,7 +3432,7 @@ def fetch_shioaji_data(api, code, interval='1d', lookback_days=10):
         else:
             try:
                 contract = api.Contracts.Stocks[code]
-            except:
+            except Exception:
                 pass
 
         if not contract:
@@ -3501,7 +3501,7 @@ def fetch_shioaji_data(api, code, interval='1d', lookback_days=10):
                                 all_amount.extend(amount)
                             break
                         time.sleep(0.3)
-                    except:
+                    except Exception:
                         time.sleep(0.3)
             
             if all_ts:
@@ -6113,9 +6113,9 @@ def plot_fibonacci_chart(
                 else:
                     try: 
                         contract_snap = st.session_state.sj_api.Contracts.Stocks[raw_code]
-                    except:
+                    except Exception:
                         try: contract_snap = getattr(st.session_state.sj_api.Contracts.Stocks, raw_code, None)
-                        except: pass
+                        except Exception: pass
                 
                 if contract_snap:
                     snap = get_stream_quotes(st.session_state.sj_api, [contract_snap])
@@ -6148,7 +6148,7 @@ def plot_fibonacci_chart(
                                 explicit_ref_prev_close = rt_price - float(change_val)
                             elif hasattr(contract_snap, 'reference') and contract_snap.reference > 0:
                                 explicit_ref_prev_close = float(contract_snap.reference)
-                        except:
+                        except Exception:
                             pass
                         
                         if df.index.tzinfo is not None: df.index = df.index.tz_localize(None)
@@ -6857,7 +6857,7 @@ def get_tw_stocker_data(direction):
                         'three_inst_ratio': '三大法人持股(%)'
                     })
                     return df[['代號', '名稱', '持股變化(%)', '三大法人持股(%)']]
-    except:
+    except Exception:
         pass
     return pd.DataFrame()
 
@@ -6881,6 +6881,217 @@ _GOODINFO_LEGACY_USER_AGENT = (
     'AppleWebKit/537.36 (KHTML, like Gecko) '
     'Chrome/114.0.0.0 Safari/537.36'
 )
+_OFFICIAL_TURNOVER_CACHE_FILE = "official_turnover_ranking.json"
+_TWSE_DAILY_QUOTES_URL = "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX"
+_TWSE_LISTED_COMPANIES_URL = "https://openapi.twse.com.tw/v1/opendata/t187ap03_L"
+_TWSE_LISTED_FUNDS_URL = "https://openapi.twse.com.tw/v1/opendata/t187ap47_L"
+_TPEX_DAILY_QUOTES_URL = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"
+
+
+def _parse_roc_trade_date(value):
+    """Convert ROC compact dates used by TWSE/TPEx into a Gregorian date."""
+    digits = re.sub(r"\D", "", str(value or ""))
+    if len(digits) == 7:
+        year, month, day = int(digits[:3]) + 1911, int(digits[3:5]), int(digits[5:])
+    elif len(digits) == 8:
+        year, month, day = int(digits[:4]), int(digits[4:6]), int(digits[6:])
+    else:
+        return None
+    try:
+        return date(year, month, day)
+    except ValueError:
+        return None
+
+
+def _official_number(value):
+    """Parse exchange numeric fields without accepting missing/zero denominators."""
+    text = re.sub(r"[^0-9.\-]", "", str(value or ""))
+    try:
+        number = float(text)
+        return number if math.isfinite(number) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_turnover_security_code(value):
+    """Keep ordinary four-digit stocks and 00-prefixed listed/OTC ETFs only."""
+    code = str(value or "").strip().upper()
+    return bool(re.fullmatch(r"(?:\d{4}|00[0-9A-Z]{4})", code))
+
+
+def _build_official_turnover_ranking(
+    tpex_rows, twse_payload, listed_company_rows, listed_fund_rows,
+):
+    """Build one TWSE+TPEx ranking using normal-session volume / issued units."""
+    tpex_rows = list(tpex_rows or [])
+    tpex_dates = {
+        parsed for parsed in (
+            _parse_roc_trade_date(row.get("Date")) for row in tpex_rows
+            if isinstance(row, dict)
+        ) if parsed is not None
+    }
+    if not tpex_dates:
+        raise ValueError("TPEx 行情缺少有效資料日期")
+    source_date = max(tpex_dates)
+    tpex_rows = [
+        row for row in tpex_rows
+        if _parse_roc_trade_date(row.get("Date")) == source_date
+    ]
+
+    issued_units = {}
+    for row in list(listed_company_rows or []):
+        if not isinstance(row, dict):
+            continue
+        code = str(row.get("公司代號", "")).strip()
+        shares = _official_number(row.get("已發行普通股數或TDR原股發行股數"))
+        if code and shares and shares > 0:
+            issued_units[code] = shares
+    for row in list(listed_fund_rows or []):
+        if not isinstance(row, dict):
+            continue
+        code = str(row.get("基金代號", "")).strip()
+        shares = _official_number(row.get("發行單位數/轉換數"))
+        if code and shares and shares > 0:
+            issued_units[code] = shares
+
+    twse_table = None
+    for table in list((twse_payload or {}).get("tables", [])):
+        fields = list(table.get("fields", []))
+        if all(field in fields for field in ("證券代號", "證券名稱", "成交股數")):
+            twse_table = table
+            break
+    if twse_table is None:
+        raise ValueError("TWSE 行情缺少每日收盤證券表")
+
+    records = []
+    fields = list(twse_table.get("fields", []))
+    for values in list(twse_table.get("data", [])):
+        row = dict(zip(fields, values))
+        code = str(row.get("證券代號", "")).strip()
+        volume = _official_number(row.get("成交股數"))
+        shares = issued_units.get(code)
+        if not _is_turnover_security_code(code) or not volume or not shares or shares <= 0:
+            continue
+        records.append({
+            "市場": "上市", "代號": code,
+            "名稱": str(row.get("證券名稱", "")).strip(),
+            "成交股數": int(volume), "發行股數": int(shares),
+            "週轉率(%)": volume / shares * 100,
+            "資料日期": source_date.isoformat(),
+        })
+
+    for row in tpex_rows:
+        code = str(row.get("SecuritiesCompanyCode", "")).strip()
+        volume = _official_number(row.get("TradingShares"))
+        shares = _official_number(row.get("Capitals"))
+        if not _is_turnover_security_code(code) or not volume or not shares or shares <= 0:
+            continue
+        records.append({
+            "市場": "上櫃", "代號": code,
+            "名稱": str(row.get("CompanyName", "")).strip(),
+            "成交股數": int(volume), "發行股數": int(shares),
+            "週轉率(%)": volume / shares * 100,
+            "資料日期": source_date.isoformat(),
+        })
+
+    if not records:
+        raise ValueError("官方行情與發行量無法配對")
+    ranking = pd.DataFrame(records)
+    ranking = ranking.sort_values(
+        ["週轉率(%)", "成交股數"], ascending=[False, False], kind="stable",
+    ).drop_duplicates(subset=["代號"], keep="first").reset_index(drop=True)
+    ranking["週轉率(%)"] = ranking["週轉率(%)"].round(4)
+    ranking.insert(0, "排名", np.arange(1, len(ranking) + 1))
+    return ranking, source_date
+
+
+@st.cache_data(ttl=300, max_entries=2, show_spinner=False)
+def fetch_official_turnover_ranking(refresh_bucket=None, now_value=None):
+    """Fetch a same-date TWSE+TPEx turnover ranking from official sources."""
+    del refresh_bucket
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+    }
+
+    def get_json(url, params=None):
+        response = requests.get(
+            url, params=params, headers=headers, timeout=(3, 8),
+        )
+        response.raise_for_status()
+        return response.json()
+
+    tpex_rows = get_json(_TPEX_DAILY_QUOTES_URL)
+    available_dates = [
+        parsed for parsed in (
+            _parse_roc_trade_date(row.get("Date"))
+            for row in list(tpex_rows or []) if isinstance(row, dict)
+        ) if parsed is not None
+    ]
+    if not available_dates:
+        raise ValueError("TPEx 尚未提供有效行情日期")
+    source_date = max(available_dates)
+    twse_params = {
+        "date": source_date.strftime("%Y%m%d"),
+        "type": "ALLBUT0999", "response": "json",
+    }
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {
+            "twse": executor.submit(get_json, _TWSE_DAILY_QUOTES_URL, twse_params),
+            "companies": executor.submit(get_json, _TWSE_LISTED_COMPANIES_URL),
+            "funds": executor.submit(get_json, _TWSE_LISTED_FUNDS_URL),
+        }
+        fetched = {name: future.result() for name, future in futures.items()}
+    twse_payload = fetched["twse"]
+    if str(twse_payload.get("stat", "")).upper() not in {"OK", ""}:
+        raise ValueError(f"TWSE {source_date:%Y/%m/%d} 尚未提供完整行情")
+    ranking, verified_date = _build_official_turnover_ranking(
+        tpex_rows, twse_payload, fetched["companies"], fetched["funds"],
+    )
+    if verified_date != source_date:
+        raise ValueError("TWSE／TPEx 資料日期不一致")
+
+    current = pd.Timestamp(now_value) if now_value is not None else pd.Timestamp.now(tz="Asia/Taipei")
+    if current.tzinfo is not None:
+        current = current.tz_convert("Asia/Taipei").tz_localize(None)
+    if (
+        current.time() >= dt_time(14, 30)
+        and not is_market_closed_func(current.date())
+        and verified_date != current.date()
+    ):
+        raise ValueError(
+            f"官方資料尚未更新到今日（TWSE／TPEx 目前為 {verified_date:%Y/%m/%d}）"
+        )
+    return ranking, verified_date
+
+
+def _save_official_turnover_cache(ranking, source_date):
+    if ranking is None or ranking.empty:
+        return False
+    try:
+        _write_json_atomic(
+            _OFFICIAL_TURNOVER_CACHE_FILE,
+            {
+                "version": 1,
+                "source_date": pd.Timestamp(source_date).date().isoformat(),
+                "updated_at": datetime.now(pytz.timezone("Asia/Taipei")).isoformat(),
+                "records": ranking.to_dict(orient="records"),
+            },
+            indent=2,
+        )
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def _load_official_turnover_cache():
+    payload = _read_json_cache_file(_OFFICIAL_TURNOVER_CACHE_FILE)
+    records = payload.get("records", []) if isinstance(payload, dict) else []
+    frame = pd.DataFrame(records)
+    return frame, str(payload.get("source_date", "")) if not frame.empty else ""
+
+
 def _goodinfo_normalize_text(value):
     """Normalize Goodinfo's nbsp/newline-heavy labels before schema checks."""
     return re.sub(r"\s+", "", str(value or "").replace("\xa0", "")).strip()
@@ -10720,6 +10931,13 @@ if 'futures_list' not in st.session_state: st.session_state.futures_list = {}
 if 'ignored_data_cache' not in st.session_state: st.session_state.ignored_data_cache = {} # 新增這行：忽略資料快取
 if 'prefetch_cache' not in st.session_state: st.session_state.prefetch_cache = {} # 🚀 新增：預載快取
 if 'cached_notes' not in st.session_state: st.session_state.cached_notes = {}    
+if 'turnover_ranking_df' not in st.session_state:
+    cached_turnover, cached_turnover_date = _load_official_turnover_cache()
+    if not cached_turnover.empty:
+        st.session_state.turnover_ranking_df = cached_turnover
+        st.session_state.goodinfo_df = cached_turnover
+        st.session_state.turnover_ranking_source = 'last_success'
+        st.session_state.turnover_ranking_date = cached_turnover_date
 
 saved_config = load_config()
 
@@ -10917,7 +11135,7 @@ with st.sidebar:
                         clear_market_stream(st.session_state.sj_api)
                         st.session_state.sj_api.logout()
                         init_shioaji_connection.clear() 
-                    except: pass
+                    except Exception: pass
                     
                     # 保持儲存現有的 Key 與記住狀態
                     save_config(
@@ -10984,59 +11202,72 @@ def render_stock_external_resources():
     """Render stock data-source links alongside upload/quick-search controls."""
     st.markdown("#### 外部資源")
 
-    def perform_goodinfo_fetch():
-        with st.spinner("正在以舊版瀏覽器識別載入排行，最長 15 秒..."):
-            result = fetch_goodinfo_data()
-            status = dict(getattr(fetch_goodinfo_data, 'last_status', {}) or {})
-            if result is not None and not result.empty:
-                st.session_state['goodinfo_df'] = result.astype(str)
-                st.session_state['goodinfo_fetch_failed'] = False
+    def perform_official_turnover_fetch():
+        with st.spinner("正在合併 TWSE／TPEx 當日成交量與最新發行量..."):
+            try:
+                result, source_date = fetch_official_turnover_ranking(
+                    refresh_bucket=int(time.time() // 5),
+                )
+                st.session_state['turnover_ranking_df'] = result
+                # Keep the old key temporarily so the existing import path and
+                # previously saved sessions remain backward compatible.
+                st.session_state['goodinfo_df'] = result
+                st.session_state['turnover_ranking_source'] = 'official'
+                st.session_state['turnover_ranking_date'] = source_date.isoformat()
+                st.session_state['turnover_fetch_failed'] = False
+                st.session_state['_run_stock_analysis_after_official_fetch'] = True
+                _save_official_turnover_cache(result, source_date)
                 st.success(
-                    f"抓取成功，共 {len(result)} 筆（{status.get('elapsed', 0):g} 秒）；"
-                    "已載入暫存，回到股票分析按執行即可。"
+                    f"官方排行已完成：{source_date:%Y/%m/%d}、共 {len(result)} 筆；"
+                    "接著會直接執行股票分析。"
                 )
-            else:
-                st.session_state['goodinfo_fetch_failed'] = True
-                reason_text = {
-                    'request_busy': '另一個頁面正在抓取，請稍後再按一次。',
-                    'rate_limited': 'Goodinfo 暫時限制請求（429／430）；請稍等後再試，或改用下方手動 CSV 備援。',
-                    'legacy_table_missing': 'Goodinfo 有回應，但沒有提供完整排行表格。',
-                    'timeout': 'Goodinfo 在 15 秒內沒有完成回應，已停止等待。',
-                    'request_error': 'Goodinfo 連線或頁面解析失敗。',
-                }.get(status.get('reason'), '抓取失敗或查無資料。')
-                st.error(reason_text)
+            except (requests.RequestException, ValueError, TypeError, KeyError) as exc:
+                st.session_state['turnover_fetch_failed'] = True
+                cached, cached_date = _load_official_turnover_cache()
+                if not cached.empty and 'turnover_ranking_df' not in st.session_state:
+                    st.session_state['turnover_ranking_df'] = cached
+                    st.session_state['goodinfo_df'] = cached
+                    st.session_state['turnover_ranking_source'] = 'last_success'
+                    st.session_state['turnover_ranking_date'] = cached_date
+                st.error(f"官方週轉率排行暫時無法更新：{exc}")
+                if 'turnover_ranking_df' in st.session_state:
+                    st.warning(
+                        "本次沒有以空資料覆蓋先前成功排行；"
+                        f"目前保留 {st.session_state.get('turnover_ranking_date', '日期不明')} 的資料。"
+                    )
                 st.info(
-                    "🛟 備援方式：開啟右側 Goodinfo 排行，在網站完成驗證並匯出 CSV；"
-                    "回到上方「本機」上傳該檔案，再按「執行分析」。"
+                    "🛟 備援：可開啟 Goodinfo 完成驗證並下載 CSV，"
+                    "回到上方「本機」上傳後再按「執行分析」。"
                 )
-                if 'goodinfo_df' in st.session_state:
-                    st.warning("本次沒有覆蓋先前成功暫存，可先沿用並留意資料時間。")
 
     resource_col1, resource_col2, resource_col3 = st.columns(3)
     with resource_col1:
         if st.button(
-            "📥 抓取 Goodinfo 週轉率排行",
-            help="沿用舊版一般瀏覽器 User-Agent；不啟動 Chromium、不循環重試，整輪最長 15 秒。",
-            width='stretch', key='fetch_goodinfo_in_stock_room'
+            "📥 官方週轉率排行＋執行分析",
+            help="合併 TWSE 上市與 TPEx 上櫃資料；兩邊日期一致才會使用，ETF 也會納入排序。",
+            width='stretch', key='fetch_official_turnover_in_stock_room'
         ):
-            perform_goodinfo_fetch()
-        if st.session_state.get('goodinfo_fetch_failed', False):
-            if st.button("🔄 重新抓取", width='stretch', key='retry_goodinfo_btn'):
-                perform_goodinfo_fetch()
-        if 'goodinfo_df' in st.session_state:
+            perform_official_turnover_fetch()
+        if st.session_state.get('turnover_fetch_failed', False):
+            if st.button("🔄 重新讀取官方排行", width='stretch', key='retry_official_turnover_btn'):
+                perform_official_turnover_fetch()
+        if 'turnover_ranking_df' in st.session_state:
             st.download_button(
                 "💾 下載 Report.csv",
-                data=st.session_state['goodinfo_df'].to_csv(index=False).encode('utf-8-sig'),
+                data=st.session_state['turnover_ranking_df'].to_csv(index=False).encode('utf-8-sig'),
                 file_name="Report.csv", mime="text/csv", width='stretch'
             )
+            ranking_date = st.session_state.get('turnover_ranking_date', '')
+            if ranking_date:
+                st.caption(f"目前排行資料日：{ranking_date}")
     with resource_col2:
         st.link_button(
-            "🌐 開啟 Goodinfo／下載 CSV",
+            "🌐 Goodinfo 人工對照／CSV 備援",
             _GOODINFO_URL,
             help="由你的瀏覽器完成 Goodinfo 驗證；載入排行後使用網站的匯出功能下載 CSV。",
             width='stretch'
         )
-        st.caption("下載後回到「本機」上傳 CSV；不需要再等伺服器爬取。")
+        st.caption("Goodinfo 不再由雲端伺服器爬取；需要比對時由瀏覽器開啟，或下載後回到「本機」上傳。")
     with resource_col3:
         st.link_button(
             "🚨 上市處置公告", "https://www.twse.com.tw/zh/announcement/punish.html",
@@ -12803,6 +13034,8 @@ def fetch_market_risk_lists():
     """取得上市、上櫃注意／處置名單；僅在使用者手動更新時呼叫。"""
     attention_counts = {}
     disposition_codes = set()
+    # Keep the legacy state key for saved-session compatibility. It now means
+    # the next actual exchange trading day, not the next calendar day.
     disposition_tomorrow_codes = set()
     errors = []
     headers = {
@@ -12859,7 +13092,7 @@ def fetch_market_risk_lists():
             session.close()
 
     def get_disposition_status(period_raw, target_date=None):
-        """判斷處置開始日是今天還是明天，支援民國年與西元年格式。"""
+        """判斷處置開始日是今天或下個開盤日，支援民國年與西元年格式。"""
         period_raw = str(period_raw or '').strip()
         target_date = target_date or datetime.now(
             pytz.timezone('Asia/Taipei')
@@ -12917,8 +13150,11 @@ def fetch_market_risk_lists():
         if start_date <= target_date <= end_date:
             return 'today'
 
-        if start_date == target_date + timedelta(days=1):
-            return 'tomorrow'
+        next_open_date = adjust_to_next_market_day(
+            target_date + timedelta(days=1)
+        )
+        if start_date == next_open_date:
+            return 'next_open'
 
         return None
 
@@ -12998,7 +13234,7 @@ def fetch_market_risk_lists():
 
                 if disposition_state == 'today':
                     target.add(code)
-                elif disposition_state == 'tomorrow':
+                elif disposition_state == 'next_open':
                     disposition_tomorrow_codes.add(code)
 
     # 6 個官方名單 API 同時抓取，避免逐一等待造成更新按鈕卡頓。
@@ -13094,7 +13330,7 @@ def fetch_market_risk_lists():
 
                 if disposition_state == 'today':
                     disposition_codes.add(code)
-                elif disposition_state == 'tomorrow':
+                elif disposition_state == 'next_open':
                     disposition_tomorrow_codes.add(code)
 
         except Exception as exc:
@@ -13232,7 +13468,7 @@ def fetch_market_risk_lists():
 
                     if disposition_state == 'today':
                         disposition_codes.add(code)
-                    elif disposition_state == 'tomorrow':
+                    elif disposition_state == 'next_open':
                         disposition_tomorrow_codes.add(code)
 
         except Exception as exc:
@@ -13279,6 +13515,72 @@ def _as_float(value, default=None):
         return default if math.isnan(number) else number
     except (TypeError, ValueError):
         return default
+
+
+def build_strategy_ranking_entries(rows, strategy_mode, now_value=None, limit=10):
+    """Rank only currently visible rows after 21:00 using their completed scores."""
+    current = pd.Timestamp(now_value) if now_value is not None else pd.Timestamp.now(tz='Asia/Taipei')
+    if current.tzinfo is not None:
+        current = current.tz_convert('Asia/Taipei').tz_localize(None)
+    if current.time() < dt_time(21, 0) or rows is None or rows.empty:
+        return []
+    score_columns = (
+        ('當沖評分', '信心分') if strategy_mode == '當沖'
+        else ('評分', '信心分')
+    )
+    entries = []
+    for _, row in rows.iterrows():
+        score = next(
+            (_as_float(row.get(column)) for column in score_columns
+             if _as_float(row.get(column)) is not None),
+            None,
+        )
+        if score is None:
+            continue
+        code = str(row.get('代號', row.get('期貨代碼', ''))).strip()
+        name = str(row.get('名稱', '')).strip() or code
+        direction = str(row.get('建議方向', row.get('方向', ''))).strip()
+        signal = str(row.get('訊號狀態', '')).strip()
+        if strategy_mode == '當沖':
+            driver = next((
+                str(row.get(column, '')).strip()
+                for column in ('VWAP 狀態', '量能', '盤中觸發', '觸發條件')
+                if str(row.get(column, '')).strip() not in ('', '—', '資料不足')
+            ), '盤中動能與量價綜合')
+        else:
+            driver = next((
+                str(row.get(column, '')).strip()
+                for column in ('隔日規則', '支撐壓力', '觸發條件')
+                if str(row.get(column, '')).strip() not in ('', '—', '資料不足')
+            ), '日 K 趨勢與支撐壓力綜合')
+        entries.append({
+            'code': code, 'name': name, 'score': int(round(score)),
+            'reason': '｜'.join(part for part in (direction, signal, driver) if part),
+        })
+    entries.sort(key=lambda item: (-item['score'], item['code']))
+    return entries[:max(1, int(limit))]
+
+
+def render_strategy_ranking(rows, strategy_mode, room_label):
+    """Render the post-21:00 ranking without changing the table's source order."""
+    entries = build_strategy_ranking_entries(rows, strategy_mode)
+    if not entries:
+        return
+    ranking_title = '當沖排名' if strategy_mode == '當沖' else '波段排名'
+    colored = []
+    for entry in entries:
+        color = '#ff6b6b' if entry['score'] >= 80 else ('#ffd166' if entry['score'] >= 65 else '#94a3b8')
+        colored.append(
+            f"<span style='color:{color};font-weight:750'>{html.escape(entry['name'])}"
+            f"({html.escape(entry['code'])})({entry['score']})</span>"
+        )
+    st.markdown(
+        f"**🌙 {room_label}{ranking_title}（21:00 後）**<br>{' &gt; '.join(colored)}",
+        unsafe_allow_html=True,
+    )
+    st.caption('排行說明：' + '；'.join(
+        f"{entry['name']}：{entry['reason']}" for entry in entries[:5]
+    ))
 
 
 def determine_stock_direction(row, is_daytrade_mode=False, direction_choice='系統自動'):
@@ -13470,7 +13772,7 @@ def calculate_risk_filter_result(row, direction, max_extension_atr, attention_co
     if is_disposed:
         risk_label, risk_score = '🚫 處置中', 0
     elif is_tomorrow_disposition:
-        risk_label, risk_score = '🔶 明天處置', 0
+        risk_label, risk_score = '🔶 下個開盤日處置', 0
     elif attention_count >= 2:
         risk_label, risk_score = f'🔴 注意 {attention_count}', 0
     elif attention_count == 1:
@@ -13923,7 +14225,7 @@ def build_stock_support_resistance(row, is_daytrade_mode=False):
 
 def get_tick_size(price):
     try: price = float(price)
-    except: return 0.01
+    except Exception: return 0.01
     if pd.isna(price) or price <= 0: return 0.01
     if price < 10: return 0.01
     if price < 50: return 0.05
@@ -13939,9 +14241,9 @@ def apply_tick_rules(price):
         tick = get_tick_size(p)
         rounded = (Decimal(str(p)) / Decimal(str(tick))).quantize(Decimal("1"), rounding=ROUND_HALF_UP) * Decimal(str(tick))
         return float(rounded)
-    except:
+    except Exception:
         try: return float(price)
-        except: return 0.0
+        except Exception: return 0.0
 
 def calculate_stop_loss_price(base_price, stop_loss_percent, is_long=True):
     """依交易方向及台股跳動單位，計算可下單的停損價格。"""
@@ -14008,7 +14310,7 @@ def move_tick(price, steps):
                 tick = get_tick_size(curr - 0.0001)
                 curr = round(curr - tick, 2)
         return curr
-    except: return price
+    except Exception: return price
 
 def apply_sr_rules(price, base_price):
     try:
@@ -14020,13 +14322,13 @@ def apply_sr_rules(price, base_price):
         if p < base_price: return float(math.ceil(d_val / d_tick) * d_tick)
         elif p > base_price: return float(math.floor(d_val / d_tick) * d_tick)
         else: return apply_tick_rules(p)
-    except: return price
+    except Exception: return price
 
 def fmt_price(v):
     try:
         if pd.isna(v) or v == "": return ""
         return f"{float(v):.2f}".rstrip('0').rstrip('.')
-    except: return str(v)
+    except Exception: return str(v)
 
 
 def calculate_note_width(series, font_size):
@@ -14065,7 +14367,7 @@ def recalculate_row(row, points_map):
         found_prices = re.findall(r'\d+\.?\d*', note_text)
         for fp in found_prices:
             try: strat_values.append(float(fp))
-            except: pass
+            except Exception: pass
             
         if l_up is not None and abs(price - l_up) < 0.01: status = "漲停"
         elif l_down is not None and abs(price - l_down) < 0.01: status = "跌停"
@@ -14080,7 +14382,7 @@ def recalculate_row(row, points_map):
                     if abs(v - price) < 0.01: hit = True; break
                 if hit: status = "命中"
         return status
-    except: return status
+    except Exception: return status
 
 def generate_note_from_points(points, manual_note, show_3d):
     # 修正：加入安全判斷，防止重整或合併時產生 NaN 導致的 TypeError
@@ -14194,14 +14496,14 @@ def fetch_stock_data_raw(
                 if not df_tw.empty:
                     hist = df_tw[cols]
                     source_used = "twstock"
-        except: pass
+        except Exception: pass
 
     if hist.empty and si is not None:
         try:
             try: df_yf = si.get_data(f"{code}.TW", start_date=(datetime.now() - timedelta(days=40)))
-            except:
+            except Exception:
                 try: df_yf = si.get_data(f"{code}.TWO", start_date=(datetime.now() - timedelta(days=40)))
-                except: df_yf = pd.DataFrame()
+                except Exception: df_yf = pd.DataFrame()
             
             if not df_yf.empty:
                 rename_map = {'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'}
@@ -14210,7 +14512,7 @@ def fetch_stock_data_raw(
                 if all(c in df_yf.columns for c in cols):
                     hist = df_yf[cols]
                     source_used = "yahoo_fin"
-        except: pass
+        except Exception: pass
 
     if hist.empty:
         try:
@@ -14261,7 +14563,7 @@ def fetch_stock_data_raw(
                         hist.at[last_hist_date, 'Low'] = min(hist.at[last_hist_date, 'Low'], rt_low)
                         hist.at[last_hist_date, 'Volume'] = rt_vol
                         if hist.at[last_hist_date, 'Open'] == 0: hist.at[last_hist_date, 'Open'] = rt_open
-        except: pass 
+        except Exception: pass
 
     if hist.empty: return None
     if hist.index.tzinfo is not None: hist.index = hist.index.tz_localize(None)
@@ -14317,7 +14619,7 @@ def fetch_stock_data_raw(
                         official_ref = rt_p - float(change_val)
                         if len(hist) >= 2:
                             hist.iloc[-2, hist.columns.get_loc('Close')] = official_ref
-        except:
+        except Exception:
             pass
 
     live_base_price = hist.iloc[-1]['Close']
@@ -15168,6 +15470,7 @@ def render_futures_strategy_room():
 
     if enhanced_layer:
         display_rows = enrich_futures_strategy_rows(display_rows, strategy_mode, market_bias)
+        render_strategy_ranking(display_rows, strategy_mode, '期貨')
         if compact_futures_table:
             futures_display_columns = [
                 '忽略', '期貨代碼', '契約月份', '名稱', '方向', '收盤價', '漲跌幅',
@@ -15585,7 +15888,7 @@ with stock_strategy_container:
                         sheet_options = xl_file.sheet_names
                         default_idx = sheet_options.index("週轉率") if "週轉率" in sheet_options else 0
                         selected_sheet = st.selectbox("選擇工作表", sheet_options, index=default_idx)
-                except: pass
+                except Exception: pass
 
         with src_tab2:
             def on_history_change(): st.session_state.cloud_url_input = st.session_state.history_selected
@@ -15613,13 +15916,18 @@ with stock_strategy_container:
     c_run, c_space = st.columns([1.5, 5])
     analysis_source_ready = bool(
         uploaded_file or st.session_state.cloud_url_input.strip()
-        or search_selection or 'goodinfo_df' in st.session_state
+        or search_selection or 'turnover_ranking_df' in st.session_state
+        or 'goodinfo_df' in st.session_state
+    )
+    auto_run_requested = bool(
+        st.session_state.pop('_run_stock_analysis_after_official_fetch', False)
     )
     with c_run:
-        btn_run = st.button(
+        btn_run_clicked = st.button(
             "🚀 執行分析", width='stretch', disabled=not analysis_source_ready,
-            help="請先上傳檔案、輸入雲端連結、抓取 Goodinfo，或選擇快速查詢標的。"
+            help="請先取得官方排行、上傳檔案、輸入雲端連結，或選擇快速查詢標的。"
         )
+    btn_run = btn_run_clicked or auto_run_requested
 
     if btn_run:
         save_search_cache(st.session_state.search_multiselect)
@@ -15640,7 +15948,7 @@ with stock_strategy_container:
                     df_up = _read_uploaded_stock_csv(uploaded_file)
                 elif fname.endswith('.html') or fname.endswith('.htm') or fname.endswith('.xls'):
                     try: dfs = pd.read_html(uploaded_file, encoding='cp950')
-                    except:
+                    except Exception:
                         uploaded_file.seek(0)
                         dfs = pd.read_html(uploaded_file, encoding='utf-8')
                     for df in dfs:
@@ -15661,14 +15969,17 @@ with stock_strategy_container:
                 if "docs.google.com" in url and "/spreadsheets/" in url and "/edit" in url:
                     url = url.split("/edit")[0] + "/export?format=csv"
                 try: df_up = pd.read_csv(url, dtype=str)
-                except:
+                except Exception:
                     try: df_up = pd.read_excel(url, dtype=str)
-                    except: st.error("❌ 無法讀取雲端檔案。")
+                    except Exception: st.error("❌ 無法讀取雲端檔案。")
             
-            # 🟢 新增：若無上傳與雲端輸入，且檢測到有 Goodinfo 暫存資料時直接讀取
+            # 官方排行與舊 Goodinfo 暫存共用既有分析入口。
+            elif 'turnover_ranking_df' in st.session_state:
+                df_up = st.session_state['turnover_ranking_df'].copy()
+                st.toast("已載入 TWSE／TPEx 官方週轉率排行並開始分析！", icon="🔄")
             elif 'goodinfo_df' in st.session_state:
                 df_up = st.session_state['goodinfo_df'].copy()
-                st.toast("已直接載入 Goodinfo 週轉率排行暫存資料進行分析！", icon="🔄")
+                st.toast("已載入舊版週轉率排行暫存資料進行分析！", icon="🔄")
                 
         except Exception as e: st.error(f"讀取失敗: {e}")
         
@@ -15892,7 +16203,7 @@ with stock_strategy_container:
                 close_p = row.get('收盤價')
                 if pd.notna(close_p) and str(close_p).strip() != "":
                     try: df_display.at[i, '5日線價差'] = round(float(close_p) - float(ma5_val), 2)
-                    except: pass
+                    except Exception: pass
 
         # 附加層只讀取原選股結果；關閉後維持既有表格、排序與戰略備註。
         risk_preview_enabled = st.checkbox(
@@ -16151,6 +16462,7 @@ with stock_strategy_container:
                     and signal_state in ('✅ 已觸發', '🔵 回測確認')
                 )
 
+            render_strategy_ranking(df_display, strategy_mode, '股票')
             notify_signal_state_changes(
                 'stocks',
                 {str(row['代號']): str(row.get('訊號狀態', '')) for _, row in df_display.iterrows()},
@@ -16191,10 +16503,10 @@ with stock_strategy_container:
                     chg = float(df_display.at[i, "漲跌幅"])
                     df_display.at[i, "收盤價"] = fmt_price(p)
                     df_display.at[i, "漲跌幅"] = _signed_percent(chg)
-                except:
+                except Exception:
                     df_display.at[i, "收盤價"] = fmt_price(df_display.at[i, "收盤價"])
                     try: df_display.at[i, "漲跌幅"] = _signed_percent(float(df_display.at[i, '漲跌幅']))
-                    except: pass
+                    except Exception: pass
 
         df_display = df_display.reset_index(drop=True)
         for col in input_cols:
@@ -16242,7 +16554,7 @@ with stock_strategy_container:
                     .replace('↑', '').replace('↓', '').replace('→', '').strip()
                 )
                 price_c = 'color: #ff4b4b;' if c_val > 0 else ('color: #00e676;' if c_val < 0 else '')
-            except: pass
+            except Exception: pass
             
             status_c = 'color: #ff4b4b;' if st_val in ["漲停", "強"] else ('color: #00e676;' if st_val in ["跌停", "弱"] else ('color: #ffeb3b;' if st_val == "命中" else ''))
             
@@ -16283,7 +16595,7 @@ with stock_strategy_container:
                         if f_val > 0: styles[idx] = 'color: #ff4b4b;'
                         elif f_val < 0: styles[idx] = 'color: #00e676;'
                         else: styles[idx] = 'color: white;'
-                    except: pass
+                    except Exception: pass
                 elif col == "風險":
                     if risk_val.startswith('🚫') or risk_val.startswith('🔴'):
                         styles[idx] = 'color: #ff4b4b; font-weight: bold;'
@@ -16768,7 +17080,7 @@ with stock_strategy_container:
                         close_p = row.get('收盤價')
                         if pd.notna(close_p) and str(close_p).strip() != "":
                             try: df_indep.at[i, '5日線價差'] = round(float(close_p) - float(ma5_val), 2)
-                            except: pass
+                            except Exception: pass
 
                 if risk_preview_enabled:
                     for i, row in df_indep.iterrows():
@@ -16883,10 +17195,10 @@ with stock_strategy_container:
                             chg = float(df_indep.at[i, "漲跌幅"])
                             df_indep.at[i, "收盤價"] = fmt_price(p)
                             df_indep.at[i, "漲跌幅"] = _signed_percent(chg)
-                        except:
+                        except Exception:
                             df_indep.at[i, "收盤價"] = fmt_price(df_indep.at[i, "收盤價"])
                             try: df_indep.at[i, "漲跌幅"] = _signed_percent(float(df_indep.at[i, '漲跌幅']))
-                            except: pass
+                            except Exception: pass
 
                 for col in input_cols:
                     if col != "信心分":
@@ -17531,10 +17843,10 @@ with tab2:
                                 stock_contracts[code].add(contract)
                             
                             try: margin_map[code] = float(m_val)
-                            except: pass
+                            except Exception: pass
                             maint_val = str(item.get("MaintenanceMarginRate", "0")).replace('%', '').strip()
                             try: maint_map[code] = float(maint_val)
-                            except: pass
+                            except Exception: pass
                             g_val = str(item.get("GroupLevel", "")).strip()
                             if g_val: group_level_map[code] = g_val
                         # 擷取更新日期
@@ -17699,7 +18011,7 @@ with tab2:
                                 valid_list = [c for c in contracts if is_valid_contract(c)]
                                 if valid_list:
                                     contract = min(valid_list, key=lambda c: str(getattr(c, 'delivery_date', getattr(c, 'delivery_month', '999999'))).replace('/', '').replace('-', ''))
-                            except: pass
+                            except Exception: pass
                         elif opt_main_tab == "個股期貨":
                             code = search_stock_futures.split(" ")[0] if search_stock_futures else ""
                             if code:
@@ -17764,7 +18076,7 @@ with tab2:
                                                     else:
                                                         valid_closes = daily_closes[daily_closes.index <= curr_d]
                                                         if not valid_closes.empty: ref_p = float(valid_closes.iloc[-1])
-                                        except: pass
+                                        except Exception: pass
                                         
                                         # 若真的都抓不到，最後才回退至快取的參考價
                                         if ref_p is None or ref_p == 0:
@@ -18882,7 +19194,7 @@ with tab_fibo:
         st.write("---")
         interval_options = {"5m": "5分", "15m": "15分", "60m": "60分", "1d": "日", "1wk": "週", "1mo": "月"}
         try: default_radio_idx = list(interval_options.keys()).index(st.session_state.fibo_interval)
-        except: default_radio_idx = 0 
+        except Exception: default_radio_idx = 0
 
         interval_col, advice_col = st.columns([1, 3], vertical_alignment="top")
         selected_interval_label = interval_col.radio(
@@ -18997,7 +19309,7 @@ with tab_db:
                     v = float(val)
                     yi_val = v / 100000000
                     return f"{int(v):,}  ({_format_compact_number(yi_val, 2, signed=True)}億)"
-                except:
+                except Exception:
                     return str(val)
             
             # 將自訂格式套用到買進、賣出、買賣差額三個欄位
@@ -19094,7 +19406,7 @@ with tab_db:
                         
                     if rep_date >= limit_date:
                         show_report = True
-                except:
+                except Exception:
                     # 只有在明確寫 "近期發布" 時才例外顯示
                     if report['日期'] == "近期發布":
                         show_report = True

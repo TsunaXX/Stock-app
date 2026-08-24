@@ -479,6 +479,74 @@ def test_goodinfo_cloudflare_block_is_detected_without_waiting_for_table():
     assert detector("<table><th>代號</th><th>週轉率</th></table>", 200) is False
 
 
+def test_official_turnover_ranking_merges_twse_tpex_and_etf_units():
+    symbols = load_app_symbols(
+        "_parse_roc_trade_date", "_official_number", "_is_turnover_security_code",
+        "_build_official_turnover_ranking",
+    )
+    twse_payload = {"tables": [{
+        "fields": ["證券代號", "證券名稱", "成交股數"],
+        "data": [["2330", "台積電", "100,000"], ["0050", "元大台灣50", "200,000"]],
+    }]}
+    companies = [{
+        "公司代號": "2330", "已發行普通股數或TDR原股發行股數": "1000000",
+    }]
+    funds = [{"基金代號": "0050", "發行單位數/轉換數": "1000000"}]
+    tpex = [{
+        "Date": "1150824", "SecuritiesCompanyCode": "6488",
+        "CompanyName": "環球晶", "TradingShares": "300000", "Capitals": "1000000",
+    }, {
+        "Date": "1150824", "SecuritiesCompanyCode": "708516",
+        "CompanyName": "權證應排除", "TradingShares": "900000", "Capitals": "1000000",
+    }]
+    ranking, source_date = symbols["_build_official_turnover_ranking"](
+        tpex, twse_payload, companies, funds,
+    )
+    assert source_date == date(2026, 8, 24)
+    assert ranking["代號"].tolist() == ["6488", "0050", "2330"]
+    assert ranking["週轉率(%)"].round(2).tolist() == [30.0, 20.0, 10.0]
+    assert ranking["市場"].tolist() == ["上櫃", "上市", "上市"]
+    assert ranking["排名"].tolist() == [1, 2, 3]
+
+
+def test_official_turnover_ranking_rejects_missing_same_date_rows():
+    symbols = load_app_symbols(
+        "_parse_roc_trade_date", "_official_number", "_is_turnover_security_code",
+        "_build_official_turnover_ranking",
+    )
+    try:
+        symbols["_build_official_turnover_ranking"]([], {"tables": []}, [], [])
+    except ValueError as exc:
+        assert "TPEx" in str(exc)
+    else:
+        raise AssertionError("missing TPEx date must not produce an empty ranking")
+
+
+def test_post_21_strategy_ranking_uses_visible_rows_and_selected_mode():
+    symbols = load_app_symbols("_as_float", "build_strategy_ranking_entries")
+    rows = pd.DataFrame([
+        {"代號": "2330", "名稱": "台積電", "當沖評分": 85, "評分": 60,
+         "建議方向": "建議多", "訊號狀態": "已觸發", "VWAP 狀態": "站上 VWAP"},
+        {"代號": "2408", "名稱": "南亞科", "當沖評分": 70, "評分": 92,
+         "建議方向": "建議多", "訊號狀態": "等待", "隔日規則": "突破昨高"},
+    ])
+    before = symbols["build_strategy_ranking_entries"](
+        rows, "當沖", now_value="2026-08-24 20:59:00",
+    )
+    intraday = symbols["build_strategy_ranking_entries"](
+        rows, "當沖", now_value="2026-08-24 21:00:00",
+    )
+    swing = symbols["build_strategy_ranking_entries"](
+        rows.iloc[[1]], "隔日／波段", now_value="2026-08-24 21:00:00",
+    )
+    assert before == []
+    assert [item["code"] for item in intraday] == ["2330", "2408"]
+    assert swing == [{
+        "code": "2408", "name": "南亞科", "score": 92,
+        "reason": "建議多｜等待｜突破昨高",
+    }]
+
+
 def test_realtime_stock_snapshots_merge_one_batch_without_network_calls():
     symbols = load_app_symbols(
         "_safe_number", "snapshot_change_rate", "price_change_amount",
@@ -517,6 +585,13 @@ def test_partial_market_risk_refresh_keeps_last_complete_lists():
     assert result["updated"] == "2026/08/21 09:00:00"
     assert result["last_attempt"] == "2026/08/21 10:00:00"
     assert result["using_last_success"] is True
+
+
+def test_disposition_preview_uses_next_market_day_not_calendar_tomorrow():
+    source = APP_PATH.read_text(encoding="utf-8")
+    assert "adjust_to_next_market_day(" in source
+    assert "'🔶 下個開盤日處置'" in source
+    assert "'🔶 明天處置'" not in source
 
 
 def test_company_sync_is_deduplicated_capped_and_section_bounded():
