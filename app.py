@@ -3301,6 +3301,93 @@ def fetch_selected_calendar_sources(year, selected_event_types, taiwan_closed_da
     return ordered_results, ordered_errors
 
 
+def _calendar_closed_dates(year, base_sources):
+    """Build the Taiwan closed-date set needed by settlement calculations."""
+    holiday_events = list((base_sources or {}).get('holidays', []) or [])
+    temporary_events = list((base_sources or {}).get('temporary', []) or [])
+    current_holidays = {
+        (pd.Timestamp(event['date']).month, pd.Timestamp(event['date']).day): event.get('title', '')
+        for event in holiday_events if event.get('closed')
+    }
+    if not current_holidays:
+        current_holidays = get_holidays(year)
+    closed_dates = {
+        date(year, month, day)
+        for (month, day), holiday_name in current_holidays.items()
+        if holiday_name != '封關日'
+    }
+    closed_dates.update(
+        pd.Timestamp(event['date']).date()
+        for event in temporary_events if event.get('date')
+    )
+    return closed_dates
+
+
+def fetch_calendar_source_bundle(year, selected_event_types):
+    """Fetch one complete tracked-event bundle without blocking unrelated tabs."""
+    base_sources, base_errors = fetch_calendar_base_sources(year)
+    closed_dates = _calendar_closed_dates(year, base_sources)
+    selected_sources, selected_errors = fetch_selected_calendar_sources(
+        year, selected_event_types, closed_dates,
+    )
+    return {
+        'base': base_sources,
+        'selected': selected_sources,
+        'errors': list(base_errors) + list(selected_errors),
+    }
+
+
+@st.cache_resource(show_spinner=False)
+def get_calendar_preload_registry():
+    """Keep a small set of daemon preload tasks across Streamlit reruns."""
+    return {'lock': threading.RLock(), 'tasks': {}}
+
+
+def schedule_calendar_source_preload(year, selected_event_types):
+    """Start loading the saved calendar selection before its tab is opened."""
+    key = (int(year), tuple(dict.fromkeys(selected_event_types or [])))
+    registry = get_calendar_preload_registry()
+    with registry['lock']:
+        task = registry['tasks'].get(key)
+        if task is not None:
+            return task
+        task = {'event': threading.Event(), 'result': None, 'error': None}
+        registry['tasks'][key] = task
+        completed_keys = [
+            item_key for item_key, item in registry['tasks'].items()
+            if item_key != key and item['event'].is_set()
+        ]
+        while len(registry['tasks']) > 6 and completed_keys:
+            registry['tasks'].pop(completed_keys.pop(0), None)
+
+    def worker():
+        try:
+            task['result'] = fetch_calendar_source_bundle(year, key[1])
+        except Exception as exc:
+            task['error'] = f'{type(exc).__name__}: {exc}'
+        finally:
+            task['event'].set()
+
+    threading.Thread(
+        target=worker,
+        name=f'calendar-preload-{year}',
+        daemon=True,
+    ).start()
+    return task
+
+
+def clear_calendar_source_preload(year=None):
+    """Forget completed preload results so a manual refresh starts a new task."""
+    registry = get_calendar_preload_registry()
+    with registry['lock']:
+        if year is None:
+            registry['tasks'].clear()
+        else:
+            for key in list(registry['tasks']):
+                if key[0] == int(year):
+                    registry['tasks'].pop(key, None)
+
+
 def merge_calendar_last_success(current_sources, previous_sources):
     """Keep each calendar feed's last non-empty result on transient failure."""
     previous = previous_sources if isinstance(previous_sources, dict) else {}
@@ -9421,6 +9508,7 @@ def _is_valid_data_cache_payload(value):
         'strategy_signal_log': list,
         'strategy_signal_deleted_keys': list,
         'stock_data_updated_at': str,
+        'market_risk_data': dict,
         'company_event_snapshot': dict,
         'futures_strategy_state': dict,
     }
@@ -10334,6 +10422,9 @@ def save_data_cache(
             'stock_data_updated_at': (
                 stock_data_updated_at
             ),
+            'market_risk_data': st.session_state.get(
+                'risk_filter_market_data', {}
+            ),
         })
 
         # 股票獨立本機快取。
@@ -10408,7 +10499,8 @@ def load_data_cache():
         ignored,
         candidates,
         saved_notes,
-        cached_notes
+        cached_notes,
+        market_risk_data
     """
     local_payload = _read_json_cache_file(
         STOCK_STRATEGY_CACHE_FILE
@@ -10454,6 +10546,12 @@ def load_data_cache():
                 'cached_notes': (
                     legacy_payload.get(
                         'cached_notes',
+                        {}
+                    )
+                ),
+                'market_risk_data': (
+                    legacy_payload.get(
+                        'market_risk_data',
                         {}
                     )
                 ),
@@ -10598,6 +10696,11 @@ def load_data_cache():
         {}
     )
 
+    market_risk_data = data.get(
+        'market_risk_data',
+        {},
+    )
+
     st.session_state[
         '_stock_data_updated_at'
     ] = str(
@@ -10617,6 +10720,7 @@ def load_data_cache():
         candidates,
         saved_notes,
         cached_notes,
+        market_risk_data,
     )
 
 def load_fibo_tags_from_cloud(
@@ -10892,6 +10996,7 @@ if 'stock_data' not in st.session_state:
         cached_candidates,
         cached_saved_notes,
         cached_note_dict,
+        cached_market_risk_data,
     ) = load_data_cache()
 
     st.session_state.stock_data = cached_df
@@ -10914,6 +11019,12 @@ if 'stock_data' not in st.session_state:
 
     st.session_state.cached_notes = (
         cached_note_dict
+    )
+
+    st.session_state.risk_filter_market_data = (
+        cached_market_risk_data
+        if isinstance(cached_market_risk_data, dict)
+        else {}
     )
 
 if 'stock_strategy_editor_revision' not in st.session_state:
@@ -13029,9 +13140,46 @@ def render_opening_direction_prompt():
             st.warning('部分行情來源暫時無法取得：' + '；'.join(errors))
 
 
+def disposition_period_status(period_raw, target_date=None):
+    """判斷處置期間是今日生效或下個實際開盤日開始。"""
+    period_raw = str(period_raw or '').strip()
+    target_date = target_date or datetime.now(
+        pytz.timezone('Asia/Taipei')
+    ).date()
+    date_matches = re.findall(
+        r'(\d{3,4})[年/-](\d{1,2})[月/-](\d{1,2})日?',
+        period_raw,
+    )
+    if len(date_matches) < 2:
+        date_matches = []
+        for value in re.findall(r'(?<!\d)(\d{7,8})(?!\d)', period_raw)[:2]:
+            year_length = 3 if len(value) == 7 else 4
+            date_matches.append((
+                value[:year_length],
+                value[year_length:year_length + 2],
+                value[year_length + 2:year_length + 4],
+            ))
+    if len(date_matches) < 2:
+        return None
+    parsed_dates = []
+    for raw_year, raw_month, raw_day in date_matches[:2]:
+        parsed_year = int(raw_year)
+        if parsed_year < 1000:
+            parsed_year += 1911
+        try:
+            parsed_dates.append(date(parsed_year, int(raw_month), int(raw_day)))
+        except ValueError:
+            return None
+    start_date, end_date = parsed_dates
+    if start_date <= target_date <= end_date:
+        return 'today'
+    next_open_date = adjust_to_next_market_day(target_date + timedelta(days=1))
+    return 'next_open' if start_date == next_open_date else None
+
+
 @st.cache_data(ttl=900, max_entries=1, show_spinner=False)
 def fetch_market_risk_lists():
-    """取得上市、上櫃注意／處置名單；僅在使用者手動更新時呼叫。"""
+    """取得上市、上櫃注意／處置名單，短重試後交由最後成功資料接手。"""
     attention_counts = {}
     disposition_codes = set()
     # Keep the legacy state key for saved-session compatibility. It now means
@@ -13050,7 +13198,7 @@ def fetch_market_risk_lists():
         last_error = None
 
         try:
-            for attempt in range(2):
+            for attempt in range(3):
                 try:
                     response = session.get(
                         url,
@@ -13082,81 +13230,14 @@ def fetch_market_risk_lists():
                 ) as exc:
                     last_error = exc
 
-                    if attempt < 1:
-                        time.sleep(0.5)
+                    if attempt < 2:
+                        time.sleep(0.35 * (attempt + 1))
 
             raise RuntimeError(
-                f"{name} 已重試 2 次仍失敗：{last_error}"
+                f"{name} 已重試 3 次仍失敗：{last_error}"
             )
         finally:
             session.close()
-
-    def get_disposition_status(period_raw, target_date=None):
-        """判斷處置開始日是今天或下個開盤日，支援民國年與西元年格式。"""
-        period_raw = str(period_raw or '').strip()
-        target_date = target_date or datetime.now(
-            pytz.timezone('Asia/Taipei')
-        ).date()
-
-        date_matches = re.findall(
-            r'(\d{3,4})[年/-](\d{1,2})[月/-](\d{1,2})日?',
-            period_raw
-        )
-
-        if len(date_matches) < 2:
-            compact_dates = re.findall(
-                r'(\d{7,8})',
-                period_raw
-            )
-
-            if len(compact_dates) >= 2:
-                date_matches = []
-
-                for value in compact_dates[:2]:
-                    if len(value) == 7:
-                        date_matches.append(
-                            (
-                                value[:3],
-                                value[3:5],
-                                value[5:7],
-                            )
-                        )
-                    elif len(value) == 8:
-                        date_matches.append(
-                            (
-                                value[:4],
-                                value[4:6],
-                                value[6:8],
-                            )
-                        )
-
-        if len(date_matches) < 2:
-            return None
-
-        start_year, start_month, start_day = map(int, date_matches[0])
-        end_year, end_month, end_day = map(int, date_matches[1])
-
-        if start_year < 1000:
-            start_year += 1911
-        if end_year < 1000:
-            end_year += 1911
-
-        try:
-            start_date = date(start_year, start_month, start_day)
-            end_date = date(end_year, end_month, end_day)
-        except ValueError:
-            return None
-
-        if start_date <= target_date <= end_date:
-            return 'today'
-
-        next_open_date = adjust_to_next_market_day(
-            target_date + timedelta(days=1)
-        )
-        if start_date == next_open_date:
-            return 'next_open'
-
-        return None
 
     def parse_twse_rows(
         payload,
@@ -13228,7 +13309,7 @@ def fetch_market_risk_lists():
                     )
                 ).strip()
 
-                disposition_state = get_disposition_status(
+                disposition_state = disposition_period_status(
                     period_raw
                 )
 
@@ -13275,7 +13356,7 @@ def fetch_market_risk_lists():
 
     fetched = {}
 
-    with ThreadPoolExecutor(max_workers=3) as executor:
+    with ThreadPoolExecutor(max_workers=6) as executor:
         future_map = {
             executor.submit(fetch_json, name, url, expected_type): name
             for name, url, expected_type in fetch_jobs
@@ -13326,7 +13407,7 @@ def fetch_market_risk_lists():
                     record.get('DispositionPeriod', '')
                 ).strip()
 
-                disposition_state = get_disposition_status(period_raw)
+                disposition_state = disposition_period_status(period_raw)
 
                 if disposition_state == 'today':
                     disposition_codes.add(code)
@@ -13462,7 +13543,7 @@ def fetch_market_risk_lists():
                         )
                     ).strip()
 
-                    disposition_state = get_disposition_status(
+                    disposition_state = disposition_period_status(
                         period_raw
                     )
 
@@ -13529,6 +13610,12 @@ def build_strategy_ranking_entries(rows, strategy_mode, now_value=None, limit=10
         else ('評分', '信心分')
     )
     entries = []
+
+    def concise(value, maximum=28):
+        text = re.sub(r'\s+', ' ', str(value or '')).strip()
+        text = re.split(r'[；。\n]', text, maxsplit=1)[0].strip()
+        return text if len(text) <= maximum else text[:maximum - 1] + '…'
+
     for _, row in rows.iterrows():
         score = next(
             (_as_float(row.get(column)) for column in score_columns
@@ -13543,19 +13630,21 @@ def build_strategy_ranking_entries(rows, strategy_mode, now_value=None, limit=10
         signal = str(row.get('訊號狀態', '')).strip()
         if strategy_mode == '當沖':
             driver = next((
-                str(row.get(column, '')).strip()
+                concise(row.get(column, ''))
                 for column in ('VWAP 狀態', '量能', '盤中觸發', '觸發條件')
                 if str(row.get(column, '')).strip() not in ('', '—', '資料不足')
             ), '盤中動能與量價綜合')
         else:
             driver = next((
-                str(row.get(column, '')).strip()
+                concise(row.get(column, ''))
                 for column in ('隔日規則', '支撐壓力', '觸發條件')
                 if str(row.get(column, '')).strip() not in ('', '—', '資料不足')
             ), '日 K 趨勢與支撐壓力綜合')
         entries.append({
             'code': code, 'name': name, 'score': int(round(score)),
-            'reason': '｜'.join(part for part in (direction, signal, driver) if part),
+            'reason': '｜'.join(
+                concise(part) for part in (direction, signal, driver) if part
+            ),
         })
     entries.sort(key=lambda item: (-item['score'], item['code']))
     return entries[:max(1, int(limit))]
@@ -13580,7 +13669,7 @@ def render_strategy_ranking(rows, strategy_mode, room_label):
     )
     st.caption('排行說明：' + '；'.join(
         f"{entry['name']}：{entry['reason']}" for entry in entries[:5]
-    ))
+    ) + '。分數為表格內各項條件綜合後的進場信心，不代表勝率。')
 
 
 def determine_stock_direction(row, is_daytrade_mode=False, direction_choice='系統自動'):
@@ -14273,6 +14362,26 @@ def calculate_limits(price):
         return 0, 0
 
 
+def detect_stock_candle_limit_touch(previous_close, day_high, day_low):
+    """Compare one trading day's high/low with limits derived from its own prior close."""
+    limit_up, limit_down = calculate_limits(previous_close)
+    high_value = _safe_number(day_high)
+    low_value = _safe_number(day_low)
+    tolerance = 0.011
+    return {
+        'limit_up': limit_up,
+        'limit_down': limit_down,
+        'touched_up': bool(
+            limit_up and high_value is not None
+            and abs(high_value - limit_up) <= tolerance
+        ),
+        'touched_down': bool(
+            limit_down and low_value is not None
+            and abs(low_value - limit_down) <= tolerance
+        ),
+    }
+
+
 def stock_limit_context(previous_close, current_close, now_tw=None):
     """Return today's limits and the limits shown for the next session.
 
@@ -14675,8 +14784,26 @@ def fetch_stock_data_raw(
     limit_down_show = limit_context['display_down']
     limit_up_today = limit_context['today_up']
     limit_down_today = limit_context['today_down']
-    limit_up_T = limit_up_today
-    limit_down_T = limit_down_today
+    latest_limit_touch = (
+        detect_stock_candle_limit_touch(
+            hist_strat.iloc[-2]['Close'],
+            hist_strat.iloc[-1]['High'],
+            hist_strat.iloc[-1]['Low'],
+        )
+        if len(hist_strat) >= 2
+        else {
+            'limit_up': limit_up_today, 'limit_down': limit_down_today,
+            'touched_up': False, 'touched_down': False,
+        }
+    )
+    limit_up_T = latest_limit_touch['limit_up']
+    limit_down_T = latest_limit_touch['limit_down']
+    note_floor = min(
+        value for value in (limit_down_show, limit_down_T) if value and value > 0
+    )
+    note_ceiling = max(
+        value for value in (limit_up_show, limit_up_T) if value and value > 0
+    )
 
     target_price = apply_sr_rules(strategy_base_price * 1.03, strategy_base_price)
     stop_price = apply_sr_rules(strategy_base_price * 0.97, strategy_base_price)
@@ -14691,8 +14818,8 @@ def fetch_stock_data_raw(
             prefix = days_map[idx]
             h_val = apply_tick_rules(row['High'])
             l_val = apply_tick_rules(row['Low'])
-            if h_val > 0 and limit_down_show <= h_val <= limit_up_show: points.append({"val": h_val, "tag": f"{prefix}高"})
-            if l_val > 0 and limit_down_show <= l_val <= limit_up_show: points.append({"val": l_val, "tag": f"{prefix}低"})
+            if h_val > 0 and note_floor <= h_val <= note_ceiling: points.append({"val": h_val, "tag": f"{prefix}高"})
+            if l_val > 0 and note_floor <= l_val <= note_ceiling: points.append({"val": l_val, "tag": f"{prefix}低"})
 
     if len(hist_strat) >= 5:
         last_5_closes = hist_strat['Close'].tail(5).values
@@ -14705,21 +14832,23 @@ def fetch_stock_data_raw(
     if len(hist_strat) >= 2:
         last_candle = hist_strat.iloc[-1]
         p_open = apply_tick_rules(last_candle['Open'])
-        if limit_down_show <= p_open <= limit_up_show: points.append({"val": p_open, "tag": ""})
+        if note_floor <= p_open <= note_ceiling: points.append({"val": p_open, "tag": ""})
 
         p_high = apply_tick_rules(last_candle['High'])
         p_low = apply_tick_rules(last_candle['Low'])
-        if limit_down_show <= p_high <= limit_up_show: points.append({"val": p_high, "tag": ""})
-        if limit_down_show <= p_low <= limit_up_show: 
-             tag_low = "跌停" if limit_down_T and abs(p_low - limit_down_T) < 0.01 else ""
+        if note_floor <= p_high <= note_ceiling:
+             tag_high = "漲停" if latest_limit_touch['touched_up'] else ""
+             points.append({"val": p_high, "tag": tag_high})
+        if note_floor <= p_low <= note_ceiling:
+             tag_low = "跌停" if latest_limit_touch['touched_down'] else ""
              points.append({"val": p_low, "tag": tag_low})
 
     if len(hist_strat) >= 3:
         pre_prev_candle = hist_strat.iloc[-2]
         pp_high = apply_tick_rules(pre_prev_candle['High'])
         pp_low = apply_tick_rules(pre_prev_candle['Low'])
-        if limit_down_show <= pp_high <= limit_up_show: points.append({"val": pp_high, "tag": ""})
-        if limit_down_show <= pp_low <= limit_up_show: points.append({"val": pp_low, "tag": ""})
+        if note_floor <= pp_high <= note_ceiling: points.append({"val": pp_high, "tag": ""})
+        if note_floor <= pp_low <= note_ceiling: points.append({"val": pp_low, "tag": ""})
 
     show_plus_3 = False
     show_minus_3 = False
@@ -14735,17 +14864,16 @@ def fetch_stock_data_raw(
         points.append({"val": low_90, "tag": "低"})
         
         if len(hist_strat) >= 2:
-             today_high = hist_strat.iloc[-1]['High']
-             if limit_up_T and abs(today_high - limit_up_T) < 0.01:
+             if latest_limit_touch['touched_up']:
                  tag_label = "漲停高" if (abs(limit_up_T - high_90_raw) < 0.05) else "漲停"
-                 if limit_down_show <= limit_up_T <= limit_up_show: points.append({"val": limit_up_T, "tag": tag_label})
+                 if note_floor <= limit_up_T <= note_ceiling: points.append({"val": limit_up_T, "tag": tag_label})
 
         if len(hist_strat) >= 2:
             high_T = hist_strat.iloc[-1]['High']
             low_T = hist_strat.iloc[-1]['Low']
             close_T = hist_strat.iloc[-1]['Close']
-            if (limit_up_T and high_T >= limit_up_T - 0.01) and (limit_up_T and close_T >= limit_up_T * 0.97): show_plus_3 = True
-            if (limit_down_T and low_T <= limit_down_T + 0.01) and (limit_down_T and close_T <= limit_down_T * 1.03): show_minus_3 = True
+            if latest_limit_touch['touched_up'] and close_T >= limit_up_T * 0.97: show_plus_3 = True
+            if latest_limit_touch['touched_down'] and close_T <= limit_down_T * 1.03: show_minus_3 = True
 
     if show_plus_3: points.append({"val": target_price, "tag": ""})
     if show_minus_3: points.append({"val": stop_price, "tag": ""})
@@ -14754,7 +14882,7 @@ def fetch_stock_data_raw(
     threed_tags = ['前高', '前低', '昨高', '昨低', '今高', '今低']
     for p in points:
         v = float(f"{p['val']:.2f}")
-        if p.get('force', False) or p.get('tag') in threed_tags or (limit_down_show <= v <= limit_up_show): full_calc_points.append(p) 
+        if p.get('force', False) or p.get('tag') in threed_tags or (note_floor <= v <= note_ceiling): full_calc_points.append(p)
     
     manual_note = saved_notes_dict.get(code, "") if saved_notes_dict else ""
     strategy_note, auto_note = generate_note_from_points(full_calc_points, manual_note, show_3d=False)
@@ -15762,7 +15890,16 @@ def render_futures_strategy_room():
         "快速查詢（中文名稱／期貨代碼）", list(option_map),
         key='futures_independent_search', placeholder='選擇一檔或多檔期貨'
     )
-    if st.button("🚀 執行期貨獨立分析", key='run_futures_independent') and independent_labels:
+    run_futures_independent = st.button(
+        "🚀 執行期貨獨立分析", key='run_futures_independent'
+    )
+    if 'futures_independent_result' not in st.session_state:
+        st.session_state.futures_independent_result = {
+            'strategy_mode': '', 'rows': [],
+        }
+    if run_futures_independent and not independent_labels:
+        st.warning("請先選擇至少一檔期貨。")
+    if run_futures_independent and independent_labels:
         keys = [option_map[label] for label in independent_labels]
         independent_rows = universe[universe['契約鍵'].isin(keys)].copy()
         if st.session_state.get('sj_logged_in', False) and st.session_state.get('sj_api') is not None:
@@ -15778,6 +15915,31 @@ def render_futures_strategy_room():
             st.info("目前未登入 Shioaji，獨立計算先使用期交所日行情；登入後可加入即時與夜盤 K 棒。")
         if enhanced_layer:
             independent_rows = enrich_futures_strategy_rows(independent_rows, strategy_mode, market_bias)
+        st.session_state.futures_independent_result = {
+            'strategy_mode': strategy_mode,
+            'rows': _json_safe(independent_rows.to_dict(orient='records')),
+        }
+
+    cached_independent = st.session_state.get('futures_independent_result', {})
+    independent_rows = pd.DataFrame(cached_independent.get('rows', []))
+    if not independent_rows.empty and cached_independent.get('strategy_mode') != strategy_mode:
+        for index, row in independent_rows.iterrows():
+            analysis = calculate_futures_strategy_levels(row, strategy_mode, direction_choice)
+            for column, value in analysis.items():
+                independent_rows.at[index, column] = value
+        if enhanced_layer:
+            independent_rows = enrich_futures_strategy_rows(
+                independent_rows, strategy_mode, market_bias,
+            )
+        st.session_state.futures_independent_result = {
+            'strategy_mode': strategy_mode,
+            'rows': _json_safe(independent_rows.to_dict(orient='records')),
+        }
+
+    if not independent_rows.empty:
+        render_strategy_ranking(
+            independent_rows, strategy_mode, '期貨獨立計算',
+        )
         independent_columns = [column for column in futures_display_columns if column != '忽略']
         for column in independent_columns:
             if column not in independent_rows.columns:
@@ -15818,507 +15980,1154 @@ with tab1:
         if tab1.open and validation_strategy_tab.open:
             render_strategy_validation_room()
 
-with stock_strategy_container:
-    if st.session_state.pop('_stock_cache_refresh_pending', False):
-        code_name_map, _ = load_local_stock_names()
-        cached_row_count = len(st.session_state.stock_data)
-        with st.spinner(f"正在更新保留表格中的 {cached_row_count} 檔股票資料..."):
-            refreshed_stock_data, refreshed_stock_count = refresh_persisted_stock_rows(
-                st.session_state.stock_data,
-                st.session_state.get('futures_list', {}),
-                st.session_state.get('saved_notes', {}),
-                code_name_map,
-                st.session_state.get('sj_logged_in', False),
-                st.session_state.get('sj_api'),
-            )
-        st.session_state.stock_data = refreshed_stock_data
-        mark_stock_data_updated()
-        st.session_state.stock_strategy_editor_revision += 1
-        save_data_cache(
-            st.session_state.stock_data, st.session_state.ignored_stocks,
-            st.session_state.all_candidates, st.session_state.saved_notes,
-            replace_stock_data=True,
-        )
-        if refreshed_stock_count:
-            st.session_state['_stock_auto_refresh_notice'] = (
-                f"已自動更新 {refreshed_stock_count}/{cached_row_count} 檔；"
-                "未更新成功的股票會保留並標示資料過期。"
-            )
-        else:
-            st.session_state['_stock_auto_refresh_notice'] = (
-                "本次未取得最新行情，已保留原表並標示資料過期；可稍後按執行分析重試。"
-            )
-    stock_settings_col, stock_help_col = st.columns([3, 2])
-    with stock_settings_col:
-        hide_non_stock, show_3d_hilo = render_stock_strategy_controls()
-    with stock_help_col:
-        render_stock_strategy_explanation()
-    stock_auto_refresh_notice = st.session_state.pop('_stock_auto_refresh_notice', '')
-    if stock_auto_refresh_notice:
-        if st.session_state.stock_data.get('_data_stale', pd.Series(dtype=bool)).fillna(False).any():
-            st.warning(stock_auto_refresh_notice)
-        else:
-            st.caption(stock_auto_refresh_notice)
-    col_search = st.expander(
-        "📥 選股資料來源與快速查詢",
-        expanded=st.session_state.stock_data.empty,
-    )
-    with col_search:
-        code_map, name_map = load_local_stock_names()
-        stock_options = []
-        for code, name in sorted(code_map.items()):
-            if not st.session_state.get('allow_warrant_search', False) and is_warrant(code):
-                continue
-            stock_options.append(f"{code} {name}")
-        
-        src_tab1, src_tab2 = st.tabs(["📂 本機", "☁️ 雲端"])
-        with src_tab1:
-            uploaded_file = st.file_uploader(
-                "上傳 Goodinfo 下載檔或其他選股檔案",
-                type=['xlsx', 'csv', 'html', 'xls'],
-                help="支援 Goodinfo 匯出的 CSV；會自動辨識 CP950／UTF-8 與前置說明列。",
-                key='stock_source_upload',
-            )
-            selected_sheet = 0
-            if uploaded_file:
-                st.caption(f"✅ 已選擇 {uploaded_file.name}；下方按「執行分析」即可。")
-                try:
-                    if not uploaded_file.name.lower().endswith('.csv'):
-                        xl_file = pd.ExcelFile(uploaded_file)
-                        sheet_options = xl_file.sheet_names
-                        default_idx = sheet_options.index("週轉率") if "週轉率" in sheet_options else 0
-                        selected_sheet = st.selectbox("選擇工作表", sheet_options, index=default_idx)
-                except Exception: pass
-
-        with src_tab2:
-            def on_history_change(): st.session_state.cloud_url_input = st.session_state.history_selected
-            history_opts = st.session_state.url_history if st.session_state.url_history else ["(無紀錄)"]
-            c_sel, c_del = st.columns([8, 1], gap="small")
-            with c_sel:
-                selected = st.selectbox("📜 歷史紀錄 (選取自動填入)", options=history_opts, key="history_selected", index=None, placeholder="請選擇...", on_change=on_history_change, label_visibility="collapsed")
-            with c_del:
-                if st.button("🗑️", help="刪除選取的歷史紀錄"):
-                    if st.session_state.history_selected and st.session_state.history_selected in st.session_state.url_history:
-                        st.session_state.url_history.remove(st.session_state.history_selected)
-                        save_url_history(st.session_state.url_history)
-                        st.toast("已刪除。", icon="🗑️")
-                        st.rerun()
-            st.text_input("輸入連結 (CSV/Excel/Google Sheet)", key="cloud_url_input", placeholder="https://...")
-        
-        def update_search_cache():
-            save_search_cache(
-                st.session_state.get("search_multiselect", [])
-            )
-        search_selection = st.multiselect("🔍 快速查詢 (中文/代號)", options=stock_options, key="search_multiselect", on_change=update_search_cache, placeholder="輸入 2330 或 台積電...")
-        st.markdown("---")
-        render_stock_external_resources()
-
-    c_run, c_space = st.columns([1.5, 5])
-    analysis_source_ready = bool(
-        uploaded_file or st.session_state.cloud_url_input.strip()
-        or search_selection or 'turnover_ranking_df' in st.session_state
-        or 'goodinfo_df' in st.session_state
-    )
-    auto_run_requested = bool(
-        st.session_state.pop('_run_stock_analysis_after_official_fetch', False)
-    )
-    with c_run:
-        btn_run_clicked = st.button(
-            "🚀 執行分析", width='stretch', disabled=not analysis_source_ready,
-            help="請先取得官方排行、上傳檔案、輸入雲端連結，或選擇快速查詢標的。"
-        )
-    btn_run = btn_run_clicked or auto_run_requested
-
-    if btn_run:
-        save_search_cache(st.session_state.search_multiselect)
-        if not st.session_state.futures_list: st.session_state.futures_list = fetch_futures_list()
-        targets = []
-        df_up = pd.DataFrame()
-        current_url = st.session_state.cloud_url_input.strip()
-        if current_url:
-            if current_url not in st.session_state.url_history:
-                st.session_state.url_history.insert(0, current_url) 
-                save_url_history(st.session_state.url_history)
-        
-        try:
-            if uploaded_file:
-                uploaded_file.seek(0)
-                fname = uploaded_file.name.lower()
-                if fname.endswith('.csv'):
-                    df_up = _read_uploaded_stock_csv(uploaded_file)
-                elif fname.endswith('.html') or fname.endswith('.htm') or fname.endswith('.xls'):
-                    try: dfs = pd.read_html(uploaded_file, encoding='cp950')
-                    except Exception:
-                        uploaded_file.seek(0)
-                        dfs = pd.read_html(uploaded_file, encoding='utf-8')
-                    for df in dfs:
-                        if df.apply(lambda r: r.astype(str).str.contains('代號').any(), axis=1).any():
-                             df_up = df
-                             for i, row in df.iterrows():
-                                 if "代號" in row.values:
-                                     df_up.columns = row
-                                     df_up = df_up.iloc[i+1:]
-                                     break
-                             break
-                    if df_up.empty and dfs: df_up = dfs[0]
-                elif fname.endswith('.xlsx'):
-                    df_up = pd.read_excel(uploaded_file, sheet_name=selected_sheet, dtype=str)
-
-            elif st.session_state.cloud_url_input:
-                url = st.session_state.cloud_url_input
-                if "docs.google.com" in url and "/spreadsheets/" in url and "/edit" in url:
-                    url = url.split("/edit")[0] + "/export?format=csv"
-                try: df_up = pd.read_csv(url, dtype=str)
-                except Exception:
-                    try: df_up = pd.read_excel(url, dtype=str)
-                    except Exception: st.error("❌ 無法讀取雲端檔案。")
-            
-            # 官方排行與舊 Goodinfo 暫存共用既有分析入口。
-            elif 'turnover_ranking_df' in st.session_state:
-                df_up = st.session_state['turnover_ranking_df'].copy()
-                st.toast("已載入 TWSE／TPEx 官方週轉率排行並開始分析！", icon="🔄")
-            elif 'goodinfo_df' in st.session_state:
-                df_up = st.session_state['goodinfo_df'].copy()
-                st.toast("已載入舊版週轉率排行暫存資料進行分析！", icon="🔄")
-                
-        except Exception as e: st.error(f"讀取失敗: {e}")
-        
-        # 先處理上傳/資料帶入的股票 (優先權高)
-        if not df_up.empty:
-            df_up.columns = df_up.columns.astype(str).str.strip()
-            c_col = next((c for c in df_up.columns if "代號" in str(c)), None)
-            n_col = next((c for c in df_up.columns if "名稱" in str(c)), None)
-            if c_col:
-                limit_rows = st.session_state.limit_rows
-                count = 0
-                for _, row in df_up.iterrows():
-                    c_raw = str(row[c_col]).replace('=', '').replace('"', '').strip()
-                    code_match = re.search(r'(?<!\d)\d{4,6}(?!\d)', c_raw)
-                    if not code_match:
-                        continue
-                    c_raw = code_match.group(0)
-                    if c_raw in st.session_state.ignored_stocks: continue
-                    if hide_non_stock:
-                        is_etf = c_raw.startswith('00')
-                        is_warrant_flag = (len(c_raw) > 4) and c_raw.isdigit()
-                        if is_etf or is_warrant_flag: continue
-                    n = str(row[n_col]) if n_col else ""
-                    if n.lower() == 'nan': n = ""
-                    targets.append((c_raw, n, 'upload', count))
-                    count += 1
-
-        # 再處理快速查詢的股票，確保其排序在後面
-        if search_selection:
-            for i, item in enumerate(search_selection):
-                parts = item.split(' ', 1)
-                targets.append((parts[0], parts[1] if len(parts) > 1 else "", 'search', i))
-
-        st.session_state.all_candidates = targets
-        seen = set()
-        status_text = st.empty()
-        bar = st.progress(0)
-        
-        upload_limit = st.session_state.limit_rows
-        upload_current = 0
-        existing_data = {}
-        previous_stock_data = st.session_state.stock_data.copy()
-        
-        futures_copy = dict(st.session_state.futures_list)
-        notes_copy = dict(st.session_state.saved_notes)
-        code_map_copy, _ = load_local_stock_names()
-
-        def process_stock_task(t_code, t_name, t_source, t_extra, f_set, n_dict, c_map, sj_logged, sj_api_obj):
-            # 將原本 0.5~1.5 秒的長時間延遲，改為 0.1 秒的微小緩衝以防 API 封鎖
-            time.sleep(API_REQUEST_GAP_SECONDS)
-            try: return (t_code, t_source, t_extra, fetch_stock_data_raw(t_code, t_name, t_extra, f_set, n_dict, c_map, sj_logged, sj_api_obj))
-            except Exception: return (t_code, t_source, t_extra, None)
-
-        tasks_to_run = []
-        for i, (code, name, source, extra) in enumerate(targets):
-            if source == 'upload' and upload_current >= upload_limit: continue
-            if code in st.session_state.ignored_stocks: continue
-            if (code, source) in seen: continue
-            tasks_to_run.append((code, name, source, extra))
-            if source == 'upload': upload_current += 1
-            seen.add((code, source))
-
-        sj_logged_in_flag = st.session_state.get('sj_logged_in', False)
-        sj_api_obj = st.session_state.get('sj_api', None)
-
-        with ThreadPoolExecutor(max_workers=ANALYSIS_MAX_WORKERS) as executor:
-            future_to_task = {executor.submit(process_stock_task, t[0], t[1], t[2], t[3], futures_copy, notes_copy, code_map_copy, sj_logged_in_flag, sj_api_obj): t for t in tasks_to_run}
-            completed_count = 0
-            total_tasks = len(tasks_to_run) if len(tasks_to_run) > 0 else 1
-            
-            for future in as_completed(future_to_task):
-                t_code, t_source, t_extra, data = future.result()
-                completed_count += 1
-                bar.progress(min(completed_count / total_tasks, 1.0))
-                status_text.text(f"正在分析 ({completed_count}/{total_tasks}): {t_code} ...")
-                if data:
-                    data['_source'] = t_source
-                    data['_order'] = t_extra
-                    data['_source_rank'] = 1 if t_source == 'upload' else 2
-                    
-                    # 檢查是否已存在資料，若存在則依據來源優先權判斷是否覆蓋
-                    if t_code in existing_data:
-                        if existing_data[t_code]['_source'] == 'upload' and t_source == 'search':
-                            pass  # 已有在顯示筆數內的檔案資料，忽略查詢資料的覆蓋，保留檔案排序
-                        elif existing_data[t_code]['_source'] == 'search' and t_source == 'upload':
-                            existing_data[t_code] = data  # 檔案資料優先權高，覆蓋掉原先寫入的查詢資料
-                        else:
-                            existing_data[t_code] = data
-                    else:
-                        existing_data[t_code] = data
-                # 每個單一股票任務結束後即時主動回收
-                del data
-        
-        bar.empty()
-        status_text.empty()
-
-        failed_codes = {
-            str(task[0]) for task in tasks_to_run
-            if str(task[0]) not in existing_data
-        }
-        if failed_codes and not previous_stock_data.empty and '代號' in previous_stock_data.columns:
-            previous_failed = previous_stock_data[
-                previous_stock_data['代號'].astype(str).isin(failed_codes)
-            ]
-            for _, previous_row in previous_failed.iterrows():
-                previous_code = str(previous_row.get('代號', ''))
-                if previous_code:
-                    existing_data[previous_code] = _stale_stock_identity_row(previous_row)
-            if not previous_failed.empty:
-                st.warning(
-                    f"{len(previous_failed)} 檔本次更新失敗；已保留代號，舊行情與舊策略不再顯示。"
+if tab1.open and stock_strategy_tab.open:
+    with stock_strategy_container:
+        if st.session_state.pop('_stock_cache_refresh_pending', False):
+            code_name_map, _ = load_local_stock_names()
+            cached_row_count = len(st.session_state.stock_data)
+            with st.spinner(f"正在更新保留表格中的 {cached_row_count} 檔股票資料..."):
+                refreshed_stock_data, refreshed_stock_count = refresh_persisted_stock_rows(
+                    st.session_state.stock_data,
+                    st.session_state.get('futures_list', {}),
+                    st.session_state.get('saved_notes', {}),
+                    code_name_map,
+                    st.session_state.get('sj_logged_in', False),
+                    st.session_state.get('sj_api'),
                 )
-        
-        if existing_data:
-            df_temp = pd.DataFrame(list(existing_data.values()))
-            # 確保寫入 stock_data 時，嚴格按照來源優先權與順序排序
-            if '_source_rank' in df_temp.columns:
-                df_temp = df_temp.sort_values(by=['_source_rank', '_order']).reset_index(drop=True)
-            st.session_state.stock_data = df_temp
+            st.session_state.stock_data = refreshed_stock_data
             mark_stock_data_updated()
             st.session_state.stock_strategy_editor_revision += 1
-            cloud_sync_ok = save_data_cache(
+            save_data_cache(
                 st.session_state.stock_data, st.session_state.ignored_stocks,
                 st.session_state.all_candidates, st.session_state.saved_notes,
                 replace_stock_data=True,
-                verify_stock_data=True,
             )
-            if not cloud_sync_ok:
-                st.warning(
-                    "分析結果已保留在目前工作階段與本機快取，但 Google Sheet 尚未回讀確認；"
-                    "請稍後再執行一次分析，確認同步狀態。"
+            if refreshed_stock_count:
+                st.session_state['_stock_auto_refresh_notice'] = (
+                    f"已自動更新 {refreshed_stock_count}/{cached_row_count} 檔；"
+                    "未更新成功的股票會保留並標示資料過期。"
                 )
-        else:
-            st.session_state.stock_data = previous_stock_data
-            if tasks_to_run:
-                st.warning("本次未取得任何有效股票資料，已保留原本表格；請確認連線或稍後再試。")
             else:
-                st.warning("沒有可分析的標的，已保留原本表格；請檢查忽略名單與篩選設定。")
-            
-        # 強制清除大型臨時變數並回收記憶體
-        del tasks_to_run
-        del existing_data
-        gc.collect()
-
-    if not st.session_state.stock_data.empty:
-        # 舊版股票自訂價不再參與顯示或策略計算；成交價統一採行情資料。
-        legacy_stock_columns = [
-            column for column in ('自訂價(可修)', '自訂價價差')
-            if column in st.session_state.stock_data.columns
-        ]
-        if legacy_stock_columns:
-            st.session_state.stock_data = st.session_state.stock_data.drop(columns=legacy_stock_columns)
-
-        # 新增：當限制筆數減少時，自動隱藏多餘的檔案上傳資料
-        df_check = st.session_state.stock_data
-        if '_source' in df_check.columns:
-            upload_mask = df_check['_source'] == 'upload'
-            if upload_mask.sum() > st.session_state.limit_rows:
-                keep_upload = df_check[upload_mask].head(st.session_state.limit_rows)
-                keep_other = df_check[~upload_mask]
-                st.session_state.stock_data = pd.concat([keep_upload, keep_other]).sort_values(by=['_source_rank', '_order'] if '_source_rank' in df_check.columns else None)
-                st.session_state.stock_strategy_editor_revision += 1
-                save_data_cache(st.session_state.stock_data, st.session_state.ignored_stocks, st.session_state.all_candidates, st.session_state.saved_notes)
-
-        df_all = st.session_state.stock_data.copy()
-        if '_source' not in df_all.columns: df_all['_source'] = 'upload'
-        df_all = df_all.rename(columns={"漲停價": "當日漲停價", "跌停價": "當日跌停價", "獲利目標": "+3%", "防守停損": "-3%"})
-        df_all['代號'] = df_all['代號'].astype(str)
-        df_all = df_all[~df_all['代號'].isin(st.session_state.ignored_stocks)]
-        
-        if hide_non_stock:
-             mask_etf = df_all['代號'].str.startswith('00')
-             mask_warrant = (df_all['代號'].str.len() > 4) & df_all['代號'].str.isdigit()
-             df_all = df_all[~(mask_etf | mask_warrant)]
-        
-        if '_source_rank' in df_all.columns: df_all = df_all.sort_values(by=['_source_rank', '_order'])
-        df_display = df_all.reset_index(drop=True)
-        
-        for i, row in df_display.iterrows():
-            code = row['代號']
-            points = row.get('_points', [])
-            manual = st.session_state.saved_notes.get(code, "")
-        
-            if not points:
-                cached = st.session_state.get('cached_notes', {}).get(code, {})
-                if cached and cached.get('note'):
-                    new_full_note = cached['note']
-                    new_auto_note = cached.get('auto', '')
-                else:
-                    new_full_note, new_auto_note = generate_note_from_points(points, manual, show_3d_hilo)
+                st.session_state['_stock_auto_refresh_notice'] = (
+                    "本次未取得最新行情，已保留原表並標示資料過期；可稍後按執行分析重試。"
+                )
+        stock_settings_col, stock_help_col = st.columns([3, 2])
+        with stock_settings_col:
+            hide_non_stock, show_3d_hilo = render_stock_strategy_controls()
+        with stock_help_col:
+            render_stock_strategy_explanation()
+        stock_auto_refresh_notice = st.session_state.pop('_stock_auto_refresh_notice', '')
+        if stock_auto_refresh_notice:
+            if st.session_state.stock_data.get('_data_stale', pd.Series(dtype=bool)).fillna(False).any():
+                st.warning(stock_auto_refresh_notice)
             else:
-                new_full_note, new_auto_note = generate_note_from_points(points, manual, show_3d_hilo)
-        
-            df_display.at[i, "戰略備註"] = new_full_note
-            df_display.at[i, "_auto_note"] = new_auto_note
-            clean_name = row['名稱'].replace('🔴 ', '').replace('🟢 ', '').replace('⚪ ', '')
-            df_display.at[i, "名稱"] = clean_name
+                st.caption(stock_auto_refresh_notice)
+        col_search = st.expander(
+            "📥 選股資料來源與快速查詢",
+            expanded=st.session_state.stock_data.empty,
+        )
+        with col_search:
+            code_map, name_map = load_local_stock_names()
+            stock_options = []
+            for code, name in sorted(code_map.items()):
+                if not st.session_state.get('allow_warrant_search', False) and is_warrant(code):
+                    continue
+                stock_options.append(f"{code} {name}")
 
-        note_width_px = calculate_note_width(df_display['戰略備註'], 15)
-        df_display["移除"] = False
-        points_map = df_display.set_index('代號')['_points'].to_dict() if '_points' in df_display.columns else {}
-        auto_notes_dict = df_display.set_index('代號')['_auto_note'].to_dict() if '_auto_note' in df_display.columns else {}
-
-        # 成交價價差是相對昨收的點數；5 日線價差則是成交價相對 MA5 的距離。
-        if "成交價價差" not in df_display.columns: df_display["成交價價差"] = None
-        if "5日線價差" not in df_display.columns: df_display["5日線價差"] = None
-        
-        for i, row in df_display.iterrows():
-            price_difference = price_change_amount(row.get('收盤價'), row.get('漲跌幅'))
-            df_display.at[i, '成交價價差'] = (
-                round(price_difference, 2) if price_difference is not None else None
-            )
-            ma5_val = row.get('_ma5')
-            if pd.isna(ma5_val):
-                for p in row.get('_points', []):
-                    if p.get('tag') in ['多', '空', '平']:
-                        ma5_val = p.get('val')
-                        break
-            
-            if pd.notna(ma5_val):
-                close_p = row.get('收盤價')
-                if pd.notna(close_p) and str(close_p).strip() != "":
-                    try: df_display.at[i, '5日線價差'] = round(float(close_p) - float(ma5_val), 2)
+            src_tab1, src_tab2 = st.tabs(["📂 本機", "☁️ 雲端"])
+            with src_tab1:
+                uploaded_file = st.file_uploader(
+                    "上傳 Goodinfo 下載檔或其他選股檔案",
+                    type=['xlsx', 'csv', 'html', 'xls'],
+                    help="支援 Goodinfo 匯出的 CSV；會自動辨識 CP950／UTF-8 與前置說明列。",
+                    key='stock_source_upload',
+                )
+                selected_sheet = 0
+                if uploaded_file:
+                    st.caption(f"✅ 已選擇 {uploaded_file.name}；下方按「執行分析」即可。")
+                    try:
+                        if not uploaded_file.name.lower().endswith('.csv'):
+                            xl_file = pd.ExcelFile(uploaded_file)
+                            sheet_options = xl_file.sheet_names
+                            default_idx = sheet_options.index("週轉率") if "週轉率" in sheet_options else 0
+                            selected_sheet = st.selectbox("選擇工作表", sheet_options, index=default_idx)
                     except Exception: pass
 
-        # 附加層只讀取原選股結果；關閉後維持既有表格、排序與戰略備註。
-        risk_preview_enabled = st.checkbox(
-            "🛡️ 啟用附加分析層（可隨時關閉回到原表）",
-            value=True,
-            key="risk_filter_preview_enabled",
-            help="加入支撐壓力、進出場點位、訊號、信心、資料品質與成效紀錄；不改動週轉率排序或原始戰略備註。"
-        )
-        risk_details = {}
-        risk_show_only_eligible = False
-        stock_compact_table = False
-        stock_notify = False
+            with src_tab2:
+                def on_history_change(): st.session_state.cloud_url_input = st.session_state.history_selected
+                history_opts = st.session_state.url_history if st.session_state.url_history else ["(無紀錄)"]
+                c_sel, c_del = st.columns([8, 1], gap="small")
+                with c_sel:
+                    selected = st.selectbox("📜 歷史紀錄 (選取自動填入)", options=history_opts, key="history_selected", index=None, placeholder="請選擇...", on_change=on_history_change, label_visibility="collapsed")
+                with c_del:
+                    if st.button("🗑️", help="刪除選取的歷史紀錄"):
+                        if st.session_state.history_selected and st.session_state.history_selected in st.session_state.url_history:
+                            st.session_state.url_history.remove(st.session_state.history_selected)
+                            save_url_history(st.session_state.url_history)
+                            st.toast("已刪除。", icon="🗑️")
+                            st.rerun()
+                st.text_input("輸入連結 (CSV/Excel/Google Sheet)", key="cloud_url_input", placeholder="https://...")
 
-        if risk_preview_enabled:
-            if st.session_state.get('risk_filter_strategy_mode') == '當沖預覽':
-                st.session_state['risk_filter_strategy_mode'] = '當沖'
-            if 'risk_filter_market_data' not in st.session_state:
-                st.session_state.risk_filter_market_data = {
-                    'attention': {}, 'disposition': [], 'updated': None, 'errors': []
-                }
-
-            reopen_strategy_settings = st.session_state.pop(
-                '_reopen_stock_strategy_settings', False,
-            )
-            with st.expander(
-                "🧭 選股條件與進場信心設定",
-                expanded=reopen_strategy_settings,
-            ):
-                strategy_mode = st.radio(
-                    "策略模式", ["當沖", "隔日／波段"], horizontal=True,
-                    key="risk_filter_strategy_mode",
-                    help="隔日／波段維持原有規則；09:00–09:15 採即時串流＋1 分 K，之後採 5 分 K、VWAP 與完整開盤區間，不會自動下單。"
+            def update_search_cache():
+                save_search_cache(
+                    st.session_state.get("search_multiselect", [])
                 )
-                is_daytrade_mode = strategy_mode == "當沖"
-                if st.session_state.get('risk_filter_direction') in ('多頭', '空頭'):
-                    st.session_state['risk_filter_direction'] = '多' if st.session_state['risk_filter_direction'] == '多頭' else '空'
-                risk_col1, risk_col2, risk_col3 = st.columns(3)
-                with risk_col1:
-                    risk_direction = st.radio(
-                        "判斷方向", ["系統自動", "多", "空"], horizontal=True,
-                        key="risk_filter_direction",
-                        help="系統自動會逐檔判斷：當沖以分 K、VWAP、開盤區間及量能為主；隔日／波段以日 K 均線、前高前低與支撐壓力為主。選多或空可強制整表使用指定方向。"
+            search_selection = st.multiselect("🔍 快速查詢 (中文/代號)", options=stock_options, key="search_multiselect", on_change=update_search_cache, placeholder="輸入 2330 或 台積電...")
+            st.markdown("---")
+            render_stock_external_resources()
+
+        c_run, c_space = st.columns([1.5, 5])
+        analysis_source_ready = bool(
+            uploaded_file or st.session_state.cloud_url_input.strip()
+            or search_selection or 'turnover_ranking_df' in st.session_state
+            or 'goodinfo_df' in st.session_state
+        )
+        auto_run_requested = bool(
+            st.session_state.pop('_run_stock_analysis_after_official_fetch', False)
+        )
+        with c_run:
+            btn_run_clicked = st.button(
+                "🚀 執行分析", width='stretch', disabled=not analysis_source_ready,
+                help="請先取得官方排行、上傳檔案、輸入雲端連結，或選擇快速查詢標的。"
+            )
+        btn_run = btn_run_clicked or auto_run_requested
+
+        if btn_run:
+            save_search_cache(st.session_state.search_multiselect)
+            if not st.session_state.futures_list: st.session_state.futures_list = fetch_futures_list()
+            targets = []
+            df_up = pd.DataFrame()
+            current_url = st.session_state.cloud_url_input.strip()
+            if current_url:
+                if current_url not in st.session_state.url_history:
+                    st.session_state.url_history.insert(0, current_url)
+                    save_url_history(st.session_state.url_history)
+
+            try:
+                if uploaded_file:
+                    uploaded_file.seek(0)
+                    fname = uploaded_file.name.lower()
+                    if fname.endswith('.csv'):
+                        df_up = _read_uploaded_stock_csv(uploaded_file)
+                    elif fname.endswith('.html') or fname.endswith('.htm') or fname.endswith('.xls'):
+                        try: dfs = pd.read_html(uploaded_file, encoding='cp950')
+                        except Exception:
+                            uploaded_file.seek(0)
+                            dfs = pd.read_html(uploaded_file, encoding='utf-8')
+                        for df in dfs:
+                            if df.apply(lambda r: r.astype(str).str.contains('代號').any(), axis=1).any():
+                                 df_up = df
+                                 for i, row in df.iterrows():
+                                     if "代號" in row.values:
+                                         df_up.columns = row
+                                         df_up = df_up.iloc[i+1:]
+                                         break
+                                 break
+                        if df_up.empty and dfs: df_up = dfs[0]
+                    elif fname.endswith('.xlsx'):
+                        df_up = pd.read_excel(uploaded_file, sheet_name=selected_sheet, dtype=str)
+
+                elif st.session_state.cloud_url_input:
+                    url = st.session_state.cloud_url_input
+                    if "docs.google.com" in url and "/spreadsheets/" in url and "/edit" in url:
+                        url = url.split("/edit")[0] + "/export?format=csv"
+                    try: df_up = pd.read_csv(url, dtype=str)
+                    except Exception:
+                        try: df_up = pd.read_excel(url, dtype=str)
+                        except Exception: st.error("❌ 無法讀取雲端檔案。")
+
+                # 官方排行與舊 Goodinfo 暫存共用既有分析入口。
+                elif 'turnover_ranking_df' in st.session_state:
+                    df_up = st.session_state['turnover_ranking_df'].copy()
+                    st.toast("已載入 TWSE／TPEx 官方週轉率排行並開始分析！", icon="🔄")
+                elif 'goodinfo_df' in st.session_state:
+                    df_up = st.session_state['goodinfo_df'].copy()
+                    st.toast("已載入舊版週轉率排行暫存資料進行分析！", icon="🔄")
+
+            except Exception as e: st.error(f"讀取失敗: {e}")
+
+            # 先處理上傳/資料帶入的股票 (優先權高)
+            if not df_up.empty:
+                df_up.columns = df_up.columns.astype(str).str.strip()
+                c_col = next((c for c in df_up.columns if "代號" in str(c)), None)
+                n_col = next((c for c in df_up.columns if "名稱" in str(c)), None)
+                if c_col:
+                    limit_rows = st.session_state.limit_rows
+                    count = 0
+                    for _, row in df_up.iterrows():
+                        c_raw = str(row[c_col]).replace('=', '').replace('"', '').strip()
+                        code_match = re.search(r'(?<!\d)\d{4,6}(?!\d)', c_raw)
+                        if not code_match:
+                            continue
+                        c_raw = code_match.group(0)
+                        if c_raw in st.session_state.ignored_stocks: continue
+                        if hide_non_stock:
+                            is_etf = c_raw.startswith('00')
+                            is_warrant_flag = (len(c_raw) > 4) and c_raw.isdigit()
+                            if is_etf or is_warrant_flag: continue
+                        n = str(row[n_col]) if n_col else ""
+                        if n.lower() == 'nan': n = ""
+                        targets.append((c_raw, n, 'upload', count))
+                        count += 1
+
+            # 再處理快速查詢的股票，確保其排序在後面
+            if search_selection:
+                for i, item in enumerate(search_selection):
+                    parts = item.split(' ', 1)
+                    targets.append((parts[0], parts[1] if len(parts) > 1 else "", 'search', i))
+
+            st.session_state.all_candidates = targets
+            seen = set()
+            status_text = st.empty()
+            bar = st.progress(0)
+
+            upload_limit = st.session_state.limit_rows
+            upload_current = 0
+            existing_data = {}
+            previous_stock_data = st.session_state.stock_data.copy()
+
+            futures_copy = dict(st.session_state.futures_list)
+            notes_copy = dict(st.session_state.saved_notes)
+            code_map_copy, _ = load_local_stock_names()
+
+            def process_stock_task(t_code, t_name, t_source, t_extra, f_set, n_dict, c_map, sj_logged, sj_api_obj):
+                # 將原本 0.5~1.5 秒的長時間延遲，改為 0.1 秒的微小緩衝以防 API 封鎖
+                time.sleep(API_REQUEST_GAP_SECONDS)
+                try: return (t_code, t_source, t_extra, fetch_stock_data_raw(t_code, t_name, t_extra, f_set, n_dict, c_map, sj_logged, sj_api_obj))
+                except Exception: return (t_code, t_source, t_extra, None)
+
+            tasks_to_run = []
+            for i, (code, name, source, extra) in enumerate(targets):
+                if source == 'upload' and upload_current >= upload_limit: continue
+                if code in st.session_state.ignored_stocks: continue
+                if (code, source) in seen: continue
+                tasks_to_run.append((code, name, source, extra))
+                if source == 'upload': upload_current += 1
+                seen.add((code, source))
+
+            sj_logged_in_flag = st.session_state.get('sj_logged_in', False)
+            sj_api_obj = st.session_state.get('sj_api', None)
+
+            with ThreadPoolExecutor(max_workers=ANALYSIS_MAX_WORKERS) as executor:
+                future_to_task = {executor.submit(process_stock_task, t[0], t[1], t[2], t[3], futures_copy, notes_copy, code_map_copy, sj_logged_in_flag, sj_api_obj): t for t in tasks_to_run}
+                completed_count = 0
+                total_tasks = len(tasks_to_run) if len(tasks_to_run) > 0 else 1
+
+                for future in as_completed(future_to_task):
+                    t_code, t_source, t_extra, data = future.result()
+                    completed_count += 1
+                    bar.progress(min(completed_count / total_tasks, 1.0))
+                    status_text.text(f"正在分析 ({completed_count}/{total_tasks}): {t_code} ...")
+                    if data:
+                        data['_source'] = t_source
+                        data['_order'] = t_extra
+                        data['_source_rank'] = 1 if t_source == 'upload' else 2
+
+                        # 檢查是否已存在資料，若存在則依據來源優先權判斷是否覆蓋
+                        if t_code in existing_data:
+                            if existing_data[t_code]['_source'] == 'upload' and t_source == 'search':
+                                pass  # 已有在顯示筆數內的檔案資料，忽略查詢資料的覆蓋，保留檔案排序
+                            elif existing_data[t_code]['_source'] == 'search' and t_source == 'upload':
+                                existing_data[t_code] = data  # 檔案資料優先權高，覆蓋掉原先寫入的查詢資料
+                            else:
+                                existing_data[t_code] = data
+                        else:
+                            existing_data[t_code] = data
+                    # 每個單一股票任務結束後即時主動回收
+                    del data
+
+            bar.empty()
+            status_text.empty()
+
+            failed_codes = {
+                str(task[0]) for task in tasks_to_run
+                if str(task[0]) not in existing_data
+            }
+            if failed_codes and not previous_stock_data.empty and '代號' in previous_stock_data.columns:
+                previous_failed = previous_stock_data[
+                    previous_stock_data['代號'].astype(str).isin(failed_codes)
+                ]
+                for _, previous_row in previous_failed.iterrows():
+                    previous_code = str(previous_row.get('代號', ''))
+                    if previous_code:
+                        existing_data[previous_code] = _stale_stock_identity_row(previous_row)
+                if not previous_failed.empty:
+                    st.warning(
+                        f"{len(previous_failed)} 檔本次更新失敗；已保留代號，舊行情與舊策略不再顯示。"
                     )
-                    risk_min_score = st.slider("最低進場信心", min_value=60, max_value=90, value=75, key="risk_filter_min_score")
-                with risk_col2:
-                    risk_max_extension = st.slider("最大乖離（ATR）", min_value=1.0, max_value=3.0, value=2.0, step=0.1, key="risk_filter_max_extension")
-                    risk_block_attention = st.checkbox("封鎖注意累計 ≥ 2", value=True, key="risk_filter_block_attention")
-                    stock_compact_table = st.checkbox(
-                        "精簡主表", value=True, key='stock_strategy_compact_table',
-                        help='戰略備註維持原樣；其餘細節移到個股明細。'
+
+            if existing_data:
+                df_temp = pd.DataFrame(list(existing_data.values()))
+                # 確保寫入 stock_data 時，嚴格按照來源優先權與順序排序
+                if '_source_rank' in df_temp.columns:
+                    df_temp = df_temp.sort_values(by=['_source_rank', '_order']).reset_index(drop=True)
+                st.session_state.stock_data = df_temp
+                mark_stock_data_updated()
+                st.session_state.stock_strategy_editor_revision += 1
+                cloud_sync_ok = save_data_cache(
+                    st.session_state.stock_data, st.session_state.ignored_stocks,
+                    st.session_state.all_candidates, st.session_state.saved_notes,
+                    replace_stock_data=True,
+                    verify_stock_data=True,
+                )
+                if not cloud_sync_ok:
+                    st.warning(
+                        "分析結果已保留在目前工作階段與本機快取，但 Google Sheet 尚未回讀確認；"
+                        "請稍後再執行一次分析，確認同步狀態。"
                     )
-                with risk_col3:
-                    risk_show_only_eligible = st.checkbox("只顯示可操作候選", value=False, key="risk_filter_show_eligible")
-                    stock_notify = st.checkbox("🔔 訊號變化提醒", value=True, key='stock_strategy_notify')
-                    if st.button("📊 重抓日 K 並計算策略指標", key="refresh_risk_filter_metrics"):
-                        code_name_map, _ = load_local_stock_names()
-                        with st.spinner("正在重抓日 K 並回填策略指標..."):
-                            refreshed_data, updated_count = refresh_risk_metrics_for_codes(
-                                st.session_state.stock_data,
-                                st.session_state.get('futures_list', {}),
-                                st.session_state.get('saved_notes', {}),
-                                code_name_map,
-                                st.session_state.get('sj_logged_in', False),
-                                st.session_state.get('sj_api', None)
+            else:
+                st.session_state.stock_data = previous_stock_data
+                if tasks_to_run:
+                    st.warning("本次未取得任何有效股票資料，已保留原本表格；請確認連線或稍後再試。")
+                else:
+                    st.warning("沒有可分析的標的，已保留原本表格；請檢查忽略名單與篩選設定。")
+
+            # 強制清除大型臨時變數並回收記憶體
+            del tasks_to_run
+            del existing_data
+            gc.collect()
+
+        if not st.session_state.stock_data.empty:
+            # 舊版股票自訂價不再參與顯示或策略計算；成交價統一採行情資料。
+            legacy_stock_columns = [
+                column for column in ('自訂價(可修)', '自訂價價差')
+                if column in st.session_state.stock_data.columns
+            ]
+            if legacy_stock_columns:
+                st.session_state.stock_data = st.session_state.stock_data.drop(columns=legacy_stock_columns)
+
+            # 新增：當限制筆數減少時，自動隱藏多餘的檔案上傳資料
+            df_check = st.session_state.stock_data
+            if '_source' in df_check.columns:
+                upload_mask = df_check['_source'] == 'upload'
+                if upload_mask.sum() > st.session_state.limit_rows:
+                    keep_upload = df_check[upload_mask].head(st.session_state.limit_rows)
+                    keep_other = df_check[~upload_mask]
+                    st.session_state.stock_data = pd.concat([keep_upload, keep_other]).sort_values(by=['_source_rank', '_order'] if '_source_rank' in df_check.columns else None)
+                    st.session_state.stock_strategy_editor_revision += 1
+                    save_data_cache(st.session_state.stock_data, st.session_state.ignored_stocks, st.session_state.all_candidates, st.session_state.saved_notes)
+
+            df_all = st.session_state.stock_data.copy()
+            if '_source' not in df_all.columns: df_all['_source'] = 'upload'
+            df_all = df_all.rename(columns={"漲停價": "當日漲停價", "跌停價": "當日跌停價", "獲利目標": "+3%", "防守停損": "-3%"})
+            df_all['代號'] = df_all['代號'].astype(str)
+            df_all = df_all[~df_all['代號'].isin(st.session_state.ignored_stocks)]
+
+            if hide_non_stock:
+                 mask_etf = df_all['代號'].str.startswith('00')
+                 mask_warrant = (df_all['代號'].str.len() > 4) & df_all['代號'].str.isdigit()
+                 df_all = df_all[~(mask_etf | mask_warrant)]
+
+            if '_source_rank' in df_all.columns: df_all = df_all.sort_values(by=['_source_rank', '_order'])
+            df_display = df_all.reset_index(drop=True)
+
+            for i, row in df_display.iterrows():
+                code = row['代號']
+                points = row.get('_points', [])
+                manual = st.session_state.saved_notes.get(code, "")
+
+                if not points:
+                    cached = st.session_state.get('cached_notes', {}).get(code, {})
+                    if cached and cached.get('note'):
+                        new_full_note = cached['note']
+                        new_auto_note = cached.get('auto', '')
+                    else:
+                        new_full_note, new_auto_note = generate_note_from_points(points, manual, show_3d_hilo)
+                else:
+                    new_full_note, new_auto_note = generate_note_from_points(points, manual, show_3d_hilo)
+
+                df_display.at[i, "戰略備註"] = new_full_note
+                df_display.at[i, "_auto_note"] = new_auto_note
+                clean_name = row['名稱'].replace('🔴 ', '').replace('🟢 ', '').replace('⚪ ', '')
+                df_display.at[i, "名稱"] = clean_name
+
+            note_width_px = calculate_note_width(df_display['戰略備註'], 15)
+            df_display["移除"] = False
+            points_map = df_display.set_index('代號')['_points'].to_dict() if '_points' in df_display.columns else {}
+            auto_notes_dict = df_display.set_index('代號')['_auto_note'].to_dict() if '_auto_note' in df_display.columns else {}
+
+            # 成交價價差是相對昨收的點數；5 日線價差則是成交價相對 MA5 的距離。
+            if "成交價價差" not in df_display.columns: df_display["成交價價差"] = None
+            if "5日線價差" not in df_display.columns: df_display["5日線價差"] = None
+
+            for i, row in df_display.iterrows():
+                price_difference = price_change_amount(row.get('收盤價'), row.get('漲跌幅'))
+                df_display.at[i, '成交價價差'] = (
+                    round(price_difference, 2) if price_difference is not None else None
+                )
+                ma5_val = row.get('_ma5')
+                if pd.isna(ma5_val):
+                    for p in row.get('_points', []):
+                        if p.get('tag') in ['多', '空', '平']:
+                            ma5_val = p.get('val')
+                            break
+
+                if pd.notna(ma5_val):
+                    close_p = row.get('收盤價')
+                    if pd.notna(close_p) and str(close_p).strip() != "":
+                        try: df_display.at[i, '5日線價差'] = round(float(close_p) - float(ma5_val), 2)
+                        except Exception: pass
+
+            # 附加層只讀取原選股結果；關閉後維持既有表格、排序與戰略備註。
+            risk_preview_enabled = st.checkbox(
+                "🛡️ 啟用附加分析層（可隨時關閉回到原表）",
+                value=True,
+                key="risk_filter_preview_enabled",
+                help="加入支撐壓力、進出場點位、訊號、信心、資料品質與成效紀錄；不改動週轉率排序或原始戰略備註。"
+            )
+            risk_details = {}
+            risk_show_only_eligible = False
+            stock_compact_table = False
+            stock_notify = False
+
+            if risk_preview_enabled:
+                if st.session_state.get('risk_filter_strategy_mode') == '當沖預覽':
+                    st.session_state['risk_filter_strategy_mode'] = '當沖'
+                if 'risk_filter_market_data' not in st.session_state:
+                    st.session_state.risk_filter_market_data = {
+                        'attention': {}, 'disposition': [], 'updated': None, 'errors': []
+                    }
+
+                reopen_strategy_settings = st.session_state.pop(
+                    '_reopen_stock_strategy_settings', False,
+                )
+                with st.expander(
+                    "🧭 選股條件與進場信心設定",
+                    expanded=reopen_strategy_settings,
+                ):
+                    strategy_mode = st.radio(
+                        "策略模式", ["當沖", "隔日／波段"], horizontal=True,
+                        key="risk_filter_strategy_mode",
+                        help="隔日／波段維持原有規則；09:00–09:15 採即時串流＋1 分 K，之後採 5 分 K、VWAP 與完整開盤區間，不會自動下單。"
+                    )
+                    is_daytrade_mode = strategy_mode == "當沖"
+                    if st.session_state.get('risk_filter_direction') in ('多頭', '空頭'):
+                        st.session_state['risk_filter_direction'] = '多' if st.session_state['risk_filter_direction'] == '多頭' else '空'
+                    risk_col1, risk_col2, risk_col3 = st.columns(3)
+                    with risk_col1:
+                        risk_direction = st.radio(
+                            "判斷方向", ["系統自動", "多", "空"], horizontal=True,
+                            key="risk_filter_direction",
+                            help="系統自動會逐檔判斷：當沖以分 K、VWAP、開盤區間及量能為主；隔日／波段以日 K 均線、前高前低與支撐壓力為主。選多或空可強制整表使用指定方向。"
+                        )
+                        risk_min_score = st.slider("最低進場信心", min_value=60, max_value=90, value=75, key="risk_filter_min_score")
+                    with risk_col2:
+                        risk_max_extension = st.slider("最大乖離（ATR）", min_value=1.0, max_value=3.0, value=2.0, step=0.1, key="risk_filter_max_extension")
+                        risk_block_attention = st.checkbox("封鎖注意累計 ≥ 2", value=True, key="risk_filter_block_attention")
+                        stock_compact_table = st.checkbox(
+                            "精簡主表", value=True, key='stock_strategy_compact_table',
+                            help='戰略備註維持原樣；其餘細節移到個股明細。'
+                        )
+                    with risk_col3:
+                        risk_show_only_eligible = st.checkbox("只顯示可操作候選", value=False, key="risk_filter_show_eligible")
+                        stock_notify = st.checkbox("🔔 訊號變化提醒", value=True, key='stock_strategy_notify')
+                        if st.button("📊 重抓日 K 並計算策略指標", key="refresh_risk_filter_metrics"):
+                            code_name_map, _ = load_local_stock_names()
+                            with st.spinner("正在重抓日 K 並回填策略指標..."):
+                                refreshed_data, updated_count = refresh_risk_metrics_for_codes(
+                                    st.session_state.stock_data,
+                                    st.session_state.get('futures_list', {}),
+                                    st.session_state.get('saved_notes', {}),
+                                    code_name_map,
+                                    st.session_state.get('sj_logged_in', False),
+                                    st.session_state.get('sj_api', None)
+                                )
+                            if updated_count:
+                                st.session_state.stock_data = refreshed_data
+                                mark_stock_data_updated()
+                                cloud_sync_ok = save_data_cache(
+                                    st.session_state.stock_data,
+                                    st.session_state.ignored_stocks,
+                                    st.session_state.all_candidates,
+                                    st.session_state.saved_notes,
+                                    verify_stock_data=True,
+                                )
+                                if not cloud_sync_ok:
+                                    st.session_state['_stock_cache_sync_notice'] = (
+                                        "日 K 已更新，但 Google Sheet 尚未回讀確認；目前先保留本機最新資料。"
+                                    )
+                                st.session_state['_reopen_stock_strategy_settings'] = True
+                                st.toast(f"已回填 {updated_count} 檔的 20 日趨勢與 ATR 指標。", icon="✅")
+                                st.rerun()
+                            else:
+                                st.warning("沒有可回填的資料；請確認標的至少有 20 個交易日的日 K。")
+                        if is_daytrade_mode:
+                            if st.button("📈 更新盤中資料與當沖條件", key="refresh_daytrade_filter_metrics"):
+                                if not st.session_state.get('sj_logged_in', False) or st.session_state.get('sj_api') is None:
+                                    st.warning("當沖需要先登入永豐 Shioaji，才能取得即時串流與分 K 資料。")
+                                else:
+                                    with st.spinner("正在讀取即時串流與分 K、計算 VWAP 與開盤條件..."):
+                                        refreshed_data, updated_count = refresh_daytrade_metrics_for_codes(
+                                            st.session_state.stock_data,
+                                            st.session_state.get('sj_logged_in', False),
+                                            st.session_state.get('sj_api', None)
+                                        )
+                                    if updated_count:
+                                        st.session_state.stock_data = refreshed_data
+                                        mark_stock_data_updated()
+                                        cloud_sync_ok = save_data_cache(
+                                            st.session_state.stock_data,
+                                            st.session_state.ignored_stocks,
+                                            st.session_state.all_candidates,
+                                            st.session_state.saved_notes,
+                                            verify_stock_data=True,
+                                        )
+                                        if not cloud_sync_ok:
+                                            st.session_state['_stock_cache_sync_notice'] = (
+                                                "盤中資料已更新，但 Google Sheet 尚未回讀確認；目前先保留本機最新資料。"
+                                            )
+                                        st.session_state['_reopen_stock_strategy_settings'] = True
+                                        st.toast(f"已更新 {updated_count} 檔的即時成交、VWAP 與開盤條件", icon="📈")
+                                        st.rerun()
+                                    else:
+                                        st.warning("沒有取得足夠的盤中 5 分 K；請確認 Shioaji 連線與交易時段資料。")
+                        if st.button("🔄 更新上市／上櫃注意與處置名單", key="refresh_risk_filter_market_data"):
+                            fetch_market_risk_lists.clear()
+                            with st.spinner("正在更新上市／上櫃注意與處置名單..."):
+                                attention, disposition, disposition_tomorrow, errors = fetch_market_risk_lists()
+                            st.session_state.risk_filter_market_data = merge_market_risk_refresh(
+                                st.session_state.get('risk_filter_market_data', {}),
+                                attention, disposition, disposition_tomorrow, errors,
                             )
-                        if updated_count:
-                            st.session_state.stock_data = refreshed_data
-                            mark_stock_data_updated()
-                            cloud_sync_ok = save_data_cache(
+                            save_data_cache(
                                 st.session_state.stock_data,
                                 st.session_state.ignored_stocks,
                                 st.session_state.all_candidates,
                                 st.session_state.saved_notes,
-                                verify_stock_data=True,
+                                replace_stock_data=True,
                             )
-                            if not cloud_sync_ok:
-                                st.session_state['_stock_cache_sync_notice'] = (
-                                    "日 K 已更新，但 Google Sheet 尚未回讀確認；目前先保留本機最新資料。"
-                                )
                             st.session_state['_reopen_stock_strategy_settings'] = True
-                            st.toast(f"已回填 {updated_count} 檔的 20 日趨勢與 ATR 指標。", icon="✅")
                             st.rerun()
+
+                    cache_sync_notice = st.session_state.pop('_stock_cache_sync_notice', '')
+                    if cache_sync_notice:
+                        st.warning(cache_sync_notice)
+                    market_risk_data = st.session_state.risk_filter_market_data
+                    if market_risk_data.get('updated') and not market_risk_data.get('errors'):
+                        st.caption(f"上市／上櫃注意與處置名單更新：{market_risk_data['updated']}。")
+                    elif market_risk_data.get('errors'):
+                        if market_risk_data.get('using_last_success'):
+                            st.warning(
+                                f"本次名單未完整取得，沿用 {market_risk_data.get('updated')} 的最後成功資料；"
+                                "不會以空名單覆蓋。"
+                            )
                         else:
-                            st.warning("沒有可回填的資料；請確認標的至少有 20 個交易日的日 K。")
+                            st.warning("注意／處置名單暫時無法完整更新；本次不會將未查核資料誤標為安全。")
+                    else:
+                        st.info("尚未更新上市／上櫃注意與處置名單；資料未查核時不會被誤判為安全。")
+
+                    risk_ready_mask = df_display.reindex(columns=RISK_METRIC_COLUMNS).apply(
+                        lambda row: all(_safe_number(row.get(column)) is not None for column in RISK_METRIC_COLUMNS),
+                        axis=1,
+                    )
+                    risk_ready_count = int(risk_ready_mask.sum())
+                    st.caption(f"日 K 策略指標：{risk_ready_count} / {len(df_display)} 檔可計算；資料不足時，先按「重抓日 K 並計算策略指標」。")
                     if is_daytrade_mode:
-                        if st.button("📈 更新盤中資料與當沖條件", key="refresh_daytrade_filter_metrics"):
-                            if not st.session_state.get('sj_logged_in', False) or st.session_state.get('sj_api') is None:
-                                st.warning("當沖需要先登入永豐 Shioaji，才能取得即時串流與分 K 資料。")
-                            else:
-                                with st.spinner("正在讀取即時串流與分 K、計算 VWAP 與開盤條件..."):
-                                    refreshed_data, updated_count = refresh_daytrade_metrics_for_codes(
-                                        st.session_state.stock_data,
-                                        st.session_state.get('sj_logged_in', False),
-                                        st.session_state.get('sj_api', None)
-                                    )
-                                if updated_count:
-                                    st.session_state.stock_data = refreshed_data
-                                    mark_stock_data_updated()
-                                    cloud_sync_ok = save_data_cache(
-                                        st.session_state.stock_data,
-                                        st.session_state.ignored_stocks,
-                                        st.session_state.all_candidates,
-                                        st.session_state.saved_notes,
-                                        verify_stock_data=True,
-                                    )
-                                    if not cloud_sync_ok:
-                                        st.session_state['_stock_cache_sync_notice'] = (
-                                            "盤中資料已更新，但 Google Sheet 尚未回讀確認；目前先保留本機最新資料。"
-                                        )
-                                    st.session_state['_reopen_stock_strategy_settings'] = True
-                                    st.toast(f"已更新 {updated_count} 檔的即時成交、VWAP 與開盤條件", icon="📈")
-                                    st.rerun()
+                        daytrade_ready_mask = df_display.reindex(columns=DAYTRADE_METRIC_COLUMNS).apply(
+                            lambda row: (
+                                all(_safe_number(row.get(column)) is not None for column in DAYTRADE_REQUIRED_COLUMNS)
+                                and parse_strategy_data_time(row.get('_daytrade_data_time')) is not None
+                            ),
+                            axis=1,
+                        )
+                        daytrade_ready_count = int(daytrade_ready_mask.sum())
+                        st.caption(f"當沖盤中指標：{daytrade_ready_count} / {len(df_display)} 檔可計算；09:00–09:15 使用快照＋1 分 K，09:15 後使用 5 分 K，僅在手動按更新時抓取。")
+
+                market_risk_data = st.session_state.risk_filter_market_data
+                attention_counts = market_risk_data.get('attention', {})
+                disposition_codes = market_risk_data.get('disposition', [])
+                disposition_tomorrow_codes = market_risk_data.get('disposition_tomorrow', [])
+                market_lists_updated = bool(market_risk_data.get('updated')) and not market_risk_data.get('errors')
+                market_environment = st.session_state.get('strategy_market_environment', {})
+                market_bias = str(market_environment.get('bias', '盤整'))
+                market_source = str(market_environment.get('source', '臺指期資料不足'))
+                market_change = _safe_number(market_environment.get('change'))
+                market_change_text = f" {_signed_percent_arrow(market_change)}" if market_change is not None else ''
+                st.caption(f"市場環境：{market_bias}｜依據 {market_source}{market_change_text}；只提供順逆勢標示，不改動原選股順位。")
+
+                for i, row in df_display.iterrows():
+                    direction_info = determine_stock_direction(row, is_daytrade_mode, risk_direction)
+                    row_direction = direction_info['direction']
+                    result = calculate_daytrade_filter_result(
+                        row, row_direction, attention_counts, disposition_codes,
+                        market_lists_updated, risk_block_attention
+                    ) if is_daytrade_mode else calculate_risk_filter_result(
+                        row, row_direction, risk_max_extension, attention_counts, disposition_codes,
+                        market_lists_updated, risk_block_attention,
+                        disposition_tomorrow_codes=disposition_tomorrow_codes
+                    )
+                    code = str(row.get('代號', ''))
+                    if is_daytrade_mode:
+                        daily_risk = calculate_risk_filter_result(
+                            row, row_direction, risk_max_extension, attention_counts, disposition_codes,
+                            market_lists_updated, risk_block_attention,
+                            disposition_tomorrow_codes=disposition_tomorrow_codes
+                        )
+                        # 日 ATR 乖離與官方風險是當沖的盤前門檻；盤中訊號成立也不放行過度延伸標的。
+                        if not daily_risk['eligible']:
+                            result['eligible'] = False
+                            if result['rule'].startswith('觸發：'):
+                                result['rule'] = f"不交易：盤前門檻未通過（{daily_risk['rule']}）"
+                        df_display.at[i, '風險'] = daily_risk['risk']
+                        df_display.at[i, 'VWAP 狀態'] = result['vwap_status']
+                        df_display.at[i, '開盤區間'] = result['opening_range']
+                        volume_ratio = _as_float(row.get('_daytrade_volume_ratio'))
+                        df_display.at[i, '量能'] = f"{_format_compact_number(volume_ratio, 2)}x" if volume_ratio is not None else "資料不足"
+                        df_display.at[i, '當沖評分'] = result['score']
+                        df_display.at[i, '盤中觸發'] = result['rule']
+                    else:
+                        df_display.at[i, '風險'] = result['risk']
+                        df_display.at[i, '評分'] = result['score']
+                        df_display.at[i, '乖離'] = f"{_format_compact_number(result['extension'], 1, signed=True)} ATR" if result['extension'] is not None else "—"
+                        df_display.at[i, '隔日規則'] = result['rule']
+                    trade_plan = build_trade_plan(row, row_direction, is_daytrade_mode, result)
+                    if result.get('eligible') and not trade_plan.get('valid', False):
+                        result['eligible'] = False
+                        result['rule'] = f"觀察：{trade_plan.get('blocking_reason', '進場品質未達門檻')}"
+                        if is_daytrade_mode:
+                            df_display.at[i, '盤中觸發'] = result['rule']
+                        else:
+                            df_display.at[i, '隔日規則'] = result['rule']
+                    result['trade_plan'] = trade_plan
+                    result['direction_info'] = direction_info
+                    risk_details[code] = result
+                    df_display.at[i, '建議方向'] = direction_info['label']
+                    df_display.at[i, '方向依據'] = direction_info['basis']
+                    df_display.at[i, '_系統方向'] = row_direction
+                    df_display.at[i, '進出場預判'] = trade_plan['summary']
+                    signal_state = classify_signal_state(result['rule'], result['eligible'], result['score'], risk_min_score)
+                    quote_time = row.get('_quote_time') or (row.get('_daytrade_data_time') if is_daytrade_mode else None)
+                    required_ready = bool(result.get('data_time')) if is_daytrade_mode else result.get('extension') is not None
+                    if bool(row.get('_data_stale', False)):
+                        data_health = '🔴 資料過期'
+                    elif row.get('_quote_time'):
+                        data_health = build_data_health(row.get('_quote_time'), required_ready, live_expected=True)
+                    else:
+                        data_health = build_data_health(quote_time, required_ready, live_expected=is_daytrade_mode)
+                    bid = _safe_number(row.get('_quote_bid'))
+                    ask = _safe_number(row.get('_quote_ask'))
+                    reference_price = _safe_number(row.get('收盤價'))
+                    tick = get_tick_size(reference_price) if reference_price is not None else 0.01
+                    spread_ticks = (ask - bid) / tick if bid is not None and ask is not None and ask >= bid and tick > 0 else None
+                    market_alignment = calculate_market_alignment(row_direction, market_bias)
+                    current_price = (
+                        _safe_number(row.get('_daytrade_close')) if is_daytrade_mode else None
+                    ) or reference_price
+                    confidence = calculate_entry_confidence(
+                        result['score'], signal_state, current_price, trade_plan['summary'], row_direction,
+                        data_health, market_alignment, result.get('detail', '')
+                    )
+                    result['confidence'] = confidence
+                    eligible_with_score = result['eligible'] and confidence['score'] >= risk_min_score
+                    df_display.at[i, '訊號狀態'] = signal_state
+                    df_display.at[i, '信心分'] = confidence['score']
+                    df_display.at[i, '信心判讀'] = confidence['label']
+                    df_display.at[i, '支撐壓力'] = build_stock_support_resistance(row, is_daytrade_mode)
+                    df_display.at[i, '市場一致'] = market_alignment
+                    df_display.at[i, '資料狀態'] = data_health
+                    df_display.at[i, '買賣價差'] = f'{spread_ticks:.0f}跳' if spread_ticks is not None else '—'
+                    df_display.at[i, '_risk_eligible'] = eligible_with_score
+                    df_display.at[i, '_附加可記錄'] = (
+                        bool(trade_plan.get('valid')) and eligible_with_score
+                        and signal_state in ('✅ 已觸發', '🔵 回測確認')
+                    )
+
+                notify_signal_state_changes(
+                    'stocks',
+                    {str(row['代號']): str(row.get('訊號狀態', '')) for _, row in df_display.iterrows()},
+                    stock_notify,
+                )
+
+                if risk_show_only_eligible:
+                    df_display = df_display[df_display['_risk_eligible']].reset_index(drop=True)
+                    if df_display.empty:
+                        st.warning("目前沒有符合門檻的候選；可降低最低評分、放寬最大乖離，或切換回原表。")
+
+                render_strategy_ranking(df_display, strategy_mode, '股票')
+
+                if stock_compact_table:
+                    input_cols = [
+                        "移除", "代號", "名稱", "戰略備註", "收盤價", "漲跌幅",
+                        "建議方向", "方向依據", "支撐壓力", "進出場預判", "5日線價差", "信心分", "信心判讀",
+                        "訊號狀態", "市場一致", "風險", "資料狀態"
+                    ]
+                elif is_daytrade_mode:
+                    input_cols = ["移除", "代號", "名稱", "戰略備註", "收盤價", "漲跌幅", "建議方向", "方向依據", "狀態", "成交價價差", "5日線價差", "風險", "VWAP 狀態", "開盤區間", "量能", "信心分", "信心判讀", "支撐壓力", "盤中觸發", "進出場預判", "訊號狀態", "市場一致", "當日漲停價", "當日跌停價", "期貨", "資料狀態", "買賣價差"]
+                else:
+                    input_cols = ["移除", "代號", "名稱", "戰略備註", "收盤價", "漲跌幅", "建議方向", "方向依據", "狀態", "成交價價差", "5日線價差", "風險", "信心分", "信心判讀", "乖離", "支撐壓力", "隔日規則", "進出場預判", "訊號狀態", "市場一致", "當日漲停價", "當日跌停價", "期貨", "資料狀態", "買賣價差"]
+            else:
+                input_cols = ["移除", "代號", "名稱", "戰略備註", "收盤價", "漲跌幅", "狀態", "成交價價差", "5日線價差", "當日漲停價", "當日跌停價", "期貨"]
+            for col in input_cols:
+                if col not in df_display.columns: df_display[col] = None
+
+            cols_to_fmt = ["當日漲停價", "當日跌停價", "成交價價差", "5日線價差"]
+            for c in cols_to_fmt:
+                if c in df_display.columns: df_display[c] = df_display[c].apply(fmt_price)
+
+            if "收盤價" in df_display.columns: df_display["收盤價"] = df_display["收盤價"].astype(object)
+            if "漲跌幅" in df_display.columns: df_display["漲跌幅"] = df_display["漲跌幅"].astype(object)
+
+            if "收盤價" in df_display.columns and "漲跌幅" in df_display.columns:
+                for i in range(len(df_display)):
+                    try:
+                        p = float(df_display.at[i, "收盤價"])
+                        chg = float(df_display.at[i, "漲跌幅"])
+                        df_display.at[i, "收盤價"] = fmt_price(p)
+                        df_display.at[i, "漲跌幅"] = _signed_percent(chg)
+                    except Exception:
+                        df_display.at[i, "收盤價"] = fmt_price(df_display.at[i, "收盤價"])
+                        try: df_display.at[i, "漲跌幅"] = _signed_percent(float(df_display.at[i, '漲跌幅']))
+                        except Exception: pass
+
+            df_display = df_display.reset_index(drop=True)
+            for col in input_cols:
+                if col not in ["移除", "信心分"]:
+                    df_display[col] = df_display[col].map(_blank_display_text)
+
+            # 定義上色邏輯
+            def style_tab1_df(row, source_frame=None):
+                styles = [''] * len(row)
+                note = str(row.get('戰略備註', ''))
+                # 精簡主表不顯示「狀態」，名稱底色必須以目前成交價與漲跌停價
+                # 重新比對；不能沿用可能是上一輪報價留下的「漲停／跌停」文字。
+                st_val = str(row.get('狀態', ''))
+                frame = source_frame if isinstance(source_frame, pd.DataFrame) else df_display
+                if not st_val and row.name in frame.index:
+                    st_val = str(frame.at[row.name, '狀態'])
+                source_row = frame.loc[row.name] if row.name in frame.index else row
+                limit_state = stock_limit_state(
+                    row.get('收盤價'),
+                    source_row.get('_交易日漲停價', row.get('當日漲停價')),
+                    source_row.get('_交易日跌停價', row.get('當日跌停價')),
+                )
+                risk_val = str(row.get('風險', ''))
+                vwap_val = str(row.get('VWAP 狀態', ''))
+                signal_state = str(row.get('訊號狀態', ''))
+                data_health = str(row.get('資料狀態', ''))
+                market_alignment = str(row.get('市場一致', ''))
+
+                if limit_state == 'up':
+                    name_c = 'background-color: #ff4b4b; color: #ffffff; font-weight: bold;'
+                elif limit_state == 'down':
+                    name_c = 'background-color: #00e676; color: #ffffff; font-weight: bold;'
+                elif st_val == "命中":
+                    name_c = 'background-color: #ffeb3b; color: #000000; font-weight: bold;'
+                else:
+                    name_c = (
+                        'color: #ff4b4b; font-weight: bold;' if "多" in note
+                        else ('color: #00e676; font-weight: bold;' if "空" in note else 'font-weight: bold;')
+                    )
+
+                price_c = ''
+                try:
+                    c_val = float(
+                        str(row.get('漲跌幅', '0')).replace('%', '').replace('+', '')
+                        .replace('↑', '').replace('↓', '').replace('→', '').strip()
+                    )
+                    price_c = 'color: #ff4b4b;' if c_val > 0 else ('color: #00e676;' if c_val < 0 else '')
+                except Exception: pass
+
+                status_c = 'color: #ff4b4b;' if st_val in ["漲停", "強"] else ('color: #00e676;' if st_val in ["跌停", "弱"] else ('color: #ffeb3b;' if st_val == "命中" else ''))
+
+                for idx, col in enumerate(row.index):
+                    if col == "名稱": styles[idx] = name_c
+                    elif col in ["收盤價", "漲跌幅"]: styles[idx] = price_c
+                    elif col == "狀態": styles[idx] = status_c
+                    elif col == "建議方向":
+                        direction_text = str(row.get('建議方向', ''))
+                        if '多' in direction_text:
+                            styles[idx] = 'color:#ff4b4b;font-weight:bold;'
+                        elif '空' in direction_text:
+                            styles[idx] = 'color:#00e676;font-weight:bold;'
+                    elif col == "方向依據":
+                        direction_text = str(row.get('建議方向', ''))
+                        styles[idx] = (
+                            'color:#ff6b6b;' if '多' in direction_text
+                            else ('color:#35d07f;' if '空' in direction_text else 'color:#cbd5e1;')
+                        )
+                    elif col == "支撐壓力":
+                        styles[idx] = 'color:#4fc3f7;font-weight:600;'
+                    elif col in ("盤中觸發", "隔日規則", "進出場預判"):
+                        value = str(row.get(col, ''))
+                        if any(keyword in value for keyword in ('資料不足', '不建立', '觀察：', '等待')):
+                            styles[idx] = 'color:#ffd166;'
+                        elif '多' in str(row.get('建議方向', '')):
+                            styles[idx] = 'color:#ff6b6b;'
+                        elif '空' in str(row.get('建議方向', '')):
+                            styles[idx] = 'color:#35d07f;'
+                    elif col == "當日漲停價":
+                        styles[idx] = 'color:#ff4b4b;font-weight:bold;'
+                    elif col == "當日跌停價":
+                        styles[idx] = 'color:#00e676;font-weight:bold;'
+                    elif col in ["成交價價差", "5日線價差"]:
+                        val = row[col]
+                        try:
+                            f_val = float(val)
+                            if f_val > 0: styles[idx] = 'color: #ff4b4b;'
+                            elif f_val < 0: styles[idx] = 'color: #00e676;'
+                            else: styles[idx] = 'color: white;'
+                        except Exception: pass
+                    elif col == "風險":
+                        if risk_val.startswith('🚫') or risk_val.startswith('🔴'):
+                            styles[idx] = 'color: #ff4b4b; font-weight: bold;'
+                        elif risk_val.startswith('🔶'):
+                            styles[idx] = 'color: #ff9800; font-weight: bold;'
+                        elif risk_val.startswith('🟡'):
+                            styles[idx] = 'color: #ffeb3b; font-weight: bold;'
+                        elif risk_val.startswith('🟢'):
+                            styles[idx] = 'color: #00e676;'
+                    elif col == "VWAP 狀態":
+                        if vwap_val.startswith('偏多'):
+                            styles[idx] = 'color: #ff4b4b; font-weight: bold;'
+                        elif vwap_val.startswith('偏空'):
+                            styles[idx] = 'color: #00e676; font-weight: bold;'
+                        elif vwap_val.startswith('中性'):
+                            styles[idx] = 'color: #ffeb3b;'
+                    elif col == "訊號狀態":
+                        if signal_state.startswith('✅'):
+                            styles[idx] = 'color:#ff4b4b;font-weight:bold;'
+                        elif signal_state.startswith('🔵'):
+                            styles[idx] = 'color:#29b6f6;font-weight:bold;'
+                        elif signal_state.startswith('⛔'):
+                            styles[idx] = 'color:#ff9800;font-weight:bold;'
+                        elif signal_state.startswith('🟡'):
+                            styles[idx] = 'color:#ffeb3b;'
+                    elif col in ["資料狀態", "市場一致"]:
+                        value = data_health if col == "資料狀態" else market_alignment
+                        if value.startswith('🟢'):
+                            styles[idx] = 'color:#00e676;'
+                        elif value.startswith(('🔴', '⛔')):
+                            styles[idx] = 'color:#ff4b4b;font-weight:bold;'
+                        elif value.startswith('🟡'):
+                            styles[idx] = 'color:#ffeb3b;'
+                    elif col == "信心判讀":
+                        confidence = str(row.get('信心判讀', ''))
+                        if confidence.startswith('🟢'):
+                            styles[idx] = 'color:#00e676;font-weight:bold;'
+                        elif confidence.startswith(('🟡', '🟠')):
+                            styles[idx] = 'color:#ffb300;font-weight:bold;'
+                        elif confidence.startswith('🔴'):
+                            styles[idx] = 'color:#ff4b4b;font-weight:bold;'
+                return styles
+
+            styled_df = df_display[input_cols].style.apply(style_tab1_df, axis=1)
+
+            def stock_content_width(column, minimum, maximum=520, full_content=False):
+                return _content_column_width(
+                    df_display.get(column), minimum, maximum, full_content,
+                )
+
+            risk_column_config = {}
+            if risk_preview_enabled:
+                risk_column_config = {
+                    "建議方向": st.column_config.TextColumn(width=stock_content_width('建議方向', 56, 90), disabled=True, help="系統自動時逐檔判斷；紅色為建議多、綠色為建議空。選擇手動多／空時會標示為手動。"),
+                    "方向依據": st.column_config.TextColumn(width=stock_content_width('方向依據', 86), disabled=True, help="當沖優先列出分 K、VWAP、開盤區間與量能；隔日／波段列出日 K 均線、前高前低及 K 棒位置。括號為多空條件分數。"),
+                    "風險": st.column_config.TextColumn("處置／注意", width=stock_content_width('風險', 64, 110), disabled=True, help="官方注意與處置查核結果；不預測漲跌方向。"),
+                    "訊號狀態": st.column_config.TextColumn(width=stock_content_width('訊號狀態', 56, 140), disabled=True, help="將原條件濃縮為等待、接近、觸發或暫停；原規則仍在明細。"),
+                    "市場一致": st.column_config.TextColumn(width=stock_content_width('市場一致', 56, 120), disabled=True, help="目前方向是否與近月臺指期環境一致；不改變原排序。"),
+                    "資料狀態": st.column_config.TextColumn(width=stock_content_width('資料狀態', 56, 150), disabled=True, help="顯示即時、手動／暫存、官方日行情或資料過期。"),
+                    "買賣價差": st.column_config.TextColumn(
+                        width=stock_content_width('買賣價差', 56, 96), disabled=True,
+                        help="即時最佳賣價與最佳買價的距離，換算為跳動單位；跳數越少通常代表報價較連續、進出成本較低。無即時買賣價時顯示「—」。"
+                    ),
+                    "信心分": st.column_config.ProgressColumn("進場信心", min_value=0, max_value=100, format="%d", width=82, help="綜合方向條件、觸發位置、市場一致與資料狀態；代表條件一致度，不是勝率。"),
+                    "信心判讀": st.column_config.TextColumn(width=stock_content_width('信心判讀', 48, 96), disabled=True, help="高／中高／中／低；追離進場點、條件失效或資料過期時會降級。"),
+                    "支撐壓力": st.column_config.TextColumn(width=stock_content_width('支撐壓力', 76), disabled=True, help="當沖採開盤區間與 VWAP；隔日／波段沿用原戰略價位，顯示最接近目前價格的支撐與壓力。"),
+                }
+                if is_daytrade_mode:
+                    risk_column_config.update({
+                        "VWAP 狀態": st.column_config.TextColumn(width=stock_content_width('VWAP 狀態', 72, 150), disabled=True, help="價格相對成交量加權平均價的位置；上方偏多、下方偏空。"),
+                        "開盤區間": st.column_config.TextColumn(width=stock_content_width('開盤區間', 80, 150), disabled=True, help="09:00–09:15 顯示形成中的即時低點－高點；09:15 後固定為完整開盤區間。"),
+                        "量能": st.column_config.TextColumn(width=stock_content_width('量能', 52, 96), disabled=True, help="目前累積量相對最近交易日同時段平均量。"),
+                        "盤中觸發": st.column_config.TextColumn(width=stock_content_width('盤中觸發', 72), disabled=True, help="僅在盤中條件同時成立時提供觀察提示，不是自動買賣指令。"),
+                        "進出場預判": st.column_config.TextColumn(width=stock_content_width('進出場預判', 86, 720, True), disabled=True, help="通過條件後，以開盤區間與 VWAP 推估進場、策略失效離場與第一目標；僅供觀察與回測。"),
+                    })
+                else:
+                    risk_column_config.update({
+                        "乖離": st.column_config.TextColumn(width=stock_content_width('乖離', 52, 96), disabled=True, help="收盤價相對 20 日線的 ATR 距離；數值越大越不宜追價或追空。"),
+                        "隔日規則": st.column_config.TextColumn(width=stock_content_width('隔日規則', 72), disabled=True, help="僅在隔日條件成真時才列入評估，不是自動買賣指令。"),
+                        "進出場預判": st.column_config.TextColumn(width=stock_content_width('進出場預判', 86, 720, True), disabled=True, help="通過條件後，以昨高／昨低與 ATR 推估進場、策略失效離場與第一目標；僅供觀察與回測。"),
+                    })
+
+            stock_table_signature = abs(hash((
+                tuple(df_display['代號'].astype(str).tolist()), tuple(input_cols)
+            )))
+            stock_editor_key = (
+                f"main_editor_{st.session_state.stock_strategy_editor_revision}_{stock_table_signature}"
+            )
+            edited_df = st.data_editor(
+                styled_df,
+                column_config={
+                    **risk_column_config,
+                    "移除": st.column_config.CheckboxColumn("刪除", width=40, help="勾選後刪除並自動遞補"),
+                    "代號": st.column_config.TextColumn(disabled=True, width=_content_column_width(df_display.get("代號"), 44, 62)),
+                    "名稱": st.column_config.TextColumn(disabled=True, width=_content_column_width(df_display.get("名稱"), 44, 130)),
+                    "收盤價": st.column_config.TextColumn("成交價", width=_content_column_width(df_display.get("收盤價"), 52, 78), disabled=True),
+                    "漲跌幅": st.column_config.TextColumn(disabled=True, width=_content_column_width(df_display.get("漲跌幅"), 56, 78)),
+                    "期貨": st.column_config.TextColumn(width=_content_column_width(df_display.get("期貨"), 44, 70), disabled=True),
+                    "當日漲停價": st.column_config.TextColumn(width=_content_column_width(df_display.get("當日漲停價"), 54, 78), disabled=True),
+                    "當日跌停價": st.column_config.TextColumn(width=_content_column_width(df_display.get("當日跌停價"), 54, 78), disabled=True),
+                    "成交價價差": st.column_config.TextColumn(
+                        width=80, disabled=True,
+                        help="目前成交價減去昨日收盤價；正值為上漲點數，負值為下跌點數。"
+                    ),
+                    "5日線價差": st.column_config.TextColumn(
+                        width=80, disabled=True,
+                        help="目前成交價減去 5 日均線；正值在均線上方，負值在均線下方。"
+                    ),
+                    "狀態": None, # 設定為 None 即可在資料編輯器中隱藏該欄位
+                    "戰略備註": st.column_config.TextColumn("戰略備註 ✏️", width=note_width_px, disabled=False),
+                },
+                hide_index=True, width='stretch' if risk_preview_enabled else 'content', num_rows="fixed", key=stock_editor_key
+            )
+
+            if risk_preview_enabled and risk_details:
+                detail_options = {
+                    f"{row['代號']} {row['名稱']}": str(row['代號'])
+                    for _, row in df_display.iterrows()
+                }
+                if detail_options:
+                    selected_risk_label = st.selectbox("查看策略信心明細", list(detail_options), key="risk_filter_detail_code")
+                    selected_risk = risk_details[detail_options[selected_risk_label]]
+                    rule_label = "盤中觸發" if is_daytrade_mode else "隔日規則"
+                    data_time_text = f"｜盤中資料更新：{selected_risk['data_time']}" if is_daytrade_mode and selected_risk.get('data_time') else ""
+                    plan_text = selected_risk.get('trade_plan', {}).get('detail', '尚未預判點位。')
+                    confidence_detail = selected_risk.get('confidence', {})
+                    direction_detail = selected_risk.get('direction_info', {})
+                    st.caption(
+                        f"{direction_detail.get('label', '方向未判定')}｜{direction_detail.get('basis', '方向依據不足')}｜"
+                        f"進場信心 {confidence_detail.get('score', '—')} 分（{confidence_detail.get('label', '—')}）｜"
+                        f"{selected_risk['detail']}｜{rule_label}：{selected_risk['rule']}｜進出場預判：{plan_text}{data_time_text}。"
+                        "信心分代表條件一致度，不是勝率；僅供策略觀察與回測。"
+                    )
+                    selected_code = detail_options[selected_risk_label]
+                    selected_rows = df_display[df_display['代號'].astype(str) == selected_code]
+                    if not selected_rows.empty:
+                        selected_row = selected_rows.iloc[0]
+                        st.caption(
+                            f"附加狀態：{selected_row.get('訊號狀態', '—')}｜{selected_row.get('市場一致', '—')}｜"
+                            f"{selected_row.get('資料狀態', '—')}｜買賣價差 {selected_row.get('買賣價差', '—')}。"
+                        )
+
+                if st.button(
+                    '📝 記錄目前表格的已觸發股票訊號', key='record_stock_strategy_signals',
+                    help='一次記錄目前股票表格中所有已觸發或回測確認、且達最低進場信心的個股；不是只記錄單一個股。'
+                ):
+                    records = []
+                    recordable_rows = df_display[df_display.get('_附加可記錄', False) == True]
+                    for _, row in recordable_rows.iterrows():
+                        plan = parse_trade_plan_numbers(row.get('進出場預判'))
+                        score = row.get('信心分')
+                        records.append({
+                            '市場': '股票', '商品鍵': str(row['代號']), '代碼': str(row['代號']),
+                            '名稱': str(row['名稱']), '策略': strategy_mode, '方向': str(row.get('_系統方向', '')),
+                            '訊號狀態': str(row.get('訊號狀態', '')), '評分': _safe_number(score),
+                            '信心判讀': str(row.get('信心判讀', '')),
+                            '進場價': plan['entry'], '停損價': plan['stop'], '目標價': plan['target'],
+                            '最新價': _safe_number(row.get('收盤價')),
+                            '風險': str(row.get('風險', '')), '資料狀態': str(row.get('資料狀態', '')),
+                        })
+                    added, saved = register_strategy_signals(records)
+                    if saved:
+                        save_data_cache(
+                            st.session_state.stock_data, st.session_state.ignored_stocks,
+                            st.session_state.all_candidates, st.session_state.saved_notes,
+                        )
+                        st.toast(f'已新增 {added} 筆股票訊號；重複訊號不另建。', icon='📝')
+                    else:
+                        st.error('訊號紀錄儲存失敗，請確認檔案是否可寫入。')
+
+            if not edited_df.empty:
+                trigger_rerun = False
+                if "移除" in edited_df.columns:
+                    to_remove = edited_df[edited_df["移除"] == True]
+                    if not to_remove.empty:
+                        remove_codes = to_remove["代號"].unique()
+
+                        # 速度優化：將刪除的股票資料快取起來
+                        for c in remove_codes:
+                            st.session_state.ignored_stocks.add(str(c))
+                            row_data = st.session_state.stock_data[st.session_state.stock_data["代號"] == c]
+                            if not row_data.empty:
+                                st.session_state.ignored_data_cache[c] = row_data.iloc[0].to_dict()
+
+                        # --- 新增：資源優化，忽略快取超過 5 檔就刪除最舊的 ---
+                        while len(st.session_state.ignored_data_cache) > 5:
+                            oldest_key = next(iter(st.session_state.ignored_data_cache))
+                            del st.session_state.ignored_data_cache[oldest_key]
+                        # ----------------------------------------------------
+
+                        # 從表格資料中剃除
+                        st.session_state.stock_data = st.session_state.stock_data[~st.session_state.stock_data["代號"].isin(remove_codes)]
+
+                        # 🚀 關鍵修改：立刻儲存並 Rerun，讓畫面「瞬間」移除該行，
+                        # 把耗時的遞補抓取動作交給最下方的區塊去處理，避免畫面卡死！
+                        save_data_cache(st.session_state.stock_data, st.session_state.ignored_stocks, st.session_state.all_candidates, st.session_state.saved_notes)
+                        st.session_state.stock_strategy_editor_revision += 1
+                        st.rerun()
+
+                if trigger_rerun: st.rerun()
+
+            df_curr = st.session_state.stock_data
+            if not df_curr.empty:
+                upload_count = len(df_curr) if '_source' not in df_curr.columns else len(df_curr[df_curr['_source'] == 'upload'])
+                limit = st.session_state.limit_rows
+
+                # 若筆數不足且有候補名單，則進行自動遞補
+                if upload_count < limit and st.session_state.all_candidates:
+                    needed = limit - upload_count
+                    existing_codes = set(st.session_state.stock_data['代號'].astype(str))
+                    futures_copy = dict(st.session_state.futures_list)
+                    notes_copy = dict(st.session_state.saved_notes)
+                    code_map_copy, _ = load_local_stock_names()
+
+                    cand_to_fetch = []
+                    for cand in st.session_state.all_candidates:
+                         c_code, c_name, c_source, c_extra = str(cand[0]), cand[1], cand[2], cand[3]
+                         if c_source != 'upload' or c_code in st.session_state.ignored_stocks or c_code in existing_codes: continue
+                         cand_to_fetch.append((c_code, c_name, c_source, c_extra))
+                         if len(cand_to_fetch) >= needed: break
+
+                    if cand_to_fetch:
+                        with st.spinner(f"正在遞補 {len(cand_to_fetch)} 檔股票..."):
+                            # 🚀 1. 優先從「背景預載快取」提取 (瞬間完成)
+                            ready_results = []
+                            remaining_to_fetch = []
+
+                            for cand in cand_to_fetch:
+                                t_code = cand[0]
+                                if t_code in st.session_state.get('prefetch_cache', {}):
+                                    ready_results.append(st.session_state.prefetch_cache.pop(t_code))
                                 else:
-                                    st.warning("沒有取得足夠的盤中 5 分 K；請確認 Shioaji 連線與交易時段資料。")
-                    if st.button("🔄 更新上市／上櫃注意與處置名單", key="refresh_risk_filter_market_data"):
+                                    remaining_to_fetch.append(cand)
+
+                            if ready_results:
+                                st.session_state.stock_data = pd.concat([st.session_state.stock_data, pd.DataFrame(ready_results)], ignore_index=True)
+
+                            # 🚀 2. 若快取不足(例如剛開啟網頁還沒預載完)，才即時抓取剩下的
+                            if remaining_to_fetch:
+                                worker_sj_logged_in = st.session_state.get('sj_logged_in', False)
+                                worker_sj_api = st.session_state.get('sj_api')
+                                def _replenish_worker(cand):
+                                    time.sleep(API_REQUEST_GAP_SECONDS)
+                                    t_code, t_name, t_src, t_extra = cand
+                                    res = fetch_stock_data_raw(
+                                        t_code, t_name, t_extra, futures_copy, notes_copy,
+                                        code_map_copy, worker_sj_logged_in, worker_sj_api,
+                                    )
+                                    if res: res.update({'_source': t_src, '_order': t_extra, '_source_rank': 1})
+                                    return res
+
+                                with ThreadPoolExecutor(max_workers=ANALYSIS_MAX_WORKERS) as executor:
+                                    results = list(executor.map(_replenish_worker, remaining_to_fetch))
+                                    valid_results = [r for r in results if r]
+                                    if valid_results:
+                                        st.session_state.stock_data = pd.concat([st.session_state.stock_data, pd.DataFrame(valid_results)], ignore_index=True)
+
+                            # 修正：強制依據來源優先權進行排序，讓自動遞補的新股票排在查詢的股票之前
+                            if '_source_rank' in st.session_state.stock_data.columns:
+                                st.session_state.stock_data = st.session_state.stock_data.sort_values(by=['_source_rank', '_order']).reset_index(drop=True)
+
+                            save_data_cache(st.session_state.stock_data, st.session_state.ignored_stocks, st.session_state.all_candidates, st.session_state.saved_notes)
+                            st.rerun() # 遞補完成，立刻更新畫面
+
+
+            st.markdown("---")
+            # 重新配置欄位比例與順序
+            col_rt_update, col_btn, col_clear = st.columns([2, 2.5, 2])
+            with col_rt_update: btn_rt_update = st.button("⏱️ 即時更新報價", width='stretch', type="primary")
+            with col_btn: btn_update = st.button("⚡ 執行更新&儲存手動備註", width='stretch')
+            with col_clear: btn_clear_notes = st.button("🧹 清除手動備註", width='stretch', help="清除所有記憶的戰略備註內容")
+
+            if btn_rt_update:
+                if st.session_state.get('sj_logged_in', False) and st.session_state.get('sj_api'):
+                    sj_api = st.session_state.sj_api
+                    with st.spinner("正在透過永豐API更新報價..."):
+                        quote_codes = st.session_state.stock_data['代號'].astype(str).tolist()
+                        snapshot_map = fetch_stock_snapshot_map(sj_api, quote_codes)
+                        refreshed_quotes, updated_count = merge_realtime_stock_snapshots(
+                            st.session_state.stock_data,
+                            snapshot_map,
+                            points_map=points_map,
+                        )
+                    if updated_count:
+                        st.session_state.stock_data = refreshed_quotes
+                        tz_tw = pytz.timezone('Asia/Taipei')
+                        st.session_state.last_rt_update_time = datetime.now(tz_tw).strftime("%Y/%m/%d %H:%M:%S")
+                        update_strategy_signal_outcomes({
+                            str(row['代號']): _safe_number(row.get('收盤價'))
+                            for _, row in st.session_state.stock_data.iterrows()
+                        })
+                        save_data_cache(st.session_state.stock_data, st.session_state.ignored_stocks, st.session_state.all_candidates, st.session_state.saved_notes)
+                        st.session_state.stock_strategy_editor_revision += 1
+                        st.toast(f"已用單一批次更新 {updated_count} 檔報價。", icon="⏱️")
+                        st.rerun()
+                    else:
+                        st.warning("目前未取得任何有效即時報價，原表格資料未變更。")
+                else:
+                    st.warning("⚠️ 請先登入永豐 API 才能使用即時更新報價功能。")
+
+            if btn_clear_notes:
+                st.session_state.saved_notes = {}
+                st.toast("手動備註已清除", icon="🧹")
+                if not st.session_state.stock_data.empty:
+                     for idx, row in st.session_state.stock_data.iterrows():
+                         clean_note, _ = generate_note_from_points(row.get('_points', []), "", show_3d_hilo)
+                         st.session_state.stock_data.at[idx, '戰略備註'] = clean_note
+                         if '_auto_note' in st.session_state.stock_data.columns: st.session_state.stock_data.at[idx, '_auto_note'] = clean_note
+                save_data_cache(st.session_state.stock_data, st.session_state.ignored_stocks, st.session_state.all_candidates, st.session_state.saved_notes)
+                st.session_state.stock_strategy_editor_revision += 1
+                st.rerun()
+
+            if 'last_rt_update_time' in st.session_state:
+                st.markdown(f"<div style='text-align: left; color: #888; font-size: 14px; margin-top: 5px; margin-bottom: 10px;'>透過永豐API即時更新報價(更新時間:{st.session_state.last_rt_update_time})</div>", unsafe_allow_html=True)
+
+            if btn_update:
+                 update_map = edited_df.set_index('代號')[['戰略備註']].to_dict('index')
+                 for i, row in st.session_state.stock_data.iterrows():
+                    code = row['代號']
+                    if code in update_map:
+                        new_note = update_map[code]['戰略備註']
+                        if str(row['戰略備註']) != str(new_note):
+                            b_auto = str(auto_notes_dict.get(code, "")).strip()
+                            n_note = str(new_note).strip()
+                            st.session_state.saved_notes[code] = n_note[len(b_auto):] if b_auto and n_note.startswith(b_auto) else f"[M]{n_note}"
+                        st.session_state.stock_data.at[i, '戰略備註'] = new_note
+                    st.session_state.stock_data.at[i, '狀態'] = recalculate_row(st.session_state.stock_data.iloc[i], points_map)
+                 save_data_cache(st.session_state.stock_data, st.session_state.ignored_stocks, st.session_state.all_candidates, st.session_state.saved_notes)
+                 st.session_state.stock_strategy_editor_revision += 1
+                 st.rerun()
+
+            st.markdown("### ⚡獨立計算")
+            indep_strategy_mode = None
+            if risk_preview_enabled:
+                if st.session_state.get('indep_strategy_mode') == '當沖預覽':
+                    st.session_state['indep_strategy_mode'] = '當沖'
+                if 'risk_filter_market_data' not in st.session_state:
+                    st.session_state.risk_filter_market_data = {
+                        'attention': {}, 'disposition': [], 'updated': None, 'errors': []
+                    }
+                indep_ctrl1, indep_ctrl2, indep_ctrl3 = st.columns(3)
+                with indep_ctrl1:
+                    indep_strategy_mode = st.radio(
+                        "獨立計算模式", ["當沖", "隔日／波段"], horizontal=True,
+                        key="indep_strategy_mode",
+                        help="09:00–09:15 會取得即時串流＋1 分 K；09:15 後改用 5 分 K，計算 VWAP、開盤區間與量能。"
+                    )
+                    if st.session_state.get('indep_risk_direction') in ('多頭', '空頭'):
+                        st.session_state['indep_risk_direction'] = '多' if st.session_state['indep_risk_direction'] == '多頭' else '空'
+                    indep_direction = st.radio(
+                        "判斷方向", ["系統自動", "多", "空"], horizontal=True,
+                        key="indep_risk_direction",
+                        help="系統自動會依每檔股票可用的分 K／日 K、VWAP 與支撐壓力分別判斷多空。"
+                    )
+                with indep_ctrl2:
+                    indep_min_score = st.slider("最低進場信心", 60, 90, 75, key="indep_risk_min_score")
+                    indep_max_extension = st.slider("最大乖離（ATR）", 1.0, 3.0, 2.0, 0.1, key="indep_risk_max_extension")
+                with indep_ctrl3:
+                    indep_block_attention = st.checkbox("封鎖注意累計 ≥ 2", value=True, key="indep_risk_block_attention")
+                    indep_show_only_eligible = st.checkbox("只顯示可操作候選", value=False, key="indep_risk_show_eligible")
+                    if st.button("🔄 更新注意／處置名單", key="refresh_indep_market_risk_data"):
                         fetch_market_risk_lists.clear()
                         with st.spinner("正在更新上市／上櫃注意與處置名單..."):
                             attention, disposition, disposition_tomorrow, errors = fetch_market_risk_lists()
@@ -16326,968 +17135,342 @@ with stock_strategy_container:
                             st.session_state.get('risk_filter_market_data', {}),
                             attention, disposition, disposition_tomorrow, errors,
                         )
-                        st.session_state['_reopen_stock_strategy_settings'] = True
-                        st.rerun()
-
-                cache_sync_notice = st.session_state.pop('_stock_cache_sync_notice', '')
-                if cache_sync_notice:
-                    st.warning(cache_sync_notice)
-                market_risk_data = st.session_state.risk_filter_market_data
-                if market_risk_data.get('updated') and not market_risk_data.get('errors'):
-                    st.caption(f"上市／上櫃注意與處置名單更新：{market_risk_data['updated']}。")
-                elif market_risk_data.get('errors'):
-                    if market_risk_data.get('using_last_success'):
-                        st.warning(
-                            f"本次名單未完整取得，沿用 {market_risk_data.get('updated')} 的最後成功資料；"
-                            "不會以空名單覆蓋。"
+                        save_data_cache(
+                            st.session_state.stock_data,
+                            st.session_state.ignored_stocks,
+                            st.session_state.all_candidates,
+                            st.session_state.saved_notes,
+                            replace_stock_data=True,
                         )
-                    else:
-                        st.warning("注意／處置名單暫時無法完整更新；本次不會將未查核資料誤標為安全。")
-                else:
-                    st.info("尚未更新上市／上櫃注意與處置名單；資料未查核時不會被誤判為安全。")
-
-                risk_ready_mask = df_display.reindex(columns=RISK_METRIC_COLUMNS).apply(
-                    lambda row: all(_safe_number(row.get(column)) is not None for column in RISK_METRIC_COLUMNS),
-                    axis=1,
+                if indep_strategy_mode == "當沖":
+                    st.caption("VWAP 判讀：偏多＝站上 VWAP（紅色）；偏空＝跌破 VWAP（綠色）。09:00–09:15 使用快照＋1 分 K，之後使用 5 分 K。")
+            col_q1, col_q2 = st.columns([5, 1.5])
+            with col_q1:
+                indep_selection = st.multiselect(
+                    "🔍 快速查詢 (中文/代號)",
+                    options=stock_options,
+                    key="indep_search_multiselect",
+                    placeholder="輸入 2330 或 台積電..."
                 )
-                risk_ready_count = int(risk_ready_mask.sum())
-                st.caption(f"日 K 策略指標：{risk_ready_count} / {len(df_display)} 檔可計算；資料不足時，先按「重抓日 K 並計算策略指標」。")
-                if is_daytrade_mode:
-                    daytrade_ready_mask = df_display.reindex(columns=DAYTRADE_METRIC_COLUMNS).apply(
-                        lambda row: (
-                            all(_safe_number(row.get(column)) is not None for column in DAYTRADE_REQUIRED_COLUMNS)
-                            and parse_strategy_data_time(row.get('_daytrade_data_time')) is not None
-                        ),
-                        axis=1,
-                    )
-                    daytrade_ready_count = int(daytrade_ready_mask.sum())
-                    st.caption(f"當沖盤中指標：{daytrade_ready_count} / {len(df_display)} 檔可計算；09:00–09:15 使用快照＋1 分 K，09:15 後使用 5 分 K，僅在手動按更新時抓取。")
+            with col_q2:
+                st.markdown("<div style='margin-top: 28px;'></div>", unsafe_allow_html=True)
+                btn_indep_run = st.button("🚀 執行分析", key="btn_indep_run", width='stretch')
 
-            market_risk_data = st.session_state.risk_filter_market_data
-            attention_counts = market_risk_data.get('attention', {})
-            disposition_codes = market_risk_data.get('disposition', [])
-            disposition_tomorrow_codes = market_risk_data.get('disposition_tomorrow', [])
-            market_lists_updated = bool(market_risk_data.get('updated')) and not market_risk_data.get('errors')
-            market_environment = st.session_state.get('strategy_market_environment', {})
-            market_bias = str(market_environment.get('bias', '盤整'))
-            market_source = str(market_environment.get('source', '臺指期資料不足'))
-            market_change = _safe_number(market_environment.get('change'))
-            market_change_text = f" {_signed_percent_arrow(market_change)}" if market_change is not None else ''
-            st.caption(f"市場環境：{market_bias}｜依據 {market_source}{market_change_text}；只提供順逆勢標示，不改動原選股順位。")
-
-            for i, row in df_display.iterrows():
-                direction_info = determine_stock_direction(row, is_daytrade_mode, risk_direction)
-                row_direction = direction_info['direction']
-                result = calculate_daytrade_filter_result(
-                    row, row_direction, attention_counts, disposition_codes,
-                    market_lists_updated, risk_block_attention
-                ) if is_daytrade_mode else calculate_risk_filter_result(
-                    row, row_direction, risk_max_extension, attention_counts, disposition_codes,
-                    market_lists_updated, risk_block_attention,
-                    disposition_tomorrow_codes=disposition_tomorrow_codes
-                )
-                code = str(row.get('代號', ''))
-                if is_daytrade_mode:
-                    daily_risk = calculate_risk_filter_result(
-                        row, row_direction, risk_max_extension, attention_counts, disposition_codes,
-                        market_lists_updated, risk_block_attention,
-                        disposition_tomorrow_codes=disposition_tomorrow_codes
-                    )
-                    # 日 ATR 乖離與官方風險是當沖的盤前門檻；盤中訊號成立也不放行過度延伸標的。
-                    if not daily_risk['eligible']:
-                        result['eligible'] = False
-                        if result['rule'].startswith('觸發：'):
-                            result['rule'] = f"不交易：盤前門檻未通過（{daily_risk['rule']}）"
-                    df_display.at[i, '風險'] = daily_risk['risk']
-                    df_display.at[i, 'VWAP 狀態'] = result['vwap_status']
-                    df_display.at[i, '開盤區間'] = result['opening_range']
-                    volume_ratio = _as_float(row.get('_daytrade_volume_ratio'))
-                    df_display.at[i, '量能'] = f"{_format_compact_number(volume_ratio, 2)}x" if volume_ratio is not None else "資料不足"
-                    df_display.at[i, '當沖評分'] = result['score']
-                    df_display.at[i, '盤中觸發'] = result['rule']
-                else:
-                    df_display.at[i, '風險'] = result['risk']
-                    df_display.at[i, '評分'] = result['score']
-                    df_display.at[i, '乖離'] = f"{_format_compact_number(result['extension'], 1, signed=True)} ATR" if result['extension'] is not None else "—"
-                    df_display.at[i, '隔日規則'] = result['rule']
-                trade_plan = build_trade_plan(row, row_direction, is_daytrade_mode, result)
-                if result.get('eligible') and not trade_plan.get('valid', False):
-                    result['eligible'] = False
-                    result['rule'] = f"觀察：{trade_plan.get('blocking_reason', '進場品質未達門檻')}"
-                    if is_daytrade_mode:
-                        df_display.at[i, '盤中觸發'] = result['rule']
-                    else:
-                        df_display.at[i, '隔日規則'] = result['rule']
-                result['trade_plan'] = trade_plan
-                result['direction_info'] = direction_info
-                risk_details[code] = result
-                df_display.at[i, '建議方向'] = direction_info['label']
-                df_display.at[i, '方向依據'] = direction_info['basis']
-                df_display.at[i, '_系統方向'] = row_direction
-                df_display.at[i, '進出場預判'] = trade_plan['summary']
-                signal_state = classify_signal_state(result['rule'], result['eligible'], result['score'], risk_min_score)
-                quote_time = row.get('_quote_time') or (row.get('_daytrade_data_time') if is_daytrade_mode else None)
-                required_ready = bool(result.get('data_time')) if is_daytrade_mode else result.get('extension') is not None
-                if bool(row.get('_data_stale', False)):
-                    data_health = '🔴 資料過期'
-                elif row.get('_quote_time'):
-                    data_health = build_data_health(row.get('_quote_time'), required_ready, live_expected=True)
-                else:
-                    data_health = build_data_health(quote_time, required_ready, live_expected=is_daytrade_mode)
-                bid = _safe_number(row.get('_quote_bid'))
-                ask = _safe_number(row.get('_quote_ask'))
-                reference_price = _safe_number(row.get('收盤價'))
-                tick = get_tick_size(reference_price) if reference_price is not None else 0.01
-                spread_ticks = (ask - bid) / tick if bid is not None and ask is not None and ask >= bid and tick > 0 else None
-                market_alignment = calculate_market_alignment(row_direction, market_bias)
-                current_price = (
-                    _safe_number(row.get('_daytrade_close')) if is_daytrade_mode else None
-                ) or reference_price
-                confidence = calculate_entry_confidence(
-                    result['score'], signal_state, current_price, trade_plan['summary'], row_direction,
-                    data_health, market_alignment, result.get('detail', '')
-                )
-                result['confidence'] = confidence
-                eligible_with_score = result['eligible'] and confidence['score'] >= risk_min_score
-                df_display.at[i, '訊號狀態'] = signal_state
-                df_display.at[i, '信心分'] = confidence['score']
-                df_display.at[i, '信心判讀'] = confidence['label']
-                df_display.at[i, '支撐壓力'] = build_stock_support_resistance(row, is_daytrade_mode)
-                df_display.at[i, '市場一致'] = market_alignment
-                df_display.at[i, '資料狀態'] = data_health
-                df_display.at[i, '買賣價差'] = f'{spread_ticks:.0f}跳' if spread_ticks is not None else '—'
-                df_display.at[i, '_risk_eligible'] = eligible_with_score
-                df_display.at[i, '_附加可記錄'] = (
-                    bool(trade_plan.get('valid')) and eligible_with_score
-                    and signal_state in ('✅ 已觸發', '🔵 回測確認')
-                )
-
-            render_strategy_ranking(df_display, strategy_mode, '股票')
-            notify_signal_state_changes(
-                'stocks',
-                {str(row['代號']): str(row.get('訊號狀態', '')) for _, row in df_display.iterrows()},
-                stock_notify,
-            )
-
-            if risk_show_only_eligible:
-                df_display = df_display[df_display['_risk_eligible']].reset_index(drop=True)
-                if df_display.empty:
-                    st.warning("目前沒有符合門檻的候選；可降低最低評分、放寬最大乖離，或切換回原表。")
-
-            if stock_compact_table:
-                input_cols = [
-                    "移除", "代號", "名稱", "戰略備註", "收盤價", "漲跌幅",
-                    "建議方向", "方向依據", "支撐壓力", "進出場預判", "5日線價差", "信心分", "信心判讀",
-                    "訊號狀態", "市場一致", "風險", "資料狀態"
-                ]
-            elif is_daytrade_mode:
-                input_cols = ["移除", "代號", "名稱", "戰略備註", "收盤價", "漲跌幅", "建議方向", "方向依據", "狀態", "成交價價差", "5日線價差", "風險", "VWAP 狀態", "開盤區間", "量能", "信心分", "信心判讀", "支撐壓力", "盤中觸發", "進出場預判", "訊號狀態", "市場一致", "當日漲停價", "當日跌停價", "期貨", "資料狀態", "買賣價差"]
-            else:
-                input_cols = ["移除", "代號", "名稱", "戰略備註", "收盤價", "漲跌幅", "建議方向", "方向依據", "狀態", "成交價價差", "5日線價差", "風險", "信心分", "信心判讀", "乖離", "支撐壓力", "隔日規則", "進出場預判", "訊號狀態", "市場一致", "當日漲停價", "當日跌停價", "期貨", "資料狀態", "買賣價差"]
-        else:
-            input_cols = ["移除", "代號", "名稱", "戰略備註", "收盤價", "漲跌幅", "狀態", "成交價價差", "5日線價差", "當日漲停價", "當日跌停價", "期貨"]
-        for col in input_cols:
-            if col not in df_display.columns: df_display[col] = None
-
-        cols_to_fmt = ["當日漲停價", "當日跌停價", "成交價價差", "5日線價差"]
-        for c in cols_to_fmt:
-            if c in df_display.columns: df_display[c] = df_display[c].apply(fmt_price)
-
-        if "收盤價" in df_display.columns: df_display["收盤價"] = df_display["收盤價"].astype(object)
-        if "漲跌幅" in df_display.columns: df_display["漲跌幅"] = df_display["漲跌幅"].astype(object)
-
-        if "收盤價" in df_display.columns and "漲跌幅" in df_display.columns:
-            for i in range(len(df_display)):
-                try:
-                    p = float(df_display.at[i, "收盤價"])
-                    chg = float(df_display.at[i, "漲跌幅"])
-                    df_display.at[i, "收盤價"] = fmt_price(p)
-                    df_display.at[i, "漲跌幅"] = _signed_percent(chg)
-                except Exception:
-                    df_display.at[i, "收盤價"] = fmt_price(df_display.at[i, "收盤價"])
-                    try: df_display.at[i, "漲跌幅"] = _signed_percent(float(df_display.at[i, '漲跌幅']))
-                    except Exception: pass
-
-        df_display = df_display.reset_index(drop=True)
-        for col in input_cols:
-            if col not in ["移除", "信心分"]:
-                df_display[col] = df_display[col].map(_blank_display_text)
-
-        # 定義上色邏輯
-        def style_tab1_df(row, source_frame=None):
-            styles = [''] * len(row)
-            note = str(row.get('戰略備註', ''))
-            # 精簡主表不顯示「狀態」，名稱底色必須以目前成交價與漲跌停價
-            # 重新比對；不能沿用可能是上一輪報價留下的「漲停／跌停」文字。
-            st_val = str(row.get('狀態', ''))
-            frame = source_frame if isinstance(source_frame, pd.DataFrame) else df_display
-            if not st_val and row.name in frame.index:
-                st_val = str(frame.at[row.name, '狀態'])
-            source_row = frame.loc[row.name] if row.name in frame.index else row
-            limit_state = stock_limit_state(
-                row.get('收盤價'),
-                source_row.get('_交易日漲停價', row.get('當日漲停價')),
-                source_row.get('_交易日跌停價', row.get('當日跌停價')),
-            )
-            risk_val = str(row.get('風險', ''))
-            vwap_val = str(row.get('VWAP 狀態', ''))
-            signal_state = str(row.get('訊號狀態', ''))
-            data_health = str(row.get('資料狀態', ''))
-            market_alignment = str(row.get('市場一致', ''))
-            
-            if limit_state == 'up':
-                name_c = 'background-color: #ff4b4b; color: #ffffff; font-weight: bold;'
-            elif limit_state == 'down':
-                name_c = 'background-color: #00e676; color: #ffffff; font-weight: bold;'
-            elif st_val == "命中":
-                name_c = 'background-color: #ffeb3b; color: #000000; font-weight: bold;'
-            else:
-                name_c = (
-                    'color: #ff4b4b; font-weight: bold;' if "多" in note
-                    else ('color: #00e676; font-weight: bold;' if "空" in note else 'font-weight: bold;')
-                )
-            
-            price_c = ''
-            try:
-                c_val = float(
-                    str(row.get('漲跌幅', '0')).replace('%', '').replace('+', '')
-                    .replace('↑', '').replace('↓', '').replace('→', '').strip()
-                )
-                price_c = 'color: #ff4b4b;' if c_val > 0 else ('color: #00e676;' if c_val < 0 else '')
-            except Exception: pass
-            
-            status_c = 'color: #ff4b4b;' if st_val in ["漲停", "強"] else ('color: #00e676;' if st_val in ["跌停", "弱"] else ('color: #ffeb3b;' if st_val == "命中" else ''))
-            
-            for idx, col in enumerate(row.index):
-                if col == "名稱": styles[idx] = name_c
-                elif col in ["收盤價", "漲跌幅"]: styles[idx] = price_c
-                elif col == "狀態": styles[idx] = status_c
-                elif col == "建議方向":
-                    direction_text = str(row.get('建議方向', ''))
-                    if '多' in direction_text:
-                        styles[idx] = 'color:#ff4b4b;font-weight:bold;'
-                    elif '空' in direction_text:
-                        styles[idx] = 'color:#00e676;font-weight:bold;'
-                elif col == "方向依據":
-                    direction_text = str(row.get('建議方向', ''))
-                    styles[idx] = (
-                        'color:#ff6b6b;' if '多' in direction_text
-                        else ('color:#35d07f;' if '空' in direction_text else 'color:#cbd5e1;')
-                    )
-                elif col == "支撐壓力":
-                    styles[idx] = 'color:#4fc3f7;font-weight:600;'
-                elif col in ("盤中觸發", "隔日規則", "進出場預判"):
-                    value = str(row.get(col, ''))
-                    if any(keyword in value for keyword in ('資料不足', '不建立', '觀察：', '等待')):
-                        styles[idx] = 'color:#ffd166;'
-                    elif '多' in str(row.get('建議方向', '')):
-                        styles[idx] = 'color:#ff6b6b;'
-                    elif '空' in str(row.get('建議方向', '')):
-                        styles[idx] = 'color:#35d07f;'
-                elif col == "當日漲停價":
-                    styles[idx] = 'color:#ff4b4b;font-weight:bold;'
-                elif col == "當日跌停價":
-                    styles[idx] = 'color:#00e676;font-weight:bold;'
-                elif col in ["成交價價差", "5日線價差"]:
-                    val = row[col]
-                    try:
-                        f_val = float(val)
-                        if f_val > 0: styles[idx] = 'color: #ff4b4b;'
-                        elif f_val < 0: styles[idx] = 'color: #00e676;'
-                        else: styles[idx] = 'color: white;'
-                    except Exception: pass
-                elif col == "風險":
-                    if risk_val.startswith('🚫') or risk_val.startswith('🔴'):
-                        styles[idx] = 'color: #ff4b4b; font-weight: bold;'
-                    elif risk_val.startswith('🔶'):
-                        styles[idx] = 'color: #ff9800; font-weight: bold;'
-                    elif risk_val.startswith('🟡'):
-                        styles[idx] = 'color: #ffeb3b; font-weight: bold;'
-                    elif risk_val.startswith('🟢'):
-                        styles[idx] = 'color: #00e676;'
-                elif col == "VWAP 狀態":
-                    if vwap_val.startswith('偏多'):
-                        styles[idx] = 'color: #ff4b4b; font-weight: bold;'
-                    elif vwap_val.startswith('偏空'):
-                        styles[idx] = 'color: #00e676; font-weight: bold;'
-                    elif vwap_val.startswith('中性'):
-                        styles[idx] = 'color: #ffeb3b;'
-                elif col == "訊號狀態":
-                    if signal_state.startswith('✅'):
-                        styles[idx] = 'color:#ff4b4b;font-weight:bold;'
-                    elif signal_state.startswith('🔵'):
-                        styles[idx] = 'color:#29b6f6;font-weight:bold;'
-                    elif signal_state.startswith('⛔'):
-                        styles[idx] = 'color:#ff9800;font-weight:bold;'
-                    elif signal_state.startswith('🟡'):
-                        styles[idx] = 'color:#ffeb3b;'
-                elif col in ["資料狀態", "市場一致"]:
-                    value = data_health if col == "資料狀態" else market_alignment
-                    if value.startswith('🟢'):
-                        styles[idx] = 'color:#00e676;'
-                    elif value.startswith(('🔴', '⛔')):
-                        styles[idx] = 'color:#ff4b4b;font-weight:bold;'
-                    elif value.startswith('🟡'):
-                        styles[idx] = 'color:#ffeb3b;'
-                elif col == "信心判讀":
-                    confidence = str(row.get('信心判讀', ''))
-                    if confidence.startswith('🟢'):
-                        styles[idx] = 'color:#00e676;font-weight:bold;'
-                    elif confidence.startswith(('🟡', '🟠')):
-                        styles[idx] = 'color:#ffb300;font-weight:bold;'
-                    elif confidence.startswith('🔴'):
-                        styles[idx] = 'color:#ff4b4b;font-weight:bold;'
-            return styles
-            
-        styled_df = df_display[input_cols].style.apply(style_tab1_df, axis=1)
-
-        def stock_content_width(column, minimum, maximum=520, full_content=False):
-            return _content_column_width(
-                df_display.get(column), minimum, maximum, full_content,
-            )
-
-        risk_column_config = {}
-        if risk_preview_enabled:
-            risk_column_config = {
-                "建議方向": st.column_config.TextColumn(width=stock_content_width('建議方向', 56, 90), disabled=True, help="系統自動時逐檔判斷；紅色為建議多、綠色為建議空。選擇手動多／空時會標示為手動。"),
-                "方向依據": st.column_config.TextColumn(width=stock_content_width('方向依據', 86), disabled=True, help="當沖優先列出分 K、VWAP、開盤區間與量能；隔日／波段列出日 K 均線、前高前低及 K 棒位置。括號為多空條件分數。"),
-                "風險": st.column_config.TextColumn("處置／注意", width=stock_content_width('風險', 64, 110), disabled=True, help="官方注意與處置查核結果；不預測漲跌方向。"),
-                "訊號狀態": st.column_config.TextColumn(width=stock_content_width('訊號狀態', 56, 140), disabled=True, help="將原條件濃縮為等待、接近、觸發或暫停；原規則仍在明細。"),
-                "市場一致": st.column_config.TextColumn(width=stock_content_width('市場一致', 56, 120), disabled=True, help="目前方向是否與近月臺指期環境一致；不改變原排序。"),
-                "資料狀態": st.column_config.TextColumn(width=stock_content_width('資料狀態', 56, 150), disabled=True, help="顯示即時、手動／暫存、官方日行情或資料過期。"),
-                "買賣價差": st.column_config.TextColumn(
-                    width=stock_content_width('買賣價差', 56, 96), disabled=True,
-                    help="即時最佳賣價與最佳買價的距離，換算為跳動單位；跳數越少通常代表報價較連續、進出成本較低。無即時買賣價時顯示「—」。"
-                ),
-                "信心分": st.column_config.ProgressColumn("進場信心", min_value=0, max_value=100, format="%d", width=82, help="綜合方向條件、觸發位置、市場一致與資料狀態；代表條件一致度，不是勝率。"),
-                "信心判讀": st.column_config.TextColumn(width=stock_content_width('信心判讀', 48, 96), disabled=True, help="高／中高／中／低；追離進場點、條件失效或資料過期時會降級。"),
-                "支撐壓力": st.column_config.TextColumn(width=stock_content_width('支撐壓力', 76), disabled=True, help="當沖採開盤區間與 VWAP；隔日／波段沿用原戰略價位，顯示最接近目前價格的支撐與壓力。"),
-            }
-            if is_daytrade_mode:
-                risk_column_config.update({
-                    "VWAP 狀態": st.column_config.TextColumn(width=stock_content_width('VWAP 狀態', 72, 150), disabled=True, help="價格相對成交量加權平均價的位置；上方偏多、下方偏空。"),
-                    "開盤區間": st.column_config.TextColumn(width=stock_content_width('開盤區間', 80, 150), disabled=True, help="09:00–09:15 顯示形成中的即時低點－高點；09:15 後固定為完整開盤區間。"),
-                    "量能": st.column_config.TextColumn(width=stock_content_width('量能', 52, 96), disabled=True, help="目前累積量相對最近交易日同時段平均量。"),
-                    "盤中觸發": st.column_config.TextColumn(width=stock_content_width('盤中觸發', 72), disabled=True, help="僅在盤中條件同時成立時提供觀察提示，不是自動買賣指令。"),
-                    "進出場預判": st.column_config.TextColumn(width=stock_content_width('進出場預判', 86, 720, True), disabled=True, help="通過條件後，以開盤區間與 VWAP 推估進場、策略失效離場與第一目標；僅供觀察與回測。"),
-                })
-            else:
-                risk_column_config.update({
-                    "乖離": st.column_config.TextColumn(width=stock_content_width('乖離', 52, 96), disabled=True, help="收盤價相對 20 日線的 ATR 距離；數值越大越不宜追價或追空。"),
-                    "隔日規則": st.column_config.TextColumn(width=stock_content_width('隔日規則', 72), disabled=True, help="僅在隔日條件成真時才列入評估，不是自動買賣指令。"),
-                    "進出場預判": st.column_config.TextColumn(width=stock_content_width('進出場預判', 86, 720, True), disabled=True, help="通過條件後，以昨高／昨低與 ATR 推估進場、策略失效離場與第一目標；僅供觀察與回測。"),
-                })
-
-        stock_table_signature = abs(hash((
-            tuple(df_display['代號'].astype(str).tolist()), tuple(input_cols)
-        )))
-        stock_editor_key = (
-            f"main_editor_{st.session_state.stock_strategy_editor_revision}_{stock_table_signature}"
-        )
-        edited_df = st.data_editor(
-            styled_df,
-            column_config={
-                **risk_column_config,
-                "移除": st.column_config.CheckboxColumn("刪除", width=40, help="勾選後刪除並自動遞補"),
-                "代號": st.column_config.TextColumn(disabled=True, width=_content_column_width(df_display.get("代號"), 44, 62)),
-                "名稱": st.column_config.TextColumn(disabled=True, width=_content_column_width(df_display.get("名稱"), 44, 130)),
-                "收盤價": st.column_config.TextColumn("成交價", width=_content_column_width(df_display.get("收盤價"), 52, 78), disabled=True),
-                "漲跌幅": st.column_config.TextColumn(disabled=True, width=_content_column_width(df_display.get("漲跌幅"), 56, 78)),
-                "期貨": st.column_config.TextColumn(width=_content_column_width(df_display.get("期貨"), 44, 70), disabled=True),
-                "當日漲停價": st.column_config.TextColumn(width=_content_column_width(df_display.get("當日漲停價"), 54, 78), disabled=True),
-                "當日跌停價": st.column_config.TextColumn(width=_content_column_width(df_display.get("當日跌停價"), 54, 78), disabled=True),
-                "成交價價差": st.column_config.TextColumn(
-                    width=80, disabled=True,
-                    help="目前成交價減去昨日收盤價；正值為上漲點數，負值為下跌點數。"
-                ),
-                "5日線價差": st.column_config.TextColumn(
-                    width=80, disabled=True,
-                    help="目前成交價減去 5 日均線；正值在均線上方，負值在均線下方。"
-                ),
-                "狀態": None, # 設定為 None 即可在資料編輯器中隱藏該欄位
-                "戰略備註": st.column_config.TextColumn("戰略備註 ✏️", width=note_width_px, disabled=False),
-            },
-            hide_index=True, width='stretch' if risk_preview_enabled else 'content', num_rows="fixed", key=stock_editor_key
-        )
-
-        if risk_preview_enabled and risk_details:
-            detail_options = {
-                f"{row['代號']} {row['名稱']}": str(row['代號'])
-                for _, row in df_display.iterrows()
-            }
-            if detail_options:
-                selected_risk_label = st.selectbox("查看策略信心明細", list(detail_options), key="risk_filter_detail_code")
-                selected_risk = risk_details[detail_options[selected_risk_label]]
-                rule_label = "盤中觸發" if is_daytrade_mode else "隔日規則"
-                data_time_text = f"｜盤中資料更新：{selected_risk['data_time']}" if is_daytrade_mode and selected_risk.get('data_time') else ""
-                plan_text = selected_risk.get('trade_plan', {}).get('detail', '尚未預判點位。')
-                confidence_detail = selected_risk.get('confidence', {})
-                direction_detail = selected_risk.get('direction_info', {})
-                st.caption(
-                    f"{direction_detail.get('label', '方向未判定')}｜{direction_detail.get('basis', '方向依據不足')}｜"
-                    f"進場信心 {confidence_detail.get('score', '—')} 分（{confidence_detail.get('label', '—')}）｜"
-                    f"{selected_risk['detail']}｜{rule_label}：{selected_risk['rule']}｜進出場預判：{plan_text}{data_time_text}。"
-                    "信心分代表條件一致度，不是勝率；僅供策略觀察與回測。"
-                )
-                selected_code = detail_options[selected_risk_label]
-                selected_rows = df_display[df_display['代號'].astype(str) == selected_code]
-                if not selected_rows.empty:
-                    selected_row = selected_rows.iloc[0]
-                    st.caption(
-                        f"附加狀態：{selected_row.get('訊號狀態', '—')}｜{selected_row.get('市場一致', '—')}｜"
-                        f"{selected_row.get('資料狀態', '—')}｜買賣價差 {selected_row.get('買賣價差', '—')}。"
+            cached_indep_data = st.session_state.get('stock_independent_raw_results', [])
+            if btn_indep_run and not indep_selection:
+                st.warning("請先選擇至少一檔股票再執行獨立分析。")
+            if (btn_indep_run and indep_selection) or cached_indep_data:
+                c_map_q, n_map_q = load_local_stock_names()
+                sj_logged = st.session_state.get('sj_logged_in', False)
+                sj_api_obj = st.session_state.get('sj_api', None)
+                indep_data = list(cached_indep_data)
+                if btn_indep_run and indep_selection:
+                    if not st.session_state.futures_list:
+                        st.session_state.futures_list = fetch_futures_list()
+                    f_set = st.session_state.futures_list
+                    notes_copy = dict(st.session_state.get('saved_notes', {}))
+                    indep_now_tw = datetime.now(pytz.timezone('Asia/Taipei'))
+                    indep_opening_micro = _is_opening_micro_window(indep_now_tw)
+                    indep_intraday_interval = '1m' if indep_opening_micro else '5m'
+                    indep_interval_label = '1 分 K' if indep_opening_micro else '5 分 K'
+                    indep_codes = [item.split(' ', 1)[0] for item in indep_selection]
+                    indep_snapshot_map = (
+                        fetch_stock_snapshot_map(sj_api_obj, indep_codes)
+                        if sj_logged and sj_api_obj is not None else {}
                     )
 
-            if st.button(
-                '📝 記錄目前表格的已觸發股票訊號', key='record_stock_strategy_signals',
-                help='一次記錄目前股票表格中所有已觸發或回測確認、且達最低進場信心的個股；不是只記錄單一個股。'
-            ):
-                records = []
-                recordable_rows = df_display[df_display.get('_附加可記錄', False) == True]
-                for _, row in recordable_rows.iterrows():
-                    plan = parse_trade_plan_numbers(row.get('進出場預判'))
-                    score = row.get('信心分')
-                    records.append({
-                        '市場': '股票', '商品鍵': str(row['代號']), '代碼': str(row['代號']),
-                        '名稱': str(row['名稱']), '策略': strategy_mode, '方向': str(row.get('_系統方向', '')),
-                        '訊號狀態': str(row.get('訊號狀態', '')), '評分': _safe_number(score),
-                        '信心判讀': str(row.get('信心判讀', '')),
-                        '進場價': plan['entry'], '停損價': plan['stop'], '目標價': plan['target'],
-                        '最新價': _safe_number(row.get('收盤價')),
-                        '風險': str(row.get('風險', '')), '資料狀態': str(row.get('資料狀態', '')),
-                    })
-                added, saved = register_strategy_signals(records)
-                if saved:
-                    save_data_cache(
-                        st.session_state.stock_data, st.session_state.ignored_stocks,
-                        st.session_state.all_candidates, st.session_state.saved_notes,
-                    )
-                    st.toast(f'已新增 {added} 筆股票訊號；重複訊號不另建。', icon='📝')
-                else:
-                    st.error('訊號紀錄儲存失敗，請確認檔案是否可寫入。')
-        
-        if not edited_df.empty:
-            trigger_rerun = False
-            if "移除" in edited_df.columns:
-                to_remove = edited_df[edited_df["移除"] == True]
-                if not to_remove.empty:
-                    remove_codes = to_remove["代號"].unique()
-                    
-                    # 速度優化：將刪除的股票資料快取起來
-                    for c in remove_codes: 
-                        st.session_state.ignored_stocks.add(str(c))
-                        row_data = st.session_state.stock_data[st.session_state.stock_data["代號"] == c]
-                        if not row_data.empty:
-                            st.session_state.ignored_data_cache[c] = row_data.iloc[0].to_dict()
-                            
-                    # --- 新增：資源優化，忽略快取超過 5 檔就刪除最舊的 ---
-                    while len(st.session_state.ignored_data_cache) > 5:
-                        oldest_key = next(iter(st.session_state.ignored_data_cache))
-                        del st.session_state.ignored_data_cache[oldest_key]
-                    # ----------------------------------------------------
-                    
-                    # 從表格資料中剃除
-                    st.session_state.stock_data = st.session_state.stock_data[~st.session_state.stock_data["代號"].isin(remove_codes)]
-                    
-                    # 🚀 關鍵修改：立刻儲存並 Rerun，讓畫面「瞬間」移除該行，
-                    # 把耗時的遞補抓取動作交給最下方的區塊去處理，避免畫面卡死！
-                    save_data_cache(st.session_state.stock_data, st.session_state.ignored_stocks, st.session_state.all_candidates, st.session_state.saved_notes)
-                    st.session_state.stock_strategy_editor_revision += 1
-                    st.rerun()
-
-            if trigger_rerun: st.rerun()
-
-        df_curr = st.session_state.stock_data
-        if not df_curr.empty:
-            upload_count = len(df_curr) if '_source' not in df_curr.columns else len(df_curr[df_curr['_source'] == 'upload'])
-            limit = st.session_state.limit_rows
-            
-            # 若筆數不足且有候補名單，則進行自動遞補
-            if upload_count < limit and st.session_state.all_candidates:
-                needed = limit - upload_count
-                existing_codes = set(st.session_state.stock_data['代號'].astype(str))
-                futures_copy = dict(st.session_state.futures_list)
-                notes_copy = dict(st.session_state.saved_notes)
-                code_map_copy, _ = load_local_stock_names()
-                
-                cand_to_fetch = []
-                for cand in st.session_state.all_candidates:
-                     c_code, c_name, c_source, c_extra = str(cand[0]), cand[1], cand[2], cand[3]
-                     if c_source != 'upload' or c_code in st.session_state.ignored_stocks or c_code in existing_codes: continue
-                     cand_to_fetch.append((c_code, c_name, c_source, c_extra))
-                     if len(cand_to_fetch) >= needed: break
-                     
-                if cand_to_fetch:
-                    with st.spinner(f"正在遞補 {len(cand_to_fetch)} 檔股票..."):
-                        # 🚀 1. 優先從「背景預載快取」提取 (瞬間完成)
-                        ready_results = []
-                        remaining_to_fetch = []
-                        
-                        for cand in cand_to_fetch:
-                            t_code = cand[0]
-                            if t_code in st.session_state.get('prefetch_cache', {}):
-                                ready_results.append(st.session_state.prefetch_cache.pop(t_code))
-                            else:
-                                remaining_to_fetch.append(cand)
-                                
-                        if ready_results:
-                            st.session_state.stock_data = pd.concat([st.session_state.stock_data, pd.DataFrame(ready_results)], ignore_index=True)
-                            
-                        # 🚀 2. 若快取不足(例如剛開啟網頁還沒預載完)，才即時抓取剩下的
-                        if remaining_to_fetch:
-                            worker_sj_logged_in = st.session_state.get('sj_logged_in', False)
-                            worker_sj_api = st.session_state.get('sj_api')
-                            def _replenish_worker(cand):
-                                time.sleep(API_REQUEST_GAP_SECONDS)
-                                t_code, t_name, t_src, t_extra = cand
-                                res = fetch_stock_data_raw(
-                                    t_code, t_name, t_extra, futures_copy, notes_copy,
-                                    code_map_copy, worker_sj_logged_in, worker_sj_api,
-                                )
-                                if res: res.update({'_source': t_src, '_order': t_extra, '_source_rank': 1})
-                                return res
-
-                            with ThreadPoolExecutor(max_workers=ANALYSIS_MAX_WORKERS) as executor:
-                                results = list(executor.map(_replenish_worker, remaining_to_fetch))
-                                valid_results = [r for r in results if r]
-                                if valid_results:
-                                    st.session_state.stock_data = pd.concat([st.session_state.stock_data, pd.DataFrame(valid_results)], ignore_index=True)
-                        
-                        # 修正：強制依據來源優先權進行排序，讓自動遞補的新股票排在查詢的股票之前
-                        if '_source_rank' in st.session_state.stock_data.columns:
-                            st.session_state.stock_data = st.session_state.stock_data.sort_values(by=['_source_rank', '_order']).reset_index(drop=True)
-
-                        save_data_cache(st.session_state.stock_data, st.session_state.ignored_stocks, st.session_state.all_candidates, st.session_state.saved_notes)
-                        st.rerun() # 遞補完成，立刻更新畫面
-
-        
-        st.markdown("---")
-        # 重新配置欄位比例與順序
-        col_rt_update, col_btn, col_clear = st.columns([2, 2.5, 2])
-        with col_rt_update: btn_rt_update = st.button("⏱️ 即時更新報價", width='stretch', type="primary")
-        with col_btn: btn_update = st.button("⚡ 執行更新&儲存手動備註", width='stretch')
-        with col_clear: btn_clear_notes = st.button("🧹 清除手動備註", width='stretch', help="清除所有記憶的戰略備註內容")
-
-        if btn_rt_update:
-            if st.session_state.get('sj_logged_in', False) and st.session_state.get('sj_api'):
-                sj_api = st.session_state.sj_api
-                with st.spinner("正在透過永豐API更新報價..."):
-                    quote_codes = st.session_state.stock_data['代號'].astype(str).tolist()
-                    snapshot_map = fetch_stock_snapshot_map(sj_api, quote_codes)
-                    refreshed_quotes, updated_count = merge_realtime_stock_snapshots(
-                        st.session_state.stock_data,
-                        snapshot_map,
-                        points_map=points_map,
-                    )
-                if updated_count:
-                    st.session_state.stock_data = refreshed_quotes
-                    tz_tw = pytz.timezone('Asia/Taipei')
-                    st.session_state.last_rt_update_time = datetime.now(tz_tw).strftime("%Y/%m/%d %H:%M:%S")
-                    update_strategy_signal_outcomes({
-                        str(row['代號']): _safe_number(row.get('收盤價'))
-                        for _, row in st.session_state.stock_data.iterrows()
-                    })
-                    save_data_cache(st.session_state.stock_data, st.session_state.ignored_stocks, st.session_state.all_candidates, st.session_state.saved_notes)
-                    st.session_state.stock_strategy_editor_revision += 1
-                    st.toast(f"已用單一批次更新 {updated_count} 檔報價。", icon="⏱️")
-                    st.rerun()
-                else:
-                    st.warning("目前未取得任何有效即時報價，原表格資料未變更。")
-            else:
-                st.warning("⚠️ 請先登入永豐 API 才能使用即時更新報價功能。")
-
-        if btn_clear_notes:
-            st.session_state.saved_notes = {}
-            st.toast("手動備註已清除", icon="🧹")
-            if not st.session_state.stock_data.empty:
-                 for idx, row in st.session_state.stock_data.iterrows():
-                     clean_note, _ = generate_note_from_points(row.get('_points', []), "", show_3d_hilo)
-                     st.session_state.stock_data.at[idx, '戰略備註'] = clean_note
-                     if '_auto_note' in st.session_state.stock_data.columns: st.session_state.stock_data.at[idx, '_auto_note'] = clean_note
-            save_data_cache(st.session_state.stock_data, st.session_state.ignored_stocks, st.session_state.all_candidates, st.session_state.saved_notes)
-            st.session_state.stock_strategy_editor_revision += 1
-            st.rerun()
-        
-        if 'last_rt_update_time' in st.session_state:
-            st.markdown(f"<div style='text-align: left; color: #888; font-size: 14px; margin-top: 5px; margin-bottom: 10px;'>透過永豐API即時更新報價(更新時間:{st.session_state.last_rt_update_time})</div>", unsafe_allow_html=True)
-
-        if btn_update:
-             update_map = edited_df.set_index('代號')[['戰略備註']].to_dict('index')
-             for i, row in st.session_state.stock_data.iterrows():
-                code = row['代號']
-                if code in update_map:
-                    new_note = update_map[code]['戰略備註']
-                    if str(row['戰略備註']) != str(new_note):
-                        b_auto = str(auto_notes_dict.get(code, "")).strip()
-                        n_note = str(new_note).strip()
-                        st.session_state.saved_notes[code] = n_note[len(b_auto):] if b_auto and n_note.startswith(b_auto) else f"[M]{n_note}"
-                    st.session_state.stock_data.at[i, '戰略備註'] = new_note
-                st.session_state.stock_data.at[i, '狀態'] = recalculate_row(st.session_state.stock_data.iloc[i], points_map)
-             save_data_cache(st.session_state.stock_data, st.session_state.ignored_stocks, st.session_state.all_candidates, st.session_state.saved_notes)
-             st.session_state.stock_strategy_editor_revision += 1
-             st.rerun()
-
-        st.markdown("### ⚡獨立計算")
-        indep_strategy_mode = None
-        if risk_preview_enabled:
-            if st.session_state.get('indep_strategy_mode') == '當沖預覽':
-                st.session_state['indep_strategy_mode'] = '當沖'
-            if 'risk_filter_market_data' not in st.session_state:
-                st.session_state.risk_filter_market_data = {
-                    'attention': {}, 'disposition': [], 'updated': None, 'errors': []
-                }
-            indep_ctrl1, indep_ctrl2, indep_ctrl3 = st.columns(3)
-            with indep_ctrl1:
-                indep_strategy_mode = st.radio(
-                    "獨立計算模式", ["當沖", "隔日／波段"], horizontal=True,
-                    key="indep_strategy_mode",
-                    help="09:00–09:15 會取得即時串流＋1 分 K；09:15 後改用 5 分 K，計算 VWAP、開盤區間與量能。"
-                )
-                if st.session_state.get('indep_risk_direction') in ('多頭', '空頭'):
-                    st.session_state['indep_risk_direction'] = '多' if st.session_state['indep_risk_direction'] == '多頭' else '空'
-                indep_direction = st.radio(
-                    "判斷方向", ["系統自動", "多", "空"], horizontal=True,
-                    key="indep_risk_direction",
-                    help="系統自動會依每檔股票可用的分 K／日 K、VWAP 與支撐壓力分別判斷多空。"
-                )
-            with indep_ctrl2:
-                indep_min_score = st.slider("最低進場信心", 60, 90, 75, key="indep_risk_min_score")
-                indep_max_extension = st.slider("最大乖離（ATR）", 1.0, 3.0, 2.0, 0.1, key="indep_risk_max_extension")
-            with indep_ctrl3:
-                indep_block_attention = st.checkbox("封鎖注意累計 ≥ 2", value=True, key="indep_risk_block_attention")
-                indep_show_only_eligible = st.checkbox("只顯示可操作候選", value=False, key="indep_risk_show_eligible")
-                if st.button("🔄 更新注意／處置名單", key="refresh_indep_market_risk_data"):
-                    fetch_market_risk_lists.clear()
-                    with st.spinner("正在更新上市／上櫃注意與處置名單..."):
-                        attention, disposition, disposition_tomorrow, errors = fetch_market_risk_lists()
-                    st.session_state.risk_filter_market_data = merge_market_risk_refresh(
-                        st.session_state.get('risk_filter_market_data', {}),
-                        attention, disposition, disposition_tomorrow, errors,
-                    )
-            if indep_strategy_mode == "當沖":
-                st.caption("VWAP 判讀：偏多＝站上 VWAP（紅色）；偏空＝跌破 VWAP（綠色）。09:00–09:15 使用快照＋1 分 K，之後使用 5 分 K。")
-        col_q1, col_q2 = st.columns([5, 1.5])
-        with col_q1:
-            indep_selection = st.multiselect(
-                "🔍 快速查詢 (中文/代號)", 
-                options=stock_options, 
-                key="indep_search_multiselect", 
-                placeholder="輸入 2330 或 台積電..."
-            )
-        with col_q2:
-            st.markdown("<div style='margin-top: 28px;'></div>", unsafe_allow_html=True)
-            btn_indep_run = st.button("🚀 執行分析", key="btn_indep_run", width='stretch')
-            
-        cached_indep_data = st.session_state.get('stock_independent_raw_results', [])
-        if btn_indep_run and not indep_selection:
-            st.warning("請先選擇至少一檔股票再執行獨立分析。")
-        if (btn_indep_run and indep_selection) or cached_indep_data:
-            c_map_q, n_map_q = load_local_stock_names()
-            sj_logged = st.session_state.get('sj_logged_in', False)
-            sj_api_obj = st.session_state.get('sj_api', None)
-            indep_data = list(cached_indep_data)
-            if btn_indep_run and indep_selection:
-                if not st.session_state.futures_list:
-                    st.session_state.futures_list = fetch_futures_list()
-                f_set = st.session_state.futures_list
-                notes_copy = dict(st.session_state.get('saved_notes', {}))
-                indep_now_tw = datetime.now(pytz.timezone('Asia/Taipei'))
-                indep_opening_micro = _is_opening_micro_window(indep_now_tw)
-                indep_intraday_interval = '1m' if indep_opening_micro else '5m'
-                indep_interval_label = '1 分 K' if indep_opening_micro else '5 分 K'
-                indep_codes = [item.split(' ', 1)[0] for item in indep_selection]
-                indep_snapshot_map = (
-                    fetch_stock_snapshot_map(sj_api_obj, indep_codes)
-                    if sj_logged and sj_api_obj is not None else {}
-                )
-
-                with st.spinner("正在獨立分析..."):
-                    def _indep_worker(item):
-                        time.sleep(API_REQUEST_GAP_SECONDS)
-                        parts = item.split(' ', 1)
-                        q_code = parts[0]
-                        q_name = parts[1] if len(parts) > 1 else ""
-                        result = fetch_stock_data_raw(
-                            q_code, q_name, None, f_set, notes_copy,
-                            c_map_q, sj_logged, sj_api_obj
-                        )
-                        if result and risk_preview_enabled and indep_strategy_mode == "當沖" and sj_logged and sj_api_obj is not None:
+                    with st.spinner("正在獨立分析..."):
+                        def _indep_worker(item):
                             time.sleep(API_REQUEST_GAP_SECONDS)
-                            intraday_df = fetch_shioaji_data(
-                                sj_api_obj, q_code, interval=indep_intraday_interval, lookback_days=3
+                            parts = item.split(' ', 1)
+                            q_code = parts[0]
+                            q_name = parts[1] if len(parts) > 1 else ""
+                            result = fetch_stock_data_raw(
+                                q_code, q_name, None, f_set, notes_copy,
+                                c_map_q, sj_logged, sj_api_obj
                             )
-                            snapshot = indep_snapshot_map.get(q_code)
-                            daytrade_metrics = calculate_daytrade_metrics(
-                                intraday_df, live_snapshot=snapshot, now_tw=indep_now_tw,
-                                interval_label=indep_interval_label,
-                            )
-                            if daytrade_metrics:
-                                result.update(daytrade_metrics)
-                                if snapshot is not None:
-                                    price = _safe_number(getattr(snapshot, 'close', None))
-                                    change_rate = snapshot_change_rate(snapshot, price) if price is not None else None
-                                    if price is not None and price > 0:
-                                        result['收盤價'] = price
-                                        if change_rate is not None:
-                                            result['漲跌幅'] = change_rate
-                                            result['成交價價差'] = price_change_amount(price, change_rate)
-                                    result['_quote_bid'] = _safe_number(getattr(snapshot, 'buy_price', None))
-                                    result['_quote_ask'] = _safe_number(getattr(snapshot, 'sell_price', None))
-                                    result['_quote_time'] = indep_now_tw.strftime('%Y/%m/%d %H:%M:%S')
-                        return result
+                            if result and risk_preview_enabled and indep_strategy_mode == "當沖" and sj_logged and sj_api_obj is not None:
+                                time.sleep(API_REQUEST_GAP_SECONDS)
+                                intraday_df = fetch_shioaji_data(
+                                    sj_api_obj, q_code, interval=indep_intraday_interval, lookback_days=3
+                                )
+                                snapshot = indep_snapshot_map.get(q_code)
+                                daytrade_metrics = calculate_daytrade_metrics(
+                                    intraday_df, live_snapshot=snapshot, now_tw=indep_now_tw,
+                                    interval_label=indep_interval_label,
+                                )
+                                if daytrade_metrics:
+                                    result.update(daytrade_metrics)
+                                    if snapshot is not None:
+                                        price = _safe_number(getattr(snapshot, 'close', None))
+                                        change_rate = snapshot_change_rate(snapshot, price) if price is not None else None
+                                        if price is not None and price > 0:
+                                            result['收盤價'] = price
+                                            if change_rate is not None:
+                                                result['漲跌幅'] = change_rate
+                                                result['成交價價差'] = price_change_amount(price, change_rate)
+                                        result['_quote_bid'] = _safe_number(getattr(snapshot, 'buy_price', None))
+                                        result['_quote_ask'] = _safe_number(getattr(snapshot, 'sell_price', None))
+                                        result['_quote_time'] = indep_now_tw.strftime('%Y/%m/%d %H:%M:%S')
+                            return result
 
-                    with ThreadPoolExecutor(max_workers=ANALYSIS_MAX_WORKERS) as executor:
-                        results = list(executor.map(_indep_worker, indep_selection))
-                        indep_data = [res for res in results if res]
+                        with ThreadPoolExecutor(max_workers=ANALYSIS_MAX_WORKERS) as executor:
+                            results = list(executor.map(_indep_worker, indep_selection))
+                            indep_data = [res for res in results if res]
+                    if indep_data:
+                        st.session_state.stock_independent_raw_results = indep_data
+                    else:
+                        st.warning("本次未取得有效資料，已保留上一份獨立分析結果。")
+                        indep_data = list(cached_indep_data)
+
                 if indep_data:
-                    st.session_state.stock_independent_raw_results = indep_data
-                else:
-                    st.warning("本次未取得有效資料，已保留上一份獨立分析結果。")
-                    indep_data = list(cached_indep_data)
+                    df_indep = pd.DataFrame(indep_data)
+                    indep_is_daytrade = risk_preview_enabled and indep_strategy_mode == "當沖"
+                    indep_risk_details = {}
 
-            if indep_data:
-                df_indep = pd.DataFrame(indep_data)
-                indep_is_daytrade = risk_preview_enabled and indep_strategy_mode == "當沖"
-                indep_risk_details = {}
+                    if risk_preview_enabled:
+                        indep_market_risk_data = st.session_state.risk_filter_market_data
+                        indep_attention_counts = indep_market_risk_data.get('attention', {})
+                        indep_disposition_codes = indep_market_risk_data.get('disposition', [])
+                        indep_market_lists_updated = bool(indep_market_risk_data.get('updated')) and not indep_market_risk_data.get('errors')
+                        if indep_is_daytrade and (not sj_logged or sj_api_obj is None):
+                            st.info("當沖需要登入永豐 Shioaji 才能取得即時串流與分 K；目前仍會顯示日 K 資料，但盤中條件會標示為資料不足。")
 
-                if risk_preview_enabled:
-                    indep_market_risk_data = st.session_state.risk_filter_market_data
-                    indep_attention_counts = indep_market_risk_data.get('attention', {})
-                    indep_disposition_codes = indep_market_risk_data.get('disposition', [])
-                    indep_market_lists_updated = bool(indep_market_risk_data.get('updated')) and not indep_market_risk_data.get('errors')
-                    if indep_is_daytrade and (not sj_logged or sj_api_obj is None):
-                        st.info("當沖需要登入永豐 Shioaji 才能取得即時串流與分 K；目前仍會顯示日 K 資料，但盤中條件會標示為資料不足。")
-                
-                # 重新套用戰略備註與價差邏輯
-                for i, row in df_indep.iterrows():
-                    pts = row.get('_points', [])
-                    manual = st.session_state.saved_notes.get(row['代號'], "")
-                    n_full, n_auto = generate_note_from_points(pts, manual, show_3d_hilo)
-                    df_indep.at[i, "戰略備註"] = n_full
-                    df_indep.at[i, "名稱"] = row['名稱'].replace('🔴 ', '').replace('🟢 ', '').replace('⚪ ', '')
-                    price_difference = price_change_amount(row.get('收盤價'), row.get('漲跌幅'))
-                    df_indep.at[i, '成交價價差'] = (
-                        round(price_difference, 2) if price_difference is not None else None
-                    )
-                    
-                    ma5_val = row.get('_ma5')
-                    if pd.isna(ma5_val):
-                        for p in pts:
-                            if p.get('tag') in ['多', '空', '平']:
-                                ma5_val = p.get('val')
-                                break
-                    if pd.notna(ma5_val):
-                        close_p = row.get('收盤價')
-                        if pd.notna(close_p) and str(close_p).strip() != "":
-                            try: df_indep.at[i, '5日線價差'] = round(float(close_p) - float(ma5_val), 2)
-                            except Exception: pass
-
-                if risk_preview_enabled:
+                    # 重新套用戰略備註與價差邏輯
                     for i, row in df_indep.iterrows():
-                        direction_info = determine_stock_direction(row, indep_is_daytrade, indep_direction)
-                        row_direction = direction_info['direction']
-                        result = calculate_daytrade_filter_result(
-                            row, row_direction, indep_attention_counts, indep_disposition_codes,
-                            indep_market_lists_updated, indep_block_attention
-                        ) if indep_is_daytrade else calculate_risk_filter_result(
-                            row, row_direction, indep_max_extension, indep_attention_counts, indep_disposition_codes,
-                            indep_market_lists_updated, indep_block_attention
+                        pts = row.get('_points', [])
+                        manual = st.session_state.saved_notes.get(row['代號'], "")
+                        n_full, n_auto = generate_note_from_points(pts, manual, show_3d_hilo)
+                        df_indep.at[i, "戰略備註"] = n_full
+                        df_indep.at[i, "名稱"] = row['名稱'].replace('🔴 ', '').replace('🟢 ', '').replace('⚪ ', '')
+                        price_difference = price_change_amount(row.get('收盤價'), row.get('漲跌幅'))
+                        df_indep.at[i, '成交價價差'] = (
+                            round(price_difference, 2) if price_difference is not None else None
                         )
-                        code = str(row.get('代號', ''))
-                        if indep_is_daytrade:
-                            daily_risk = calculate_risk_filter_result(
+
+                        ma5_val = row.get('_ma5')
+                        if pd.isna(ma5_val):
+                            for p in pts:
+                                if p.get('tag') in ['多', '空', '平']:
+                                    ma5_val = p.get('val')
+                                    break
+                        if pd.notna(ma5_val):
+                            close_p = row.get('收盤價')
+                            if pd.notna(close_p) and str(close_p).strip() != "":
+                                try: df_indep.at[i, '5日線價差'] = round(float(close_p) - float(ma5_val), 2)
+                                except Exception: pass
+
+                    if risk_preview_enabled:
+                        for i, row in df_indep.iterrows():
+                            direction_info = determine_stock_direction(row, indep_is_daytrade, indep_direction)
+                            row_direction = direction_info['direction']
+                            result = calculate_daytrade_filter_result(
+                                row, row_direction, indep_attention_counts, indep_disposition_codes,
+                                indep_market_lists_updated, indep_block_attention
+                            ) if indep_is_daytrade else calculate_risk_filter_result(
                                 row, row_direction, indep_max_extension, indep_attention_counts, indep_disposition_codes,
                                 indep_market_lists_updated, indep_block_attention
                             )
-                            if not daily_risk['eligible']:
-                                result['eligible'] = False
-                                if result['rule'].startswith('觸發：'):
-                                    result['rule'] = f"不交易：盤前門檻未通過（{daily_risk['rule']}）"
-                            df_indep.at[i, '風險'] = daily_risk['risk']
-                            df_indep.at[i, 'VWAP 狀態'] = result['vwap_status']
-                            df_indep.at[i, '開盤區間'] = result['opening_range']
-                            volume_ratio = _as_float(row.get('_daytrade_volume_ratio'))
-                            df_indep.at[i, '量能'] = f"{_format_compact_number(volume_ratio, 2)}x" if volume_ratio is not None else "資料不足"
-                            df_indep.at[i, '盤中觸發'] = result['rule']
-                        else:
-                            df_indep.at[i, '風險'] = result['risk']
-                            df_indep.at[i, '乖離'] = f"{_format_compact_number(result['extension'], 1, signed=True)} ATR" if result['extension'] is not None else "—"
-                            df_indep.at[i, '隔日規則'] = result['rule']
-                        trade_plan = build_trade_plan(row, row_direction, indep_is_daytrade, result)
-                        if result.get('eligible') and not trade_plan.get('valid', False):
-                            result['eligible'] = False
-                            result['rule'] = f"觀察：{trade_plan.get('blocking_reason', '進場品質未達門檻')}"
+                            code = str(row.get('代號', ''))
                             if indep_is_daytrade:
+                                daily_risk = calculate_risk_filter_result(
+                                    row, row_direction, indep_max_extension, indep_attention_counts, indep_disposition_codes,
+                                    indep_market_lists_updated, indep_block_attention
+                                )
+                                if not daily_risk['eligible']:
+                                    result['eligible'] = False
+                                    if result['rule'].startswith('觸發：'):
+                                        result['rule'] = f"不交易：盤前門檻未通過（{daily_risk['rule']}）"
+                                df_indep.at[i, '風險'] = daily_risk['risk']
+                                df_indep.at[i, 'VWAP 狀態'] = result['vwap_status']
+                                df_indep.at[i, '開盤區間'] = result['opening_range']
+                                volume_ratio = _as_float(row.get('_daytrade_volume_ratio'))
+                                df_indep.at[i, '量能'] = f"{_format_compact_number(volume_ratio, 2)}x" if volume_ratio is not None else "資料不足"
                                 df_indep.at[i, '盤中觸發'] = result['rule']
                             else:
+                                df_indep.at[i, '風險'] = result['risk']
+                                df_indep.at[i, '乖離'] = f"{_format_compact_number(result['extension'], 1, signed=True)} ATR" if result['extension'] is not None else "—"
                                 df_indep.at[i, '隔日規則'] = result['rule']
-                        result['trade_plan'] = trade_plan
-                        result['direction_info'] = direction_info
-                        signal_state = classify_signal_state(
-                            result['rule'], result['eligible'], result['score'], indep_min_score
-                        )
-                        data_time = row.get('_daytrade_data_time') if indep_is_daytrade else None
-                        required_ready = bool(data_time) if indep_is_daytrade else result.get('extension') is not None
-                        quote_time = row.get('_quote_time') or data_time
-                        data_health = build_data_health(
-                            quote_time, required_ready,
-                            live_expected=bool(row.get('_quote_time')) or indep_is_daytrade
-                        )
-                        bid = _safe_number(row.get('_quote_bid'))
-                        ask = _safe_number(row.get('_quote_ask'))
-                        reference_price = _safe_number(row.get('收盤價'))
-                        tick = get_tick_size(reference_price) if reference_price is not None else 0.01
-                        spread_ticks = (
-                            (ask - bid) / tick
-                            if bid is not None and ask is not None and ask >= bid and tick > 0 else None
-                        )
-                        market_alignment = calculate_market_alignment(row_direction, market_bias)
-                        current_price = (
-                            _safe_number(row.get('_daytrade_close')) if indep_is_daytrade else None
-                        ) or _safe_number(row.get('收盤價'))
-                        confidence = calculate_entry_confidence(
-                            result['score'], signal_state, current_price, trade_plan['summary'], row_direction,
-                            data_health, market_alignment, result.get('detail', '')
-                        )
-                        result['confidence'] = confidence
-                        indep_risk_details[code] = result
-                        df_indep.at[i, '建議方向'] = direction_info['label']
-                        df_indep.at[i, '方向依據'] = direction_info['basis']
-                        df_indep.at[i, '進出場預判'] = trade_plan['summary']
-                        df_indep.at[i, '支撐壓力'] = build_stock_support_resistance(row, indep_is_daytrade)
-                        df_indep.at[i, '訊號狀態'] = signal_state
-                        df_indep.at[i, '信心分'] = confidence['score']
-                        df_indep.at[i, '信心判讀'] = confidence['label']
-                        df_indep.at[i, '市場一致'] = market_alignment
-                        df_indep.at[i, '資料狀態'] = data_health
-                        df_indep.at[i, '買賣價差'] = f'{spread_ticks:.0f}跳' if spread_ticks is not None else '—'
-                        df_indep.at[i, '_indep_eligible'] = (
-                            bool(trade_plan.get('valid')) and result['eligible']
-                            and confidence['score'] >= indep_min_score
-                        )
+                            trade_plan = build_trade_plan(row, row_direction, indep_is_daytrade, result)
+                            if result.get('eligible') and not trade_plan.get('valid', False):
+                                result['eligible'] = False
+                                result['rule'] = f"觀察：{trade_plan.get('blocking_reason', '進場品質未達門檻')}"
+                                if indep_is_daytrade:
+                                    df_indep.at[i, '盤中觸發'] = result['rule']
+                                else:
+                                    df_indep.at[i, '隔日規則'] = result['rule']
+                            result['trade_plan'] = trade_plan
+                            result['direction_info'] = direction_info
+                            signal_state = classify_signal_state(
+                                result['rule'], result['eligible'], result['score'], indep_min_score
+                            )
+                            data_time = row.get('_daytrade_data_time') if indep_is_daytrade else None
+                            required_ready = bool(data_time) if indep_is_daytrade else result.get('extension') is not None
+                            quote_time = row.get('_quote_time') or data_time
+                            data_health = build_data_health(
+                                quote_time, required_ready,
+                                live_expected=bool(row.get('_quote_time')) or indep_is_daytrade
+                            )
+                            bid = _safe_number(row.get('_quote_bid'))
+                            ask = _safe_number(row.get('_quote_ask'))
+                            reference_price = _safe_number(row.get('收盤價'))
+                            tick = get_tick_size(reference_price) if reference_price is not None else 0.01
+                            spread_ticks = (
+                                (ask - bid) / tick
+                                if bid is not None and ask is not None and ask >= bid and tick > 0 else None
+                            )
+                            market_alignment = calculate_market_alignment(row_direction, market_bias)
+                            current_price = (
+                                _safe_number(row.get('_daytrade_close')) if indep_is_daytrade else None
+                            ) or _safe_number(row.get('收盤價'))
+                            confidence = calculate_entry_confidence(
+                                result['score'], signal_state, current_price, trade_plan['summary'], row_direction,
+                                data_health, market_alignment, result.get('detail', '')
+                            )
+                            result['confidence'] = confidence
+                            indep_risk_details[code] = result
+                            df_indep.at[i, '建議方向'] = direction_info['label']
+                            df_indep.at[i, '方向依據'] = direction_info['basis']
+                            df_indep.at[i, '進出場預判'] = trade_plan['summary']
+                            df_indep.at[i, '支撐壓力'] = build_stock_support_resistance(row, indep_is_daytrade)
+                            df_indep.at[i, '訊號狀態'] = signal_state
+                            df_indep.at[i, '信心分'] = confidence['score']
+                            df_indep.at[i, '信心判讀'] = confidence['label']
+                            df_indep.at[i, '市場一致'] = market_alignment
+                            df_indep.at[i, '資料狀態'] = data_health
+                            df_indep.at[i, '買賣價差'] = f'{spread_ticks:.0f}跳' if spread_ticks is not None else '—'
+                            df_indep.at[i, '_indep_eligible'] = (
+                                bool(trade_plan.get('valid')) and result['eligible']
+                                and confidence['score'] >= indep_min_score
+                            )
 
-                    if indep_show_only_eligible:
-                        df_indep = df_indep[df_indep['_indep_eligible']].reset_index(drop=True)
-                        if df_indep.empty:
-                            st.warning("目前沒有符合門檻的候選；可降低最低評分、放寬最大乖離，或改看完整結果。")
+                        if indep_show_only_eligible:
+                            df_indep = df_indep[df_indep['_indep_eligible']].reset_index(drop=True)
+                            if df_indep.empty:
+                                st.warning("目前沒有符合門檻的候選；可降低最低評分、放寬最大乖離，或改看完整結果。")
 
-                    if indep_is_daytrade:
-                        input_cols = ["代號", "名稱", "戰略備註", "收盤價", "漲跌幅", "建議方向", "方向依據", "成交價價差", "5日線價差", "風險", "VWAP 狀態", "開盤區間", "量能", "訊號狀態", "信心分", "信心判讀", "支撐壓力", "盤中觸發", "進出場預判", "市場一致", "當日漲停價", "當日跌停價", "期貨", "資料狀態", "買賣價差"]
+                        if indep_is_daytrade:
+                            input_cols = ["代號", "名稱", "戰略備註", "收盤價", "漲跌幅", "建議方向", "方向依據", "成交價價差", "5日線價差", "風險", "VWAP 狀態", "開盤區間", "量能", "訊號狀態", "信心分", "信心判讀", "支撐壓力", "盤中觸發", "進出場預判", "市場一致", "當日漲停價", "當日跌停價", "期貨", "資料狀態", "買賣價差"]
+                        else:
+                            input_cols = ["代號", "名稱", "戰略備註", "收盤價", "漲跌幅", "建議方向", "方向依據", "成交價價差", "5日線價差", "風險", "訊號狀態", "信心分", "信心判讀", "乖離", "支撐壓力", "隔日規則", "進出場預判", "市場一致", "當日漲停價", "當日跌停價", "期貨", "資料狀態", "買賣價差"]
                     else:
-                        input_cols = ["代號", "名稱", "戰略備註", "收盤價", "漲跌幅", "建議方向", "方向依據", "成交價價差", "5日線價差", "風險", "訊號狀態", "信心分", "信心判讀", "乖離", "支撐壓力", "隔日規則", "進出場預判", "市場一致", "當日漲停價", "當日跌停價", "期貨", "資料狀態", "買賣價差"]
-                else:
-                    input_cols = ["代號", "名稱", "戰略備註", "收盤價", "漲跌幅", "成交價價差", "5日線價差", "當日漲停價", "當日跌停價", "期貨"]
-                for col in input_cols:
-                    if col not in df_indep.columns: df_indep[col] = None
-                    
-                cols_to_fmt = ["當日漲停價", "當日跌停價", "成交價價差", "5日線價差"]
-                for c in cols_to_fmt:
-                    if c in df_indep.columns: df_indep[c] = df_indep[c].apply(fmt_price)
+                        input_cols = ["代號", "名稱", "戰略備註", "收盤價", "漲跌幅", "成交價價差", "5日線價差", "當日漲停價", "當日跌停價", "期貨"]
+                    for col in input_cols:
+                        if col not in df_indep.columns: df_indep[col] = None
 
-                # 強制轉換為 object 型別，以防寫入字串時發生 TypeError
-                if "收盤價" in df_indep.columns: df_indep["收盤價"] = df_indep["收盤價"].astype(object)
-                if "漲跌幅" in df_indep.columns: df_indep["漲跌幅"] = df_indep["漲跌幅"].astype(object)
+                    cols_to_fmt = ["當日漲停價", "當日跌停價", "成交價價差", "5日線價差"]
+                    for c in cols_to_fmt:
+                        if c in df_indep.columns: df_indep[c] = df_indep[c].apply(fmt_price)
 
-                if "收盤價" in df_indep.columns and "漲跌幅" in df_indep.columns:
-                    for i in range(len(df_indep)):
-                        try:
-                            p = float(df_indep.at[i, "收盤價"])
-                            chg = float(df_indep.at[i, "漲跌幅"])
-                            df_indep.at[i, "收盤價"] = fmt_price(p)
-                            df_indep.at[i, "漲跌幅"] = _signed_percent(chg)
-                        except Exception:
-                            df_indep.at[i, "收盤價"] = fmt_price(df_indep.at[i, "收盤價"])
-                            try: df_indep.at[i, "漲跌幅"] = _signed_percent(float(df_indep.at[i, '漲跌幅']))
-                            except Exception: pass
+                    # 強制轉換為 object 型別，以防寫入字串時發生 TypeError
+                    if "收盤價" in df_indep.columns: df_indep["收盤價"] = df_indep["收盤價"].astype(object)
+                    if "漲跌幅" in df_indep.columns: df_indep["漲跌幅"] = df_indep["漲跌幅"].astype(object)
 
-                for col in input_cols:
-                    if col != "信心分":
-                        df_indep[col] = df_indep[col].map(_blank_display_text)
+                    if "收盤價" in df_indep.columns and "漲跌幅" in df_indep.columns:
+                        for i in range(len(df_indep)):
+                            try:
+                                p = float(df_indep.at[i, "收盤價"])
+                                chg = float(df_indep.at[i, "漲跌幅"])
+                                df_indep.at[i, "收盤價"] = fmt_price(p)
+                                df_indep.at[i, "漲跌幅"] = _signed_percent(chg)
+                            except Exception:
+                                df_indep.at[i, "收盤價"] = fmt_price(df_indep.at[i, "收盤價"])
+                                try: df_indep.at[i, "漲跌幅"] = _signed_percent(float(df_indep.at[i, '漲跌幅']))
+                                except Exception: pass
 
-                # 套用與主表格完全一致的顏色邏輯
-                styled_indep = df_indep[input_cols].style.apply(
-                    lambda row: style_tab1_df(row, df_indep), axis=1,
-                )
-                def indep_content_width(column, minimum, maximum=520, full_content=False):
-                    return _content_column_width(
-                        df_indep.get(column), minimum, maximum, full_content,
+                    for col in input_cols:
+                        if col != "信心分":
+                            df_indep[col] = df_indep[col].map(_blank_display_text)
+
+                    if risk_preview_enabled:
+                        render_strategy_ranking(
+                            df_indep, indep_strategy_mode, '股票獨立計算',
+                        )
+
+                    # 套用與主表格完全一致的顏色邏輯
+                    styled_indep = df_indep[input_cols].style.apply(
+                        lambda row: style_tab1_df(row, df_indep), axis=1,
+                    )
+                    def indep_content_width(column, minimum, maximum=520, full_content=False):
+                        return _content_column_width(
+                            df_indep.get(column), minimum, maximum, full_content,
+                        )
+
+                    indep_column_config = {}
+                    if risk_preview_enabled:
+                        indep_column_config.update({
+                            "建議方向": st.column_config.TextColumn(width=indep_content_width('建議方向', 56, 90), disabled=True, help="紅色為建議多、綠色為建議空；手動指定時會顯示手動。"),
+                            "方向依據": st.column_config.TextColumn(width=indep_content_width('方向依據', 86), disabled=True, help="列出本檔採用的分 K／日 K、VWAP 與支撐壓力判斷。"),
+                            "風險": st.column_config.TextColumn("處置／注意", width=indep_content_width('風險', 64, 110), disabled=True, help="官方注意與處置查核結果；不預測漲跌方向。"),
+                            "訊號狀態": st.column_config.TextColumn(width=indep_content_width('訊號狀態', 56, 140), disabled=True),
+                            "信心分": st.column_config.ProgressColumn("進場信心", min_value=0, max_value=100, format="%d", width=82, help="條件一致度，不是勝率。"),
+                            "信心判讀": st.column_config.TextColumn(width=indep_content_width('信心判讀', 48, 96), disabled=True),
+                            "支撐壓力": st.column_config.TextColumn(width=indep_content_width('支撐壓力', 76), disabled=True),
+                            "市場一致": st.column_config.TextColumn(width=indep_content_width('市場一致', 56, 120), disabled=True),
+                            "資料狀態": st.column_config.TextColumn(width=indep_content_width('資料狀態', 56, 150), disabled=True),
+                        })
+                        if indep_is_daytrade:
+                            indep_column_config.update({
+                                "VWAP 狀態": st.column_config.TextColumn(width=indep_content_width('VWAP 狀態', 72, 150), disabled=True, help="偏多：站上 VWAP；偏空：跌破 VWAP。"),
+                                "開盤區間": st.column_config.TextColumn(width=indep_content_width('開盤區間', 80, 150), disabled=True, help="09:00–09:15 顯示形成中的即時低點－高點；09:15 後固定為完整開盤區間。"),
+                                "量能": st.column_config.TextColumn(width=indep_content_width('量能', 52, 96), disabled=True, help="目前累積量相對最近交易日同時段平均量。"),
+                                "盤中觸發": st.column_config.TextColumn(width=indep_content_width('盤中觸發', 72), disabled=True, help="僅為盤中觀察提示，不是自動買賣指令。"),
+                                "進出場預判": st.column_config.TextColumn(width=indep_content_width('進出場預判', 86, 720, True), disabled=True, help="以開盤區間與 VWAP 推估進場、策略失效離場與第一目標。"),
+                            })
+                        else:
+                            indep_column_config.update({
+                                "乖離": st.column_config.TextColumn(width=indep_content_width('乖離', 52, 96), disabled=True),
+                                "隔日規則": st.column_config.TextColumn(width=indep_content_width('隔日規則', 72), disabled=True),
+                                "進出場預判": st.column_config.TextColumn(width=indep_content_width('進出場預判', 86, 720, True), disabled=True, help="以昨高／昨低與 ATR 推估進場、策略失效離場與第一目標。"),
+                            })
+
+                    st.dataframe(
+                        styled_indep,
+                        column_config={
+                            **indep_column_config,
+                            "代號": st.column_config.TextColumn(width=_content_column_width(df_indep.get("代號"), 44, 62)),
+                            "名稱": st.column_config.TextColumn(width=_content_column_width(df_indep.get("名稱"), 44, 130)),
+                            "收盤價": st.column_config.TextColumn("成交價", width=_content_column_width(df_indep.get("收盤價"), 52, 78)),
+                            "漲跌幅": st.column_config.TextColumn(width=_content_column_width(df_indep.get("漲跌幅"), 56, 78)),
+                            "期貨": st.column_config.TextColumn(width=_content_column_width(df_indep.get("期貨"), 44, 70)),
+                            "當日漲停價": st.column_config.TextColumn(width=_content_column_width(df_indep.get("當日漲停價"), 54, 78)),
+                            "當日跌停價": st.column_config.TextColumn(width=_content_column_width(df_indep.get("當日跌停價"), 54, 78)),
+                            "成交價價差": st.column_config.TextColumn(
+                                width=indep_content_width('成交價價差', 56, 96),
+                                help="目前成交價減去昨日收盤價；正值為上漲點數，負值為下跌點數。"
+                            ),
+                            "5日線價差": st.column_config.TextColumn(
+                                width=indep_content_width('5日線價差', 56, 96),
+                                help="目前成交價減去 5 日均線；正值在均線上方，負值在均線下方。"
+                            ),
+                            "買賣價差": st.column_config.TextColumn(
+                                width=indep_content_width('買賣價差', 56, 96),
+                                help="即時最佳賣價與最佳買價的距離，換算為跳動單位。"
+                            ),
+                            "狀態": None, # 設定為 None 隱藏獨立計算結果的狀態欄位
+                            "戰略備註": st.column_config.TextColumn("戰略備註", width=note_width_px)
+                        },
+                        hide_index=True, width='content', key="indep_table_output"
                     )
 
-                indep_column_config = {}
-                if risk_preview_enabled:
-                    indep_column_config.update({
-                        "建議方向": st.column_config.TextColumn(width=indep_content_width('建議方向', 56, 90), disabled=True, help="紅色為建議多、綠色為建議空；手動指定時會顯示手動。"),
-                        "方向依據": st.column_config.TextColumn(width=indep_content_width('方向依據', 86), disabled=True, help="列出本檔採用的分 K／日 K、VWAP 與支撐壓力判斷。"),
-                        "風險": st.column_config.TextColumn("處置／注意", width=indep_content_width('風險', 64, 110), disabled=True, help="官方注意與處置查核結果；不預測漲跌方向。"),
-                        "訊號狀態": st.column_config.TextColumn(width=indep_content_width('訊號狀態', 56, 140), disabled=True),
-                        "信心分": st.column_config.ProgressColumn("進場信心", min_value=0, max_value=100, format="%d", width=82, help="條件一致度，不是勝率。"),
-                        "信心判讀": st.column_config.TextColumn(width=indep_content_width('信心判讀', 48, 96), disabled=True),
-                        "支撐壓力": st.column_config.TextColumn(width=indep_content_width('支撐壓力', 76), disabled=True),
-                        "市場一致": st.column_config.TextColumn(width=indep_content_width('市場一致', 56, 120), disabled=True),
-                        "資料狀態": st.column_config.TextColumn(width=indep_content_width('資料狀態', 56, 150), disabled=True),
-                    })
-                    if indep_is_daytrade:
-                        indep_column_config.update({
-                            "VWAP 狀態": st.column_config.TextColumn(width=indep_content_width('VWAP 狀態', 72, 150), disabled=True, help="偏多：站上 VWAP；偏空：跌破 VWAP。"),
-                            "開盤區間": st.column_config.TextColumn(width=indep_content_width('開盤區間', 80, 150), disabled=True, help="09:00–09:15 顯示形成中的即時低點－高點；09:15 後固定為完整開盤區間。"),
-                            "量能": st.column_config.TextColumn(width=indep_content_width('量能', 52, 96), disabled=True, help="目前累積量相對最近交易日同時段平均量。"),
-                            "盤中觸發": st.column_config.TextColumn(width=indep_content_width('盤中觸發', 72), disabled=True, help="僅為盤中觀察提示，不是自動買賣指令。"),
-                            "進出場預判": st.column_config.TextColumn(width=indep_content_width('進出場預判', 86, 720, True), disabled=True, help="以開盤區間與 VWAP 推估進場、策略失效離場與第一目標。"),
-                        })
-                    else:
-                        indep_column_config.update({
-                            "乖離": st.column_config.TextColumn(width=indep_content_width('乖離', 52, 96), disabled=True),
-                            "隔日規則": st.column_config.TextColumn(width=indep_content_width('隔日規則', 72), disabled=True),
-                            "進出場預判": st.column_config.TextColumn(width=indep_content_width('進出場預判', 86, 720, True), disabled=True, help="以昨高／昨低與 ATR 推估進場、策略失效離場與第一目標。"),
-                        })
-
-                st.dataframe(
-                    styled_indep,
-                    column_config={
-                        **indep_column_config,
-                        "代號": st.column_config.TextColumn(width=_content_column_width(df_indep.get("代號"), 44, 62)),
-                        "名稱": st.column_config.TextColumn(width=_content_column_width(df_indep.get("名稱"), 44, 130)),
-                        "收盤價": st.column_config.TextColumn("成交價", width=_content_column_width(df_indep.get("收盤價"), 52, 78)),
-                        "漲跌幅": st.column_config.TextColumn(width=_content_column_width(df_indep.get("漲跌幅"), 56, 78)),
-                        "期貨": st.column_config.TextColumn(width=_content_column_width(df_indep.get("期貨"), 44, 70)),
-                        "當日漲停價": st.column_config.TextColumn(width=_content_column_width(df_indep.get("當日漲停價"), 54, 78)),
-                        "當日跌停價": st.column_config.TextColumn(width=_content_column_width(df_indep.get("當日跌停價"), 54, 78)),
-                        "成交價價差": st.column_config.TextColumn(
-                            width=indep_content_width('成交價價差', 56, 96),
-                            help="目前成交價減去昨日收盤價；正值為上漲點數，負值為下跌點數。"
-                        ),
-                        "5日線價差": st.column_config.TextColumn(
-                            width=indep_content_width('5日線價差', 56, 96),
-                            help="目前成交價減去 5 日均線；正值在均線上方，負值在均線下方。"
-                        ),
-                        "買賣價差": st.column_config.TextColumn(
-                            width=indep_content_width('買賣價差', 56, 96),
-                            help="即時最佳賣價與最佳買價的距離，換算為跳動單位。"
-                        ),
-                        "狀態": None, # 設定為 None 隱藏獨立計算結果的狀態欄位
-                        "戰略備註": st.column_config.TextColumn("戰略備註", width=note_width_px)
-                    },
-                    hide_index=True, width='content', key="indep_table_output"
-                )
-
-                if indep_risk_details and not df_indep.empty:
-                    detail_options = {
-                        f"{row['代號']} {row['名稱']}": str(row['代號'])
-                        for _, row in df_indep.iterrows()
-                    }
-                    selected_label = st.selectbox("查看獨立計算信心明細", list(detail_options), key="indep_risk_detail_code")
-                    selected_result = indep_risk_details[detail_options[selected_label]]
-                    rule_label = "盤中觸發" if indep_is_daytrade else "隔日規則"
-                    data_time_text = f"｜盤中資料更新：{selected_result['data_time']}" if indep_is_daytrade and selected_result.get('data_time') else ""
-                    plan_text = selected_result.get('trade_plan', {}).get('detail', '尚未預判點位。')
-                    confidence_detail = selected_result.get('confidence', {})
-                    direction_detail = selected_result.get('direction_info', {})
-                    st.caption(
-                        f"{direction_detail.get('label', '方向未判定')}｜{direction_detail.get('basis', '方向依據不足')}｜"
-                        f"進場信心 {confidence_detail.get('score', '—')} 分（{confidence_detail.get('label', '—')}）｜"
-                        f"{selected_result['detail']}｜{rule_label}：{selected_result['rule']}｜"
-                        f"進出場預判：{plan_text}{data_time_text}。信心分代表條件一致度，不是勝率。"
-                    )
+                    if indep_risk_details and not df_indep.empty:
+                        detail_options = {
+                            f"{row['代號']} {row['名稱']}": str(row['代號'])
+                            for _, row in df_indep.iterrows()
+                        }
+                        selected_label = st.selectbox("查看獨立計算信心明細", list(detail_options), key="indep_risk_detail_code")
+                        selected_result = indep_risk_details[detail_options[selected_label]]
+                        rule_label = "盤中觸發" if indep_is_daytrade else "隔日規則"
+                        data_time_text = f"｜盤中資料更新：{selected_result['data_time']}" if indep_is_daytrade and selected_result.get('data_time') else ""
+                        plan_text = selected_result.get('trade_plan', {}).get('detail', '尚未預判點位。')
+                        confidence_detail = selected_result.get('confidence', {})
+                        direction_detail = selected_result.get('direction_info', {})
+                        st.caption(
+                            f"{direction_detail.get('label', '方向未判定')}｜{direction_detail.get('basis', '方向依據不足')}｜"
+                            f"進場信心 {confidence_detail.get('score', '—')} 分（{confidence_detail.get('label', '—')}）｜"
+                            f"{selected_result['detail']}｜{rule_label}：{selected_result['rule']}｜"
+                            f"進出場預判：{plan_text}{data_time_text}。信心分代表條件一致度，不是勝率。"
+                        )
 
 with tab2:
     tab2_1, tab2_2, tab2_3 = st.tabs(
@@ -19753,6 +19936,7 @@ with tab3:
                 fetch_tradingview_us_calendar.clear()
                 fetch_adp_employment_events.clear()
                 build_us_initial_claims_events.clear()
+                clear_calendar_source_preload(st.session_state.cal_year)
                 st.toast("已更新市場與總經行事曆；公司資料請在獨立分頁同步。", icon="🔄")
                 st.rerun()
         with save_col:
@@ -19813,13 +19997,27 @@ with tab3:
     with col_next: st.button("▶️", on_click=change_month, args=(1,), width='stretch')
     with col_header: st.markdown(f"<div class='calendar-header'>{sel_year}/{sel_month:02}</div>", unsafe_allow_html=True)
 
-    # 主分頁切換會觸發 rerun；只有行事曆實際開啟時才讀網路來源，
-    # 避免股票／期貨按鈕每次 rerun 都連帶執行整套行事曆請求。
+    # 啟動後以單一背景工作預載已儲存的追蹤事件。分頁切換只取完成結果，
+    # 不會重複建立整套網路請求，也不會阻塞股票／期貨頁面。
     calendar_network_active = bool(tab3.open)
-    calendar_base_sources, calendar_base_errors = (
-        fetch_calendar_base_sources(sel_year)
-        if calendar_network_active else ({}, [])
+    calendar_preload_task = schedule_calendar_source_preload(
+        sel_year, selected_event_types,
     )
+    if calendar_network_active and not calendar_preload_task['event'].is_set():
+        calendar_preload_task['event'].wait(timeout=12)
+    calendar_bundle = (
+        calendar_preload_task.get('result')
+        if calendar_preload_task['event'].is_set()
+        and isinstance(calendar_preload_task.get('result'), dict)
+        else {}
+    )
+    calendar_base_sources = calendar_bundle.get('base', {})
+    selected_calendar_sources = calendar_bundle.get('selected', {})
+    calendar_bundle_errors = list(calendar_bundle.get('errors', []))
+    if calendar_preload_task.get('error'):
+        calendar_bundle_errors.append(calendar_preload_task['error'])
+    if calendar_network_active and not calendar_bundle:
+        st.info('追蹤事件仍在背景載入；目前先顯示上次成功資料。')
     calendar_last_success = st.session_state.setdefault(
         '_calendar_source_last_success', {}
     )
@@ -19858,11 +20056,6 @@ with tab3:
 
     if calendar_network_active and "台股開休市" in selected_event_types:
         add_network_source('台股開休市', twse_holiday_events)
-    selected_calendar_sources, selected_calendar_errors = (
-        fetch_selected_calendar_sources(
-            sel_year, selected_event_types, taiwan_closed_dates,
-        ) if calendar_network_active else ({}, [])
-    )
     selected_calendar_sources, retained_selected_sources = merge_calendar_last_success(
         selected_calendar_sources, calendar_year_cache.get('selected', {}),
     )
@@ -19870,10 +20063,10 @@ with tab3:
         calendar_year_cache['selected'] = selected_calendar_sources
     for source_label, source_events in selected_calendar_sources.items():
         add_network_source(source_label, source_events)
-    if calendar_base_errors or selected_calendar_errors:
+    if calendar_bundle_errors:
         logger.warning(
             'Calendar source refresh was partial: %s',
-            calendar_base_errors + selected_calendar_errors,
+            calendar_bundle_errors,
         )
     if retained_base_sources or retained_selected_sources:
         st.caption(

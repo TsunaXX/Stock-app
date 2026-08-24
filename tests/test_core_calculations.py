@@ -547,6 +547,18 @@ def test_post_21_strategy_ranking_uses_visible_rows_and_selected_mode():
     }]
 
 
+def test_limit_note_uses_the_candles_own_previous_close():
+    symbols = load_app_symbols(
+        "_safe_number", "get_tick_size", "calculate_limits",
+        "detect_stock_candle_limit_touch",
+    )
+    touch = symbols["detect_stock_candle_limit_touch"](21.2, 23.3, 21.0)
+    assert touch["limit_up"] == 23.3
+    assert touch["limit_down"] == 19.1
+    assert touch["touched_up"] is True
+    assert touch["touched_down"] is False
+
+
 def test_realtime_stock_snapshots_merge_one_batch_without_network_calls():
     symbols = load_app_symbols(
         "_safe_number", "snapshot_change_rate", "price_change_amount",
@@ -592,6 +604,16 @@ def test_disposition_preview_uses_next_market_day_not_calendar_tomorrow():
     assert "adjust_to_next_market_day(" in source
     assert "'🔶 下個開盤日處置'" in source
     assert "'🔶 明天處置'" not in source
+
+
+def test_disposition_period_status_skips_weekend_to_next_open_day():
+    symbols = load_app_symbols(
+        "get_holidays", "is_market_closed_func", "adjust_to_next_market_day",
+        "disposition_period_status",
+    )
+    status = symbols["disposition_period_status"]
+    assert status("1150824~1150828", date(2026, 8, 21)) == "next_open"
+    assert status("115/08/24～115/08/28", date(2026, 8, 24)) == "today"
 
 
 def test_company_sync_is_deduplicated_capped_and_section_bounded():
@@ -717,6 +739,15 @@ def test_heavy_hidden_sources_require_an_active_keyed_tab():
     assert 'database_institutional_active = bool(tab_db.open and sub_tab1.open)' in source
     assert 'reports_active = bool(tab_db.open and sub_tab2.open)' in source
     assert 'calendar_network_active = bool(tab3.open)' in source
+    assert 'if tab1.open and stock_strategy_tab.open:' in source
+    assert 'schedule_calendar_source_preload(' in source
+    assert "calendar_preload_task['event'].wait(timeout=12)" in source
+
+
+def test_independent_tables_use_the_same_post_21_ranking():
+    source = APP_PATH.read_text(encoding="utf-8")
+    assert "independent_rows, strategy_mode, '期貨獨立計算'" in source
+    assert "df_indep, indep_strategy_mode, '股票獨立計算'" in source
 
 
 def test_streamlit_magic_ast_rewrite_is_disabled_for_large_app():

@@ -220,6 +220,7 @@ function buildStockPayload_(payload) {
   [
     'version', 'stock_data', 'ignored_stocks', 'all_candidates',
     'saved_notes', 'cached_notes', 'stock_data_updated_at',
+    'market_risk_data',
   ].forEach(function(key) {
     if (payload[key] !== undefined) result[key] = payload[key];
   });
