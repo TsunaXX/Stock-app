@@ -523,28 +523,79 @@ def test_official_turnover_ranking_rejects_missing_same_date_rows():
 
 
 def test_post_21_strategy_ranking_uses_visible_rows_and_selected_mode():
-    symbols = load_app_symbols("_as_float", "build_strategy_ranking_entries")
+    symbols = load_app_symbols(
+        "get_holidays", "is_market_closed_func", "_as_float", "_ranking_number",
+        "_ranking_clamp", "_post_close_target_date", "_ranking_fundamental_component",
+        "_ranking_chip_component", "_stock_ranking_technical_component",
+        "_futures_ranking_technical_component", "_futures_contract_chip_component",
+        "_combine_ranking_components", "_score_stock_post_close",
+        "_score_futures_post_close", "build_strategy_ranking_entries",
+    )
     rows = pd.DataFrame([
-        {"代號": "2330", "名稱": "台積電", "當沖評分": 85, "評分": 60,
-         "建議方向": "建議多", "訊號狀態": "已觸發", "VWAP 狀態": "站上 VWAP"},
-        {"代號": "2408", "名稱": "南亞科", "當沖評分": 70, "評分": 92,
-         "建議方向": "建議多", "訊號狀態": "等待", "隔日規則": "突破昨高"},
+        {"代號": "2330", "名稱": "台積電", "信心分": 1, "收盤價": 110,
+         "漲跌幅": 3.5, "_ma5": 102, "_risk_atr14": 3, "_risk_ma20_slope": 1,
+         "_risk_close_position": 85, "_daytrade_vwap": 104},
+        {"代號": "2408", "名稱": "南亞科", "信心分": 99, "收盤價": 92,
+         "漲跌幅": -2.5, "_ma5": 100, "_risk_atr14": 4, "_risk_ma20_slope": -1,
+         "_risk_close_position": 20, "_daytrade_vwap": 97},
     ])
+    original_codes = rows["代號"].tolist()
+    context = {
+        "stocks": {
+            "2330": {"institutional_net": 800000, "margin_delta": -200,
+                     "short_delta": 20, "pe": 18, "pb": 3, "yield": 2.5},
+            "2408": {"institutional_net": -700000, "margin_delta": 180,
+                     "short_delta": -15, "pe": 55, "pb": 6.5, "yield": 0.5},
+        },
+        "scales": {"institutional": 800000, "margin": 200, "short": 20},
+    }
     before = symbols["build_strategy_ranking_entries"](
-        rows, "當沖", now_value="2026-08-24 20:59:00",
+        rows, "當沖", now_value="2026-08-24 20:59:00", market_context=context,
     )
     intraday = symbols["build_strategy_ranking_entries"](
-        rows, "當沖", now_value="2026-08-24 21:00:00",
+        rows, "當沖", now_value="2026-08-24 21:00:00", market_context=context,
     )
     swing = symbols["build_strategy_ranking_entries"](
-        rows.iloc[[1]], "隔日／波段", now_value="2026-08-24 21:00:00",
+        rows, "隔日／波段", now_value="2026-08-24 21:00:00", market_context=context,
     )
     assert before == []
-    assert [item["code"] for item in intraday] == ["2330", "2408"]
-    assert swing == [{
-        "code": "2408", "name": "南亞科", "score": 92,
-        "reason": "建議多｜等待｜突破昨高",
-    }]
+    assert {item["code"] for item in intraday} == {"2330", "2408"}
+    assert {item["code"] for item in swing} == {"2330", "2408"}
+    assert all(item["direction"] in {"多", "空"} for item in intraday + swing)
+    assert all("技術偏" in item["reason"] and "籌碼偏" in item["reason"] for item in intraday)
+    assert all("基本偏" in item["reason"] for item in swing)
+    assert rows["代號"].tolist() == original_codes
+    assert intraday[0]["score"] != rows.loc[rows["代號"] == intraday[0]["code"], "信心分"].iloc[0]
+
+
+def test_futures_post_close_ranking_uses_taifex_position_direction():
+    symbols = load_app_symbols(
+        "get_holidays", "is_market_closed_func", "_as_float", "_ranking_number",
+        "_ranking_clamp", "_post_close_target_date", "_ranking_fundamental_component",
+        "_ranking_chip_component", "_stock_ranking_technical_component",
+        "_futures_ranking_technical_component", "_futures_contract_chip_component",
+        "_combine_ranking_components", "_score_stock_post_close",
+        "_score_futures_post_close", "build_strategy_ranking_entries",
+    )
+    rows = pd.DataFrame([
+        {"期貨代碼": "TX", "名稱": "臺股期貨", "商品類型": "指數", "收盤價": 22000,
+         "開盤價": 22000, "漲跌幅": 0, "當日成交口數": 90000, "未平倉量": 70000},
+        {"期貨代碼": "MTX", "名稱": "小型臺指期貨", "商品類型": "指數", "收盤價": 22000,
+         "開盤價": 22000, "漲跌幅": 0, "當日成交口數": 80000, "未平倉量": 60000},
+    ])
+    context = {
+        "stocks": {}, "scales": {},
+        "futures_products": {
+            "臺股期貨": {"signal": 0.9, "quality": 90, "text": "外資淨部位+10,000口"},
+            "小型臺指期貨": {"signal": -0.9, "quality": 90, "text": "外資淨部位-10,000口"},
+        },
+    }
+    entries = symbols["build_strategy_ranking_entries"](
+        rows, "當沖", now_value="2026-08-24 21:00:00",
+        market_context=context, asset_type="futures",
+    )
+    assert {item["code"]: item["direction"] for item in entries} == {"TX": "多", "MTX": "空"}
+    assert all("量倉／籌碼偏" in item["reason"] for item in entries)
 
 
 def test_limit_note_uses_the_candles_own_previous_close():
@@ -748,6 +799,14 @@ def test_independent_tables_use_the_same_post_21_ranking():
     source = APP_PATH.read_text(encoding="utf-8")
     assert "independent_rows, strategy_mode, '期貨獨立計算'" in source
     assert "df_indep, indep_strategy_mode, '股票獨立計算'" in source
+    main_futures_table = source.index("edited = st.data_editor(", source.index("def futures_column_config"))
+    main_futures_rank = source.index("render_strategy_ranking(display_rows, strategy_mode, '期貨')")
+    main_futures_detail = source.index("'查看期貨策略信心明細'")
+    assert main_futures_table < main_futures_rank < main_futures_detail
+    main_stock_table = source.index("edited_df = st.data_editor(", source.index("stock_editor_key ="))
+    main_stock_rank = source.index("render_strategy_ranking(df_display, strategy_mode, '股票')")
+    main_stock_detail = source.index('"查看策略信心明細"', main_stock_table)
+    assert main_stock_table < main_stock_rank < main_stock_detail
 
 
 def test_streamlit_magic_ast_rewrite_is_disabled_for_large_app():
