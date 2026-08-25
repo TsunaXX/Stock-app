@@ -14188,6 +14188,15 @@ def format_ranking_reason_component(reason):
     return f"<span style='color:#94a3b8'>{safe_text}</span>"
 
 
+def format_ranking_entry_identity(rank, name, code, direction):
+    """Render an explanation-row identity with its long/short direction color."""
+    color = '#ff6b6b' if str(direction) == '多' else '#35d07f'
+    return (
+        f"<span style='color:{color};font-weight:800;white-space:nowrap'>"
+        f"{int(rank)}.{html.escape(str(name))}({html.escape(str(code))})</span>"
+    )
+
+
 def render_strategy_ranking(rows, strategy_mode, room_label):
     """Render the independent post-close ranking immediately below its table."""
     current, target_date = _post_close_target_date()
@@ -14214,8 +14223,11 @@ def render_strategy_ranking(rows, strategy_mode, room_label):
             format_ranking_reason_component(component)
             for component in str(entry['reason']).split('｜') if component.strip()
         )
+        identity_html = format_ranking_entry_identity(
+            rank, entry['name'], entry['code'], entry['direction'],
+        )
         explanation_rows.append(
-            f"<div style='margin-top:5px;overflow-wrap:anywhere'><b>{rank}. {html.escape(entry['name'])}</b>："
+            f"<div style='margin-top:5px;overflow-wrap:anywhere'>{identity_html}："
             f"<span style='color:{color};font-weight:700'>{html.escape(entry['direction'])}方</span>"
             f"<span style='color:#64748b;padding:0 2px'>｜</span>{reason_html}"
             f"<span style='color:#64748b;padding:0 2px'>｜</span>"

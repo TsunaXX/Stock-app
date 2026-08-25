@@ -596,6 +596,20 @@ def test_ranking_reason_uses_consistent_category_and_direction_colors():
     assert "#94a3b8" in unavailable
 
 
+def test_ranking_explanation_identity_includes_code_and_direction_color():
+    formatter = load_app_symbols("format_ranking_entry_identity")[
+        "format_ranking_entry_identity"
+    ]
+
+    long_entry = formatter(1, "台積電", "2330", "多")
+    short_entry = formatter(2, "南亞科", "2408", "空")
+
+    assert "1.台積電(2330)" in long_entry
+    assert "#ff6b6b" in long_entry
+    assert "2.南亞科(2408)" in short_entry
+    assert "#35d07f" in short_entry
+
+
 def test_futures_post_close_ranking_uses_taifex_position_direction():
     symbols = load_app_symbols(
         "get_holidays", "is_market_closed_func", "_as_float", "_ranking_number",
