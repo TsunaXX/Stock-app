@@ -16871,6 +16871,8 @@ if tab1.open and stock_strategy_tab.open:
             del existing_data
             gc.collect()
 
+        # 即使資料在本輪重整時被篩成空表，原表欄位設定仍有可用的安全欄寬。
+        note_width_px = 160
         if not st.session_state.stock_data.empty:
             # 舊版股票自訂價不再參與顯示或策略計算；成交價統一採行情資料。
             legacy_stock_columns = [
@@ -16963,8 +16965,6 @@ if tab1.open and stock_strategy_tab.open:
             risk_show_only_eligible = False
             stock_compact_table = False
             stock_notify = False
-            # 原表也需要戰略備註欄寬；資料尚未完整正規化時可安全使用此預設值。
-            note_width_px = 160
             # 排行清單也會在關閉附加分析層時呈現；沿用上次選擇的模式，
             # 並在尚未建立過模式 widget 時採波段預設，避免未定義變數。
             strategy_mode = str(st.session_state.get(
