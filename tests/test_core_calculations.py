@@ -815,7 +815,11 @@ def test_index_history_empty_refresh_keeps_stale_nonempty_data():
     symbols["fetch_market_temperature_data"] = lambda *_args, **_kwargs: (
         pd.DataFrame(), "",
     )
-    data, source = symbols["get_cached_market_temperature_data"]("^TWII")
+    # This case verifies the expired-cache fallback.  Do not rely on the
+    # runner's uptime: a freshly started CI runner can have monotonic < 180.
+    data, source = symbols["get_cached_market_temperature_data"](
+        "^TWII", max_age_seconds=0,
+    )
     assert not data.empty
     assert "暫時沿用" in source
 
