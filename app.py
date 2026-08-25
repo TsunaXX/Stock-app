@@ -13629,7 +13629,11 @@ def _post_close_target_date(now_value=None):
     current = pd.Timestamp(now_value) if now_value is not None else pd.Timestamp.now(tz='Asia/Taipei')
     if current.tzinfo is not None:
         current = current.tz_convert('Asia/Taipei').tz_localize(None)
+    # 當日的法人、融資券與估值在 21:00 後才視為完整；此前固定使用
+    # 前一個實際開盤日，避免把尚未完成的今日資料與昨日資料混在一起。
     target = current.date()
+    if current.time() < dt_time(21, 0) or is_market_closed_func(target):
+        target -= timedelta(days=1)
     while is_market_closed_func(target):
         target -= timedelta(days=1)
     return current, target
@@ -13834,8 +13838,6 @@ def fetch_post_close_stock_ranking_context(target_date_text):
 def resolve_post_close_ranking_context(now_value=None):
     """Use current official data, falling back to this session's last usable snapshot."""
     current, target = _post_close_target_date(now_value)
-    if current.time() < dt_time(21, 0):
-        return {}
     try:
         context = fetch_post_close_stock_ranking_context(target.strftime('%Y%m%d'))
     except Exception as exc:
@@ -14128,9 +14130,9 @@ def _score_futures_post_close(row, strategy_mode, market_context, row_scales):
 def build_strategy_ranking_entries(
     rows, strategy_mode, now_value=None, limit=None, market_context=None, asset_type=None,
 ):
-    """Independently rank visible rows after 21:00 without modifying table order."""
+    """Rank visible rows from the latest completed post-close date without reordering them."""
     current, _ = _post_close_target_date(now_value)
-    if current.time() < dt_time(21, 0) or rows is None or rows.empty:
+    if rows is None or rows.empty:
         return []
     market_context = market_context or {'stocks': {}, 'scales': {}}
     asset_type = asset_type or ('futures' if '期貨代碼' in rows.columns else 'stock')
@@ -14156,8 +14158,8 @@ def build_strategy_ranking_entries(
 
 def render_strategy_ranking(rows, strategy_mode, room_label):
     """Render the independent post-close ranking immediately below its table."""
-    current, _ = _post_close_target_date()
-    if current.time() < dt_time(21, 0) or rows is None or rows.empty:
+    current, target_date = _post_close_target_date()
+    if rows is None or rows.empty:
         return
     market_context = resolve_post_close_ranking_context(current)
     entries = build_strategy_ranking_entries(
@@ -14166,6 +14168,7 @@ def render_strategy_ranking(rows, strategy_mode, room_label):
     if not entries:
         return
     ranking_title = '當沖排名' if strategy_mode == '當沖' else '波段排名'
+    period_label = '今日盤後' if target_date == current.date() else '前一交易日盤後'
     colored = []
     explanation_rows = []
     for rank, entry in enumerate(entries, 1):
@@ -14183,7 +14186,7 @@ def render_strategy_ranking(rows, strategy_mode, room_label):
     st.markdown(
         "<div style='margin:8px 0 4px;padding:8px 10px;border-radius:8px;"
         "background:rgba(128,128,128,.08);line-height:1.65'>"
-        f"<b>🌙 {html.escape(room_label)}{ranking_title}（21:00 盤後）</b><br>"
+        f"<b>🌙 {html.escape(room_label)}{ranking_title}（{period_label}）</b><br>"
         f"{' &gt; '.join(colored)}"
         "<div style='font-size:13px;margin-top:6px'><b>排行說明</b>"
         f"{''.join(explanation_rows)}</div></div>",

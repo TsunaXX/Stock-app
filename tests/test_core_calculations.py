@@ -549,7 +549,7 @@ def test_post_21_strategy_ranking_uses_visible_rows_and_selected_mode():
         },
         "scales": {"institutional": 800000, "margin": 200, "short": 20},
     }
-    before = symbols["build_strategy_ranking_entries"](
+    before_21 = symbols["build_strategy_ranking_entries"](
         rows, "當沖", now_value="2026-08-24 20:59:00", market_context=context,
     )
     intraday = symbols["build_strategy_ranking_entries"](
@@ -558,7 +558,7 @@ def test_post_21_strategy_ranking_uses_visible_rows_and_selected_mode():
     swing = symbols["build_strategy_ranking_entries"](
         rows, "隔日／波段", now_value="2026-08-24 21:00:00", market_context=context,
     )
-    assert before == []
+    assert {item["code"] for item in before_21} == {"2330", "2408"}
     assert {item["code"] for item in intraday} == {"2330", "2408"}
     assert {item["code"] for item in swing} == {"2330", "2408"}
     assert all(item["direction"] in {"多", "空"} for item in intraday + swing)
@@ -566,6 +566,20 @@ def test_post_21_strategy_ranking_uses_visible_rows_and_selected_mode():
     assert all("基本偏" in item["reason"] for item in swing)
     assert rows["代號"].tolist() == original_codes
     assert intraday[0]["score"] != rows.loc[rows["代號"] == intraday[0]["code"], "信心分"].iloc[0]
+
+
+def test_post_close_ranking_date_uses_previous_session_before_21():
+    symbols = load_app_symbols(
+        "get_holidays", "is_market_closed_func", "_post_close_target_date",
+    )
+    _, before_21 = symbols["_post_close_target_date"]("2026-08-25 20:59:00")
+    _, at_21 = symbols["_post_close_target_date"]("2026-08-25 21:00:00")
+    _, monday_before_21 = symbols["_post_close_target_date"]("2026-08-24 10:00:00")
+    _, holiday_before_21 = symbols["_post_close_target_date"]("2026-09-28 10:00:00")
+    assert before_21 == date(2026, 8, 24)
+    assert at_21 == date(2026, 8, 25)
+    assert monday_before_21 == date(2026, 8, 21)
+    assert holiday_before_21 == date(2026, 9, 24)
 
 
 def test_futures_post_close_ranking_uses_taifex_position_direction():
