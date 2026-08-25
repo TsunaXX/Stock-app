@@ -582,6 +582,20 @@ def test_post_close_ranking_date_uses_previous_session_before_21():
     assert holiday_before_21 == date(2026, 9, 24)
 
 
+def test_ranking_reason_uses_consistent_category_and_direction_colors():
+    formatter = load_app_symbols("format_ranking_reason_component")[
+        "format_ranking_reason_component"
+    ]
+    technical = formatter("技術偏多 80（站上5日線）")
+    chips = formatter("量倉／籌碼偏空 70（外資淨部位-1,000口）")
+    fundamental = formatter("標的基本偏多 65（本益比 12）")
+    unavailable = formatter("基本面不適用或未取得，不以零分處理")
+    assert "#4fc3f7" in technical and "#ff6b6b" in technical
+    assert "#ffb74d" in chips and "#35d07f" in chips
+    assert "#c4b5fd" in fundamental and "#ff6b6b" in fundamental
+    assert "#94a3b8" in unavailable
+
+
 def test_futures_post_close_ranking_uses_taifex_position_direction():
     symbols = load_app_symbols(
         "get_holidays", "is_market_closed_func", "_as_float", "_ranking_number",

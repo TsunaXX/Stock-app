@@ -14156,6 +14156,38 @@ def build_strategy_ranking_entries(
     return entries if limit is None else entries[:max(1, int(limit))]
 
 
+def format_ranking_reason_component(reason):
+    """Color-code the basis category while retaining red/green long-short cues."""
+    text = str(reason or '').strip()
+    safe_text = html.escape(text)
+    if any(marker in text for marker in ('不適用', '未取得', '資料不足')):
+        return f"<span style='color:#94a3b8'>{safe_text}</span>"
+    category_specs = (
+        ('量倉／籌碼', '#ffb74d', 'rgba(255,183,77,.16)'),
+        ('標的基本', '#c4b5fd', 'rgba(196,181,253,.16)'),
+        ('技術', '#4fc3f7', 'rgba(79,195,247,.16)'),
+        ('籌碼', '#ffb74d', 'rgba(255,183,77,.16)'),
+        ('基本', '#c4b5fd', 'rgba(196,181,253,.16)'),
+    )
+    for category, color, background in category_specs:
+        if not text.startswith(category):
+            continue
+        rest = html.escape(text[len(category):])
+        for direction, direction_color in (('偏多', '#ff6b6b'), ('偏空', '#35d07f')):
+            if direction in rest:
+                before, after = rest.split(direction, 1)
+                rest = (
+                    f"{before}<span style='color:{direction_color};font-weight:700'>{direction}</span>{after}"
+                )
+                break
+        return (
+            "<span style='display:inline-block;margin:1px 3px 1px 0;padding:1px 5px;"
+            f"border-radius:4px;background:{background};color:{color};font-weight:750'>{category}</span>"
+            f"{rest}"
+        )
+    return f"<span style='color:#94a3b8'>{safe_text}</span>"
+
+
 def render_strategy_ranking(rows, strategy_mode, room_label):
     """Render the independent post-close ranking immediately below its table."""
     current, target_date = _post_close_target_date()
@@ -14178,10 +14210,16 @@ def render_strategy_ranking(rows, strategy_mode, room_label):
             f"{html.escape(entry['name'])}({html.escape(entry['code'])})"
             f"({entry['score']}·{entry['direction']})</span>"
         )
+        reason_html = "<span style='color:#64748b;padding:0 2px'>｜</span>".join(
+            format_ranking_reason_component(component)
+            for component in str(entry['reason']).split('｜') if component.strip()
+        )
         explanation_rows.append(
-            f"<div style='margin-top:3px'><b>{rank}. {html.escape(entry['name'])}</b>："
-            f"{html.escape(entry['direction'])}方｜{html.escape(entry['reason'])}｜"
-            f"資料覆蓋 {entry['coverage']}%</div>"
+            f"<div style='margin-top:5px;overflow-wrap:anywhere'><b>{rank}. {html.escape(entry['name'])}</b>："
+            f"<span style='color:{color};font-weight:700'>{html.escape(entry['direction'])}方</span>"
+            f"<span style='color:#64748b;padding:0 2px'>｜</span>{reason_html}"
+            f"<span style='color:#64748b;padding:0 2px'>｜</span>"
+            f"<span style='color:#94a3b8'>資料覆蓋 {entry['coverage']}%</span></div>"
         )
     st.markdown(
         "<div style='margin:8px 0 4px;padding:8px 10px;border-radius:8px;"
