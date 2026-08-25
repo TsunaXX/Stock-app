@@ -16963,6 +16963,14 @@ if tab1.open and stock_strategy_tab.open:
             risk_show_only_eligible = False
             stock_compact_table = False
             stock_notify = False
+            # 排行清單也會在關閉附加分析層時呈現；沿用上次選擇的模式，
+            # 並在尚未建立過模式 widget 時採波段預設，避免未定義變數。
+            strategy_mode = str(st.session_state.get(
+                'risk_filter_strategy_mode', '隔日／波段',
+            ))
+            if strategy_mode == '當沖預覽':
+                strategy_mode = '當沖'
+            is_daytrade_mode = strategy_mode == '當沖'
 
             if risk_preview_enabled:
                 if st.session_state.get('risk_filter_strategy_mode') == '當沖預覽':
