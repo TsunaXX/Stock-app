@@ -5404,6 +5404,36 @@ def render_txo_scenario_note(option_quote):
     )
 
 
+def get_txo_payoff_level_items(option_quote, plan):
+    """Return current/target/stop levels for the chart's separate level cards.
+
+    The levels used to be Plotly annotations.  When prices cluster near one
+    strike, their labels and connector lines inevitably overlap on phones.
+    Rendering the levels outside the canvas keeps the same values visible on
+    both phone and desktop without obscuring the payoff curve.
+    """
+    if not option_quote or not plan:
+        return []
+    spot = float(plan.get('latest', 0) or 0)
+    target = float(plan.get('target', spot) or spot)
+    stop = float(plan.get('invalidation', spot) or spot)
+    if spot <= 0:
+        return []
+    items = [
+        {'label': '目前', 'value': _format_compact_number(spot, 0), 'color': '#29b6f6'},
+        {'label': '目標', 'value': _format_compact_number(target, 0), 'color': '#ff4b4b'},
+        {'label': '停損', 'value': _format_compact_number(stop, 0), 'color': '#00c853'},
+    ]
+    breakeven = option_quote.get('breakeven')
+    if breakeven is not None:
+        items.append({
+            'label': '損益兩平',
+            'value': _format_compact_number(breakeven, 0),
+            'color': '#ffb300',
+        })
+    return items
+
+
 def build_txo_payoff_chart(option_quote, plan, is_spread=False):
     """Build an interactive expiry payoff curve in TWD per option position."""
     if not option_quote or not plan:
@@ -5475,30 +5505,11 @@ def build_txo_payoff_chart(option_quote, plan, is_spread=False):
         hovertemplate='結算指數 %{x:,.0f}<br>虧損 $%{y:,.0f}<extra></extra>',
     ))
     fig.add_hline(y=0, line_color='#7f8c8d', line_width=1)
-    markers = [
-        ('目前', spot, '#29b6f6'), ('目標', target, '#ff4b4b'), ('停損', stop, '#00c853'),
-    ]
-    if option_quote.get('breakeven') is not None:
-        markers.append(('損益兩平', float(option_quote['breakeven']), '#ffb300'))
-    # Nearby current/target/stop/breakeven prices can differ by less than one
-    # phone character width.  Give every marker a distinct vertical lane;
-    # visual overlap is worse than the extra top margin on a narrow screen.
-    sorted_markers = sorted(markers, key=lambda item: item[1])
-    for lane, (label, value, color) in enumerate(sorted_markers):
-        fig.add_vline(x=value, line_color=color, line_dash='dot', line_width=1.4)
-        fig.add_annotation(
-            x=value, y=0.98, yref='paper',
-            text=f"{label} {value:,.0f}",
-            showarrow=True, arrowhead=0, arrowwidth=1.4, arrowcolor=color,
-            ax=0, ay=-(32 + lane * 40), xanchor='center', yanchor='bottom',
-            bgcolor='rgba(16,21,29,.88)', bordercolor=color, borderwidth=1,
-            borderpad=3, font=dict(size=12, color=color),
-        )
     fig.update_layout(
-        template='plotly_dark', height=470,
-        margin=dict(l=45, r=24, t=126 + max(0, len(sorted_markers) - 1) * 38, b=72),
+        template='plotly_dark', height=430,
+        margin=dict(l=45, r=24, t=28, b=72),
         xaxis_title='到期結算指數', yaxis_title='損益（元）',
-        legend=dict(orientation='h', y=-0.20, x=1, xanchor='right', font=dict(size=11)),
+        showlegend=False,
         hovermode='x unified',
     )
     fig.update_xaxes(title_font=dict(size=13), tickfont=dict(size=12), automargin=True)
@@ -19926,10 +19937,12 @@ with tab_fibo:
                 else:
                     payoff_chart = build_txo_payoff_chart(option_quote, quote_plan, display_spread)
                     if payoff_chart is not None:
-                        # The Plotly top margin is reserved for the staggered
-                        # current/target/stop labels.  Keep the title outside the
-                        # canvas so it cannot collide with those labels on phones.
                         st.markdown("#### 到期損益曲線（每口／每組）")
+                        render_compact_metric_card_grid(
+                            get_txo_payoff_level_items(option_quote, quote_plan),
+                            columns=4,
+                            class_name='compact-metric-grid txo-payoff-level-grid',
+                        )
                         st.plotly_chart(
                             payoff_chart, width='stretch',
                             config={'displayModeBar': False, 'scrollZoom': False},
