@@ -4324,16 +4324,45 @@ def get_trade_risk_level(risk_points, atr):
     return '高', '#ff4b4b', ratio
 
 
+def _is_shioaji_auth_error(exc):
+    """辨識 Shioaji 已登出／連線物件失效，不把一般網路抖動誤判為登出。"""
+    error_name = type(exc).__name__.lower()
+    error_text = str(exc or '').lower()
+    return (
+        'auth' in error_name
+        or 'not authenticated' in error_text
+        or 'not login' in error_text
+        or '尚未登入' in error_text
+    )
+
+
 def get_near_futures_contract(api, product='TMF'):
     """Resolve the live near-month futures contract used by the trade plan."""
     if api is None:
         return None
     try:
+        resolver = globals().get('resolve_shioaji_futures_contract')
+        if callable(resolver):
+            contract_month = get_near_month_futures_settlement().strftime('%Y%m')
+            contract = resolver(api, product, contract_month)
+            if contract is not None:
+                return contract
+    except Exception as exc:
+        invalidator = globals().get('invalidate_shioaji_connection')
+        if _is_shioaji_auth_error(exc) and callable(invalidator):
+            invalidator(exc)
+        return None
+
+    # 舊版 SDK／尚未完成延遲載入的契約檔備援。
+    try:
         if product == 'TMF':
             return api.Contracts.Futures.TMF.TMFR1
         candidates = [c for c in api.Contracts.Futures.TXF if c.code[-2:] not in ('R1', 'R2') and '/' not in c.code]
         return min(candidates, key=lambda c: getattr(c, 'delivery_date', '999999'))
-    except (AttributeError, ValueError):
+    except Exception as exc:
+        invalidator = globals().get('invalidate_shioaji_connection')
+        if _is_shioaji_auth_error(exc) and callable(invalidator):
+            invalidator(exc)
         return None
 
 
@@ -7662,6 +7691,9 @@ st.markdown("""
     div[data-testid="stDataEditor"] [role="gridcell"] {
         line-height:1.25;
         vertical-align:middle;
+        white-space:nowrap;
+        overflow:hidden;
+        text-overflow:ellipsis;
     }
     [data-testid="stPlotlyChart"] { max-width:100%; overflow-x:auto; }
     .calendar-mobile-list { display:none; }
@@ -7720,7 +7752,15 @@ st.markdown("""
         /* Index plan cards and option result cards remain readable in two columns. */
         [data-testid="stAppViewContainer"] .index-plan-main-grid { grid-template-columns:repeat(2,minmax(0,1fr)); gap:.4rem; }
         [data-testid="stAppViewContainer"] .index-plan-main-label { font-size:.74rem; }
-        [data-testid="stAppViewContainer"] .index-plan-main-value { font-size:1.25rem; line-height:1.18; }
+        [data-testid="stAppViewContainer"] .index-plan-main-value { font-size:1.25rem; line-height:1.18; overflow-wrap:anywhere; }
+        [data-testid="stAppViewContainer"] [data-testid="stMetricLabel"] p,
+        [data-testid="stAppViewContainer"] [data-testid="stMetricValue"] {
+            white-space:normal !important;
+            overflow-wrap:anywhere;
+            word-break:break-word;
+            line-height:1.18;
+        }
+        [data-testid="stAppViewContainer"] [data-testid="stMetricValue"] { font-size:1.25rem; }
         [data-testid="stAppViewContainer"] .opt-card { padding:9px !important; margin-bottom:7px !important; }
         [data-testid="stAppViewContainer"] .opt-label { font-size:.72rem !important; }
         [data-testid="stAppViewContainer"] .opt-value { font-size:1rem !important; line-height:1.25; }
@@ -7735,6 +7775,19 @@ st.markdown("""
         .calendar-mobile-day > div:not(.calendar-mobile-date) { font-size:.84rem !important; }
         .calendar-mobile-date { display:flex; justify-content:space-between; gap:8px; align-items:center; font-size:1rem; font-weight:850; margin-bottom:5px; }
         .calendar-mobile-week { color:#ffb74d; font-size:.74rem; font-weight:750; white-space:nowrap; }
+    }
+    @media (max-width: 480px) {
+        /* 窄手機改為單欄操作，避免多組輸入、按鈕與數字互相覆蓋。 */
+        div[data-testid="stHorizontalBlock"] > div[data-testid="column"] {
+            flex:1 1 100% !important;
+            width:100% !important;
+            min-width:0 !important;
+        }
+        [data-testid="stAppViewContainer"] .index-plan-main-grid {
+            grid-template-columns:repeat(2,minmax(0,1fr));
+        }
+        [data-testid="stAppViewContainer"] .index-plan-main-value { font-size:1.08rem; }
+        [data-testid="stAppViewContainer"] [data-testid="stMetricValue"] { font-size:1.12rem; }
     }
     div[data-testid="column"] { text-align: center; }
 </style>
@@ -7862,9 +7915,9 @@ def resolve_shioaji_credentials(config=None):
     runtime_key = str(get_app_secret('sj_key', '') or '').strip()
     runtime_secret = str(get_app_secret('sj_secret', '') or '').strip()
     if runtime_key and runtime_secret:
-        return runtime_key, runtime_secret, True, 'render_env'
+        return runtime_key, runtime_secret, True, 'runtime_secret'
     if runtime_key or runtime_secret:
-        logger.warning('Ignoring incomplete Render Shioaji credential pair')
+        logger.warning('Ignoring incomplete runtime Shioaji credential pair')
 
     saved_key = str(config.get('sj_key', '') or '').strip()
     saved_secret = str(config.get('sj_secret', '') or '').strip()
@@ -11145,6 +11198,25 @@ def init_shioaji_connection(api_key, secret_key):
     return api
 
 
+def invalidate_shioaji_connection(exc=None, clear_resource=True):
+    """將失效的登入物件退回未登入狀態，讓記住的帳密可安全重連。"""
+    st.session_state.sj_logged_in = False
+    st.session_state.pop('sj_api', None)
+    if exc is not None:
+        st.session_state.sj_connection_error = type(exc).__name__
+    try:
+        shared, cache_lock = get_shared_market_data_cache()
+        with cache_lock:
+            shared['shioaji_usage'].clear()
+    except Exception:
+        pass
+    if clear_resource:
+        try:
+            init_shioaji_connection.clear()
+        except Exception:
+            pass
+
+
 def get_cached_shioaji_usage(api, max_age_seconds=60):
     """Avoid two broker network calls on every Streamlit widget rerun."""
     if api is None:
@@ -11177,23 +11249,41 @@ if 'sj_secret' not in st.session_state:
 if 'remember_sj' not in st.session_state: 
     st.session_state.remember_sj = secret_remember_sj
 
+# 自動更新／Reboot 後，session_state 可能仍指向已被券商中斷的舊物件。
+# 只在明確的 AuthError 時失效；一般暫時性網路錯誤仍保留目前連線。
+if st.session_state.get('sj_logged_in', False):
+    current_sj_api = st.session_state.get('sj_api')
+    if current_sj_api is None:
+        invalidate_shioaji_connection(clear_resource=False)
+    else:
+        try:
+            get_cached_shioaji_usage(current_sj_api, max_age_seconds=30)
+        except BaseException as exc:
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
+            if _is_shioaji_auth_error(exc):
+                invalidate_shioaji_connection(exc)
+
 if (
     sj and not st.session_state.get('sj_logged_in', False)
     and st.session_state.remember_sj
     and st.session_state.sj_key and st.session_state.sj_secret
     and not st.session_state.get('manual_logout', False)
+    and time.monotonic() >= float(st.session_state.get('sj_auto_login_retry_after', 0) or 0)
 ):
     try:
         api_obj = init_shioaji_connection(st.session_state.sj_key, st.session_state.sj_secret)
         st.session_state.sj_api = api_obj
         st.session_state.sj_logged_in = True
         st.session_state.pop('sj_connection_error', None)
+        st.session_state.pop('sj_auto_login_retry_after', None)
     except BaseException as exc:
         if isinstance(exc, (KeyboardInterrupt, SystemExit)):
             raise
         st.session_state.sj_logged_in = False
         st.session_state.pop('sj_api', None)
         st.session_state.sj_connection_error = type(exc).__name__
+        st.session_state.sj_auto_login_retry_after = time.monotonic() + 30
 
 @st.cache_data(ttl=300, max_entries=512)
 def get_stock_name_online(code):
@@ -11271,6 +11361,8 @@ with st.sidebar:
                     
                     st.session_state.sj_api = init_shioaji_connection(st.session_state.sj_key, st.session_state.sj_secret)
                     st.session_state.sj_logged_in = True
+                    st.session_state.pop('sj_connection_error', None)
+                    st.session_state.pop('sj_auto_login_retry_after', None)
                     msg_placeholder.success("✅ 重新登入成功！")
                     time.sleep(0.5)
                     st.rerun()
@@ -11279,10 +11371,10 @@ with st.sidebar:
                     st.session_state.sj_logged_in = False
                     st.rerun()
         else:
-            if sj_credential_source == 'render_env':
-                st.caption("Render 已保存 API 資訊；登入失敗時可按下方按鈕重試。")
+            if sj_credential_source == 'runtime_secret':
+                st.caption("Streamlit Secrets 已保存 API 資訊；登入失敗時可按下方按鈕重試。")
             else:
-                st.caption("若要在容器重啟後自動登入，請在 Render 設定 SHIOAJI_API_KEY 與 SHIOAJI_SECRET_KEY。")
+                st.caption("若要在 App Reboot 後自動登入，請在 Streamlit Secrets 設定 sj_key 與 sj_secret。")
             sj_api_key = st.text_input("API Key", type="password", value=st.session_state.sj_key, key="input_sj_key")
             sj_secret = st.text_input("Secret Key", type="password", value=st.session_state.sj_secret, key="input_sj_secret")
             remember_sj = st.checkbox("記住 API 資訊", value=st.session_state.remember_sj, key="input_remember_sj")
@@ -11290,8 +11382,12 @@ with st.sidebar:
             if st.button("登入 Shioaji"):
                 try:
                     st.session_state.manual_logout = False # 解除手動登出標記
+                    # 同一組帳密可能命中已失效的 cache_resource，手動登入必須新建連線。
+                    init_shioaji_connection.clear()
                     st.session_state.sj_api = init_shioaji_connection(sj_api_key, sj_secret)
                     st.session_state.sj_logged_in = True
+                    st.session_state.pop('sj_connection_error', None)
+                    st.session_state.pop('sj_auto_login_retry_after', None)
                     
                     st.session_state.sj_key = sj_api_key
                     st.session_state.sj_secret = sj_secret
@@ -12075,8 +12171,12 @@ def _list_shioaji_futures_contracts(api):
     try:
         security_type = sj.SecurityType.Futures if sj is not None else 'FUT'
         contracts.extend(list(api.contracts.list(security_type) or []))
-    except (AttributeError, TypeError, ValueError):
-        pass
+    except Exception as exc:
+        if _is_shioaji_auth_error(exc):
+            invalidator = globals().get('invalidate_shioaji_connection')
+            if callable(invalidator):
+                invalidator(exc)
+            return []
     if not contracts:
         try:
             for category in api.Contracts.Futures:
@@ -12084,8 +12184,12 @@ def _list_shioaji_futures_contracts(api):
                     contracts.extend(list(category))
                 except TypeError:
                     continue
-        except (AttributeError, TypeError):
-            pass
+        except Exception as exc:
+            if _is_shioaji_auth_error(exc):
+                invalidator = globals().get('invalidate_shioaji_connection')
+                if callable(invalidator):
+                    invalidator(exc)
+            return []
     unique = {}
     for contract in contracts:
         code = str(getattr(contract, 'code', '') or '').upper()
@@ -12123,7 +12227,12 @@ def resolve_shioaji_futures_contract(api, root, contract_month):
             except TypeError:
                 found = api.contracts.futures(query_root)
             candidates.extend(list(found or []))
-        except (AttributeError, KeyError, TypeError, ValueError):
+        except Exception as exc:
+            if _is_shioaji_auth_error(exc):
+                invalidator = globals().get('invalidate_shioaji_connection')
+                if callable(invalidator):
+                    invalidator(exc)
+                return None
             continue
 
     # Older SDK/session objects still expose category attributes.
@@ -12131,7 +12240,12 @@ def resolve_shioaji_futures_contract(api, root, contract_month):
         for query_root in roots:
             try:
                 candidates.extend(list(getattr(api.Contracts.Futures, query_root)))
-            except (AttributeError, KeyError, TypeError):
+            except Exception as exc:
+                if _is_shioaji_auth_error(exc):
+                    invalidator = globals().get('invalidate_shioaji_connection')
+                    if callable(invalidator):
+                        invalidator(exc)
+                    return None
                 continue
     if not candidates:
         candidates = _list_shioaji_futures_contracts(api)

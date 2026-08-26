@@ -1022,7 +1022,7 @@ def test_shioaji_futures_resolver_uses_v17_lazy_root_api():
     symbols = load_app_symbols(
         "SHIOAJI_FUTURES_ROOT_ALIASES", "FUTURES_MONTH_CODE",
         "shioaji_futures_root_candidates", "expected_shioaji_futures_code",
-        "_contract_delivery_month", "_is_actual_futures_contract",
+        "_is_shioaji_auth_error", "_contract_delivery_month", "_is_actual_futures_contract",
         "resolve_shioaji_futures_contract",
     )
 
@@ -1053,6 +1053,39 @@ def test_shioaji_futures_resolver_uses_v17_lazy_root_api():
     assert api.contracts.calls[0] == ("MXF", "202609")
     assert symbols["expected_shioaji_futures_code"]("MTX", "202608") == "MXFH6"
     assert symbols["expected_shioaji_futures_code"]("CDF", "202609") == "CDFI6"
+
+
+def test_expired_shioaji_session_is_invalidated_without_crashing_futures_room():
+    symbols = load_app_symbols(
+        "SHIOAJI_FUTURES_ROOT_ALIASES", "FUTURES_MONTH_CODE",
+        "shioaji_futures_root_candidates", "expected_shioaji_futures_code",
+        "_is_shioaji_auth_error", "_contract_delivery_month", "_is_actual_futures_contract",
+        "_list_shioaji_futures_contracts", "resolve_shioaji_futures_contract",
+    )
+
+    class AuthError(Exception):
+        pass
+
+    class ExpiredContracts:
+        def futures(self, *_args, **_kwargs):
+            raise AuthError("Not authenticated")
+
+    class API:
+        contracts = ExpiredContracts()
+
+    invalidated = []
+    symbols["invalidate_shioaji_connection"] = lambda exc: invalidated.append(str(exc))
+    assert symbols["resolve_shioaji_futures_contract"](API(), "TMF", "202609") is None
+    assert invalidated == ["Not authenticated"]
+    assert symbols["_is_shioaji_auth_error"](TimeoutError("temporary timeout")) is False
+
+
+def test_mobile_layout_prevents_metrics_and_table_cells_from_overlapping():
+    source = APP_PATH.read_text(encoding="utf-8")
+    assert "@media (max-width: 480px)" in source
+    assert "flex:1 1 100% !important" in source
+    assert "text-overflow:ellipsis" in source
+    assert "overflow-wrap:anywhere" in source
 
 
 def test_futures_settlement_cutover_uses_taipei_1330_and_official_date_first():
