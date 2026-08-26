@@ -1089,6 +1089,8 @@ def test_mobile_layout_prevents_metrics_and_table_cells_from_overlapping():
     assert "def render_compact_metric_card_grid" in source
     assert "compact-metric-grid index-level-metric-grid" in source
     assert "compact-metric-grid fibo-suggestion-metric-grid" in source
+    assert "compact-metric-grid index-entry-risk-grid" in source
+    assert "compact-metric-grid index-short-risk-grid" in source
 
 
 def test_phone_charts_hide_modebar_and_keep_nearby_markers_in_separate_lanes():
@@ -1102,6 +1104,8 @@ def test_phone_charts_hide_modebar_and_keep_nearby_markers_in_separate_lanes():
     fibo_source = functions["plot_fibonacci_chart"]
     assert "for lane, (label, value, color) in enumerate(sorted_markers):" in payoff_source
     assert "lane * 40" in payoff_source
+    assert "title=dict(text='到期損益曲線" not in payoff_source
+    assert 'st.markdown("#### 到期損益曲線（每口／每組）")' in source
     assert "padding_ratio=0.10" in fibo_source
     assert "displayModeBar': False" in fibo_source
     assert "orientation='h'" in fibo_source

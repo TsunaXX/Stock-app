@@ -5497,7 +5497,6 @@ def build_txo_payoff_chart(option_quote, plan, is_spread=False):
     fig.update_layout(
         template='plotly_dark', height=470,
         margin=dict(l=45, r=24, t=126 + max(0, len(sorted_markers) - 1) * 38, b=72),
-        title=dict(text='到期損益曲線（每口／每組）', font=dict(size=17)),
         xaxis_title='到期結算指數', yaxis_title='損益（元）',
         legend=dict(orientation='h', y=-0.20, x=1, xanchor='right', font=dict(size=11)),
         hovermode='x unified',
@@ -19530,32 +19529,29 @@ with tab_fibo:
             )
             entry_risk_amount = trade_state['risk_points'] * 10 * position_count
             entry_reward_amount = trade_state['reward_points'] * 10 * position_count
-            er1, er2, er3, er4 = st.columns(4)
-            er1.markdown(
-                f"""<div style='line-height:1.2'>
-                <div style='font-size:12px;color:#b7c0cc'>計畫風險點數</div>
-                <div style='font-size:19px;font-weight:700;color:{entry_risk_color}'>{trade_state['risk_points']:,.0f} 點</div>
-                <div style='font-size:12px;font-weight:700;color:{entry_risk_color}'>風險等級：{entry_risk_level}</div>
-                </div>""", unsafe_allow_html=True,
-            )
-            er2.markdown(
-                f"""<div style='line-height:1.2'>
-                <div style='font-size:12px;color:#b7c0cc'>預估盈利點數</div>
-                <div style='font-size:19px;font-weight:700;color:#ff4b4b'>{trade_state['reward_points']:,.0f} 點</div>
-                </div>""", unsafe_allow_html=True,
-            )
-            er3.markdown(
-                f"""<div style='line-height:1.2'>
-                <div style='font-size:12px;color:#b7c0cc'>{position_count} 口最大風險</div>
-                <div style='font-size:19px;font-weight:700;color:{entry_risk_color}'>${entry_risk_amount:,.0f}</div>
-                </div>""", unsafe_allow_html=True,
-            )
-            er4.markdown(
-                f"""<div style='line-height:1.2'>
-                <div style='font-size:12px;color:#b7c0cc'>{position_count} 口預估收益</div>
-                <div style='font-size:19px;font-weight:700;color:#ff4b4b'>${entry_reward_amount:,.0f}</div>
-                </div>""", unsafe_allow_html=True,
-            )
+            render_compact_metric_card_grid([
+                {
+                    'label': '計畫風險點數',
+                    'value': f"{trade_state['risk_points']:,.0f} 點",
+                    'detail': f'風險等級：{entry_risk_level}',
+                    'color': entry_risk_color,
+                },
+                {
+                    'label': '預估盈利點數',
+                    'value': f"{trade_state['reward_points']:,.0f} 點",
+                    'color': '#ff4b4b',
+                },
+                {
+                    'label': f'{position_count} 口最大風險',
+                    'value': f'${entry_risk_amount:,.0f}',
+                    'color': entry_risk_color,
+                },
+                {
+                    'label': f'{position_count} 口預估收益',
+                    'value': f'${entry_reward_amount:,.0f}',
+                    'color': '#ff4b4b',
+                },
+            ], columns=4, class_name='compact-metric-grid index-entry-risk-grid')
             st.caption(
                 f"風險等級以停損距離相對日 ATR 判定：{_format_compact_number(entry_risk_ratio, 2)} ATR；"
                 "微台每點 10 元。"
@@ -19624,32 +19620,29 @@ with tab_fibo:
                 )
                 short_risk_amount = short_wave['risk'] * 10 * position_count
                 short_reward_amount = short_wave['reward'] * 10 * position_count
-                sr1, sr2, sr3, sr4 = st.columns(4)
-                sr1.markdown(
-                    f"""<div style='line-height:1.2'>
-                    <div style='font-size:12px;color:#b7c0cc'>短波風險點數</div>
-                    <div style='font-size:18px;font-weight:700;color:{short_risk_color}'>{short_wave['risk']:,.0f} 點</div>
-                    <div style='font-size:12px;font-weight:700;color:{short_risk_color}'>風險等級：{short_risk_level}</div>
-                    </div>""", unsafe_allow_html=True,
-                )
-                sr2.markdown(
-                    f"""<div style='line-height:1.2'>
-                    <div style='font-size:12px;color:#b7c0cc'>短波盈利點數</div>
-                    <div style='font-size:18px;font-weight:700;color:#ff4b4b'>{short_wave['reward']:,.0f} 點</div>
-                    </div>""", unsafe_allow_html=True,
-                )
-                sr3.markdown(
-                    f"""<div style='line-height:1.2'>
-                    <div style='font-size:12px;color:#b7c0cc'>{position_count} 口最大風險</div>
-                    <div style='font-size:18px;font-weight:700;color:{short_risk_color}'>${short_risk_amount:,.0f}</div>
-                    </div>""", unsafe_allow_html=True,
-                )
-                sr4.markdown(
-                    f"""<div style='line-height:1.2'>
-                    <div style='font-size:12px;color:#b7c0cc'>{position_count} 口預估收益</div>
-                    <div style='font-size:18px;font-weight:700;color:#ff4b4b'>${short_reward_amount:,.0f}</div>
-                    </div>""", unsafe_allow_html=True,
-                )
+                render_compact_metric_card_grid([
+                    {
+                        'label': '短波風險點數',
+                        'value': f"{short_wave['risk']:,.0f} 點",
+                        'detail': f'風險等級：{short_risk_level}',
+                        'color': short_risk_color,
+                    },
+                    {
+                        'label': '短波盈利點數',
+                        'value': f"{short_wave['reward']:,.0f} 點",
+                        'color': '#ff4b4b',
+                    },
+                    {
+                        'label': f'{position_count} 口最大風險',
+                        'value': f'${short_risk_amount:,.0f}',
+                        'color': short_risk_color,
+                    },
+                    {
+                        'label': f'{position_count} 口預估收益',
+                        'value': f'${short_reward_amount:,.0f}',
+                        'color': '#ff4b4b',
+                    },
+                ], columns=4, class_name='compact-metric-grid index-short-risk-grid')
                 st.caption(
                     "以最新 6 根 5 分 K、EMA5 與前根高低點計算；短波停損為日 ATR 的 "
                     f"{_format_compact_number(short_risk_ratio, 2)} 倍。"
@@ -19933,6 +19926,10 @@ with tab_fibo:
                 else:
                     payoff_chart = build_txo_payoff_chart(option_quote, quote_plan, display_spread)
                     if payoff_chart is not None:
+                        # The Plotly top margin is reserved for the staggered
+                        # current/target/stop labels.  Keep the title outside the
+                        # canvas so it cannot collide with those labels on phones.
+                        st.markdown("#### 到期損益曲線（每口／每組）")
                         st.plotly_chart(
                             payoff_chart, width='stretch',
                             config={'displayModeBar': False, 'scrollZoom': False},
