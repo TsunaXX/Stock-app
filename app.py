@@ -2016,6 +2016,45 @@ def render_index_plan_metric_cards(items):
     )
 
 
+def render_compact_metric_card_grid(items, columns=4, class_name='compact-metric-grid'):
+    """Render responsive value cards without relying on Streamlit columns.
+
+    Streamlit column widths are calculated before the phone CSS is applied.  On
+    very narrow devices this can leave a label and the next value in the same
+    visual row.  These cards use a self-contained CSS grid instead.
+    """
+    safe_columns = max(1, min(int(columns or 1), 5))
+    cards = []
+    for item in items:
+        label = item.get('label', '')
+        value = item.get('value', '—')
+        detail = item.get('detail', '')
+        color = item.get('color', '#f5f5f5')
+        cards.append(
+            "<div class='compact-metric-card'>"
+            f"<div class='compact-metric-label'>{html.escape(str(label))}</div>"
+            f"<div class='compact-metric-value' style='color:{html.escape(str(color))}'>{html.escape(str(value))}</div>"
+            + (
+                f"<div class='compact-metric-detail' style='color:{html.escape(str(color))}'>{html.escape(str(detail))}</div>"
+                if str(detail).strip() else ''
+            )
+            + "</div>"
+        )
+    st.markdown(
+        "<style>"
+        ".compact-metric-grid{display:grid;grid-template-columns:repeat(var(--metric-columns),minmax(0,1fr));gap:.65rem;margin:.35rem 0 .75rem}"
+        ".compact-metric-card{min-width:0;padding:.62rem .7rem;border:1px solid #273444;border-radius:.55rem;background:#101821;text-align:left}"
+        ".compact-metric-label{color:#cbd5e1;font-size:.83rem;font-weight:650;line-height:1.25;overflow-wrap:anywhere}"
+        ".compact-metric-value{font-size:1.55rem;font-weight:800;line-height:1.18;margin-top:.22rem;white-space:nowrap}"
+        ".compact-metric-detail{font-size:.82rem;font-weight:700;line-height:1.2;margin-top:.18rem;overflow-wrap:anywhere}"
+        "@media(max-width:700px){.compact-metric-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:.48rem}.compact-metric-card{padding:.55rem .58rem}.compact-metric-label{font-size:.77rem}.compact-metric-value{font-size:1.3rem}.compact-metric-detail{font-size:.75rem}}"
+        "@media(max-width:340px){.compact-metric-grid{grid-template-columns:1fr}}"
+        "</style>"
+        f"<div class='{html.escape(str(class_name))}' style='--metric-columns:{safe_columns}'>{''.join(cards)}</div>",
+        unsafe_allow_html=True,
+    )
+
+
 def render_index_level_metric(container, label, value):
     """指數計畫頂端價位採與即時微台相近的緊湊字級。"""
     container.markdown(
@@ -5441,33 +5480,23 @@ def build_txo_payoff_chart(option_quote, plan, is_spread=False):
     ]
     if option_quote.get('breakeven') is not None:
         markers.append(('損益兩平', float(option_quote['breakeven']), '#ffb300'))
-    # Labels at nearby strikes (especially current/target/stop on a spread)
-    # used to share one row and overlap on both desktop and phone widths.
-    # Assign horizontal-distance lanes so close labels move to separate rows.
-    marker_lanes = []
-    annotation_gap = max(span * 0.09, 120.0)
-    for label, value, color in sorted(markers, key=lambda item: item[1]):
-        lane = next(
-            (position for position, last_value in enumerate(marker_lanes)
-             if value - last_value >= annotation_gap),
-            len(marker_lanes),
-        )
-        if lane == len(marker_lanes):
-            marker_lanes.append(value)
-        else:
-            marker_lanes[lane] = value
+    # Nearby current/target/stop/breakeven prices can differ by less than one
+    # phone character width.  Give every marker a distinct vertical lane;
+    # visual overlap is worse than the extra top margin on a narrow screen.
+    sorted_markers = sorted(markers, key=lambda item: item[1])
+    for lane, (label, value, color) in enumerate(sorted_markers):
         fig.add_vline(x=value, line_color=color, line_dash='dot', line_width=1.4)
         fig.add_annotation(
             x=value, y=0.98, yref='paper',
             text=f"{label} {value:,.0f}",
             showarrow=True, arrowhead=0, arrowwidth=1.4, arrowcolor=color,
-            ax=0, ay=-(28 + lane * 27), xanchor='center', yanchor='bottom',
+            ax=0, ay=-(32 + lane * 40), xanchor='center', yanchor='bottom',
             bgcolor='rgba(16,21,29,.88)', bordercolor=color, borderwidth=1,
             borderpad=3, font=dict(size=12, color=color),
         )
     fig.update_layout(
-        template='plotly_dark', height=430,
-        margin=dict(l=45, r=24, t=118 + max(0, len(marker_lanes) - 2) * 18, b=62),
+        template='plotly_dark', height=470,
+        margin=dict(l=45, r=24, t=126 + max(0, len(sorted_markers) - 1) * 38, b=72),
         title=dict(text='到期損益曲線（每口／每組）', font=dict(size=17)),
         xaxis_title='到期結算指數', yaxis_title='損益（元）',
         legend=dict(orientation='h', y=-0.20, x=1, xanchor='right', font=dict(size=11)),
@@ -6014,7 +6043,6 @@ def render_fibonacci_trade_suggestion(suggestion):
 
     entry, stop, target = suggestion['entry'], suggestion['stop'], suggestion['target']
     risk, reward = suggestion['risk'], suggestion['reward']
-    cols = header_cols[1].columns(5)
     metric_unit = '元' if suggestion['asset_type'] == 'stock' else '點'
     metric_decimals = 2 if suggestion['asset_type'] != 'futures' else 0
 
@@ -6026,21 +6054,28 @@ def render_fibonacci_trade_suggestion(suggestion):
         '預估獲利': '#FF5252',
     }
 
-    def compact_metric(container, label, value):
-        metric_color = metric_colors.get(label, '#F5F5F5')
-        container.markdown(
-            f"<div style='white-space:nowrap;'>"
-            f"<div style='font-size:12px;font-weight:700;color:{metric_color};'>{label}</div>"
-            f"<div style='font-size:19px;font-weight:650;line-height:1.25;color:{metric_color};'>"
-            f"{value}</div></div>",
-            unsafe_allow_html=True,
+    # Five Streamlit columns are too narrow on 21:9 phones.  Use the dedicated
+    # responsive grid so each label always stays with its numeric value.
+    with header_cols[1]:
+        render_compact_metric_card_grid(
+            [
+                {'label': '參考進場', 'value': price_text(entry), 'color': metric_colors['參考進場']},
+                {'label': '停損／出場', 'value': price_text(stop), 'color': metric_colors['停損／出場']},
+                {'label': '第一目標', 'value': price_text(target), 'color': metric_colors['第一目標']},
+                {
+                    'label': '預估風險',
+                    'value': f"{_format_fibo_number(risk, metric_decimals)} {metric_unit}",
+                    'color': metric_colors['預估風險'],
+                },
+                {
+                    'label': '預估獲利',
+                    'value': f"{_format_fibo_number(reward, metric_decimals)} {metric_unit}",
+                    'color': metric_colors['預估獲利'],
+                },
+            ],
+            columns=5,
+            class_name='compact-metric-grid fibo-suggestion-metric-grid',
         )
-
-    compact_metric(cols[0], '參考進場', price_text(entry))
-    compact_metric(cols[1], '停損／出場', price_text(stop))
-    compact_metric(cols[2], '第一目標', price_text(target))
-    compact_metric(cols[3], '預估風險', f"{_format_fibo_number(risk, metric_decimals)} {metric_unit}")
-    compact_metric(cols[4], '預估獲利', f"{_format_fibo_number(reward, metric_decimals)} {metric_unit}")
     st.caption(explanation)
     if suggestion['asset_type'] == 'futures':
         st.caption(
@@ -6579,7 +6614,8 @@ def plot_fibonacci_chart(
             row=target_row, col=target_col,
         )
 
-    y_min_view, y_max_view = fibonacci_initial_y_range(low_60, high_60)
+    # 額外留白讓最高／最低標記不會壓到圖表標題，手機上也能看清 K 棒。
+    y_min_view, y_max_view = fibonacci_initial_y_range(low_60, high_60, padding_ratio=0.10)
     if pd.isna(y_min_view) or pd.isna(y_max_view): y_min_view, y_max_view = None, None
 
     interval_display_map = {"1m": "1分K", "5m": "5分K", "15m": "15分K", "60m": "60分K", "1d": "日K", "1wk": "週K", "1mo": "月K"}
@@ -6660,7 +6696,7 @@ def plot_fibonacci_chart(
         
         # 標題改為各自獨立套用顏色
         title_html = (
-            f"<span style='color:{color_main};'>{disp_title}{ticker_suffix}</span> - {interval_name} {date_str} "
+            f"<span style='color:{color_main};'><b>{disp_title}{ticker_suffix}</b></span> · {interval_name} {date_str}<br>"
             f"開 <span style='color:{color_op};'>{_format_compact_number(op, 2)}</span> "
             f"高 <span style='color:{color_hi};'>{_format_compact_number(hi, 2)}</span> "
             f"低 <span style='color:{color_lo};'>{_format_compact_number(lo, 2)}</span> "
@@ -6673,11 +6709,15 @@ def plot_fibonacci_chart(
         title_html = f"{display_name}{ticker_suffix} - {interval_name}"
 
     layout_update = dict(
-        title=dict(text=title_html, font=dict(size=16)),
+        title=dict(text=title_html, font=dict(size=14), x=0.01, xanchor='left', y=0.98, yanchor='top'),
         template="plotly_dark",
         height=800 if show_vol else 700,
-        margin=dict(l=30, r=82, t=58, b=42),
+        margin=dict(l=42, r=62, t=84, b=76),
         showlegend=True,
+        legend=dict(
+            orientation='h', x=0.5, xanchor='center', y=-0.16, yanchor='top',
+            font=dict(size=10),
+        ),
     )
 
     if show_vol and 'Volume' in df_subset.columns:
@@ -6703,7 +6743,10 @@ def plot_fibonacci_chart(
             render_fibonacci_trade_suggestion(trade_suggestion)
 
     fig.update_layout(**layout_update)
-    st.plotly_chart(fig, width='stretch')
+    st.plotly_chart(
+        fig, width='stretch',
+        config={'displayModeBar': False, 'scrollZoom': False, 'responsive': True},
+    )
     
     fetch_time_str = datetime.now(pytz.timezone('Asia/Taipei')).strftime('%Y-%m-%d %H:%M:%S')
     
@@ -19358,22 +19401,31 @@ with tab_fibo:
                 </div>""", unsafe_allow_html=True
             )
             st.info(f"**即時判斷：** {trade_state['reason']}")
-            p1, p2, p3, p4 = st.columns(4)
             if live_snapshot:
-                p1.markdown(
-                    f"""<div style='line-height:1.25'>
-                    <div style='font-size:14px;font-weight:600;color:#dfe6e9'>最新微台（{live_snapshot['contract_code']}）</div>
-                    <div style='font-size:25px;font-weight:700;color:{live_snapshot['color']}'>{live_snapshot['price']:,.0f}</div>
-                    <div style='font-size:14px;font-weight:700;color:{live_snapshot['color']}'>{live_snapshot['arrow']} {abs(live_snapshot['change']):,.0f} ({_format_compact_number(live_snapshot['change_pct'], 2, signed=True)}%)</div>
-                    </div>""",
-                    unsafe_allow_html=True,
-                )
+                latest_card = {
+                    'label': f"最新微台（{live_snapshot['contract_code']}）",
+                    'value': f"{live_snapshot['price']:,.0f}",
+                    'detail': (
+                        f"{live_snapshot['arrow']} {abs(live_snapshot['change']):,.0f} "
+                        f"({_format_compact_number(live_snapshot['change_pct'], 2, signed=True)}%)"
+                    ),
+                    'color': live_snapshot['color'],
+                }
             else:
-                p1.metric("最新期貨（日 K）", f"{plan['latest']:,.0f}")
-            render_index_level_metric(p2, "費波支撐", _format_compact_number(plan['support'], 0))
-            render_index_level_metric(p3, "費波壓力", _format_compact_number(plan['resistance'], 0))
-            render_index_level_metric(
-                p4, "費波區寬", f"± {_format_compact_number(plan['zone_points'], 0)} 點"
+                latest_card = {
+                    'label': '最新期貨（日 K）',
+                    'value': f"{plan['latest']:,.0f}",
+                    'color': '#f5f5f5',
+                }
+            render_compact_metric_card_grid(
+                [
+                    latest_card,
+                    {'label': '費波支撐', 'value': _format_compact_number(plan['support'], 0), 'color': '#40c4ff'},
+                    {'label': '費波壓力', 'value': _format_compact_number(plan['resistance'], 0), 'color': '#ff5252'},
+                    {'label': '費波區寬', 'value': f"± {_format_compact_number(plan['zone_points'], 0)} 點", 'color': '#f5f5f5'},
+                ],
+                columns=4,
+                class_name='compact-metric-grid index-level-metric-grid',
             )
             if live_snapshot:
                 st.caption(
@@ -19419,30 +19471,29 @@ with tab_fibo:
                 futures_color = '#ff4b4b' if futures_change > 0 else ('#00c853' if futures_change < 0 else '#dfe6e9')
                 futures_arrow = '▲' if futures_change > 0 else ('▼' if futures_change < 0 else '◆')
                 st.markdown("##### ⚖️ 期現價差判讀")
-                b1, b2, b3 = st.columns(3)
-                b1.markdown(
-                    f"""<div style='line-height:1.25'>
-                    <div style='font-size:14px;font-weight:600;color:#dfe6e9'>{basis_reference}</div>
-                    <div style='font-size:24px;font-weight:700;color:{index_color}'>{index_price:,.0f}</div>
-                    <div style='font-size:14px;font-weight:700;color:{index_color}'>{index_arrow} {abs(index_change):,.0f} ({_format_compact_number(index_change_pct, 2, signed=True)}%)</div>
-                    </div>""",
-                    unsafe_allow_html=True,
-                )
-                b2.markdown(
-                    f"""<div style='line-height:1.25'>
-                    <div style='font-size:14px;font-weight:600;color:#dfe6e9'>期貨指數</div>
-                    <div style='font-size:24px;font-weight:700;color:{futures_color}'>{live_price:,.0f}</div>
-                    <div style='font-size:14px;font-weight:700;color:{futures_color}'>{futures_arrow} {abs(futures_change):,.0f} ({_format_compact_number(futures_change_pct, 2, signed=True)}%)</div>
-                    </div>""",
-                    unsafe_allow_html=True,
-                )
-                b3.markdown(
-                    f"""<div style='line-height:1.25'>
-                    <div style='font-size:14px;font-weight:600;color:#dfe6e9'>期貨－加權價差</div>
-                    <div style='font-size:24px;font-weight:700;color:{basis_color}'>{basis:+,.0f} 點</div>
-                    <div style='font-size:14px;font-weight:700;color:{basis_color}'>{basis_label}</div>
-                    </div>""",
-                    unsafe_allow_html=True,
+                render_compact_metric_card_grid(
+                    [
+                        {
+                            'label': basis_reference,
+                            'value': f"{index_price:,.0f}",
+                            'detail': f"{index_arrow} {abs(index_change):,.0f} ({_format_compact_number(index_change_pct, 2, signed=True)}%)",
+                            'color': index_color,
+                        },
+                        {
+                            'label': '期貨指數',
+                            'value': f"{live_price:,.0f}",
+                            'detail': f"{futures_arrow} {abs(futures_change):,.0f} ({_format_compact_number(futures_change_pct, 2, signed=True)}%)",
+                            'color': futures_color,
+                        },
+                        {
+                            'label': '期貨－加權價差',
+                            'value': f"{basis:+,.0f} 點",
+                            'detail': basis_label,
+                            'color': basis_color,
+                        },
+                    ],
+                    columns=3,
+                    class_name='compact-metric-grid index-basis-metric-grid',
                 )
                 st.caption(
                     f"計算：期貨 {live_price:,.0f} − {basis_reference} {index_price:,.0f} = {basis:+,.0f} 點。"

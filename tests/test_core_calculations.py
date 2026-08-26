@@ -1086,6 +1086,25 @@ def test_mobile_layout_prevents_metrics_and_table_cells_from_overlapping():
     assert "flex:1 1 100% !important" in source
     assert "text-overflow:ellipsis" in source
     assert "overflow-wrap:anywhere" in source
+    assert "def render_compact_metric_card_grid" in source
+    assert "compact-metric-grid index-level-metric-grid" in source
+    assert "compact-metric-grid fibo-suggestion-metric-grid" in source
+
+
+def test_phone_charts_hide_modebar_and_keep_nearby_markers_in_separate_lanes():
+    source = APP_PATH.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    functions = {
+        node.name: ast.get_source_segment(source, node)
+        for node in tree.body if isinstance(node, ast.FunctionDef)
+    }
+    payoff_source = functions["build_txo_payoff_chart"]
+    fibo_source = functions["plot_fibonacci_chart"]
+    assert "for lane, (label, value, color) in enumerate(sorted_markers):" in payoff_source
+    assert "lane * 40" in payoff_source
+    assert "padding_ratio=0.10" in fibo_source
+    assert "displayModeBar': False" in fibo_source
+    assert "orientation='h'" in fibo_source
 
 
 def test_futures_settlement_cutover_uses_taipei_1330_and_official_date_first():
