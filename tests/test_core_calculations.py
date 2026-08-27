@@ -23,6 +23,7 @@ from bs4 import BeautifulSoup
 
 
 APP_PATH = Path(__file__).parents[1] / "app.py"
+APPS_SCRIPT_PATH = Path(__file__).parents[1] / "google_apps_script.gs"
 
 
 def load_app_symbols(*names):
@@ -520,6 +521,44 @@ def test_official_turnover_ranking_rejects_missing_same_date_rows():
         assert "TPEx" in str(exc)
     else:
         raise AssertionError("missing TPEx date must not produce an empty ranking")
+
+
+def test_tpex_ssl_compatibility_keeps_verification_and_is_host_scoped():
+    source = APP_PATH.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    definitions = {
+        node.name: ast.get_source_segment(source, node)
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.ClassDef))
+    }
+    adapter_source = definitions["_TpexRelaxedStrictSSLAdapter"]
+    session_source = definitions["_tpex_verified_session"]
+    fetch_source = definitions["fetch_official_turnover_ranking"]
+    assert 'context.load_verify_locations(certifi.where())' in adapter_source
+    assert 'context.verify_flags &= ~strict_flag' in adapter_source
+    assert 'context.check_hostname = False' not in adapter_source
+    assert 'verify=False' not in adapter_source
+    assert 'session.mount(_TPEX_ORIGIN, _TpexRelaxedStrictSSLAdapter())' in session_source
+    assert 'with _tpex_verified_session() as session' in fetch_source
+
+
+def test_official_turnover_auto_analysis_cannot_fall_back_to_stale_url():
+    source = APP_PATH.read_text(encoding="utf-8")
+    assert "st.session_state['_stock_analysis_source_once'] = 'official'" in source
+    assert "forced_analysis_source = st.session_state.pop(" in source
+    forced_branch = source.index("if forced_analysis_source == 'official':")
+    upload_branch = source.index("elif uploaded_file:", forced_branch)
+    cloud_branch = source.index("elif st.session_state.cloud_url_input:", upload_branch)
+    assert forced_branch < upload_branch < cloud_branch
+    assert "本次官方週轉率排行不存在，已停止分析以避免載入舊資料" in source
+
+
+def test_apps_script_rejects_only_older_stock_strategy_snapshots():
+    source = APPS_SCRIPT_PATH.read_text(encoding="utf-8")
+    assert "existingRow && scope === 'stock_strategy'" in source
+    assert "incomingTime < existingTime" in source
+    assert "incomingTime <= existingTime" not in source
+    assert "incomingUpdatedAt" in source
 
 
 def test_post_21_strategy_ranking_uses_visible_rows_and_selected_mode():

@@ -146,11 +146,36 @@ function saveScopeData_(scope, data, updatedAt) {
     throw new Error(scope + ' 資料超過單格安全上限：' + serialized.length);
   }
   const rows = getScopeRowMap_(sheet);
-  const row = rows[scope] || Math.max(sheet.getLastRow() + 1, 2);
+  const existingRow = rows[scope] || 0;
+  const row = existingRow || Math.max(sheet.getLastRow() + 1, 2);
+  const incomingUpdatedAt = String(updatedAt || new Date().toISOString());
+
+  // A phone or desktop tab left open in the background can submit an older
+  // stock snapshot after a newer official analysis has already been saved.
+  // Reject only genuinely older, parseable stock timestamps; equal timestamps
+  // remain writable so notes in the same snapshot can still be updated.
+  if (existingRow && scope === 'stock_strategy') {
+    const existingUpdatedAt = String(
+      sheet.getRange(existingRow, 3).getDisplayValue() || ''
+    ).trim();
+    const existingTime = Date.parse(existingUpdatedAt);
+    const incomingTime = Date.parse(incomingUpdatedAt);
+    if (
+      !isNaN(existingTime) &&
+      !isNaN(incomingTime) &&
+      incomingTime < existingTime
+    ) {
+      throw new Error(
+        '拒絕較舊的 stock_strategy 覆蓋較新的資料：' +
+        incomingUpdatedAt + ' < ' + existingUpdatedAt
+      );
+    }
+  }
+
   sheet.getRange(row, 1, 1, 3).setNumberFormat('@').setValues([[
     scope,
     serialized,
-    String(updatedAt || new Date().toISOString()),
+    incomingUpdatedAt,
   ]]);
   return row;
 }

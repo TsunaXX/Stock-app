@@ -2,6 +2,10 @@ import streamlit as st
 import pandas as pd
 import yfinance as yf
 import requests
+import certifi
+import ssl
+from requests.adapters import HTTPAdapter
+from urllib3.util.ssl_ import create_urllib3_context
 from bs4 import BeautifulSoup
 from lxml.etree import XMLSyntaxError
 import math
@@ -7054,7 +7058,42 @@ _OFFICIAL_TURNOVER_CACHE_FILE = "official_turnover_ranking.json"
 _TWSE_DAILY_QUOTES_URL = "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX"
 _TWSE_LISTED_COMPANIES_URL = "https://openapi.twse.com.tw/v1/opendata/t187ap03_L"
 _TWSE_LISTED_FUNDS_URL = "https://openapi.twse.com.tw/v1/opendata/t187ap47_L"
+_TPEX_ORIGIN = "https://www.tpex.org.tw/"
 _TPEX_DAILY_QUOTES_URL = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"
+
+
+class _TpexRelaxedStrictSSLAdapter(HTTPAdapter):
+    """Keep CA/hostname checks while tolerating TPEx's incomplete key identifier.
+
+    Newer OpenSSL versions enable stricter X.509 checks and reject the current
+    TPEx certificate chain because an intermediate certificate lacks a Subject
+    Key Identifier.  Only the STRICT flag is cleared for this host; certificate
+    authority and hostname verification remain enabled.
+    """
+
+    @staticmethod
+    def _verified_context():
+        context = create_urllib3_context()
+        context.load_verify_locations(certifi.where())
+        strict_flag = getattr(ssl, "VERIFY_X509_STRICT", 0)
+        if strict_flag:
+            context.verify_flags &= ~strict_flag
+        return context
+
+    def init_poolmanager(self, *args, **kwargs):
+        kwargs["ssl_context"] = self._verified_context()
+        return super().init_poolmanager(*args, **kwargs)
+
+    def proxy_manager_for(self, proxy, **proxy_kwargs):
+        proxy_kwargs["ssl_context"] = self._verified_context()
+        return super().proxy_manager_for(proxy, **proxy_kwargs)
+
+
+def _tpex_verified_session():
+    """Return a session whose relaxed strictness applies only to TPEx."""
+    session = requests.Session()
+    session.mount(_TPEX_ORIGIN, _TpexRelaxedStrictSSLAdapter())
+    return session
 
 
 def _parse_roc_trade_date(value):
@@ -7185,9 +7224,15 @@ def fetch_official_turnover_ranking(refresh_bucket=None, now_value=None):
     }
 
     def get_json(url, params=None):
-        response = requests.get(
-            url, params=params, headers=headers, timeout=(3, 8),
-        )
+        if str(url).startswith(_TPEX_ORIGIN):
+            with _tpex_verified_session() as session:
+                response = session.get(
+                    url, params=params, headers=headers, timeout=(3, 8),
+                )
+        else:
+            response = requests.get(
+                url, params=params, headers=headers, timeout=(3, 8),
+            )
         response.raise_for_status()
         return response.json()
 
@@ -11476,6 +11521,7 @@ def render_stock_external_resources():
                 st.session_state['turnover_ranking_date'] = source_date.isoformat()
                 st.session_state['turnover_fetch_failed'] = False
                 st.session_state['_run_stock_analysis_after_official_fetch'] = True
+                st.session_state['_stock_analysis_source_once'] = 'official'
                 _save_official_turnover_cache(result, source_date)
                 st.success(
                     f"官方排行已完成：{source_date:%Y/%m/%d}、共 {len(result)} 筆；"
@@ -16836,6 +16882,9 @@ if tab1.open and stock_strategy_tab.open:
         auto_run_requested = bool(
             st.session_state.pop('_run_stock_analysis_after_official_fetch', False)
         )
+        forced_analysis_source = st.session_state.pop(
+            '_stock_analysis_source_once', ''
+        )
         with c_run:
             btn_run_clicked = st.button(
                 "🚀 執行分析", width='stretch', disabled=not analysis_source_ready,
@@ -16855,7 +16904,17 @@ if tab1.open and stock_strategy_tab.open:
                     save_url_history(st.session_state.url_history)
 
             try:
-                if uploaded_file:
+                if forced_analysis_source == 'official':
+                    official_frame = st.session_state.get('turnover_ranking_df')
+                    if not isinstance(official_frame, pd.DataFrame) or official_frame.empty:
+                        raise ValueError("本次官方週轉率排行不存在，已停止分析以避免載入舊資料")
+                    df_up = official_frame.copy()
+                    st.toast(
+                        "已載入本次最新 TWSE／TPEx 官方週轉率排行並開始分析！",
+                        icon="🔄",
+                    )
+
+                elif uploaded_file:
                     uploaded_file.seek(0)
                     fname = uploaded_file.name.lower()
                     if fname.endswith('.csv'):
