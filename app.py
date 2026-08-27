@@ -14198,22 +14198,22 @@ def _ranking_fundamental_component(stock_context, is_daytrade=False):
     debt_signal = _ranking_clamp((60 - debt_ratio) / 40) if debt_ratio is not None else None
 
     revenue_label = (
-        f'營收YoY {revenue_yoy:+g}%' if revenue_yoy is not None else
-        f'累計營收 {cumulative_yoy:+g}%' if cumulative_yoy is not None else
-        f'營收MoM {revenue_mom:+g}%' if revenue_mom is not None else ''
+        f'營收YoY {round(revenue_yoy, 1):+g}%' if revenue_yoy is not None else
+        f'累計營收 {round(cumulative_yoy, 1):+g}%' if cumulative_yoy is not None else
+        f'營收MoM {round(revenue_mom, 1):+g}%' if revenue_mom is not None else ''
     )
-    eps_label = f'EPS {eps:g}' if eps is not None else (
-        f'EPS成長 {eps_growth:+g}%' if eps_growth is not None else ''
+    eps_label = f'EPS {round(eps, 2):g}' if eps is not None else (
+        f'EPS成長 {round(eps_growth, 1):+g}%' if eps_growth is not None else ''
     )
     profit_label = (
-        f'營益率 {operating_margin:g}%' if operating_margin is not None else
-        f'毛利率 {gross_margin:g}%' if gross_margin is not None else
-        f'ROE {roe:g}%' if roe is not None else ''
+        f'營益率 {round(operating_margin, 1):g}%' if operating_margin is not None else
+        f'毛利率 {round(gross_margin, 1):g}%' if gross_margin is not None else
+        f'ROE {round(roe, 1):g}%' if roe is not None else ''
     )
     valuation_label = (
-        (f'本益比 {pe:g}' if pe > 0 else '獲利為負') if pe is not None else
-        f'股淨比 {pb:g}' if pb is not None else
-        f'殖利率 {dividend_yield:g}%' if dividend_yield is not None else ''
+        (f'本益比 {round(pe, 1):g}' if pe > 0 else '獲利為負') if pe is not None else
+        f'股淨比 {round(pb, 1):g}' if pb is not None else
+        f'殖利率 {round(dividend_yield, 1):g}%' if dividend_yield is not None else ''
     )
     weights = (
         {'revenue': 3, 'eps': 3, 'profit': 2, 'valuation': 2, 'debt': 0}
@@ -14225,7 +14225,7 @@ def _ranking_fundamental_component(stock_context, is_daytrade=False):
         (eps_signal, weights['eps'], eps_label),
         (profit_signal, weights['profit'], profit_label),
         (valuation_signal, weights['valuation'], valuation_label),
-        (debt_signal, weights['debt'], f'負債比 {debt_ratio:g}%' if debt_ratio is not None else ''),
+        (debt_signal, weights['debt'], f'負債比 {round(debt_ratio, 1):g}%' if debt_ratio is not None else ''),
     ], label_limit=3)
 
 
@@ -14320,7 +14320,7 @@ def _stock_ranking_technical_component(row, is_daytrade):
             vwap_signal = _ranking_clamp(vwap_signal * min(max(volume_ratio, 0.55), 1.35))
         vwap_label = ('站上' if close >= vwap else '跌破') + 'VWAP'
         if volume_ratio is not None:
-            vwap_label += f'／量比{volume_ratio:g}'
+            vwap_label += f'／量比{round(volume_ratio, 2):g}'
     elif is_daytrade:
         vwap_text = str(row.get('VWAP 狀態', ''))
         if '偏多' in vwap_text:
@@ -14339,15 +14339,15 @@ def _stock_ranking_technical_component(row, is_daytrade):
             (vwap_signal, 20, vwap_label),
             (_ranking_average([ma5_signal, position_signal]), 15, '站上5日線' if ma5_signal is not None and ma5_signal >= 0 else '跌破5日線' if ma5_signal is not None else ''),
             (change_signal, 10, f'漲跌 {change:+g}%' if change is not None else ''),
-            (atr_signal, 5, f'ATR {atr_percent:g}%' if atr_percent is not None else ''),
+            (atr_signal, 5, f'ATR {round(atr_percent, 1):g}%' if atr_percent is not None else ''),
             (structure_signal, 5, structure_label),
         ]
     else:
         items = [
             (ma_signal, 12, '均線偏多' if ma_signal is not None and ma_signal >= 0 else '均線偏空' if ma_signal is not None else ''),
             (structure_signal, 10, structure_label),
-            (position_signal, 7, f'收盤位置 {close_position:g}%' if close_position is not None else ''),
-            (atr_signal, 5, f'ATR {atr_percent:g}%' if atr_percent is not None else ''),
+            (position_signal, 7, f'收盤位置 {round(close_position, 1):g}%' if close_position is not None else ''),
+            (atr_signal, 5, f'ATR {round(atr_percent, 1):g}%' if atr_percent is not None else ''),
             (None, 2, ''),  # CDP 未在主表保存時不計分，權重自動重配。
             (change_signal, 4, f'動能 {change:+g}%' if change is not None else ''),
         ]
@@ -14402,14 +14402,14 @@ def _futures_ranking_technical_component(row, is_daytrade):
             (cdp_signal, 8, cdp_text),
             (structure_signal, 7, structure_text),
             (_ranking_average([open_signal, change_signal]), 5, '站上開盤' if open_signal is not None and open_signal >= 0 else '跌破開盤' if open_signal is not None else ''),
-            (atr_signal, 5, f'ATR {atr_percent:g}%' if atr_percent is not None else ''),
+            (atr_signal, 5, f'ATR {round(atr_percent, 1):g}%' if atr_percent is not None else ''),
         ]
     else:
         items = [
             (open_signal, 10, '中期價格偏多' if open_signal is not None and open_signal >= 0 else '中期價格偏空' if open_signal is not None else ''),
             (structure_signal, 10, structure_text),
             (price_oi_signal, 7, f'價格×OI {oi_change:+g}' if price_oi_signal is not None else ''),
-            (atr_signal, 4, f'ATR {atr_percent:g}%' if atr_percent is not None else ''),
+            (atr_signal, 4, f'ATR {round(atr_percent, 1):g}%' if atr_percent is not None else ''),
             (cdp_signal, 1, cdp_text),
             (change_signal, 3, f'動能 {change:+g}%' if change is not None else ''),
         ]
