@@ -534,12 +534,14 @@ def test_tpex_ssl_compatibility_keeps_verification_and_is_host_scoped():
     adapter_source = definitions["_TpexRelaxedStrictSSLAdapter"]
     session_source = definitions["_tpex_verified_session"]
     fetch_source = definitions["fetch_official_turnover_ranking"]
+    ranking_fetch_source = definitions["fetch_post_close_stock_ranking_context"]
     assert 'context.load_verify_locations(certifi.where())' in adapter_source
     assert 'context.verify_flags &= ~strict_flag' in adapter_source
     assert 'context.check_hostname = False' not in adapter_source
     assert 'verify=False' not in adapter_source
     assert 'session.mount(_TPEX_ORIGIN, _TpexRelaxedStrictSSLAdapter())' in session_source
     assert 'with _tpex_verified_session() as session' in fetch_source
+    assert 'with _tpex_verified_session() as session' in ranking_fetch_source
 
 
 def test_official_turnover_auto_analysis_cannot_fall_back_to_stale_url():
@@ -564,10 +566,11 @@ def test_apps_script_rejects_only_older_stock_strategy_snapshots():
 def test_post_21_strategy_ranking_uses_visible_rows_and_selected_mode():
     symbols = load_app_symbols(
         "get_holidays", "is_market_closed_func", "_as_float", "_ranking_number",
-        "_ranking_clamp", "_post_close_target_date", "_ranking_fundamental_component",
+        "_ranking_clamp", "_ranking_component_from_items", "_ranking_average",
+        "_post_close_target_date", "_ranking_fundamental_component",
         "_ranking_chip_component", "_stock_ranking_technical_component",
         "_futures_ranking_technical_component", "_futures_contract_chip_component",
-        "_combine_ranking_components", "_score_stock_post_close",
+        "_combine_ranking_components", "strategy_ranking_weights", "_score_stock_post_close",
         "_score_futures_post_close", "build_strategy_ranking_entries",
     )
     rows = pd.DataFrame([
@@ -635,6 +638,41 @@ def test_ranking_reason_uses_consistent_category_and_direction_colors():
     assert "#94a3b8" in unavailable
 
 
+def test_strategy_ranking_weights_match_stock_and_futures_modes():
+    weights = load_app_symbols("strategy_ranking_weights")["strategy_ranking_weights"]
+    assert weights("stock", "當沖") == {
+        "technical": 0.55, "chips": 0.35, "fundamental": 0.10,
+    }
+    assert weights("stock", "隔日／波段") == {
+        "technical": 0.40, "chips": 0.30, "fundamental": 0.30,
+    }
+    assert weights("futures", "當沖") == {
+        "technical": 0.50, "chips": 0.45, "fundamental": 0.05,
+    }
+    assert weights("futures", "隔日／波段") == {
+        "technical": 0.35, "chips": 0.50, "fundamental": 0.15,
+    }
+
+
+def test_fundamental_ranking_uses_revenue_eps_and_reweights_missing_groups():
+    symbols = load_app_symbols(
+        "_as_float", "_ranking_number", "_ranking_clamp",
+        "_ranking_component_from_items", "_ranking_average",
+        "_ranking_fundamental_component",
+    )
+    complete = symbols["_ranking_fundamental_component"]({
+        "revenue_yoy": 25, "revenue_mom": 8, "revenue_cumulative_yoy": 18,
+        "eps": 5, "operating_margin": 20, "pe": 15, "pb": 2, "yield": 3,
+    }, False)
+    valuation_only = symbols["_ranking_fundamental_component"]({
+        "pe": 15, "pb": 2, "yield": 3,
+    }, False)
+    assert complete is not None and valuation_only is not None
+    assert "營收YoY" in complete["text"] and "EPS" in complete["text"]
+    assert valuation_only["coverage"] < complete["coverage"]
+    assert valuation_only["quality"] > 0
+
+
 def test_ranking_explanation_identity_includes_code_and_direction_color():
     formatter = load_app_symbols("format_ranking_entry_identity")[
         "format_ranking_entry_identity"
@@ -652,10 +690,11 @@ def test_ranking_explanation_identity_includes_code_and_direction_color():
 def test_futures_post_close_ranking_uses_taifex_position_direction():
     symbols = load_app_symbols(
         "get_holidays", "is_market_closed_func", "_as_float", "_ranking_number",
-        "_ranking_clamp", "_post_close_target_date", "_ranking_fundamental_component",
+        "_ranking_clamp", "_ranking_component_from_items", "_ranking_average",
+        "_post_close_target_date", "_ranking_fundamental_component",
         "_ranking_chip_component", "_stock_ranking_technical_component",
         "_futures_ranking_technical_component", "_futures_contract_chip_component",
-        "_combine_ranking_components", "_score_stock_post_close",
+        "_combine_ranking_components", "strategy_ranking_weights", "_score_stock_post_close",
         "_score_futures_post_close", "build_strategy_ranking_entries",
     )
     rows = pd.DataFrame([
@@ -676,7 +715,7 @@ def test_futures_post_close_ranking_uses_taifex_position_direction():
         market_context=context, asset_type="futures",
     )
     assert {item["code"]: item["direction"] for item in entries} == {"TX": "多", "MTX": "空"}
-    assert all("量倉／籌碼偏" in item["reason"] for item in entries)
+    assert all("籌碼偏" in item["reason"] for item in entries)
 
 
 def test_limit_note_uses_the_candles_own_previous_close():

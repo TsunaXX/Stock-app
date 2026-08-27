@@ -13888,11 +13888,21 @@ def fetch_post_close_stock_ranking_context(target_date_text):
             'https://openapi.taifex.com.tw/v1/'
             'MarketDataOfMajorInstitutionalTradersDetailsOfFuturesContractsBytheDate', None,
         ),
+        'twse_revenue': (TWSE_MONTHLY_REVENUE_URL, None),
+        'tpex_revenue': (TPEX_MONTHLY_REVENUE_URL, None),
+        'twse_eps': ('https://openapi.twse.com.tw/v1/opendata/t187ap14_L', None),
+        'tpex_eps': ('https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap14_O', None),
     }
 
     def fetch_one(item):
         name, (url, params) = item
-        response = requests.get(url, params=params, headers=headers, timeout=(4, 10))
+        if url.startswith(_TPEX_ORIGIN):
+            with _tpex_verified_session() as session:
+                response = session.get(
+                    url, params=params, headers=headers, timeout=(4, 10),
+                )
+        else:
+            response = requests.get(url, params=params, headers=headers, timeout=(4, 10))
         response.raise_for_status()
         payload = response.json()
         if not isinstance(payload, (dict, list)):
@@ -13901,7 +13911,7 @@ def fetch_post_close_stock_ranking_context(target_date_text):
 
     payloads = {}
     errors = []
-    with ThreadPoolExecutor(max_workers=len(jobs)) as executor:
+    with ThreadPoolExecutor(max_workers=min(8, len(jobs))) as executor:
         future_map = {executor.submit(fetch_one, item): item[0] for item in jobs.items()}
         for future in as_completed(future_map):
             name = future_map[future]
@@ -13929,14 +13939,29 @@ def fetch_post_close_stock_ranking_context(target_date_text):
             return False
         return True
 
+    def field_index(fields, *candidates):
+        return next((fields.index(name) for name in candidates if name in fields), -1)
+
     twse_inst = payloads.get('twse_institutional')
     if isinstance(twse_inst, dict) and require_target_date('上市法人', twse_inst.get('date')):
         fields = list(twse_inst.get('fields', []))
-        net_index = fields.index('三大法人買賣超股數') if '三大法人買賣超股數' in fields else -1
+        net_index = field_index(fields, '三大法人買賣超股數')
+        foreign_index = field_index(
+            fields, '外陸資買賣超股數(不含外資自營商)',
+            '外資及陸資買賣超股數(不含外資自營商)',
+        )
+        trust_index = field_index(fields, '投信買賣超股數')
+        dealer_index = field_index(fields, '自營商買賣超股數')
         for values in twse_inst.get('data', []):
             record = stock_record(values[0] if values else '')
-            if record is not None and net_index >= 0 and len(values) > net_index:
-                record['institutional_net'] = _ranking_number(values[net_index])
+            if record is None:
+                continue
+            for key, index in (
+                ('institutional_net', net_index), ('foreign_net', foreign_index),
+                ('trust_net', trust_index), ('dealer_net', dealer_index),
+            ):
+                if index >= 0 and len(values) > index:
+                    record[key] = _ranking_number(values[index])
 
     twse_margin = payloads.get('twse_margin')
     if isinstance(twse_margin, dict) and require_target_date('上市融資券', twse_margin.get('date')):
@@ -13965,6 +13990,14 @@ def fetch_post_close_stock_ranking_context(target_date_text):
         record = stock_record(item.get('SecuritiesCompanyCode'))
         if record is not None:
             record['institutional_net'] = _ranking_number(item.get('TotalDifference'))
+            record['foreign_net'] = _ranking_number(
+                item.get('ForeignInvestorsInclude MainlandAreaInvestors-Difference')
+                or item.get('Foreign Investors include Mainland Area Investors (Foreign Dealers excluded)-Difference')
+            )
+            record['trust_net'] = _ranking_number(
+                item.get('SecuritiesInvestmentTrustCompanies-Difference')
+            )
+            record['dealer_net'] = _ranking_number(item.get('Dealers-Difference'))
 
     for item in payloads.get('tpex_margin', []):
         record = stock_record(item.get('SecuritiesCompanyCode'))
@@ -13999,6 +14032,35 @@ def fetch_post_close_stock_ranking_context(target_date_text):
             item.get('SecuritiesCompanyCode'), item.get('PriceEarningRatio'),
             item.get('PriceBookRatio'), item.get('YieldRatio'),
         )
+
+    for source_key in ('twse_revenue', 'tpex_revenue'):
+        for item in payloads.get(source_key, []):
+            record = stock_record(item.get('公司代號'))
+            if record is None:
+                continue
+            record['revenue_mom'] = _ranking_number(item.get('營業收入-上月比較增減(%)'))
+            record['revenue_yoy'] = _ranking_number(item.get('營業收入-去年同月增減(%)'))
+            record['revenue_cumulative_yoy'] = _ranking_number(
+                item.get('累計營業收入-前期比較增減(%)')
+            )
+            record['revenue_period'] = str(item.get('資料年月', '')).strip()
+
+    for source_key in ('twse_eps', 'tpex_eps'):
+        for item in payloads.get(source_key, []):
+            record = stock_record(
+                item.get('公司代號') or item.get('SecuritiesCompanyCode')
+            )
+            if record is None:
+                continue
+            eps = _ranking_number(item.get('基本每股盈餘(元)') or item.get('基本每股盈餘'))
+            revenue = _ranking_number(item.get('營業收入'))
+            operating_income = _ranking_number(item.get('營業利益'))
+            record['eps'] = eps
+            if revenue not in (None, 0) and operating_income is not None:
+                record['operating_margin'] = operating_income / abs(revenue) * 100
+            record['eps_period'] = (
+                f"{item.get('年度') or item.get('Year', '')}Q{item.get('季別', '')}"
+            )
 
     futures_products = {}
     taifex_institutional = payloads.get('taifex_institutional')
@@ -14039,6 +14101,9 @@ def fetch_post_close_stock_ranking_context(target_date_text):
         'futures_products': futures_products,
         'scales': {
             'institutional': robust_scale('institutional_net', 100000),
+            'foreign': robust_scale('foreign_net', 100000),
+            'trust': robust_scale('trust_net', 30000),
+            'dealer': robust_scale('dealer_net', 30000),
             'margin': robust_scale('margin_delta', 100),
             'short': robust_scale('short_delta', 20),
         },
@@ -14066,71 +14131,153 @@ def resolve_post_close_ranking_context(now_value=None):
     return fallback
 
 
-def _ranking_fundamental_component(stock_context):
-    pe = _ranking_number(stock_context.get('pe'))
-    pb = _ranking_number(stock_context.get('pb'))
-    dividend_yield = _ranking_number(stock_context.get('yield'))
-    signals = []
-    labels = []
-    if pe is not None:
-        if pe <= 0:
-            signals.append(-0.75)
-            labels.append('獲利為負')
-        elif pe <= 15:
-            signals.append(0.80)
-            labels.append(f'本益比 {pe:g}')
-        elif pe <= 25:
-            signals.append(0.40)
-            labels.append(f'本益比 {pe:g}')
-        elif pe <= 45:
-            signals.append(-0.10)
-            labels.append(f'本益比 {pe:g}')
-        else:
-            signals.append(-0.65)
-            labels.append(f'本益比偏高 {pe:g}')
-    if pb is not None:
-        signals.append(0.45 if pb <= 1.5 else (0.15 if pb <= 3 else (-0.25 if pb <= 6 else -0.60)))
-        labels.append(f'股淨比 {pb:g}')
-    if dividend_yield is not None:
-        signals.append(0.45 if dividend_yield >= 4 else (0.20 if dividend_yield >= 2 else -0.15))
-        labels.append(f'殖利率 {dividend_yield:g}%')
-    if not signals:
+def _ranking_component_from_items(items, bonus=0, label_limit=3):
+    """Combine available sub-indicators and redistribute missing sub-weights."""
+    total_weight = sum(max(float(weight), 0) for _, weight, _ in items)
+    available = [
+        (float(signal), float(weight), str(label))
+        for signal, weight, label in items
+        if signal is not None and float(weight) > 0
+    ]
+    if not available:
         return None
-    signal = sum(signals) / len(signals)
+    available_weight = sum(weight for _, weight, _ in available)
+    signal = sum(value * weight for value, weight, _ in available) / available_weight
     return {
-        'signal': signal,
-        'quality': _ranking_clamp(45 + abs(signal) * 50, 0, 100),
-        'text': '、'.join(labels[:2]),
+        'signal': _ranking_clamp(signal),
+        'quality': _ranking_clamp(40 + abs(signal) * 50 + bonus, 0, 100),
+        'coverage': available_weight / max(total_weight, 0.01),
+        'text': '、'.join(
+            [label for _, _, label in available if label][:max(int(label_limit), 1)]
+        )[:220],
     }
 
 
-def _ranking_chip_component(stock_context, scales):
-    institutional = _ranking_number(stock_context.get('institutional_net'))
+def _ranking_average(values):
+    available = [float(value) for value in values if value is not None]
+    return sum(available) / len(available) if available else None
+
+
+def _ranking_fundamental_component(stock_context, is_daytrade=False):
+    """Latest valid revenue/EPS/profitability/valuation; missing groups reweight."""
+    pe = _ranking_number(stock_context.get('pe'))
+    pb = _ranking_number(stock_context.get('pb'))
+    dividend_yield = _ranking_number(stock_context.get('yield'))
+    revenue_yoy = _ranking_number(stock_context.get('revenue_yoy'))
+    revenue_mom = _ranking_number(stock_context.get('revenue_mom'))
+    cumulative_yoy = _ranking_number(stock_context.get('revenue_cumulative_yoy'))
+    eps = _ranking_number(stock_context.get('eps'))
+    eps_growth = _ranking_number(stock_context.get('eps_growth'))
+    gross_margin = _ranking_number(stock_context.get('gross_margin'))
+    operating_margin = _ranking_number(stock_context.get('operating_margin'))
+    roe = _ranking_number(stock_context.get('roe'))
+    debt_ratio = _ranking_number(stock_context.get('debt_ratio'))
+
+    revenue_signal = _ranking_average([
+        _ranking_clamp(revenue_yoy / 30) if revenue_yoy is not None else None,
+        _ranking_clamp(revenue_mom / 20) if revenue_mom is not None else None,
+        _ranking_clamp(cumulative_yoy / 25) if cumulative_yoy is not None else None,
+    ])
+    eps_signal = _ranking_average([
+        _ranking_clamp(eps / 5) if eps is not None else None,
+        _ranking_clamp(eps_growth / 35) if eps_growth is not None else None,
+    ])
+    profit_signal = _ranking_average([
+        _ranking_clamp((gross_margin - 15) / 25) if gross_margin is not None else None,
+        _ranking_clamp(operating_margin / 20) if operating_margin is not None else None,
+        _ranking_clamp(roe / 20) if roe is not None else None,
+    ])
+    valuation_signal = _ranking_average([
+        (-0.75 if pe <= 0 else 0.8 if pe <= 15 else 0.4 if pe <= 25 else -0.1 if pe <= 45 else -0.65)
+        if pe is not None else None,
+        (0.45 if pb <= 1.5 else 0.15 if pb <= 3 else -0.25 if pb <= 6 else -0.6)
+        if pb is not None else None,
+        (0.45 if dividend_yield >= 4 else 0.2 if dividend_yield >= 2 else -0.15)
+        if dividend_yield is not None else None,
+    ])
+    debt_signal = _ranking_clamp((60 - debt_ratio) / 40) if debt_ratio is not None else None
+
+    revenue_label = (
+        f'營收YoY {revenue_yoy:+g}%' if revenue_yoy is not None else
+        f'累計營收 {cumulative_yoy:+g}%' if cumulative_yoy is not None else
+        f'營收MoM {revenue_mom:+g}%' if revenue_mom is not None else ''
+    )
+    eps_label = f'EPS {eps:g}' if eps is not None else (
+        f'EPS成長 {eps_growth:+g}%' if eps_growth is not None else ''
+    )
+    profit_label = (
+        f'營益率 {operating_margin:g}%' if operating_margin is not None else
+        f'毛利率 {gross_margin:g}%' if gross_margin is not None else
+        f'ROE {roe:g}%' if roe is not None else ''
+    )
+    valuation_label = (
+        (f'本益比 {pe:g}' if pe > 0 else '獲利為負') if pe is not None else
+        f'股淨比 {pb:g}' if pb is not None else
+        f'殖利率 {dividend_yield:g}%' if dividend_yield is not None else ''
+    )
+    weights = (
+        {'revenue': 3, 'eps': 3, 'profit': 2, 'valuation': 2, 'debt': 0}
+        if is_daytrade else
+        {'revenue': 8, 'eps': 8, 'profit': 7, 'valuation': 4, 'debt': 3}
+    )
+    return _ranking_component_from_items([
+        (revenue_signal, weights['revenue'], revenue_label),
+        (eps_signal, weights['eps'], eps_label),
+        (profit_signal, weights['profit'], profit_label),
+        (valuation_signal, weights['valuation'], valuation_label),
+        (debt_signal, weights['debt'], f'負債比 {debt_ratio:g}%' if debt_ratio is not None else ''),
+    ], label_limit=3)
+
+
+def _ranking_chip_component(stock_context, scales, is_daytrade=True):
+    """Separate foreign/trust/dealer flows; use total only as a compatibility fallback."""
+    weights = (
+        {'foreign': 12, 'trust': 8, 'dealer': 5, 'continuity': 5, 'margin': 5}
+        if is_daytrade else
+        {'foreign': 9, 'trust': 7, 'dealer': 3, 'continuity': 6, 'margin': 5}
+    )
+    items = []
+    individual_available = False
+    for field, scale_field, label, weight_key in (
+        ('foreign_net', 'foreign', '外資', 'foreign'),
+        ('trust_net', 'trust', '投信', 'trust'),
+        ('dealer_net', 'dealer', '自營商', 'dealer'),
+    ):
+        value = _ranking_number(stock_context.get(field))
+        signal = None
+        if value is not None:
+            individual_available = True
+            signal = _ranking_clamp(value / max(_ranking_number(scales.get(scale_field), 1), 1))
+        items.append((signal, weights[weight_key], f'{label}{value / 1000:+.0f}張' if value is not None else ''))
+    if not individual_available:
+        institutional = _ranking_number(stock_context.get('institutional_net'))
+        items = [
+            (
+                _ranking_clamp(institutional / max(_ranking_number(scales.get('institutional'), 1), 1))
+                if institutional is not None else None,
+                weights['foreign'] + weights['trust'] + weights['dealer'],
+                f'法人{institutional / 1000:+.0f}張' if institutional is not None else '',
+            )
+        ]
+    streak = _ranking_number(stock_context.get('institutional_streak'))
+    items.append((
+        _ranking_clamp(streak / 5) if streak is not None else None,
+        weights['continuity'], f'法人連續 {streak:+g}日' if streak is not None else '',
+    ))
     margin_delta = _ranking_number(stock_context.get('margin_delta'))
     short_delta = _ranking_number(stock_context.get('short_delta'))
-    signals = []
-    labels = []
-    if institutional is not None:
-        inst_signal = _ranking_clamp(institutional / max(_ranking_number(scales.get('institutional'), 1), 1))
-        signals.append((inst_signal, 0.7))
-        labels.append(f'法人{institutional / 1000:+.0f}張')
+    margin_signal = None
     if margin_delta is not None or short_delta is not None:
         margin_signal = _ranking_clamp(
             (margin_delta or 0) / max(_ranking_number(scales.get('margin'), 1), 1)
             - (short_delta or 0) / max(_ranking_number(scales.get('short'), 1), 1)
         )
-        signals.append((margin_signal, 0.3))
-        labels.append(f'融資{(margin_delta or 0):+.0f}／融券{(short_delta or 0):+.0f}張')
-    if not signals:
-        return None
-    weight_total = sum(weight for _, weight in signals)
-    signal = sum(value * weight for value, weight in signals) / weight_total
-    activity = max(abs(value) for value, _ in signals)
-    return {
-        'signal': signal,
-        'quality': _ranking_clamp(40 + activity * 55, 0, 100),
-        'text': '、'.join(labels),
-    }
+    items.append((
+        margin_signal, weights['margin'],
+        f'融資{(margin_delta or 0):+.0f}／融券{(short_delta or 0):+.0f}張'
+        if margin_delta is not None or short_delta is not None else '',
+    ))
+    return _ranking_component_from_items(items, label_limit=3)
 
 
 def _stock_ranking_technical_component(row, is_daytrade):
@@ -14140,42 +14287,72 @@ def _stock_ranking_technical_component(row, is_daytrade):
     ma5 = _ranking_number(row.get('_ma5'))
     ma20_slope = _ranking_number(row.get('_risk_ma20_slope'))
     close_position = _ranking_number(row.get('_risk_close_position'))
-    signals = []
-    labels = []
-    if change is not None:
-        signals.append(_ranking_clamp(change / (4 if is_daytrade else 7)))
-        labels.append(f'漲跌 {change:+g}%')
-    if close is not None and ma5 is not None:
-        divisor = max((atr or close * 0.02), 0.01)
-        signals.append(_ranking_clamp((close - ma5) / divisor))
-        labels.append('站上5日線' if close >= ma5 else '跌破5日線')
-    if not is_daytrade and ma20_slope is not None:
-        signals.append(_ranking_clamp(ma20_slope / max((atr or 1), 0.01)))
-        labels.append('20日線上彎' if ma20_slope > 0 else '20日線下彎')
-    if close_position is not None:
-        signals.append(_ranking_clamp((close_position - 50) / 50))
-    if is_daytrade:
-        vwap = _ranking_number(row.get('_daytrade_vwap'))
-        if close is not None and vwap is not None:
-            signals.append(_ranking_clamp((close - vwap) / max((atr or close * 0.01), 0.01)))
-            labels.append('站上VWAP' if close >= vwap else '跌破VWAP')
-        else:
-            vwap_text = str(row.get('VWAP 狀態', ''))
-            if '偏多' in vwap_text:
-                signals.append(0.55)
-                labels.append('VWAP偏多')
-            elif '偏空' in vwap_text:
-                signals.append(-0.55)
-                labels.append('VWAP偏空')
-    if not signals:
-        return None
-    signal = sum(signals) / len(signals)
+    previous_high = _ranking_number(row.get('_risk_prev_high'))
+    previous_low = _ranking_number(row.get('_risk_prev_low'))
     volume_ratio = _ranking_number(row.get('_daytrade_volume_ratio')) if is_daytrade else None
-    volume_bonus = min(18, max(0, ((volume_ratio or 1) - 0.8) * 18)) if is_daytrade else 8
-    quality = _ranking_clamp(38 + abs(signal) * 44 + volume_bonus, 0, 100)
-    if is_daytrade and volume_ratio is not None:
-        labels.append(f'量比 {volume_ratio:g}x')
-    return {'signal': signal, 'quality': quality, 'text': '、'.join(labels[:3])}
+
+    ma5_signal = None
+    if close is not None and ma5 is not None:
+        ma5_signal = _ranking_clamp((close - ma5) / max((atr or close * 0.02), 0.01))
+    ma_signal = _ranking_average([
+        ma5_signal,
+        _ranking_clamp(ma20_slope / max((atr or 1), 0.01))
+        if not is_daytrade and ma20_slope is not None else None,
+    ])
+    position_signal = (
+        _ranking_clamp((close_position - 50) / 50) if close_position is not None else None
+    )
+    structure_signal = None
+    structure_label = ''
+    if close is not None and previous_high is not None and close > previous_high:
+        structure_signal, structure_label = 0.85, '突破前高'
+    elif close is not None and previous_low is not None and close < previous_low:
+        structure_signal, structure_label = -0.85, '跌破前低'
+    elif position_signal is not None:
+        structure_signal, structure_label = position_signal * 0.55, '前高低區間內'
+
+    vwap = _ranking_number(row.get('_daytrade_vwap')) if is_daytrade else None
+    vwap_signal = None
+    vwap_label = ''
+    if is_daytrade and close is not None and vwap is not None:
+        vwap_signal = _ranking_clamp((close - vwap) / max((atr or close * 0.01), 0.01))
+        if volume_ratio is not None:
+            vwap_signal = _ranking_clamp(vwap_signal * min(max(volume_ratio, 0.55), 1.35))
+        vwap_label = ('站上' if close >= vwap else '跌破') + 'VWAP'
+        if volume_ratio is not None:
+            vwap_label += f'／量比{volume_ratio:g}'
+    elif is_daytrade:
+        vwap_text = str(row.get('VWAP 狀態', ''))
+        if '偏多' in vwap_text:
+            vwap_signal, vwap_label = 0.55, 'VWAP偏多'
+        elif '偏空' in vwap_text:
+            vwap_signal, vwap_label = -0.55, 'VWAP偏空'
+
+    change_signal = _ranking_clamp(change / (4 if is_daytrade else 7)) if change is not None else None
+    directional = [value for value in (vwap_signal, ma_signal, structure_signal, position_signal, change_signal) if value is not None]
+    base_direction = 1 if sum(directional) >= 0 else -1
+    atr_percent = atr / close * 100 if atr is not None and close not in (None, 0) else None
+    atr_signal = base_direction * min(max((atr_percent or 0) / 4, 0.12), 0.65) if atr_percent is not None else None
+
+    if is_daytrade:
+        items = [
+            (vwap_signal, 20, vwap_label),
+            (_ranking_average([ma5_signal, position_signal]), 15, '站上5日線' if ma5_signal is not None and ma5_signal >= 0 else '跌破5日線' if ma5_signal is not None else ''),
+            (change_signal, 10, f'漲跌 {change:+g}%' if change is not None else ''),
+            (atr_signal, 5, f'ATR {atr_percent:g}%' if atr_percent is not None else ''),
+            (structure_signal, 5, structure_label),
+        ]
+    else:
+        items = [
+            (ma_signal, 12, '均線偏多' if ma_signal is not None and ma_signal >= 0 else '均線偏空' if ma_signal is not None else ''),
+            (structure_signal, 10, structure_label),
+            (position_signal, 7, f'收盤位置 {close_position:g}%' if close_position is not None else ''),
+            (atr_signal, 5, f'ATR {atr_percent:g}%' if atr_percent is not None else ''),
+            (None, 2, ''),  # CDP 未在主表保存時不計分，權重自動重配。
+            (change_signal, 4, f'動能 {change:+g}%' if change is not None else ''),
+        ]
+    bonus = min(10, max(0, ((volume_ratio or 1) - 0.8) * 10)) if is_daytrade else 0
+    return _ranking_component_from_items(items, bonus=bonus, label_limit=3)
 
 
 def _futures_ranking_technical_component(row, is_daytrade):
@@ -14183,30 +14360,60 @@ def _futures_ranking_technical_component(row, is_daytrade):
     open_price = _ranking_number(row.get('開盤價'))
     change = _ranking_number(row.get('漲跌幅'))
     vwap = _ranking_number(row.get('VWAP'))
+    atr = _ranking_number(row.get('_risk_atr14') or row.get('ATR14'))
+    oi_change = next((
+        value for value in (
+            _ranking_number(row.get('未平倉增減')),
+            _ranking_number(row.get('OI增減')),
+            _ranking_number(row.get('_oi_change')),
+        ) if value is not None
+    ), None)
     direction_text = str(row.get('方向', ''))
-    signals = []
-    labels = []
-    if change is not None:
-        signals.append(_ranking_clamp(change / (3 if is_daytrade else 6)))
-        labels.append(f'漲跌 {change:+g}%')
-    if close is not None and open_price is not None and open_price > 0:
-        signals.append(_ranking_clamp((close / open_price - 1) * (35 if is_daytrade else 20)))
-        labels.append('站上開盤' if close >= open_price else '跌破開盤')
-    if is_daytrade and close is not None and vwap is not None and vwap > 0:
-        signals.append(_ranking_clamp((close / vwap - 1) * 45))
-        labels.append('站上VWAP' if close >= vwap else '跌破VWAP')
-    if '多' in direction_text:
-        signals.append(0.45)
-    elif '空' in direction_text:
-        signals.append(-0.45)
-    if not signals:
-        return None
-    signal = sum(signals) / len(signals)
-    return {
-        'signal': signal,
-        'quality': _ranking_clamp(42 + abs(signal) * 52, 0, 100),
-        'text': '、'.join(labels[:3]) or direction_text,
-    }
+    change_signal = _ranking_clamp(change / (3 if is_daytrade else 6)) if change is not None else None
+    open_signal = (
+        _ranking_clamp((close / open_price - 1) * (35 if is_daytrade else 20))
+        if close is not None and open_price not in (None, 0) else None
+    )
+    vwap_signal = (
+        _ranking_clamp((close / vwap - 1) * 45)
+        if is_daytrade and close is not None and vwap not in (None, 0) else None
+    )
+    if vwap_signal is None and is_daytrade:
+        if '多' in direction_text:
+            vwap_signal = 0.45
+        elif '空' in direction_text:
+            vwap_signal = -0.45
+    price_oi_signal = None
+    if change not in (None, 0) and oi_change is not None:
+        direction = 1 if change > 0 else -1
+        price_oi_signal = direction * (0.85 if oi_change > 0 else 0.35)
+    structure_text = str(row.get('價位結構', '') or row.get('123／2B', ''))
+    structure_signal = 0.65 if '多' in structure_text else (-0.65 if '空' in structure_text else None)
+    cdp_text = str(row.get('CDP', '') or row.get('CDP狀態', ''))
+    cdp_signal = 0.5 if '多' in cdp_text else (-0.5 if '空' in cdp_text else None)
+    directional = [value for value in (change_signal, open_signal, vwap_signal, price_oi_signal) if value is not None]
+    base_direction = 1 if sum(directional) >= 0 else -1
+    atr_percent = atr / close * 100 if atr is not None and close not in (None, 0) else None
+    atr_signal = base_direction * min(max((atr_percent or 0) / 3, 0.12), 0.65) if atr_percent is not None else None
+    if is_daytrade:
+        items = [
+            (vwap_signal, 15, ('站上' if vwap_signal is not None and vwap_signal >= 0 else '跌破') + 'VWAP' if vwap_signal is not None else ''),
+            (price_oi_signal, 10, f'價格×OI {oi_change:+g}' if price_oi_signal is not None else ''),
+            (cdp_signal, 8, cdp_text),
+            (structure_signal, 7, structure_text),
+            (_ranking_average([open_signal, change_signal]), 5, '站上開盤' if open_signal is not None and open_signal >= 0 else '跌破開盤' if open_signal is not None else ''),
+            (atr_signal, 5, f'ATR {atr_percent:g}%' if atr_percent is not None else ''),
+        ]
+    else:
+        items = [
+            (open_signal, 10, '中期價格偏多' if open_signal is not None and open_signal >= 0 else '中期價格偏空' if open_signal is not None else ''),
+            (structure_signal, 10, structure_text),
+            (price_oi_signal, 7, f'價格×OI {oi_change:+g}' if price_oi_signal is not None else ''),
+            (atr_signal, 4, f'ATR {atr_percent:g}%' if atr_percent is not None else ''),
+            (cdp_signal, 1, cdp_text),
+            (change_signal, 3, f'動能 {change:+g}%' if change is not None else ''),
+        ]
+    return _ranking_component_from_items(items, label_limit=3)
 
 
 def _futures_contract_chip_component(row, market_context):
@@ -14237,13 +14444,34 @@ def _combine_ranking_components(components, weights, penalty=0):
     quality = sum(
         value['quality'] * weights[key] for key, value in available.items()
     ) / available_weight
-    coverage = min(1.0, available_weight / max(sum(weights.values()), 0.01))
-    score = quality * (0.72 + 0.28 * coverage) + abs(direction_signal) * 12 - penalty
+    total_weight = max(sum(weights.values()), 0.01)
+    coverage = min(1.0, sum(
+        weights[key] * _ranking_clamp(value.get('coverage', 1), 0, 1)
+        for key, value in available.items()
+    ) / total_weight)
+    # Missing categories and sub-indicators are reweighted, not scored as zero.
+    score = quality + abs(direction_signal) * 10 - penalty
     return {
         'direction': '多' if direction_signal >= 0 else '空',
         'score': int(round(_ranking_clamp(score, 0, 100))),
         'coverage': int(round(coverage * 100)),
     }
+
+
+def strategy_ranking_weights(asset_type, strategy_mode):
+    """Public ranking mix shown in the UI and used by both scoring paths."""
+    is_daytrade = strategy_mode == '當沖'
+    if asset_type == 'futures':
+        return (
+            {'technical': 0.50, 'chips': 0.45, 'fundamental': 0.05}
+            if is_daytrade else
+            {'technical': 0.35, 'chips': 0.50, 'fundamental': 0.15}
+        )
+    return (
+        {'technical': 0.55, 'chips': 0.35, 'fundamental': 0.10}
+        if is_daytrade else
+        {'technical': 0.40, 'chips': 0.30, 'fundamental': 0.30}
+    )
 
 
 def _score_stock_post_close(row, strategy_mode, market_context):
@@ -14252,14 +14480,12 @@ def _score_stock_post_close(row, strategy_mode, market_context):
     stock_context = market_context.get('stocks', {}).get(code, {})
     components = {
         'technical': _stock_ranking_technical_component(row, is_daytrade),
-        'chips': _ranking_chip_component(stock_context, market_context.get('scales', {})),
-        'fundamental': _ranking_fundamental_component(stock_context),
+        'chips': _ranking_chip_component(
+            stock_context, market_context.get('scales', {}), is_daytrade,
+        ),
+        'fundamental': _ranking_fundamental_component(stock_context, is_daytrade),
     }
-    weights = (
-        {'technical': 0.55, 'chips': 0.35, 'fundamental': 0.10}
-        if is_daytrade else
-        {'technical': 0.40, 'chips': 0.30, 'fundamental': 0.30}
-    )
+    weights = strategy_ranking_weights('stock', strategy_mode)
     risk_text = str(row.get('風險', ''))
     penalty = 28 if '處置' in risk_text else (12 if '注意' in risk_text else 0)
     if str(row.get('資料狀態', '')).startswith(('🔴', '⛔')):
@@ -14291,35 +14517,71 @@ def _score_futures_post_close(row, strategy_mode, market_context, row_scales):
         liquidity *= 0.75
     underlying_code = str(row.get('標的代號', '')).strip()
     underlying_context = market_context.get('stocks', {}).get(underlying_code, {})
-    underlying_chip = _ranking_chip_component(underlying_context, market_context.get('scales', {}))
+    underlying_chip = _ranking_chip_component(
+        underlying_context, market_context.get('scales', {}), is_daytrade,
+    )
     contract_chip = _futures_contract_chip_component(row, market_context)
     technical_signal = technical['signal'] if technical else 0
-    chip_signal = technical_signal * (0.45 + liquidity * 0.35)
-    chip_text = f'成交 {volume:,.0f}口、未平倉 {open_interest:,.0f}口'
-    if underlying_chip is not None:
-        chip_signal = chip_signal * 0.45 + underlying_chip['signal'] * 0.55
-        chip_text += f"、標的{underlying_chip['text']}"
-    elif contract_chip is not None:
-        chip_signal = chip_signal * 0.40 + contract_chip['signal'] * 0.60
-        chip_text += f"、{contract_chip['text']}"
-    chips = {
-        'signal': _ranking_clamp(chip_signal),
-        'quality': _ranking_clamp(
-            32 + liquidity * 48 + (contract_chip['quality'] * 0.18 if contract_chip else 0),
-            0, 100,
+    volume_oi_ratio = volume / open_interest if open_interest > 0 else None
+    basis = _ranking_number(row.get('基差') or row.get('期現價差'))
+    near_far = _ranking_number(row.get('近遠月價差') or row.get('近月／次月價差'))
+    close = _ranking_number(row.get('收盤價'))
+    basis_scale = max(abs(close or 0) * 0.01, 1)
+    institutional_change = _ranking_number(
+        row.get('法人OI增減') or row.get('_institutional_oi_change')
+    )
+    institutional_streak = _ranking_number(
+        row.get('法人連續增倉') or row.get('_institutional_oi_streak')
+    )
+    subweights = (
+        {'position': 12, 'change': 8, 'streak': 7, 'basis': 7,
+         'term': 5, 'volume_oi': 3, 'underlying': 3}
+        if is_daytrade else
+        {'position': 13, 'change': 10, 'streak': 8, 'basis': 7,
+         'term': 5, 'volume_oi': 3, 'underlying': 4}
+    )
+    chips = _ranking_component_from_items([
+        (
+            contract_chip['signal'] if contract_chip else None,
+            subweights['position'], contract_chip['text'] if contract_chip else '',
         ),
-        'text': chip_text,
-    }
+        (
+            _ranking_clamp(institutional_change / max(open_interest, 1))
+            if institutional_change is not None else None,
+            subweights['change'],
+            f'法人OI {institutional_change:+,.0f}口' if institutional_change is not None else '',
+        ),
+        (
+            _ranking_clamp(institutional_streak / 5)
+            if institutional_streak is not None else None,
+            subweights['streak'],
+            f'法人連續 {institutional_streak:+g}日' if institutional_streak is not None else '',
+        ),
+        (
+            _ranking_clamp(basis / basis_scale) if basis is not None else None,
+            subweights['basis'], f'基差 {basis:+g}' if basis is not None else '',
+        ),
+        (
+            _ranking_clamp(near_far / basis_scale) if near_far is not None else None,
+            subweights['term'], f'近遠月 {near_far:+g}' if near_far is not None else '',
+        ),
+        (
+            technical_signal * liquidity if volume_oi_ratio is not None else None,
+            subweights['volume_oi'],
+            f'量／OI {volume_oi_ratio:.2f}' if volume_oi_ratio is not None else '',
+        ),
+        (
+            underlying_chip['signal'] if underlying_chip else None,
+            subweights['underlying'],
+            f"現股{underlying_chip['text']}" if underlying_chip else '',
+        ),
+    ], bonus=liquidity * 8, label_limit=3)
     fundamental = (
-        _ranking_fundamental_component(underlying_context)
+        _ranking_fundamental_component(underlying_context, is_daytrade)
         if str(row.get('商品類型', '')) == '股票' else None
     )
     components = {'technical': technical, 'chips': chips, 'fundamental': fundamental}
-    weights = (
-        {'technical': 0.55, 'chips': 0.35, 'fundamental': 0.10}
-        if is_daytrade else
-        {'technical': 0.45, 'chips': 0.30, 'fundamental': 0.25}
-    )
+    weights = strategy_ranking_weights('futures', strategy_mode)
     penalty = 0
     if str(row.get('到期提醒', '')).startswith(('🔴', '⛔')):
         penalty += 18
@@ -14329,13 +14591,13 @@ def _score_futures_post_close(row, strategy_mode, market_context, row_scales):
     if combined is None:
         return None
     reasons = []
-    for key, label in (('technical', '技術'), ('chips', '量倉／籌碼'), ('fundamental', '標的基本')):
+    for key, label in (('technical', '技術'), ('chips', '籌碼'), ('fundamental', '基本')):
         component = components.get(key)
         if component is not None:
             direction = '多' if component['signal'] >= 0 else '空'
             reasons.append(f"{label}偏{direction} {component['quality']:.0f}（{component['text']}）")
     if fundamental is None:
-        reasons.append('基本面不適用或未取得，不以零分處理')
+        reasons.append('基本未取得（權重已重配）')
     combined['reason'] = '｜'.join(reasons)
     return combined
 
@@ -14423,12 +14685,34 @@ def render_strategy_ranking(rows, strategy_mode, room_label):
         return
     ranking_title = '當沖排名' if strategy_mode == '當沖' else '波段排名'
     period_label = '今日盤後' if target_date == current.date() else '前一交易日盤後'
+    asset_type = 'futures' if room_label == '期貨' else 'stock'
+    weights = strategy_ranking_weights(asset_type, strategy_mode)
+    indicator_summary = (
+        (
+            "<span class='ranking-tech-text'>技術</span>：VWAP、價格×OI、價位結構、ATR　"
+            "<span class='ranking-chip-text'>籌碼</span>：法人淨OI、基差、近遠月、量/OI、現股　"
+            "<span class='ranking-basic-text'>基本</span>：標的股票最新資料"
+        )
+        if asset_type == 'futures' else
+        (
+            "<span class='ranking-tech-text'>技術</span>：VWAP、均線、動能、ATR、價位結構　"
+            "<span class='ranking-chip-text'>籌碼</span>：外資、投信、自營商、融資券　"
+            "<span class='ranking-basic-text'>基本</span>：月營收、EPS、營益率、估值"
+        )
+    )
+    weight_badges = ''.join((
+        f"<span class='ranking-weight ranking-weight-{key}'>"
+        f"{label} {int(round(weights[key] * 100))}%</span>"
+        for key, label in (
+            ('technical', '技術'), ('chips', '籌碼'), ('fundamental', '基本')
+        )
+    ))
     colored = []
     explanation_rows = []
     for rank, entry in enumerate(entries, 1):
         color = '#ff6b6b' if entry['direction'] == '多' else '#35d07f'
         colored.append(
-            f"<span style='color:{color};font-weight:750;white-space:nowrap'>"
+            f"<span class='ranking-result' style='color:{color}'>"
             f"{html.escape(entry['name'])}({html.escape(entry['code'])})"
             f"({entry['score']}·{entry['direction']})</span>"
         )
@@ -14440,18 +14724,45 @@ def render_strategy_ranking(rows, strategy_mode, room_label):
             rank, entry['name'], entry['code'], entry['direction'],
         )
         explanation_rows.append(
-            f"<div style='margin-top:5px;overflow-wrap:anywhere'>{identity_html}："
-            f"<span style='color:{color};font-weight:700'>{html.escape(entry['direction'])}方</span>"
-            f"<span style='color:#64748b;padding:0 2px'>｜</span>{reason_html}"
-            f"<span style='color:#64748b;padding:0 2px'>｜</span>"
-            f"<span style='color:#94a3b8'>資料覆蓋 {entry['coverage']}%</span></div>"
+            f"<div class='ranking-explanation'><div class='ranking-identity'>{identity_html} "
+            f"<span style='color:{color};font-weight:700'>{html.escape(entry['direction'])}方</span></div>"
+            f"<div class='ranking-reasons'>{reason_html} "
+            f"<span class='ranking-coverage'>資料 {entry['coverage']}%</span></div></div>"
         )
     st.markdown(
-        "<div style='margin:8px 0 4px;padding:8px 10px;border-radius:8px;"
-        "background:rgba(128,128,128,.08);line-height:1.65'>"
-        f"<b>🌙 {html.escape(room_label)}{ranking_title}（{period_label}）</b><br>"
-        f"{' &gt; '.join(colored)}"
-        "<div style='font-size:13px;margin-top:6px'><b>排行說明</b>"
+        "<style>"
+        ".ranking-card{margin:8px 0 4px;padding:10px 12px;border-radius:9px;"
+        "background:rgba(128,128,128,.08);line-height:1.55}"
+        ".ranking-header{display:flex;align-items:center;gap:6px;flex-wrap:wrap}"
+        ".ranking-weights{display:flex;gap:5px;flex-wrap:wrap;margin-left:auto}"
+        ".ranking-weight{font-size:12px;font-weight:750;padding:2px 7px;border-radius:999px}"
+        ".ranking-weight-technical{color:#4fc3f7;background:rgba(79,195,247,.14)}"
+        ".ranking-weight-chips{color:#ffb74d;background:rgba(255,183,77,.14)}"
+        ".ranking-weight-fundamental{color:#c4b5fd;background:rgba(196,181,253,.14)}"
+        ".ranking-indicators{font-size:12px;color:#94a3b8;margin-top:5px;overflow-wrap:anywhere}"
+        ".ranking-tech-text{color:#4fc3f7;font-weight:750}.ranking-chip-text{color:#ffb74d;font-weight:750}"
+        ".ranking-basic-text{color:#c4b5fd;font-weight:750}"
+        ".ranking-results{display:flex;align-items:center;gap:5px;flex-wrap:wrap;margin-top:7px}"
+        ".ranking-result{font-weight:750;white-space:nowrap}"
+        ".ranking-arrow{color:#64748b}"
+        ".ranking-details{font-size:13px;margin-top:7px}"
+        ".ranking-explanation{display:grid;grid-template-columns:minmax(150px,auto) 1fr;"
+        "gap:4px 8px;margin-top:6px;align-items:start}"
+        ".ranking-reasons{overflow-wrap:anywhere}.ranking-coverage{color:#94a3b8;white-space:nowrap}"
+        "@media(max-width:700px){.ranking-card{padding:9px}.ranking-weights{margin-left:0;width:100%}"
+        ".ranking-explanation{grid-template-columns:1fr}.ranking-details{font-size:12.5px}"
+        ".ranking-result{font-size:13px}.ranking-coverage{display:inline-block;margin-top:2px}}"
+        "</style>"
+        "<div class='ranking-card'>"
+        f"<div class='ranking-header'><b>🌙 {html.escape(room_label)}{ranking_title}（{period_label}）</b>"
+        f"<div class='ranking-weights'>{weight_badges}</div></div>"
+        f"<div class='ranking-indicators'>{indicator_summary}</div>"
+        "<div class='ranking-results'>"
+        + "".join(
+            item + ("<span class='ranking-arrow'>›</span>" if index < len(colored) - 1 else '')
+            for index, item in enumerate(colored)
+        )
+        + "</div><div class='ranking-details'><b>排行說明</b>"
         f"{''.join(explanation_rows)}</div></div>",
         unsafe_allow_html=True,
     )
@@ -14464,6 +14775,7 @@ def render_strategy_ranking(rows, strategy_mode, room_label):
     fallback_text = '；目前沿用本次工作階段最後成功快照。' if market_context.get('using_last_success') else ''
     st.caption(
         source_text + error_text + fallback_text
+        + ' 基本面採最新有效月／季資料；缺項會在分類內重配權重。'
         + ' 排名是獨立比較，不會更動表格順序；分數代表當沖／波段適配度，不是勝率。'
     )
 
