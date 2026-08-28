@@ -9662,11 +9662,37 @@ def _is_valid_data_cache_payload(value):
         'market_risk_data': dict,
         'company_event_snapshot': dict,
         'futures_strategy_state': dict,
+        'display_settings': dict,
     }
     present = [key for key in expected_types if key in value]
     return bool(present) and all(
         isinstance(value[key], expected_types[key]) for key in present
     )
+
+
+def normalize_stock_display_settings(value):
+    """Return a safe, portable subset of stock-room display preferences."""
+    source = value if isinstance(value, dict) else {}
+    try:
+        limit_rows = int(source.get('limit_rows', 5))
+    except (TypeError, ValueError):
+        limit_rows = 5
+    return {
+        'limit_rows': max(1, limit_rows),
+        'hide_non_stock': bool(source.get('hide_non_stock', True)),
+        'allow_warrant_search': bool(source.get('allow_warrant_search', False)),
+        'show_3d_hilo': bool(source.get('show_3d_hilo', False)),
+    }
+
+
+def get_stock_display_settings():
+    """Collect only settings that should follow the stock strategy across devices."""
+    return normalize_stock_display_settings({
+        'limit_rows': st.session_state.get('limit_rows', 5),
+        'hide_non_stock': st.session_state.get('stock_hide_non_stock', True),
+        'allow_warrant_search': st.session_state.get('allow_warrant_search', False),
+        'show_3d_hilo': st.session_state.get('stock_show_3d_hilo', False),
+    })
 
 
 def _decode_data_cache_payload(payload):
@@ -10576,6 +10602,9 @@ def save_data_cache(
             'market_risk_data': st.session_state.get(
                 'risk_filter_market_data', {}
             ),
+            # Keep display settings with the stock scope so a Streamlit reboot
+            # or another device does not reset the selected row count.
+            'display_settings': get_stock_display_settings(),
         })
 
         # 股票獨立本機快取。
@@ -10704,6 +10733,12 @@ def load_data_cache():
                     legacy_payload.get(
                         'market_risk_data',
                         {}
+                    )
+                ),
+                'display_settings': (
+                    legacy_payload.get(
+                        'display_settings',
+                        {},
                     )
                 ),
                 'stock_data_updated_at': (
@@ -10850,6 +10885,12 @@ def load_data_cache():
     market_risk_data = data.get(
         'market_risk_data',
         {},
+    )
+
+    st.session_state['_cached_stock_display_settings'] = (
+        normalize_stock_display_settings(data.get('display_settings', {}))
+        if isinstance(data.get('display_settings', {}), dict)
+        else {}
     )
 
     st.session_state[
@@ -11203,6 +11244,14 @@ if 'turnover_ranking_df' not in st.session_state:
 
 saved_config = load_config()
 
+# Google Sheet stock scope stores portable UI preferences.  Apply these before
+# the corresponding widgets are created; local config remains the fallback.
+cached_stock_display_settings = st.session_state.get(
+    '_cached_stock_display_settings', {}
+)
+if not isinstance(cached_stock_display_settings, dict):
+    cached_stock_display_settings = {}
+
 # =========================================================
 # Fibo 標籤獨立初始化
 # =========================================================
@@ -11334,7 +11383,22 @@ def get_cached_shioaji_usage(api, max_age_seconds=60):
     return usage
 
 if 'font_size' not in st.session_state: st.session_state.font_size = saved_config.get('font_size', 15)
-if 'limit_rows' not in st.session_state: st.session_state.limit_rows = saved_config.get('limit_rows', 5)
+if 'limit_rows' not in st.session_state:
+    st.session_state.limit_rows = normalize_stock_display_settings(
+        cached_stock_display_settings or saved_config
+    )['limit_rows']
+if 'stock_hide_non_stock' not in st.session_state:
+    st.session_state.stock_hide_non_stock = normalize_stock_display_settings(
+        cached_stock_display_settings
+    )['hide_non_stock']
+if 'allow_warrant_search' not in st.session_state:
+    st.session_state.allow_warrant_search = normalize_stock_display_settings(
+        cached_stock_display_settings
+    )['allow_warrant_search']
+if 'stock_show_3d_hilo' not in st.session_state:
+    st.session_state.stock_show_3d_hilo = normalize_stock_display_settings(
+        cached_stock_display_settings
+    )['show_3d_hilo']
 
 # 永豐 API 帳密：Render 環境變數優先，且 key/secret 必須成對。
 secret_sj_key, secret_sj_secret, secret_remember_sj, sj_credential_source = (
@@ -11505,7 +11569,7 @@ with st.sidebar:
 
 def render_stock_external_resources():
     """Render stock data-source links alongside upload/quick-search controls."""
-    st.markdown("#### 外部資源")
+    st.markdown("##### 外部資源")
 
     def perform_official_turnover_fetch():
         with st.spinner("正在合併 TWSE／TPEx 當日成交量與最新發行量..."):
@@ -11546,7 +11610,7 @@ def render_stock_external_resources():
                     "回到上方「本機」上傳後再按「執行分析」。"
                 )
 
-    resource_col1, resource_col2, resource_col3 = st.columns(3)
+    resource_col1, resource_col2 = st.columns(2)
     with resource_col1:
         if st.button(
             "📥 官方週轉率排行＋執行分析",
@@ -11574,104 +11638,166 @@ def render_stock_external_resources():
             width='stretch'
         )
         st.caption("Goodinfo 不再由雲端伺服器爬取；需要比對時由瀏覽器開啟，或下載後回到「本機」上傳。")
-    with resource_col3:
-        st.link_button(
-            "🚨 上市處置公告", "https://www.twse.com.tw/zh/announcement/punish.html",
-            width='stretch'
-        )
-        st.link_button(
-            "🚨 上櫃處置公告", "https://www.tpex.org.tw/zh-tw/announce/market/disposal.html",
-            width='stretch'
-        )
 
 
 def render_stock_strategy_controls():
-    """將原當沖戰略室的側欄設定與資料管理移至股票戰略室。"""
-    with st.expander("⚙️ 股票戰略室設定與資料管理", expanded=False):
-        settings_col, data_col = st.columns(2)
+    """Render stock display settings and data management inside the shared panel."""
+    settings_col, data_col = st.columns(2)
 
-        with settings_col:
-            st.markdown("#### 顯示設定")
-            hide_non_stock = st.checkbox(
-                "隱藏非個股（ETF／權證／債券）", value=True,
-                key='stock_hide_non_stock'
+    with settings_col:
+        st.markdown("#### 顯示設定")
+        hide_non_stock = st.checkbox(
+            "隱藏非個股（ETF／權證／債券）", key='stock_hide_non_stock'
+        )
+        st.checkbox(
+            "查詢權證（含圖表快速標籤）", key="allow_warrant_search"
+        )
+        show_3d_hilo = st.checkbox(
+            "近 3 日高低點（戰略備註）", key='stock_show_3d_hilo',
+            help="在戰略備註加入前天、昨天、今天的高低點。"
+        )
+        current_limit_rows = st.number_input(
+            "顯示筆數（檔案／雲端）", min_value=1, step=1,
+            value=st.session_state.limit_rows, key='limit_rows_input'
+        )
+        st.session_state.limit_rows = int(current_limit_rows)
+        if st.button("💾 儲存股票設定", width='stretch', key='save_stock_room_settings'):
+            local_saved = save_config(
+                st.session_state.get('font_size', 15), current_limit_rows,
+                st.session_state.sj_key, st.session_state.sj_secret,
+                st.session_state.remember_sj
             )
-            st.checkbox(
-                "查詢權證（含圖表快速標籤）", value=False,
-                key="allow_warrant_search"
+            cloud_saved = save_data_cache(
+                st.session_state.stock_data, st.session_state.ignored_stocks,
+                st.session_state.all_candidates, st.session_state.saved_notes,
+                replace_stock_data=True,
             )
-            show_3d_hilo = st.checkbox(
-                "近 3 日高低點（戰略備註）", value=False,
-                key='stock_show_3d_hilo',
-                help="在戰略備註加入前天、昨天、今天的高低點。"
-            )
-            current_limit_rows = st.number_input(
-                "顯示筆數（檔案／雲端）", min_value=1,
-                value=st.session_state.limit_rows, key='limit_rows_input'
-            )
-            st.session_state.limit_rows = current_limit_rows
-            if st.button("💾 儲存股票設定", width='stretch', key='save_stock_room_settings'):
-                if save_config(
-                    st.session_state.get('font_size', 15), current_limit_rows,
-                    st.session_state.sj_key, st.session_state.sj_secret,
-                    st.session_state.remember_sj
-                ):
-                    st.toast("股票設定已儲存", icon="✅")
-
-        with data_col:
-            st.markdown("#### 資料管理")
-            if st.session_state.ignored_stocks:
-                ignored_list = sorted(st.session_state.ignored_stocks)
-                option_map = {f"{code} {get_stock_name_online(code)}": code for code in ignored_list}
-                selected = st.multiselect(
-                    "忽略名單（取消勾選以復原）", list(option_map),
-                    default=list(option_map),
-                    key=f"stock_ignored_manager_{abs(hash(tuple(ignored_list)))}"
-                )
-                selected_codes = {option_map[label] for label in selected}
-                if selected_codes != st.session_state.ignored_stocks:
-                    restored = st.session_state.ignored_stocks - selected_codes
-                    st.session_state.ignored_stocks = selected_codes
-                    if restored:
-                        st.session_state.pending_unignore = restored
-                    save_data_cache(
-                        st.session_state.stock_data, st.session_state.ignored_stocks,
-                        st.session_state.all_candidates, st.session_state.saved_notes,
-                        replace_ignored=True,
-                    )
-                    st.rerun()
+            if local_saved and cloud_saved:
+                st.toast("股票設定已儲存；重啟後會還原顯示筆數與篩選設定。", icon="✅")
+            elif local_saved:
+                st.warning("設定已保留於目前服務，但 Google Sheet 尚未確認寫入。")
             else:
-                st.caption("目前無忽略股票")
+                st.error("設定暫時無法儲存，請稍後再試。")
 
-            restore_col, clear_col = st.columns(2)
-            with restore_col:
-                if st.button("♻️ 全部復原", width='stretch', key='restore_all_stocks'):
-                    st.session_state.pending_unignore = set(st.session_state.ignored_stocks)
-                    st.session_state.ignored_stocks.clear()
-                    save_data_cache(
-                        st.session_state.stock_data, st.session_state.ignored_stocks,
-                        st.session_state.all_candidates, st.session_state.saved_notes,
-                        replace_ignored=True,
-                    )
-                    st.rerun()
-            with clear_col:
-                if st.button("🗑️ 全部清空", type="primary", width='stretch', key='clear_all_stock_data'):
-                    st.session_state.stock_data = pd.DataFrame()
-                    st.session_state.ignored_stocks = set()
-                    st.session_state.all_candidates = []
-                    st.session_state.search_multiselect = []
-                    st.session_state.saved_notes = {}
-                    st.session_state.cached_notes = {}
-                    st.session_state.pop('stock_independent_raw_results', None)
-                    save_search_cache([])
-                    save_data_cache(
-                        pd.DataFrame(), set(), [], {},
-                        clear_stock_data=True, replace_ignored=True,
-                    )
-                    st.rerun()
-            st.info("在股票表格左側勾選「刪除」，會立即隱藏並自動遞補下一檔。")
+    with data_col:
+        st.markdown("#### 資料管理")
+        if st.session_state.ignored_stocks:
+            ignored_list = sorted(st.session_state.ignored_stocks)
+            option_map = {f"{code} {get_stock_name_online(code)}": code for code in ignored_list}
+            selected = st.multiselect(
+                "忽略名單（取消勾選以復原）", list(option_map),
+                default=list(option_map),
+                key=f"stock_ignored_manager_{abs(hash(tuple(ignored_list)))}"
+            )
+            selected_codes = {option_map[label] for label in selected}
+            if selected_codes != st.session_state.ignored_stocks:
+                restored = st.session_state.ignored_stocks - selected_codes
+                st.session_state.ignored_stocks = selected_codes
+                if restored:
+                    st.session_state.pending_unignore = restored
+                save_data_cache(
+                    st.session_state.stock_data, st.session_state.ignored_stocks,
+                    st.session_state.all_candidates, st.session_state.saved_notes,
+                    replace_ignored=True,
+                )
+                st.rerun()
+        else:
+            st.caption("目前無忽略股票")
+
+        restore_col, clear_col = st.columns(2)
+        with restore_col:
+            if st.button("♻️ 全部復原", width='stretch', key='restore_all_stocks'):
+                st.session_state.pending_unignore = set(st.session_state.ignored_stocks)
+                st.session_state.ignored_stocks.clear()
+                save_data_cache(
+                    st.session_state.stock_data, st.session_state.ignored_stocks,
+                    st.session_state.all_candidates, st.session_state.saved_notes,
+                    replace_ignored=True,
+                )
+                st.rerun()
+        with clear_col:
+            if st.button("🗑️ 全部清空", type="primary", width='stretch', key='clear_all_stock_data'):
+                st.session_state.stock_data = pd.DataFrame()
+                st.session_state.ignored_stocks = set()
+                st.session_state.all_candidates = []
+                st.session_state.search_multiselect = []
+                st.session_state.saved_notes = {}
+                st.session_state.cached_notes = {}
+                st.session_state.pop('stock_independent_raw_results', None)
+                save_search_cache([])
+                save_data_cache(
+                    pd.DataFrame(), set(), [], {},
+                    clear_stock_data=True, replace_ignored=True,
+                )
+                st.rerun()
+        st.info("在股票表格左側勾選「刪除」，會立即隱藏並自動遞補下一檔。")
 
     return hide_non_stock, show_3d_hilo
+
+
+def render_stock_data_source_controls():
+    """Render sources and quick search in the same settings panel."""
+    st.markdown("#### 選股資料來源與快速查詢")
+    code_map, _ = load_local_stock_names()
+    stock_options = []
+    for code, name in sorted(code_map.items()):
+        if not st.session_state.get('allow_warrant_search', False) and is_warrant(code):
+            continue
+        stock_options.append(f"{code} {name}")
+
+    uploaded_file = None
+    selected_sheet = 0
+    src_tab1, src_tab2 = st.tabs(["📂 本機", "☁️ 雲端"])
+    with src_tab1:
+        uploaded_file = st.file_uploader(
+            "上傳 Goodinfo 下載檔或其他選股檔案",
+            type=['xlsx', 'csv', 'html', 'xls'],
+            help="支援 Goodinfo 匯出的 CSV；會自動辨識 CP950／UTF-8 與前置說明列。",
+            key='stock_source_upload',
+        )
+        if uploaded_file:
+            st.caption(f"✅ 已選擇 {uploaded_file.name}；下方按「執行分析」即可。")
+            try:
+                if not uploaded_file.name.lower().endswith('.csv'):
+                    xl_file = pd.ExcelFile(uploaded_file)
+                    sheet_options = xl_file.sheet_names
+                    default_idx = sheet_options.index("週轉率") if "週轉率" in sheet_options else 0
+                    selected_sheet = st.selectbox("選擇工作表", sheet_options, index=default_idx)
+            except Exception:
+                pass
+
+    with src_tab2:
+        def on_history_change():
+            st.session_state.cloud_url_input = st.session_state.history_selected
+
+        history_opts = st.session_state.url_history if st.session_state.url_history else ["(無紀錄)"]
+        c_sel, c_del = st.columns([8, 1], gap="small")
+        with c_sel:
+            st.selectbox(
+                "📜 歷史紀錄 (選取自動填入)", options=history_opts,
+                key="history_selected", index=None, placeholder="請選擇...",
+                on_change=on_history_change, label_visibility="collapsed",
+            )
+        with c_del:
+            if st.button("🗑️", help="刪除選取的歷史紀錄"):
+                selected_history = st.session_state.get('history_selected')
+                if selected_history and selected_history in st.session_state.url_history:
+                    st.session_state.url_history.remove(selected_history)
+                    save_url_history(st.session_state.url_history)
+                    st.toast("已刪除。", icon="🗑️")
+                    st.rerun()
+        st.text_input("輸入連結 (CSV/Excel/Google Sheet)", key="cloud_url_input", placeholder="https://...")
+
+    def update_search_cache():
+        save_search_cache(st.session_state.get("search_multiselect", []))
+
+    search_selection = st.multiselect(
+        "🔍 快速查詢 (中文/代號)", options=stock_options,
+        key="search_multiselect", on_change=update_search_cache,
+        placeholder="輸入 2330 或 台積電...",
+    )
+    render_stock_external_resources()
+    return uploaded_file, selected_sheet, search_selection
 
 def render_stock_strategy_explanation():
     """股票戰略室的靜態說明，與操作設定分開並預設折疊。"""
@@ -17122,7 +17248,15 @@ if tab1.open and stock_strategy_tab.open:
                 )
         stock_settings_col, stock_help_col = st.columns([3, 2])
         with stock_settings_col:
-            hide_non_stock, show_3d_hilo = render_stock_strategy_controls()
+            with st.expander(
+                "⚙️ 股票戰略室設定、資料管理與選股資料來源",
+                expanded=st.session_state.stock_data.empty,
+            ):
+                hide_non_stock, show_3d_hilo = render_stock_strategy_controls()
+                st.divider()
+                uploaded_file, selected_sheet, search_selection = (
+                    render_stock_data_source_controls()
+                )
         with stock_help_col:
             render_stock_strategy_explanation()
         stock_auto_refresh_notice = st.session_state.pop('_stock_auto_refresh_notice', '')
@@ -17131,60 +17265,6 @@ if tab1.open and stock_strategy_tab.open:
                 st.warning(stock_auto_refresh_notice)
             else:
                 st.caption(stock_auto_refresh_notice)
-        col_search = st.expander(
-            "📥 選股資料來源與快速查詢",
-            expanded=st.session_state.stock_data.empty,
-        )
-        with col_search:
-            code_map, name_map = load_local_stock_names()
-            stock_options = []
-            for code, name in sorted(code_map.items()):
-                if not st.session_state.get('allow_warrant_search', False) and is_warrant(code):
-                    continue
-                stock_options.append(f"{code} {name}")
-
-            src_tab1, src_tab2 = st.tabs(["📂 本機", "☁️ 雲端"])
-            with src_tab1:
-                uploaded_file = st.file_uploader(
-                    "上傳 Goodinfo 下載檔或其他選股檔案",
-                    type=['xlsx', 'csv', 'html', 'xls'],
-                    help="支援 Goodinfo 匯出的 CSV；會自動辨識 CP950／UTF-8 與前置說明列。",
-                    key='stock_source_upload',
-                )
-                selected_sheet = 0
-                if uploaded_file:
-                    st.caption(f"✅ 已選擇 {uploaded_file.name}；下方按「執行分析」即可。")
-                    try:
-                        if not uploaded_file.name.lower().endswith('.csv'):
-                            xl_file = pd.ExcelFile(uploaded_file)
-                            sheet_options = xl_file.sheet_names
-                            default_idx = sheet_options.index("週轉率") if "週轉率" in sheet_options else 0
-                            selected_sheet = st.selectbox("選擇工作表", sheet_options, index=default_idx)
-                    except Exception: pass
-
-            with src_tab2:
-                def on_history_change(): st.session_state.cloud_url_input = st.session_state.history_selected
-                history_opts = st.session_state.url_history if st.session_state.url_history else ["(無紀錄)"]
-                c_sel, c_del = st.columns([8, 1], gap="small")
-                with c_sel:
-                    selected = st.selectbox("📜 歷史紀錄 (選取自動填入)", options=history_opts, key="history_selected", index=None, placeholder="請選擇...", on_change=on_history_change, label_visibility="collapsed")
-                with c_del:
-                    if st.button("🗑️", help="刪除選取的歷史紀錄"):
-                        if st.session_state.history_selected and st.session_state.history_selected in st.session_state.url_history:
-                            st.session_state.url_history.remove(st.session_state.history_selected)
-                            save_url_history(st.session_state.url_history)
-                            st.toast("已刪除。", icon="🗑️")
-                            st.rerun()
-                st.text_input("輸入連結 (CSV/Excel/Google Sheet)", key="cloud_url_input", placeholder="https://...")
-
-            def update_search_cache():
-                save_search_cache(
-                    st.session_state.get("search_multiselect", [])
-                )
-            search_selection = st.multiselect("🔍 快速查詢 (中文/代號)", options=stock_options, key="search_multiselect", on_change=update_search_cache, placeholder="輸入 2330 或 台積電...")
-            st.markdown("---")
-            render_stock_external_resources()
-
         c_run, c_space = st.columns([1.5, 5])
         analysis_source_ready = bool(
             uploaded_file or st.session_state.cloud_url_input.strip()
@@ -17778,13 +17858,13 @@ if tab1.open and stock_strategy_tab.open:
                 if stock_compact_table:
                     input_cols = [
                         "移除", "代號", "名稱", "戰略備註", "收盤價", "漲跌幅",
-                        "建議方向", "方向依據", "支撐壓力", "進出場預判", "5日線價差", "信心分", "信心判讀",
+                        "建議方向", "進出場預判", "支撐壓力", "方向依據", "5日線價差", "信心分", "信心判讀",
                         "訊號狀態", "市場一致", "風險", "資料狀態"
                     ]
                 elif is_daytrade_mode:
-                    input_cols = ["移除", "代號", "名稱", "戰略備註", "收盤價", "漲跌幅", "建議方向", "方向依據", "狀態", "成交價價差", "5日線價差", "風險", "VWAP 狀態", "開盤區間", "量能", "信心分", "信心判讀", "支撐壓力", "盤中觸發", "進出場預判", "訊號狀態", "市場一致", "當日漲停價", "當日跌停價", "期貨", "資料狀態", "買賣價差"]
+                    input_cols = ["移除", "代號", "名稱", "戰略備註", "收盤價", "漲跌幅", "建議方向", "進出場預判", "狀態", "成交價價差", "5日線價差", "風險", "VWAP 狀態", "開盤區間", "量能", "信心分", "信心判讀", "支撐壓力", "盤中觸發", "方向依據", "訊號狀態", "市場一致", "當日漲停價", "當日跌停價", "期貨", "資料狀態", "買賣價差"]
                 else:
-                    input_cols = ["移除", "代號", "名稱", "戰略備註", "收盤價", "漲跌幅", "建議方向", "方向依據", "狀態", "成交價價差", "5日線價差", "風險", "信心分", "信心判讀", "乖離", "支撐壓力", "隔日規則", "進出場預判", "訊號狀態", "市場一致", "當日漲停價", "當日跌停價", "期貨", "資料狀態", "買賣價差"]
+                    input_cols = ["移除", "代號", "名稱", "戰略備註", "收盤價", "漲跌幅", "建議方向", "進出場預判", "狀態", "成交價價差", "5日線價差", "風險", "信心分", "信心判讀", "乖離", "支撐壓力", "隔日規則", "方向依據", "訊號狀態", "市場一致", "當日漲停價", "當日跌停價", "期貨", "資料狀態", "買賣價差"]
             else:
                 input_cols = ["移除", "代號", "名稱", "戰略備註", "收盤價", "漲跌幅", "狀態", "成交價價差", "5日線價差", "當日漲停價", "當日跌停價", "期貨"]
             for col in input_cols:
@@ -18482,9 +18562,9 @@ if tab1.open and stock_strategy_tab.open:
                                 st.warning("目前沒有符合門檻的候選；可降低最低評分、放寬最大乖離，或改看完整結果。")
 
                         if indep_is_daytrade:
-                            input_cols = ["代號", "名稱", "戰略備註", "收盤價", "漲跌幅", "建議方向", "方向依據", "成交價價差", "5日線價差", "風險", "VWAP 狀態", "開盤區間", "量能", "訊號狀態", "信心分", "信心判讀", "支撐壓力", "盤中觸發", "進出場預判", "市場一致", "當日漲停價", "當日跌停價", "期貨", "資料狀態", "買賣價差"]
+                            input_cols = ["代號", "名稱", "戰略備註", "收盤價", "漲跌幅", "建議方向", "進出場預判", "成交價價差", "5日線價差", "風險", "VWAP 狀態", "開盤區間", "量能", "訊號狀態", "信心分", "信心判讀", "支撐壓力", "盤中觸發", "方向依據", "市場一致", "當日漲停價", "當日跌停價", "期貨", "資料狀態", "買賣價差"]
                         else:
-                            input_cols = ["代號", "名稱", "戰略備註", "收盤價", "漲跌幅", "建議方向", "方向依據", "成交價價差", "5日線價差", "風險", "訊號狀態", "信心分", "信心判讀", "乖離", "支撐壓力", "隔日規則", "進出場預判", "市場一致", "當日漲停價", "當日跌停價", "期貨", "資料狀態", "買賣價差"]
+                            input_cols = ["代號", "名稱", "戰略備註", "收盤價", "漲跌幅", "建議方向", "進出場預判", "成交價價差", "5日線價差", "風險", "訊號狀態", "信心分", "信心判讀", "乖離", "支撐壓力", "隔日規則", "方向依據", "市場一致", "當日漲停價", "當日跌停價", "期貨", "資料狀態", "買賣價差"]
                     else:
                         input_cols = ["代號", "名稱", "戰略備註", "收盤價", "漲跌幅", "成交價價差", "5日線價差", "當日漲停價", "當日跌停價", "期貨"]
                     for col in input_cols:
@@ -20744,10 +20824,23 @@ with tab_db:
         if 'disposal_refresh_idx' not in st.session_state:
             st.session_state.disposal_refresh_idx = 0
             
-        # 新增重新整理按鈕
-        if st.button("🔄 重新整理處置股", key="btn_refresh_disposal"):
-            st.session_state.disposal_refresh_idx += 1
-            st.rerun()
+        refresh_col, official_twse_col, official_tpex_col, _ = st.columns([1.3, 1.45, 1.45, 3])
+        with refresh_col:
+            if st.button("🔄 重新整理處置股", key="btn_refresh_disposal", width='stretch'):
+                st.session_state.disposal_refresh_idx += 1
+                st.rerun()
+        with official_twse_col:
+            st.link_button(
+                "官方上市處置公告",
+                "https://www.twse.com.tw/zh/announcement/punish.html",
+                width='stretch',
+            )
+        with official_tpex_col:
+            st.link_button(
+                "官方上櫃處置公告",
+                "https://www.tpex.org.tw/zh-tw/announce/market/disposal.html",
+                width='stretch',
+            )
             
         # 將計數器加入網址參數，藉由改變網址強制 iframe 重新載入
         refresh_url = f"https://cmfaren.github.io/dispositionforecast/?t={st.session_state.disposal_refresh_idx}"

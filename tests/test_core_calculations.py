@@ -563,6 +563,29 @@ def test_apps_script_rejects_only_older_stock_strategy_snapshots():
     assert "incomingUpdatedAt" in source
 
 
+def test_apps_script_splits_large_scope_data_across_columns_and_rows():
+    source = APPS_SCRIPT_PATH.read_text(encoding="utf-8")
+    assert "['scope', 'part', 'data', 'updated_at']" in source
+    assert "function splitJsonChunks_" in source
+    assert "splitJsonChunks_(serialized)" in source
+    assert "'market_risk_data', 'display_settings'" in source
+    assert "sheet.getRange('A1').getDisplayValue()" in source
+
+
+def test_stock_display_settings_are_normalized_for_reboot_restore():
+    symbols = load_app_symbols("normalize_stock_display_settings")
+    normalize = symbols["normalize_stock_display_settings"]
+    assert normalize({
+        "limit_rows": "8", "hide_non_stock": False,
+        "allow_warrant_search": True, "show_3d_hilo": True,
+    }) == {
+        "limit_rows": 8, "hide_non_stock": False,
+        "allow_warrant_search": True, "show_3d_hilo": True,
+    }
+    assert normalize({"limit_rows": 0})["limit_rows"] == 1
+    assert normalize({"limit_rows": "invalid"})["limit_rows"] == 5
+
+
 def test_post_21_strategy_ranking_uses_visible_rows_and_selected_mode():
     symbols = load_app_symbols(
         "get_holidays", "is_market_closed_func", "_as_float", "_ranking_number",

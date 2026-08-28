@@ -2,8 +2,9 @@
  * 台股全盤戰略室 Google Sheet scope 儲存端。
  *
  * 部署方式：在綁定目標試算表的 Apps Script 中完整取代舊程式，執行一次
- * setupAppCacheSheet()，再建立「網頁應用程式」新版本。執行身分選擇自己，
- * 存取權限依目前私人使用設定。
+ * setupAppCacheSheet()；若舊版 JSON 原本存在其他工作表 A1，再執行一次
+ * migrateLegacyCacheData()，最後建立「網頁應用程式」新版本。執行身分選擇
+ * 自己，存取權限依目前私人使用設定。
  */
 
 const SCOPES = [
@@ -15,8 +16,10 @@ const SCOPES = [
 ];
 
 const CACHE_SHEET_NAME = 'app_cache';
-const HEADER = ['scope', 'data', 'updated_at'];
-const MAX_CELL_CHARS = 48000;
+// One scope can exceed Google Sheets' 50,000-character cell ceiling.  Keep
+// the same app_cache sheet, but store each JSON value in numbered chunks.
+const HEADER = ['scope', 'part', 'data', 'updated_at'];
+const MAX_CELL_CHARS = 44000;
 
 
 function getStoreSheet_() {
@@ -33,6 +36,14 @@ function ensureHeader_(sheet) {
   const current = sheet.getLastRow() >= 1
     ? sheet.getRange(1, 1, 1, HEADER.length).getDisplayValues()[0]
     : [];
+  const legacyHeader = ['scope', 'data', 'updated_at'];
+  const isLegacy = legacyHeader.every(function(value, index) {
+    return String(current[index] || '').trim() === value;
+  });
+  if (isLegacy) {
+    migrateLegacyRowsToChunks_(sheet);
+    return;
+  }
   const matches = HEADER.every(function(value, index) {
     return String(current[index] || '').trim() === value;
   });
@@ -42,14 +53,58 @@ function ensureHeader_(sheet) {
 }
 
 
+function migrateLegacyRowsToChunks_(sheet) {
+  const lastRow = sheet.getLastRow();
+  const legacyRows = lastRow > 1
+    ? sheet.getRange(2, 1, lastRow - 1, 3).getDisplayValues()
+    : [];
+  const converted = [HEADER];
+  legacyRows.forEach(function(row) {
+    const scope = normalizeScope_(row[0]);
+    const serialized = String(row[1] || '');
+    if (!scope || !serialized) return;
+    splitJsonChunks_(serialized).forEach(function(chunk, part) {
+      converted.push([scope, part, chunk, String(row[2] || '')]);
+    });
+  });
+  sheet.clearContents();
+  sheet.getRange(1, 1, 1, HEADER.length).setNumberFormat('@').setValues([HEADER]);
+  if (converted.length > 1) {
+    sheet.getRange(2, 1, converted.length - 1, HEADER.length)
+      .setNumberFormat('@')
+      .setValues(converted.slice(1));
+  }
+}
+
+
+function splitJsonChunks_(serialized) {
+  const value = String(serialized || '');
+  if (!value) return ['{}'];
+  const chunks = [];
+  for (let start = 0; start < value.length; start += MAX_CELL_CHARS) {
+    chunks.push(value.slice(start, start + MAX_CELL_CHARS));
+  }
+  return chunks;
+}
+
+
 function getScopeRowMap_(sheet) {
   const result = {};
   const rowCount = Math.max(sheet.getLastRow() - 1, 0);
   if (!rowCount) return result;
-  const values = sheet.getRange(2, 1, rowCount, 1).getDisplayValues();
+  const values = sheet.getRange(2, 1, rowCount, HEADER.length).getDisplayValues();
   values.forEach(function(row, index) {
     const scope = normalizeScope_(row[0]);
-    if (scope && !result[scope]) result[scope] = index + 2;
+    if (!scope) return;
+    if (!result[scope]) {
+      result[scope] = {rows: [], parts: [], updated_at: ''};
+    }
+    result[scope].rows.push(index + 2);
+    result[scope].parts.push({
+      part: Number(row[1]) || 0,
+      data: String(row[2] || ''),
+    });
+    if (row[3]) result[scope].updated_at = String(row[3]);
   });
   return result;
 }
@@ -78,15 +133,18 @@ function doGet(e) {
 
 
 function readScopeData_(sheet, scope, row) {
-  if (!row) {
+  if (!row || !row.parts || !row.parts.length) {
     return {success: true, scope: scope, data: null, updated_at: ''};
   }
-  const values = sheet.getRange(row, 2, 1, 2).getDisplayValues()[0];
+  const serialized = row.parts
+    .sort(function(a, b) { return a.part - b.part; })
+    .map(function(part) { return part.data; })
+    .join('');
   return {
     success: true,
     scope: scope,
-    data: parseJsonSafe_(values[0]),
-    updated_at: String(values[1] || ''),
+    data: parseJsonSafe_(serialized),
+    updated_at: String(row.updated_at || ''),
   };
 }
 
@@ -142,12 +200,10 @@ function doPost(e) {
 function saveScopeData_(scope, data, updatedAt) {
   const sheet = getStoreSheet_();
   const serialized = JSON.stringify(data);
-  if (serialized.length > MAX_CELL_CHARS) {
-    throw new Error(scope + ' 資料超過單格安全上限：' + serialized.length);
-  }
+  const chunks = splitJsonChunks_(serialized);
   const rows = getScopeRowMap_(sheet);
-  const existingRow = rows[scope] || 0;
-  const row = existingRow || Math.max(sheet.getLastRow() + 1, 2);
+  const existing = rows[scope] || null;
+  const existingRow = existing && existing.rows.length ? existing.rows[0] : 0;
   const incomingUpdatedAt = String(updatedAt || new Date().toISOString());
 
   // A phone or desktop tab left open in the background can submit an older
@@ -155,9 +211,7 @@ function saveScopeData_(scope, data, updatedAt) {
   // Reject only genuinely older, parseable stock timestamps; equal timestamps
   // remain writable so notes in the same snapshot can still be updated.
   if (existingRow && scope === 'stock_strategy') {
-    const existingUpdatedAt = String(
-      sheet.getRange(existingRow, 3).getDisplayValue() || ''
-    ).trim();
+    const existingUpdatedAt = String(existing.updated_at || '').trim();
     const existingTime = Date.parse(existingUpdatedAt);
     const incomingTime = Date.parse(incomingUpdatedAt);
     if (
@@ -172,11 +226,18 @@ function saveScopeData_(scope, data, updatedAt) {
     }
   }
 
-  sheet.getRange(row, 1, 1, 3).setNumberFormat('@').setValues([[
-    scope,
-    serialized,
-    incomingUpdatedAt,
-  ]]);
+  if (existing && existing.rows.length) {
+    existing.rows.sort(function(a, b) { return b - a; }).forEach(function(row) {
+      sheet.deleteRow(row);
+    });
+  }
+  const row = Math.max(sheet.getLastRow() + 1, 2);
+  const values = chunks.map(function(chunk, part) {
+    return [scope, part, chunk, incomingUpdatedAt];
+  });
+  sheet.getRange(row, 1, values.length, HEADER.length)
+    .setNumberFormat('@')
+    .setValues(values);
   return row;
 }
 
@@ -245,7 +306,7 @@ function buildStockPayload_(payload) {
   [
     'version', 'stock_data', 'ignored_stocks', 'all_candidates',
     'saved_notes', 'cached_notes', 'stock_data_updated_at',
-    'market_risk_data',
+    'market_risk_data', 'display_settings',
   ].forEach(function(key) {
     if (payload[key] !== undefined) result[key] = payload[key];
   });
@@ -302,16 +363,21 @@ function setupAppCacheSheet() {
 
 
 function migrateLegacyCacheData() {
-  const sheet = getStoreSheet_();
-  const values = sheet.getDataRange().getDisplayValues();
+  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  const storeSheet = getStoreSheet_();
   const migrated = {};
-  values.forEach(function(row) {
-    row.forEach(function(cell) {
-      const payload = parseJsonSafe_(String(cell || '').trim());
-      if (!payload || typeof payload !== 'object') return;
-      migratePayloadObject_(payload, new Date().toISOString()).forEach(function(scope) {
-        migrated[scope] = true;
-      });
+  // The pre-scope deployment kept its full payload in a single cell (usually
+  // A1).  Read that legacy value without touching the original sheet, then
+  // save it through the current per-scope/chunked storage format.
+  spreadsheet.getSheets().forEach(function(sheet) {
+    if (sheet.getSheetId() === storeSheet.getSheetId()) return;
+    const candidate = parseJsonSafe_(sheet.getRange('A1').getDisplayValue());
+    const payload = candidate && candidate.data !== undefined
+      ? parseJsonSafe_(candidate.data)
+      : candidate;
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return;
+    migratePayloadObject_(payload, new Date().toISOString()).forEach(function(scope) {
+      migrated[scope] = true;
     });
   });
   SpreadsheetApp.flush();
