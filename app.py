@@ -8329,6 +8329,50 @@ def merge_futures_official_snapshot(current, previous, current_meta=None, previo
     return current_frame, merged_info
 
 
+def enrich_futures_ranking_fields(current, previous=None, current_meta=None, previous_meta=None):
+    """Add ranking fields that can be truthfully derived from official snapshots.
+
+    Near/far spread comes from the current contract curve. OI change is only
+    calculated when the saved snapshot has an explicitly earlier market date;
+    same-day or undated caches never masquerade as a previous trading day.
+    """
+    frame = current.copy() if isinstance(current, pd.DataFrame) else pd.DataFrame()
+    if frame.empty or '契約鍵' not in frame.columns:
+        return frame
+
+    if {'期貨代碼', '月份順位', '收盤價'}.issubset(frame.columns):
+        for _, indices in frame.groupby('期貨代碼', sort=False).groups.items():
+            curve = frame.loc[list(indices)].copy()
+            curve['_rank_month'] = pd.to_numeric(curve['月份順位'], errors='coerce')
+            curve['_rank_close'] = pd.to_numeric(curve['收盤價'], errors='coerce')
+            curve = curve.dropna(subset=['_rank_month', '_rank_close']).sort_values('_rank_month')
+            if len(curve) < 2:
+                continue
+            front_close = float(curve.iloc[0]['_rank_close'])
+            next_close = float(curve.iloc[1]['_rank_close'])
+            frame.loc[list(indices), '近遠月價差'] = front_close - next_close
+
+    previous_frame = previous.copy() if isinstance(previous, pd.DataFrame) else pd.DataFrame()
+    current_date = _ranking_market_date((current_meta or {}).get('updated'))
+    previous_date = _ranking_market_date((previous_meta or {}).get('updated'))
+    if (
+        previous_frame.empty or '契約鍵' not in previous_frame.columns
+        or not current_date or not previous_date or previous_date >= current_date
+    ):
+        return frame
+
+    previous_oi = {
+        str(row.get('契約鍵', '')).strip(): _safe_number(row.get('未平倉量'))
+        for _, row in previous_frame.iterrows()
+    }
+    for index, row in frame.iterrows():
+        current_oi = _safe_number(row.get('未平倉量'))
+        old_oi = previous_oi.get(str(row.get('契約鍵', '')).strip())
+        if current_oi is not None and old_oi is not None:
+            frame.at[index, '未平倉增減'] = current_oi - old_oi
+    return frame
+
+
 def _parse_futures_state_time(value):
     text = str(value or '').strip()
     digits = re.sub(r'[^0-9]', '', text)
@@ -8424,7 +8468,8 @@ def compact_futures_strategy_state(state, max_chars=14000):
     keep_columns = [
         '契約鍵', '期貨代碼', '契約月份', '名稱', '標的代號', '商品類型',
         'ETF期貨', '指數期貨', '小型期貨', '次月期貨', '月份順位', '交易時段',
-        '當日成交口數', '未平倉量', '開盤價', '當日高', '當日低', '收盤價',
+        '當日成交口數', '未平倉量', '未平倉增減', '近遠月價差',
+        '開盤價', '當日高', '當日低', '收盤價',
         '漲跌幅', '當日漲停價', '當日跌停價', '所需保證金', '維持保證金',
         '資料日期', '契約最後交易日', '乘數', '跳動點',
     ]
@@ -11735,15 +11780,23 @@ def render_stock_strategy_controls():
     return hide_non_stock, show_3d_hilo
 
 
+def build_stock_search_options(allow_warrants=None):
+    """Build one shared stock selector list for the main and independent rooms."""
+    code_map, _ = load_local_stock_names()
+    stock_options = []
+    if allow_warrants is None:
+        allow_warrants = bool(st.session_state.get('allow_warrant_search', False))
+    for code, name in sorted(code_map.items()):
+        if not allow_warrants and is_warrant(code):
+            continue
+        stock_options.append(f"{code} {name}")
+    return stock_options
+
+
 def render_stock_data_source_controls():
     """Render sources and quick search in the same settings panel."""
     st.markdown("#### 選股資料來源與快速查詢")
-    code_map, _ = load_local_stock_names()
-    stock_options = []
-    for code, name in sorted(code_map.items()):
-        if not st.session_state.get('allow_warrant_search', False) and is_warrant(code):
-            continue
-        stock_options.append(f"{code} {name}")
+    stock_options = build_stock_search_options()
 
     uploaded_file = None
     selected_sheet = 0
@@ -13990,6 +14043,11 @@ def fetch_post_close_stock_ranking_context(target_date_text):
         'User-Agent': 'Mozilla/5.0 (compatible; StockApp/1.0)',
     }
     jobs = {
+        'twse_daily': (
+            _TWSE_DAILY_QUOTES_URL,
+            {'date': target_date_text, 'type': 'ALLBUT0999', 'response': 'json'},
+        ),
+        'tpex_daily': (_TPEX_DAILY_QUOTES_URL, None),
         'twse_institutional': (
             'https://www.twse.com.tw/rwd/zh/fund/T86',
             {'date': target_date_text, 'selectType': 'ALLBUT0999', 'response': 'json'},
@@ -14067,6 +14125,30 @@ def fetch_post_close_stock_ranking_context(target_date_text):
 
     def field_index(fields, *candidates):
         return next((fields.index(name) for name in candidates if name in fields), -1)
+
+    twse_daily = payloads.get('twse_daily')
+    if isinstance(twse_daily, dict) and require_target_date('上市行情', twse_daily.get('date')):
+        daily_table = next((
+            table for table in twse_daily.get('tables', [])
+            if '證券代號' in table.get('fields', []) and '收盤價' in table.get('fields', [])
+        ), {})
+        fields = list(daily_table.get('fields', []))
+        code_index = field_index(fields, '證券代號')
+        close_index = field_index(fields, '收盤價')
+        for values in daily_table.get('data', []):
+            if code_index < 0 or close_index < 0 or len(values) <= max(code_index, close_index):
+                continue
+            record = stock_record(values[code_index])
+            if record is not None:
+                record['close'] = _ranking_number(values[close_index])
+
+    tpex_daily = payloads.get('tpex_daily')
+    if isinstance(tpex_daily, list) and tpex_daily:
+        if require_target_date('上櫃行情', tpex_daily[0].get('Date')):
+            for item in tpex_daily:
+                record = stock_record(item.get('SecuritiesCompanyCode'))
+                if record is not None:
+                    record['close'] = _ranking_number(item.get('Close'))
 
     twse_inst = payloads.get('twse_institutional')
     if isinstance(twse_inst, dict) and require_target_date('上市法人', twse_inst.get('date')):
@@ -14487,6 +14569,8 @@ def _futures_ranking_technical_component(row, is_daytrade):
     change = _ranking_number(row.get('漲跌幅'))
     vwap = _ranking_number(row.get('VWAP'))
     atr = _ranking_number(row.get('_risk_atr14') or row.get('ATR14'))
+    high = _ranking_number(row.get('當日高'))
+    low = _ranking_number(row.get('當日低'))
     oi_change = next((
         value for value in (
             _ranking_number(row.get('未平倉增減')),
@@ -14515,12 +14599,32 @@ def _futures_ranking_technical_component(row, is_daytrade):
         price_oi_signal = direction * (0.85 if oi_change > 0 else 0.35)
     structure_text = str(row.get('價位結構', '') or row.get('123／2B', ''))
     structure_signal = 0.65 if '多' in structure_text else (-0.65 if '空' in structure_text else None)
+    if (
+        structure_signal is None and close is not None and high is not None and low is not None
+        and high > low
+    ):
+        range_position = _ranking_clamp(((close - low) / (high - low) - 0.5) * 2)
+        structure_signal = range_position
+        structure_text = f'日內位置 {(close - low) / (high - low) * 100:.0f}%'
     cdp_text = str(row.get('CDP', '') or row.get('CDP狀態', ''))
     cdp_signal = 0.5 if '多' in cdp_text else (-0.5 if '空' in cdp_text else None)
     directional = [value for value in (change_signal, open_signal, vwap_signal, price_oi_signal) if value is not None]
     base_direction = 1 if sum(directional) >= 0 else -1
     atr_percent = atr / close * 100 if atr is not None and close not in (None, 0) else None
+    range_percent = (
+        (high - low) / close * 100
+        if atr_percent is None and high is not None and low is not None
+        and high >= low and close not in (None, 0) else None
+    )
     atr_signal = base_direction * min(max((atr_percent or 0) / 3, 0.12), 0.65) if atr_percent is not None else None
+    if atr_signal is None and range_percent is not None:
+        atr_signal = base_direction * min(max(range_percent / 3, 0.12), 0.65)
+    volatility_label = (
+        f'ATR {round(atr_percent, 1):g}%'
+        if atr_percent is not None else
+        f'日內波幅 {round(range_percent, 1):g}%'
+        if range_percent is not None else ''
+    )
     if is_daytrade:
         items = [
             (vwap_signal, 15, ('站上' if vwap_signal is not None and vwap_signal >= 0 else '跌破') + 'VWAP' if vwap_signal is not None else ''),
@@ -14528,14 +14632,14 @@ def _futures_ranking_technical_component(row, is_daytrade):
             (cdp_signal, 8, cdp_text),
             (structure_signal, 7, structure_text),
             (_ranking_average([open_signal, change_signal]), 5, '站上開盤' if open_signal is not None and open_signal >= 0 else '跌破開盤' if open_signal is not None else ''),
-            (atr_signal, 5, f'ATR {round(atr_percent, 1):g}%' if atr_percent is not None else ''),
+            (atr_signal, 5, volatility_label),
         ]
     else:
         items = [
             (open_signal, 10, '中期價格偏多' if open_signal is not None and open_signal >= 0 else '中期價格偏空' if open_signal is not None else ''),
             (structure_signal, 10, structure_text),
             (price_oi_signal, 7, f'價格×OI {oi_change:+g}' if price_oi_signal is not None else ''),
-            (atr_signal, 4, f'ATR {round(atr_percent, 1):g}%' if atr_percent is not None else ''),
+            (atr_signal, 4, volatility_label),
             (cdp_signal, 1, cdp_text),
             (change_signal, 3, f'動能 {change:+g}%' if change is not None else ''),
         ]
@@ -14553,7 +14657,7 @@ def _futures_contract_chip_component(row, market_context):
     if product_type == '股票':
         product_name = '股票期貨'
     elif product_type == 'ETF':
-        product_name = '股票期貨'
+        product_name = 'ETF期貨'
     else:
         product_name = product_names.get(root, str(row.get('名稱', '')).strip())
     return market_context.get('futures_products', {}).get(product_name)
@@ -14652,6 +14756,12 @@ def _score_futures_post_close(row, strategy_mode, market_context, row_scales):
     basis = _ranking_number(row.get('基差') or row.get('期現價差'))
     near_far = _ranking_number(row.get('近遠月價差') or row.get('近月／次月價差'))
     close = _ranking_number(row.get('收盤價'))
+    underlying_close = _ranking_number(underlying_context.get('close'))
+    if (
+        basis is None and str(row.get('商品類型', '')) in {'股票', 'ETF'}
+        and close is not None and underlying_close is not None
+    ):
+        basis = close - underlying_close
     basis_scale = max(abs(close or 0) * 0.01, 1)
     institutional_change = _ranking_number(
         row.get('法人OI增減') or row.get('_institutional_oi_change')
@@ -16561,6 +16671,13 @@ def render_futures_strategy_room():
         }
         st.info("期交所資料暫時無法取得，已還原上次成功保存的期貨表格。")
 
+    universe = enrich_futures_ranking_fields(
+        universe,
+        saved_universe,
+        universe_meta,
+        saved_meta if isinstance(saved_meta, dict) else {},
+    )
+
     # 官方交易日切換時，舊盤中排行不可覆蓋新日盤的成交量；
     # rank cache 沒有跨日合併的意義，改由新資料重新建立。
     saved_updated = saved_meta.get('updated') if isinstance(saved_meta, dict) else None
@@ -18360,7 +18477,7 @@ if tab1.open and stock_strategy_tab.open:
             with col_q1:
                 indep_selection = st.multiselect(
                     "🔍 快速查詢 (中文/代號)",
-                    options=stock_options,
+                    options=build_stock_search_options(),
                     key="indep_search_multiselect",
                     placeholder="輸入 2330 或 台積電..."
                 )

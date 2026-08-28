@@ -741,6 +741,79 @@ def test_futures_post_close_ranking_uses_taifex_position_direction():
     assert all("籌碼偏" in item["reason"] for item in entries)
 
 
+def test_stock_search_options_are_shared_without_leaking_local_scope():
+    symbols = load_app_symbols("build_stock_search_options")
+    symbols["load_local_stock_names"] = lambda: (
+        {"2330": "台積電", "123456": "測試權證"}, {}
+    )
+    symbols["is_warrant"] = lambda code: len(str(code)) > 4
+    symbols["st"] = type("FakeStreamlit", (), {"session_state": {}})()
+    assert symbols["build_stock_search_options"]() == ["2330 台積電"]
+    assert symbols["build_stock_search_options"](allow_warrants=True) == [
+        "123456 測試權證", "2330 台積電",
+    ]
+    source = APP_PATH.read_text(encoding="utf-8")
+    independent_start = source.index('key="indep_search_multiselect"')
+    assert "options=build_stock_search_options()" in source[independent_start - 180:independent_start]
+
+
+def test_futures_ranking_derives_curve_oi_range_and_spot_basis_without_fake_values():
+    symbols = load_app_symbols(
+        "_safe_number", "_as_float", "_ranking_number", "_ranking_clamp",
+        "_ranking_market_date", "_ranking_component_from_items", "_ranking_average",
+        "_ranking_fundamental_component", "_ranking_chip_component",
+        "_futures_ranking_technical_component", "_futures_contract_chip_component",
+        "_combine_ranking_components", "strategy_ranking_weights",
+        "_score_futures_post_close", "enrich_futures_ranking_fields",
+    )
+    current = pd.DataFrame([
+        {"契約鍵": "CDF:202609", "期貨代碼": "CDF", "契約月份": "202609",
+         "月份順位": 0, "商品類型": "股票", "標的代號": "2330", "名稱": "台積電期貨",
+         "收盤價": 100, "開盤價": 98, "當日高": 105, "當日低": 95,
+         "漲跌幅": 2, "當日成交口數": 5000, "未平倉量": 1000},
+        {"契約鍵": "CDF:202610", "期貨代碼": "CDF", "契約月份": "202610",
+         "月份順位": 1, "商品類型": "股票", "標的代號": "2330", "名稱": "台積電期貨",
+         "收盤價": 99, "開盤價": 98, "當日高": 102, "當日低": 96,
+         "漲跌幅": 1, "當日成交口數": 800, "未平倉量": 300},
+    ])
+    previous = pd.DataFrame([
+        {"契約鍵": "CDF:202609", "未平倉量": 800},
+        {"契約鍵": "CDF:202610", "未平倉量": 350},
+    ])
+    enriched = symbols["enrich_futures_ranking_fields"](
+        current, previous, {"updated": "20260827"}, {"updated": "20260826"},
+    )
+    assert enriched.loc[0, "近遠月價差"] == 1
+    assert enriched.loc[0, "未平倉增減"] == 200
+    same_day = symbols["enrich_futures_ranking_fields"](
+        current, previous, {"updated": "20260827"}, {"updated": "20260827"},
+    )
+    assert "未平倉增減" not in same_day.columns
+
+    context = {
+        "stocks": {"2330": {
+            "close": 98, "foreign_net": 100000, "trust_net": 20000,
+            "dealer_net": 5000, "revenue_yoy": 10, "eps": 5, "pe": 18,
+        }},
+        "scales": {"foreign": 100000, "trust": 20000, "dealer": 5000,
+                   "margin": 100, "short": 20},
+        "futures_products": {"股票期貨": {
+            "signal": 0.5, "quality": 70, "text": "外資淨部位+1,000口",
+        }},
+    }
+    row_scales = {"volume": 5000, "open_interest": 1000}
+    baseline = symbols["_score_futures_post_close"](
+        current.iloc[0], "當沖", context, row_scales,
+    )
+    improved = symbols["_score_futures_post_close"](
+        enriched.iloc[0], "當沖", context, row_scales,
+    )
+    assert improved["coverage"] > baseline["coverage"]
+    assert "日內位置" in improved["reason"]
+    assert "價格×OI" in improved["reason"]
+    assert "基差" in improved["reason"] or "近遠月" in improved["reason"]
+
+
 def test_limit_note_uses_the_candles_own_previous_close():
     symbols = load_app_symbols(
         "_safe_number", "get_tick_size", "calculate_limits",
