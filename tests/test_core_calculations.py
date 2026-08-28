@@ -1387,6 +1387,53 @@ def test_only_small_stock_futures_excludes_index_and_etf_products():
     assert not predicate({"商品類型": "股票", "小型期貨": False, "指數期貨": False, "ETF期貨": False})
 
 
+def test_only_night_futures_filter_excludes_day_contracts_and_uses_night_volume_order():
+    symbols = load_app_symbols(
+        "TAIFEX_NIGHT_SESSION_ROOTS", "is_futures_night_session_product",
+        "is_small_stock_futures_record", "filter_futures_strategy_display_rows",
+    )
+    filter_rows = symbols["filter_futures_strategy_display_rows"]
+    rows = pd.DataFrame([
+        {
+            "契約鍵": "TX:202609", "期貨代碼": "TX", "交易時段": "日盤+夜盤",
+            "商品類型": "指數", "指數期貨": True, "ETF期貨": False, "小型期貨": False,
+            "次月期貨": False, "月份順位": 0, "當日成交口數": 900, "夜盤成交口數": 45,
+        },
+        {
+            "契約鍵": "QFF:202609", "期貨代碼": "QFF", "交易時段": "日盤+夜盤",
+            "商品類型": "股票", "指數期貨": False, "ETF期貨": False, "小型期貨": False,
+            "次月期貨": False, "月份順位": 0, "當日成交口數": 300, "夜盤成交口數": 80,
+        },
+        {
+            "契約鍵": "DAY:202609", "期貨代碼": "DAY", "交易時段": "日盤",
+            "商品類型": "股票", "指數期貨": False, "ETF期貨": False, "小型期貨": False,
+            "次月期貨": False, "月份順位": 0, "當日成交口數": 1200,
+        },
+    ])
+
+    visible = filter_rows(rows, only_night=True, hide_index=False, minimum_volume=1)
+    assert visible["契約鍵"].tolist() == ["QFF:202609", "TX:202609"]
+    assert "DAY:202609" not in set(visible["契約鍵"])
+
+    without_index = filter_rows(rows, only_night=True, hide_index=True, minimum_volume=1)
+    assert without_index["契約鍵"].tolist() == ["QFF:202609"]
+
+
+def test_requested_futures_controls_and_company_tab_order_are_present():
+    source = APP_PATH.read_text(encoding="utf-8")
+    assert "🚨 官方上市處置公告" in source
+    assert "🚨 官方上櫃處置公告" in source
+    assert "taiwan_tab, us_tab, earnings_tab = st.tabs" in source
+    assert "只顯示夜盤期貨" in source
+    assert source.index("只顯示夜盤期貨") > source.index("只顯示小型股票期貨")
+    assert source.index("只顯示夜盤期貨") < source.index("隱藏小型期貨")
+    compact_start = source.index("if compact_futures_table:")
+    compact_end = source.index("else:\n            futures_display_columns", compact_start)
+    compact_columns = source[compact_start:compact_end]
+    assert compact_columns.index("'收盤價'") < compact_columns.index("'方向'")
+    assert compact_columns.index("'進出場點位'") < compact_columns.index("'支撐壓力'")
+
+
 def test_directional_option_quality_rejects_negative_or_unreachable_trades():
     evaluate = load_app_symbols("evaluate_txo_directional_quality")["evaluate_txo_directional_quality"]
     good = evaluate(100, 3500, -2000, 0.48, 8, "中", True)

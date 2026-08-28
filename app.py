@@ -3455,7 +3455,7 @@ def render_company_event_snapshot(snapshot):
     taiwan_result = snapshot.get("taiwan_revenue", {})
     us_result = snapshot.get("us_revenue", {})
 
-    taiwan_tab, earnings_tab, us_tab = st.tabs(["🏢 台股月營收", "📅 財報時間", "🌎 美股季度／年度營收"])
+    taiwan_tab, us_tab, earnings_tab = st.tabs(["🏢 台股月營收", "🌎 美股季度／年度營收", "📅 財報時間"])
     with earnings_tab:
         earnings_events = earnings_result.get("events", [])
         if earnings_events:
@@ -8468,7 +8468,7 @@ def compact_futures_strategy_state(state, max_chars=14000):
     keep_columns = [
         '契約鍵', '期貨代碼', '契約月份', '名稱', '標的代號', '商品類型',
         'ETF期貨', '指數期貨', '小型期貨', '次月期貨', '月份順位', '交易時段',
-        '當日成交口數', '未平倉量', '未平倉增減', '近遠月價差',
+        '當日成交口數', '夜盤成交口數', '未平倉量', '未平倉增減', '近遠月價差',
         '開盤價', '當日高', '當日低', '收盤價',
         '漲跌幅', '當日漲停價', '當日跌停價', '所需保證金', '維持保證金',
         '資料日期', '契約最後交易日', '乘數', '跳動點',
@@ -12430,6 +12430,75 @@ def is_small_stock_futures_record(record):
     )
 
 
+def filter_futures_strategy_display_rows(
+    rows, *, only_small=False, hide_index=False, hide_etf=False, hide_small=False,
+    hide_next=False, only_night=False, minimum_volume=None, ignored_keys=None,
+):
+    """套用期貨戰略室主表篩選，並保留可驗證的成交量排序。"""
+    if rows is None or rows.empty:
+        return rows.copy() if isinstance(rows, pd.DataFrame) else pd.DataFrame()
+
+    filtered = rows.copy()
+
+    def flag(column):
+        if column not in filtered.columns:
+            return pd.Series(False, index=filtered.index)
+        return filtered[column].fillna(False).astype(bool)
+
+    if only_small:
+        filtered = filtered[filtered.apply(is_small_stock_futures_record, axis=1)]
+    else:
+        if hide_index:
+            filtered = filtered[~flag('指數期貨')]
+        if hide_etf:
+            filtered = filtered[~flag('ETF期貨')]
+        if hide_small:
+            filtered = filtered[~flag('小型期貨')]
+    if hide_next:
+        filtered = filtered[~flag('次月期貨')]
+    if only_night:
+        session_mask = (
+            filtered['交易時段'].astype(str).str.contains('夜盤', regex=False, na=False)
+            if '交易時段' in filtered.columns else pd.Series(False, index=filtered.index)
+        )
+        root_mask = (
+            filtered['期貨代碼'].map(is_futures_night_session_product)
+            if '期貨代碼' in filtered.columns else pd.Series(False, index=filtered.index)
+        )
+        filtered = filtered[session_mask | root_mask]
+    if minimum_volume is not None and '當日成交口數' in filtered.columns:
+        volumes = pd.to_numeric(filtered['當日成交口數'], errors='coerce').fillna(0)
+        filtered = filtered[volumes >= int(minimum_volume)]
+    if ignored_keys and '契約鍵' in filtered.columns:
+        filtered = filtered[~filtered['契約鍵'].astype(str).isin({str(key) for key in ignored_keys})]
+
+    if filtered.empty:
+        return filtered
+
+    volume_series = (
+        pd.to_numeric(filtered['當日成交口數'], errors='coerce').fillna(0)
+        if '當日成交口數' in filtered.columns else pd.Series(0, index=filtered.index)
+    )
+    month_series = (
+        pd.to_numeric(filtered['月份順位'], errors='coerce').fillna(999)
+        if '月份順位' in filtered.columns else pd.Series(999, index=filtered.index)
+    )
+    filtered = filtered.assign(_策略成交量=volume_series, _策略月份順位=month_series)
+    if only_night:
+        night_volume = (
+            pd.to_numeric(filtered['夜盤成交口數'], errors='coerce')
+            if '夜盤成交口數' in filtered.columns else pd.Series(float('nan'), index=filtered.index)
+        )
+        filtered['_策略夜盤成交量'] = night_volume.where(night_volume.notna(), filtered['_策略成交量'])
+        return filtered.sort_values(
+            ['_策略夜盤成交量', '_策略成交量', '_策略月份順位'],
+            ascending=[False, False, True],
+        ).drop(columns=['_策略夜盤成交量', '_策略成交量', '_策略月份順位'])
+    return filtered.sort_values(
+        ['_策略成交量', '_策略月份順位'], ascending=[False, True],
+    ).drop(columns=['_策略成交量', '_策略月份順位'])
+
+
 def _contract_delivery_month(contract):
     value = getattr(contract, 'delivery_month', None) or getattr(contract, 'delivery_date', '')
     match = re.search(r'\d{6}', str(value).replace('-', '').replace('/', ''))
@@ -12924,7 +12993,9 @@ def update_futures_universe_live(rows, api):
         for (index, _), snapshot in zip(batch, batch_snapshots):
             snapshots[index] = snapshot
 
-    update_time = datetime.now(pytz.timezone('Asia/Taipei')).strftime('%Y/%m/%d %H:%M:%S')
+    now_tw = datetime.now(pytz.timezone('Asia/Taipei'))
+    update_time = now_tw.strftime('%Y/%m/%d %H:%M:%S')
+    is_night_session = now_tw.time() >= dt_time(15, 0) or now_tw.time() < dt_time(5, 0)
     update_count = 0
     for index, snapshot in snapshots.items():
         price = _safe_number(getattr(snapshot, 'close', None)) or _safe_number(getattr(snapshot, 'open', None))
@@ -12938,6 +13009,8 @@ def update_futures_universe_live(rows, api):
                 updated.at[index, '漲跌幅'] = live_change_rate
         if total_volume is not None:
             updated.at[index, '當日成交口數'] = int(total_volume)
+            if is_night_session:
+                updated.at[index, '夜盤成交口數'] = int(total_volume)
         updated.at[index, '當日高'] = _safe_number(getattr(snapshot, 'high', None), updated.at[index, '當日高'])
         updated.at[index, '當日低'] = _safe_number(getattr(snapshot, 'low', None), updated.at[index, '當日低'])
         updated.at[index, '買價'] = _safe_number(getattr(snapshot, 'buy_price', None))
@@ -16610,14 +16683,30 @@ def render_futures_strategy_room():
                 limit_rows = st.number_input("顯示筆數", min_value=1, max_value=50, value=5, step=1, key="futures_strategy_limit")
                 minimum_volume = st.number_input("最低成交口數", min_value=1, value=1, step=1, key="futures_minimum_volume")
             with control3:
-                hide_index = st.checkbox("隱藏指數期貨", value=True, key="futures_hide_index")
-                hide_etf = st.checkbox("隱藏 ETF 期貨", value=False, key="futures_hide_etf")
+                hide_index = st.checkbox(
+                    "隱藏指數期貨", value=True, key="futures_hide_index",
+                    help="隱藏臺指、電子、金融等指數期貨；不會刪除已儲存的資料或快速新增設定。",
+                )
+                hide_etf = st.checkbox(
+                    "隱藏 ETF 期貨", value=False, key="futures_hide_etf",
+                    help="隱藏 ETF 標的期貨，只保留個股與指數期貨。",
+                )
                 only_small = st.checkbox(
                     "只顯示小型股票期貨", value=False, key="futures_only_small",
                     help="只保留小型個股期貨，依成交口數由高到低排序；一般股票期貨、指數期貨與 ETF 期貨都會隱藏。"
                 )
-                hide_small = st.checkbox("隱藏小型期貨", value=False, key="futures_hide_small")
-                hide_next = st.checkbox("隱藏次月期貨", value=True, key="futures_hide_next")
+                only_night = st.checkbox(
+                    "只顯示夜盤期貨", value=False, key="futures_only_night",
+                    help="只保留可交易夜盤的契約。夜盤即時排行已更新時依夜盤累計成交口數排序；否則暫用目前可用成交口數。",
+                )
+                hide_small = st.checkbox(
+                    "隱藏小型期貨", value=False, key="futures_hide_small",
+                    help="隱藏小型或微型規格的期貨；一般規格契約仍會保留。",
+                )
+                hide_next = st.checkbox(
+                    "隱藏次月期貨", value=True, key="futures_hide_next",
+                    help="隱藏次月與更遠月契約；結算日 13:30 後接手月份會自動視為近月。",
+                )
     with info_col:
         render_futures_strategy_explanation()
 
@@ -16739,7 +16828,7 @@ def render_futures_strategy_room():
         for index, row in universe.iterrows():
             cached_rank = rank_cache.get(str(row['契約鍵']), {})
             for column, value in cached_rank.items():
-                if column in universe.columns or column in ('買價', '賣價', '報價時間'):
+                if column in universe.columns or column in ('買價', '賣價', '報價時間', '夜盤成交口數'):
                     universe.at[index, column] = value
         universe = universe.sort_values(
             ['當日成交口數', '月份順位'], ascending=[False, True]
@@ -16755,7 +16844,7 @@ def render_futures_strategy_room():
                 )
             if live_count:
                 rank_columns = [
-                    '當日成交口數', '收盤價', '漲跌幅', '當日高', '當日低',
+                    '當日成交口數', '夜盤成交口數', '收盤價', '漲跌幅', '當日高', '當日低',
                     '買價', '賣價', '報價時間'
                 ]
                 st.session_state.futures_strategy_rank_cache = {
@@ -16804,6 +16893,11 @@ def render_futures_strategy_room():
     )
     if universe_meta.get('errors'):
         st.warning("部分官方資料未完整取得：" + "｜".join(universe_meta['errors']))
+    if only_night:
+        st.caption(
+            "🌙 夜盤篩選：僅顯示可交易夜盤的契約；夜盤即時排行已更新時依夜盤累計成交口數排序，"
+            "否則暫用目前可用成交口數。"
+        )
 
     front_index_rows = universe[
         universe['期貨代碼'].isin(['TX', 'MTX', 'TMF']) & (universe['月份順位'] == 0)
@@ -16822,79 +16916,66 @@ def render_futures_strategy_room():
     else:
         market_bias = str(st.session_state.get('strategy_market_environment', {}).get('bias', '盤整'))
 
-    filtered = universe.copy()
-    if only_small:
-        filtered = filtered[
-            filtered.apply(is_small_stock_futures_record, axis=1)
-        ].sort_values('當日成交口數', ascending=False)
-    else:
-        if hide_index:
-            filtered = filtered[~filtered['指數期貨']]
-        if hide_etf:
-            filtered = filtered[~filtered['ETF期貨']]
-        if hide_small:
-            filtered = filtered[~filtered['小型期貨']]
-    if hide_next:
-        filtered = filtered[~filtered['次月期貨']]
-    filtered = filtered[filtered['當日成交口數'] >= int(minimum_volume)]
-    filtered = filtered[~filtered['契約鍵'].isin(st.session_state.futures_strategy_ignored)]
+    filter_options = {
+        'only_small': only_small, 'hide_index': hide_index, 'hide_etf': hide_etf,
+        'hide_small': hide_small, 'hide_next': hide_next, 'only_night': only_night,
+        'ignored_keys': st.session_state.futures_strategy_ignored,
+    }
+    filtered = filter_futures_strategy_display_rows(
+        universe, minimum_volume=minimum_volume, **filter_options,
+    )
     base_rows = filtered.head(int(limit_rows)).copy()
 
-    # 將股票戰略室內有股期的標的依股票原順序附加：A 股期、A 小型股期、B 股期、B 小型股期。
-    linked_pool = universe.copy()
-    if only_small:
-        linked_pool = linked_pool[
-            linked_pool.apply(is_small_stock_futures_record, axis=1)
-        ].sort_values('當日成交口數', ascending=False)
+    # 夜盤模式僅依夜盤成交口數排序，不插入手動／關聯契約破壞排序。
+    if only_night:
+        display_rows = base_rows
     else:
-        if hide_index:
-            linked_pool = linked_pool[~linked_pool['指數期貨']]
-        if hide_etf:
-            linked_pool = linked_pool[~linked_pool['ETF期貨']]
-        if hide_small:
-            linked_pool = linked_pool[~linked_pool['小型期貨']]
-    linked_pool = linked_pool[
-        (linked_pool['月份順位'] == 0)
-        & ~linked_pool['契約鍵'].isin(st.session_state.futures_strategy_ignored)
-    ]
-    linked_keys = []
-    stock_rows = st.session_state.get('stock_data', pd.DataFrame())
-    if isinstance(stock_rows, pd.DataFrame) and not stock_rows.empty and '代號' in stock_rows.columns:
-        ignored_stock_codes = {
-            str(code) for code in st.session_state.get('ignored_stocks', set())
-        }
-        for stock_code in stock_rows['代號'].astype(str):
-            if stock_code in ignored_stock_codes:
-                continue
-            matches = linked_pool[linked_pool['標的代號'].astype(str) == stock_code].copy()
-            if matches.empty:
-                continue
-            matches = matches.sort_values(
-                ['小型期貨', '當日成交口數', '期貨代碼'], ascending=[True, False, True]
-            )
-            for key in matches['契約鍵'].astype(str):
-                if key not in linked_keys:
-                    linked_keys.append(key)
-    base_keys = set(base_rows['契約鍵'].astype(str))
-    linked_keys = [key for key in linked_keys if key not in base_keys]
-    linked_rows = linked_pool[linked_pool['契約鍵'].astype(str).isin(linked_keys)].copy()
-    if not linked_rows.empty:
-        linked_order = {key: order for order, key in enumerate(linked_keys)}
-        linked_rows['_linked_order'] = linked_rows['契約鍵'].astype(str).map(linked_order)
-        linked_rows = linked_rows.sort_values('_linked_order').drop(columns=['_linked_order'])
+        # 將股票戰略室內有股期的標的依股票原順序附加：A 股期、A 小型股期、B 股期、B 小型股期。
+        linked_pool = filter_futures_strategy_display_rows(
+            universe, minimum_volume=None, **filter_options,
+        )
+        linked_pool = linked_pool[linked_pool['月份順位'] == 0]
+        linked_keys = []
+        stock_rows = st.session_state.get('stock_data', pd.DataFrame())
+        if isinstance(stock_rows, pd.DataFrame) and not stock_rows.empty and '代號' in stock_rows.columns:
+            ignored_stock_codes = {
+                str(code) for code in st.session_state.get('ignored_stocks', set())
+            }
+            for stock_code in stock_rows['代號'].astype(str):
+                if stock_code in ignored_stock_codes:
+                    continue
+                matches = linked_pool[linked_pool['標的代號'].astype(str) == stock_code].copy()
+                if matches.empty:
+                    continue
+                matches = matches.sort_values(
+                    ['小型期貨', '當日成交口數', '期貨代碼'], ascending=[True, False, True]
+                )
+                for key in matches['契約鍵'].astype(str):
+                    if key not in linked_keys:
+                        linked_keys.append(key)
+        base_keys = set(base_rows['契約鍵'].astype(str))
+        linked_keys = [key for key in linked_keys if key not in base_keys]
+        linked_rows = linked_pool[linked_pool['契約鍵'].astype(str).isin(linked_keys)].copy()
+        if not linked_rows.empty:
+            linked_order = {key: order for order, key in enumerate(linked_keys)}
+            linked_rows['_linked_order'] = linked_rows['契約鍵'].astype(str).map(linked_order)
+            linked_rows = linked_rows.sort_values('_linked_order').drop(columns=['_linked_order'])
 
-    manual_keys = [
-        key for key in st.session_state.futures_strategy_manual
-        if key not in st.session_state.futures_strategy_ignored
-        and key not in base_keys
-        and key not in set(linked_keys)
-    ]
-    manual_rows = universe[universe['契約鍵'].isin(manual_keys)].copy()
-    if not manual_rows.empty:
-        order_map = {key: order for order, key in enumerate(manual_keys)}
-        manual_rows['_manual_order'] = manual_rows['契約鍵'].map(order_map)
-        manual_rows = manual_rows.sort_values('_manual_order').drop(columns=['_manual_order'])
-    display_rows = pd.concat([base_rows, manual_rows, linked_rows], ignore_index=True)
+        manual_keys = [
+            key for key in st.session_state.futures_strategy_manual
+            if key not in st.session_state.futures_strategy_ignored
+            and key not in base_keys
+            and key not in set(linked_keys)
+        ]
+        manual_pool = filter_futures_strategy_display_rows(
+            universe, minimum_volume=None, **filter_options,
+        )
+        manual_rows = manual_pool[manual_pool['契約鍵'].isin(manual_keys)].copy()
+        if not manual_rows.empty:
+            order_map = {key: order for order, key in enumerate(manual_keys)}
+            manual_rows['_manual_order'] = manual_rows['契約鍵'].map(order_map)
+            manual_rows = manual_rows.sort_values('_manual_order').drop(columns=['_manual_order'])
+        display_rows = pd.concat([base_rows, manual_rows, linked_rows], ignore_index=True)
     cache = st.session_state.futures_strategy_live_cache
 
     for index, row in display_rows.iterrows():
@@ -16951,22 +17032,23 @@ def render_futures_strategy_room():
         display_rows = enrich_futures_strategy_rows(display_rows, strategy_mode, market_bias)
         if compact_futures_table:
             futures_display_columns = [
-                '忽略', '期貨代碼', '契約月份', '名稱', '方向', '收盤價', '漲跌幅',
-                '訊號狀態', '信心分', '信心判讀', '支撐壓力', '進出場點位', '市場一致',
+                '忽略', '期貨代碼', '契約月份', '名稱', '收盤價', '漲跌幅', '方向',
+                '進出場點位', '支撐壓力', '訊號狀態', '信心分', '信心判讀', '市場一致',
                 '資料狀態', '可交易性', '交易時段', '當日成交口數', '未平倉量', '量倉比',
                 '到期提醒', '所需保證金'
             ]
         else:
             futures_display_columns = [
-                '忽略', '期貨代碼', '契約月份', '名稱', '方向', '支撐壓力', '進出場點位', '觸發條件',
-                '當日漲停價', '當日跌停價', '收盤價', '漲跌幅', '訊號狀態', '信心分', '信心判讀',
+                '忽略', '期貨代碼', '契約月份', '名稱', '收盤價', '漲跌幅', '方向',
+                '進出場點位', '支撐壓力', '觸發條件', '訊號狀態', '信心分', '信心判讀',
+                '當日漲停價', '當日跌停價',
                 '可交易性', '資料狀態', '市場一致', '買賣價差', '量倉比', '到期提醒',
                 '交易時段', '當日成交口數', '未平倉量', '所需保證金', '維持保證金'
             ]
     else:
         futures_display_columns = [
-            '忽略', '期貨代碼', '契約月份', '名稱', '方向', '支撐壓力', '進出場點位', '觸發條件',
-            '當日漲停價', '當日跌停價', '收盤價', '漲跌幅',
+            '忽略', '期貨代碼', '契約月份', '名稱', '收盤價', '漲跌幅', '方向',
+            '進出場點位', '支撐壓力', '觸發條件', '當日漲停價', '當日跌停價',
             '交易時段', '當日成交口數', '未平倉量', '所需保證金', '維持保證金'
         ]
 
@@ -20941,20 +21023,20 @@ with tab_db:
         if 'disposal_refresh_idx' not in st.session_state:
             st.session_state.disposal_refresh_idx = 0
             
-        refresh_col, official_twse_col, official_tpex_col, _ = st.columns([1.3, 1.45, 1.45, 3])
+        refresh_col, official_twse_col, official_tpex_col = st.columns([1.3, 1.45, 1.45])
         with refresh_col:
             if st.button("🔄 重新整理處置股", key="btn_refresh_disposal", width='stretch'):
                 st.session_state.disposal_refresh_idx += 1
                 st.rerun()
         with official_twse_col:
             st.link_button(
-                "官方上市處置公告",
+                "🚨 官方上市處置公告",
                 "https://www.twse.com.tw/zh/announcement/punish.html",
                 width='stretch',
             )
         with official_tpex_col:
             st.link_button(
-                "官方上櫃處置公告",
+                "🚨 官方上櫃處置公告",
                 "https://www.tpex.org.tw/zh-tw/announce/market/disposal.html",
                 width='stretch',
             )
