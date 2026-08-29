@@ -5853,6 +5853,14 @@ def _format_fibo_trade_price(value, asset_type):
     return f"{rounded:,.2f}"
 
 
+def _format_fibo_price_change(value, asset_type):
+    """Keep stock changes at two decimals while index/futures stay integral."""
+    number = float(value)
+    if asset_type == 'stock':
+        return f"{number:+,.2f}"
+    return f"{number:+,.0f}"
+
+
 def _fibo_pivots(data, width=2):
     """Return alternating local swing points, newest point last."""
     highs = data['High'].astype(float).to_numpy()
@@ -6030,10 +6038,22 @@ def render_fibonacci_trade_suggestion(suggestion):
     """Render the Fibonacci plan below the chart in a concise, actionable form."""
     if not suggestion:
         return
-    header_cols = st.columns([1.25, 2.75], vertical_alignment="top")
-    header_cols[0].markdown(
-        "<div style='font-size:17px;font-weight:700;white-space:nowrap;margin-top:-5px;'>🧭 費波操作建議 "
-        f"<span style='color:{suggestion['color']};'>｜{suggestion['action']}</span></div>",
+    st.markdown(
+        "<style>"
+        ".fibo-advice-title{display:flex;align-items:baseline;flex-wrap:wrap;gap:.2rem .45rem;"
+        "font-size:19px;font-weight:800;line-height:1.3;margin:0 0 .38rem}"
+        ".fibo-range-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.55rem;margin:0 0 .45rem}"
+        ".fibo-range-card{border:1px solid #2d3b4c;border-radius:.55rem;background:#101821;padding:.62rem .78rem;"
+        "font-size:.94rem;line-height:1.48;overflow-wrap:anywhere}"
+        ".fibo-range-card strong{font-size:1rem}"
+        ".fibo-explanation-box{border-left:3px solid #40c4ff;background:rgba(64,196,255,.08);border-radius:.35rem;"
+        "padding:.48rem .7rem;margin:.1rem 0 .35rem;color:#cbd5e1;font-size:.9rem;line-height:1.45}"
+        ".fibo-range-explanation{border-left-color:#ffc107;background:rgba(255,193,7,.08)}"
+        "@media(max-width:700px){.fibo-advice-title{font-size:17px;margin-bottom:.32rem}.fibo-range-grid{grid-template-columns:1fr;gap:.42rem}"
+        ".fibo-range-card{font-size:.88rem;padding:.55rem .65rem}.fibo-explanation-box{font-size:.84rem;padding:.44rem .6rem}}"
+        "</style>"
+        "<div class='fibo-advice-title'><span>🧭 費波操作建議</span>"
+        f"<span style='color:{html.escape(str(suggestion['color']))};'>｜{html.escape(str(suggestion['action']))}</span></div>",
         unsafe_allow_html=True,
     )
     explanation = f"結構訊號：{suggestion['signal']}；{suggestion['note']}"
@@ -6056,12 +6076,18 @@ def render_fibonacci_trade_suggestion(suggestion):
         unit_note = f"（{amount_note(long_risk, long_reward)}）"
         short_unit_note = f"（{amount_note(short_risk, short_reward)}）"
         short_label = '減碼／融券條件' if suggestion['asset_type'] == 'stock' else '做空條件'
-        header_cols[1].markdown(
-            f"- <span style='color:#ff4b4b;'>做多條件</span>：回測 **{price_text(long_entry)}** 止穩；停損 **{price_text(long_stop)}**；目標 **{price_text(long_target)}** {unit_note}  \n"
-            f"- <span style='color:#00c853;'>{short_label}</span>：反彈 **{price_text(short_entry)}** 受壓；停損 **{price_text(short_stop)}**；目標 **{price_text(short_target)}** {short_unit_note}",
+        st.markdown(
+            "<div class='fibo-range-grid'>"
+            "<div class='fibo-range-card'><strong style='color:#ff4b4b;'>做多條件</strong><br>"
+            f"回測 <b>{price_text(long_entry)}</b> 止穩；停損 <b>{price_text(long_stop)}</b>；"
+            f"目標 <b>{price_text(long_target)}</b> {html.escape(unit_note)}</div>"
+            f"<div class='fibo-range-card'><strong style='color:#00c853;'>{html.escape(short_label)}</strong><br>"
+            f"反彈 <b>{price_text(short_entry)}</b> 受壓；停損 <b>{price_text(short_stop)}</b>；"
+            f"目標 <b>{price_text(short_target)}</b> {html.escape(short_unit_note)}</div>"
+            "</div>"
+            f"<div class='fibo-explanation-box fibo-range-explanation'>{html.escape(explanation)}</div>",
             unsafe_allow_html=True,
         )
-        st.caption(explanation)
         return
 
     entry, stop, target = suggestion['entry'], suggestion['stop'], suggestion['target']
@@ -6079,29 +6105,31 @@ def render_fibonacci_trade_suggestion(suggestion):
 
     # Five Streamlit columns are too narrow on 21:9 phones.  Use the dedicated
     # responsive grid so each label always stays with its numeric value.
-    with header_cols[1]:
-        render_compact_metric_card_grid(
-            [
-                {'label': '參考進場', 'value': price_text(entry), 'color': metric_colors['參考進場']},
-                {'label': '停損／出場', 'value': price_text(stop), 'color': metric_colors['停損／出場']},
-                {'label': '第一目標', 'value': price_text(target), 'color': metric_colors['第一目標']},
-                {
-                    'label': '預估風險',
-                    'value': _format_fibo_number(risk, metric_decimals),
-                    'unit': metric_unit,
-                    'color': metric_colors['預估風險'],
-                },
-                {
-                    'label': '預估獲利',
-                    'value': _format_fibo_number(reward, metric_decimals),
-                    'unit': metric_unit,
-                    'color': metric_colors['預估獲利'],
-                },
-            ],
-            columns=5,
-            class_name='compact-metric-grid fibo-suggestion-metric-grid',
-        )
-    st.caption(explanation)
+    render_compact_metric_card_grid(
+        [
+            {'label': '參考進場', 'value': price_text(entry), 'color': metric_colors['參考進場']},
+            {'label': '停損／出場', 'value': price_text(stop), 'color': metric_colors['停損／出場']},
+            {'label': '第一目標', 'value': price_text(target), 'color': metric_colors['第一目標']},
+            {
+                'label': '預估風險',
+                'value': _format_fibo_number(risk, metric_decimals),
+                'unit': metric_unit,
+                'color': metric_colors['預估風險'],
+            },
+            {
+                'label': '預估獲利',
+                'value': _format_fibo_number(reward, metric_decimals),
+                'unit': metric_unit,
+                'color': metric_colors['預估獲利'],
+            },
+        ],
+        columns=5,
+        class_name='compact-metric-grid fibo-suggestion-metric-grid',
+    )
+    st.markdown(
+        f"<div class='fibo-explanation-box'>{html.escape(explanation)}</div>",
+        unsafe_allow_html=True,
+    )
     if suggestion['asset_type'] == 'futures':
         st.caption(
             f"微台1口試算：停損約 -{risk * 10:,.0f}；"
@@ -6720,11 +6748,11 @@ def plot_fibonacci_chart(
             else:
                 vol_num = f"{vol:,.0f}"
                 vol_unit = " 單位(口)"
-            price_unit = "<span style='font-size:0.78em;'> 點</span>"
+            price_unit = " 點"
         else:
             vol_num = f"{vol:,.0f}"
             vol_unit = " 張"
-            price_unit = "<span style='font-size:0.78em;'> 元</span>"
+            price_unit = " 元"
 
         disp_title = display_name.replace('(^TWII)', '(TSE)') if ticker == '^TWII' else display_name
         
@@ -6736,14 +6764,14 @@ def plot_fibonacci_chart(
             f"低 <span style='color:{color_lo};'>{_format_fibo_trade_price(lo, asset_type)}</span> "
             f"收 <span style='color:{color_cl};'>{_format_fibo_trade_price(cl, asset_type)}</span>{price_unit} "
             f"量 {vol_num}{vol_unit} "
-            f"<span style='color:{color_main};'>{_format_compact_number(chg, 2, signed=True)}"
+            f"<span style='color:{color_main};'>{_format_fibo_price_change(chg, asset_type)}"
             f"({_format_compact_number(pct_chg, 2, signed=True)}%)</span>"
         )
     except Exception:
         title_html = f"{display_name}{ticker_suffix} - {interval_name}"
 
     layout_update = dict(
-        title=dict(text=title_html, font=dict(size=15), x=0.01, xanchor='left', y=0.98, yanchor='top'),
+        title=dict(text=title_html, font=dict(size=17), x=0.01, xanchor='left', y=0.98, yanchor='top'),
         template="plotly_dark",
         height=800 if show_vol else 700,
         margin=dict(l=42, r=62, t=84, b=76),
