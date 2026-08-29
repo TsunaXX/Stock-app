@@ -14413,7 +14413,13 @@ def resolve_post_close_ranking_context(now_value=None):
 
 
 def _ranking_component_from_items(items, bonus=0, label_limit=3):
-    """Combine available sub-indicators and redistribute missing sub-weights."""
+    """Combine available sub-indicators and fully redistribute their weights.
+
+    ``coverage`` represents effective scoring coverage after redistribution.
+    ``source_coverage`` preserves the raw proportion for diagnostics/tests. A
+    whole missing category still returns ``None`` and therefore reduces the
+    combined effective coverage.
+    """
     total_weight = sum(max(float(weight), 0) for _, weight, _ in items)
     available = [
         (float(signal), float(weight), str(label))
@@ -14427,7 +14433,8 @@ def _ranking_component_from_items(items, bonus=0, label_limit=3):
     return {
         'signal': _ranking_clamp(signal),
         'quality': _ranking_clamp(40 + abs(signal) * 50 + bonus, 0, 100),
-        'coverage': available_weight / max(total_weight, 0.01),
+        'coverage': 1.0,
+        'source_coverage': available_weight / max(total_weight, 0.01),
         'text': '、'.join(
             [label for _, _, label in available if label][:max(int(label_limit), 1)]
         )[:220],
@@ -14750,12 +14757,19 @@ def _combine_ranking_components(components, weights, penalty=0, applicable_keys=
         weights[key] * _ranking_clamp(value.get('coverage', 1), 0, 1)
         for key, value in available.items()
     ) / total_weight)
+    source_coverage = min(1.0, sum(
+        weights[key] * _ranking_clamp(
+            value.get('source_coverage', value.get('coverage', 1)), 0, 1,
+        )
+        for key, value in available.items()
+    ) / total_weight)
     # Missing categories and sub-indicators are reweighted, not scored as zero.
     score = quality + abs(direction_signal) * 10 - penalty
     return {
         'direction': '多' if direction_signal >= 0 else '空',
         'score': int(round(_ranking_clamp(score, 0, 100))),
         'coverage': int(round(coverage * 100)),
+        'source_coverage': int(round(source_coverage * 100)),
     }
 
 
@@ -15035,7 +15049,8 @@ def render_strategy_ranking(rows, strategy_mode, room_label):
             f"<div class='ranking-explanation'><div class='ranking-identity'>{identity_html} "
             f"<span style='color:{color};font-weight:700'>{html.escape(entry['direction'])}方</span></div>"
             f"<div class='ranking-reasons'>{reason_html} "
-            f"<span class='ranking-coverage'>有效資料 {entry['coverage']}%</span></div></div>"
+            f"<span class='ranking-coverage' title='缺少的子指標已在同分類內重配權重'>"
+            f"有效資料 {entry['coverage']}%</span></div></div>"
         )
     st.markdown(
         "<style>"
@@ -15083,7 +15098,8 @@ def render_strategy_ranking(rows, strategy_mode, room_label):
     fallback_text = '；目前沿用本次工作階段最後成功快照。' if market_context.get('using_last_success') else ''
     st.caption(
         source_text + error_text + fallback_text
-        + ' 基本面採最新有效月／季資料；缺項會在分類內重配權重。'
+        + ' 有效資料率按適用分類計算；分類內缺項會把權重重配給已取得指標，整類未取得才扣覆蓋率。'
+        + ' 基本面採最新有效月／季資料。'
         + ' 個股／ETF期貨不套用「股票期貨／ETF期貨」市場總部位，避免各檔顯示相同法人數字。'
         + ' 排名是獨立比較，不會更動表格順序；分數代表當沖／波段適配度，不是勝率。'
     )

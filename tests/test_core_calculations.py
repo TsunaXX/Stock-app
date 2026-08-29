@@ -692,7 +692,8 @@ def test_fundamental_ranking_uses_revenue_eps_and_reweights_missing_groups():
     }, False)
     assert complete is not None and valuation_only is not None
     assert "營收YoY" in complete["text"] and "EPS" in complete["text"]
-    assert valuation_only["coverage"] < complete["coverage"]
+    assert valuation_only["coverage"] == complete["coverage"] == 1
+    assert valuation_only["source_coverage"] < complete["source_coverage"]
     assert valuation_only["quality"] > 0
 
 
@@ -808,7 +809,7 @@ def test_futures_ranking_derives_curve_oi_range_and_spot_basis_without_fake_valu
     improved = symbols["_score_futures_post_close"](
         enriched.iloc[0], "當沖", context, row_scales,
     )
-    assert improved["coverage"] > baseline["coverage"]
+    assert improved["source_coverage"] > baseline["source_coverage"]
     assert "日內位置" in improved["reason"]
     assert "價格×OI" in improved["reason"]
     assert "基差" in improved["reason"] or "近遠月" in improved["reason"]
