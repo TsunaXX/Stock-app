@@ -2032,12 +2032,19 @@ def render_compact_metric_card_grid(items, columns=4, class_name='compact-metric
     for item in items:
         label = item.get('label', '')
         value = item.get('value', '—')
+        unit = item.get('unit', '')
         detail = item.get('detail', '')
         color = item.get('color', '#f5f5f5')
+        value_html = html.escape(str(value))
+        if str(unit).strip():
+            value_html += (
+                " <span class='compact-metric-unit'>"
+                f"{html.escape(str(unit))}</span>"
+            )
         cards.append(
             "<div class='compact-metric-card'>"
             f"<div class='compact-metric-label'>{html.escape(str(label))}</div>"
-            f"<div class='compact-metric-value' style='color:{html.escape(str(color))}'>{html.escape(str(value))}</div>"
+            f"<div class='compact-metric-value' style='color:{html.escape(str(color))}'>{value_html}</div>"
             + (
                 f"<div class='compact-metric-detail' style='color:{html.escape(str(color))}'>{html.escape(str(detail))}</div>"
                 if str(detail).strip() else ''
@@ -2050,6 +2057,7 @@ def render_compact_metric_card_grid(items, columns=4, class_name='compact-metric
         ".compact-metric-card{min-width:0;padding:.62rem .7rem;border:1px solid #273444;border-radius:.55rem;background:#101821;text-align:left}"
         ".compact-metric-label{color:#cbd5e1;font-size:.83rem;font-weight:650;line-height:1.25;overflow-wrap:anywhere}"
         ".compact-metric-value{font-size:1.55rem;font-weight:800;line-height:1.18;margin-top:.22rem;white-space:nowrap}"
+        ".fibo-suggestion-metric-grid .compact-metric-unit{font-size:.72em;font-weight:700;vertical-align:baseline}"
         ".compact-metric-detail{font-size:.82rem;font-weight:700;line-height:1.2;margin-top:.18rem;overflow-wrap:anywhere}"
         "@media(max-width:700px){.compact-metric-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:.48rem}.compact-metric-card{padding:.55rem .58rem}.compact-metric-label{font-size:.77rem}.compact-metric-value{font-size:1.3rem}.compact-metric-detail{font-size:.75rem}}"
         "@media(max-width:340px){.compact-metric-grid{grid-template-columns:1fr}}"
@@ -5828,20 +5836,21 @@ def _round_fibo_asset_price(value, asset_type):
 
 
 def _format_fibo_number(value, decimals=2):
-    """Use grouped numbers while dropping insignificant trailing decimal zeroes."""
-    return f"{float(value):,.{decimals}f}".rstrip('0').rstrip('.')
+    """Format a number without ever trimming a significant integer zero."""
+    decimal_places = max(0, int(decimals))
+    formatted = f"{float(value):,.{decimal_places}f}"
+    # ``540`` must remain 540.  Only decimal strings may have insignificant
+    # fractional zeroes removed; the prior unconditional rstrip turned it into
+    # ``54`` in the Fibonacci entry card.
+    return formatted if decimal_places == 0 else formatted.rstrip('0').rstrip('.')
 
 
 def _format_fibo_trade_price(value, asset_type):
-    """Format futures as whole points and stocks with their actual tick decimals."""
+    """Format stock prices to cents and index/futures levels to whole points."""
     rounded = _round_fibo_asset_price(value, asset_type)
-    if asset_type == 'futures':
+    if asset_type in ('futures', 'index'):
         return f"{rounded:,.0f}"
-    if asset_type == 'index':
-        return _format_fibo_number(rounded)
-    tick = get_taiwan_tick_size(max(float(rounded), 0.01))
-    decimals = 2 if tick < 0.1 else (1 if tick < 1 else 0)
-    return _format_fibo_number(rounded, decimals)
+    return f"{rounded:,.2f}"
 
 
 def _fibo_pivots(data, width=2):
@@ -6078,12 +6087,14 @@ def render_fibonacci_trade_suggestion(suggestion):
                 {'label': '第一目標', 'value': price_text(target), 'color': metric_colors['第一目標']},
                 {
                     'label': '預估風險',
-                    'value': f"{_format_fibo_number(risk, metric_decimals)} {metric_unit}",
+                    'value': _format_fibo_number(risk, metric_decimals),
+                    'unit': metric_unit,
                     'color': metric_colors['預估風險'],
                 },
                 {
                     'label': '預估獲利',
-                    'value': f"{_format_fibo_number(reward, metric_decimals)} {metric_unit}",
+                    'value': _format_fibo_number(reward, metric_decimals),
+                    'unit': metric_unit,
                     'color': metric_colors['預估獲利'],
                 },
             ],
@@ -6604,8 +6615,16 @@ def plot_fibonacci_chart(
     target_row = 1 if (show_vol and 'Volume' in df_subset.columns) else None
     target_col = 1 if (show_vol and 'Volume' in df_subset.columns) else None
 
-    fig.add_annotation(x=high_idx_str, y=high_60, text=f"最高:{disp_high:g}", showarrow=True, arrowhead=1, yshift=10, font=dict(color="red", size=font_size), row=target_row, col=target_col)
-    fig.add_annotation(x=low_idx_str, y=low_60, text=f"最低:{disp_low:g}", showarrow=True, arrowhead=1, ay=40, font=dict(color="green", size=font_size), row=target_row, col=target_col)
+    fig.add_annotation(
+        x=high_idx_str, y=high_60, text=f"最高:{_format_fibo_trade_price(disp_high, asset_type)}",
+        showarrow=True, arrowhead=1, yshift=10, font=dict(color="red", size=font_size),
+        row=target_row, col=target_col,
+    )
+    fig.add_annotation(
+        x=low_idx_str, y=low_60, text=f"最低:{_format_fibo_trade_price(disp_low, asset_type)}",
+        showarrow=True, arrowhead=1, ay=40, font=dict(color="green", size=font_size),
+        row=target_row, col=target_col,
+    )
 
     last_date_str = x_strings[-1]
     first_date_str = x_strings[0]
@@ -6620,7 +6639,8 @@ def plot_fibonacci_chart(
             
         r_label = "1" if r == 1.0 else ("0" if r == 0.0 else f"{r:g}")
         fig.add_annotation(
-            x=last_date_str, y=price, text=f"{r_label} ({rounded_price:g})",
+            x=last_date_str, y=price,
+            text=f"{r_label} ({_format_fibo_trade_price(rounded_price, asset_type)})",
             showarrow=False, xanchor="left", xshift=10,
             # Keep the price labels legible on a phone without letting the
             # right-side stack dominate the plotting area.
@@ -6700,21 +6720,21 @@ def plot_fibonacci_chart(
             else:
                 vol_num = f"{vol:,.0f}"
                 vol_unit = " 單位(口)"
-            price_unit = " 點"
+            price_unit = "<span style='font-size:0.78em;'> 點</span>"
         else:
             vol_num = f"{vol:,.0f}"
             vol_unit = " 張"
-            price_unit = " 元"
+            price_unit = "<span style='font-size:0.78em;'> 元</span>"
 
         disp_title = display_name.replace('(^TWII)', '(TSE)') if ticker == '^TWII' else display_name
         
         # 標題改為各自獨立套用顏色
         title_html = (
             f"<span style='color:{color_main};'><b>{disp_title}{ticker_suffix}</b></span> · {interval_name} {date_str}<br>"
-            f"開 <span style='color:{color_op};'>{_format_compact_number(op, 2)}</span> "
-            f"高 <span style='color:{color_hi};'>{_format_compact_number(hi, 2)}</span> "
-            f"低 <span style='color:{color_lo};'>{_format_compact_number(lo, 2)}</span> "
-            f"收 <span style='color:{color_cl};'>{_format_compact_number(cl, 2)}</span>{price_unit} "
+            f"開 <span style='color:{color_op};'>{_format_fibo_trade_price(op, asset_type)}</span> "
+            f"高 <span style='color:{color_hi};'>{_format_fibo_trade_price(hi, asset_type)}</span> "
+            f"低 <span style='color:{color_lo};'>{_format_fibo_trade_price(lo, asset_type)}</span> "
+            f"收 <span style='color:{color_cl};'>{_format_fibo_trade_price(cl, asset_type)}</span>{price_unit} "
             f"量 {vol_num}{vol_unit} "
             f"<span style='color:{color_main};'>{_format_compact_number(chg, 2, signed=True)}"
             f"({_format_compact_number(pct_chg, 2, signed=True)}%)</span>"
@@ -6723,7 +6743,7 @@ def plot_fibonacci_chart(
         title_html = f"{display_name}{ticker_suffix} - {interval_name}"
 
     layout_update = dict(
-        title=dict(text=title_html, font=dict(size=14), x=0.01, xanchor='left', y=0.98, yanchor='top'),
+        title=dict(text=title_html, font=dict(size=15), x=0.01, xanchor='left', y=0.98, yanchor='top'),
         template="plotly_dark",
         height=800 if show_vol else 700,
         margin=dict(l=42, r=62, t=84, b=76),
@@ -6734,15 +6754,17 @@ def plot_fibonacci_chart(
         ),
     )
 
+    chart_price_format = '.2f' if asset_type == 'stock' else ',.0f'
+    chart_y_title = "股價（元）" if asset_type == 'stock' else "點數"
     if show_vol and 'Volume' in df_subset.columns:
-        fig.update_yaxes(title_text="點數", range=[y_min_view, y_max_view] if y_min_view and y_max_view else None, autorange=False if y_min_view and y_max_view else True, fixedrange=False, row=1, col=1)
+        fig.update_yaxes(title_text=chart_y_title, tickformat=chart_price_format, range=[y_min_view, y_max_view] if y_min_view and y_max_view else None, autorange=False if y_min_view and y_max_view else True, fixedrange=False, row=1, col=1)
         fig.update_yaxes(title_text="成交量", fixedrange=False, row=2, col=1)
         fig.update_xaxes(type='category', tickmode='array', tickvals=x_strings[::max(1, len(x_strings)//10)], ticktext=x_display[::max(1, len(x_display)//10)], showgrid=False, rangeslider_visible=False, row=2, col=1)
         fig.update_xaxes(type='category', showgrid=False, rangeslider_visible=False, showticklabels=False, row=1, col=1) 
     else:
         layout_update.update(
-            yaxis_title="點數",
-            yaxis=dict(range=[y_min_view, y_max_view] if y_min_view and y_max_view else None, autorange=False if y_min_view and y_max_view else True, fixedrange=False),
+            yaxis_title=chart_y_title,
+            yaxis=dict(tickformat=chart_price_format, range=[y_min_view, y_max_view] if y_min_view and y_max_view else None, autorange=False if y_min_view and y_max_view else True, fixedrange=False),
             xaxis=dict(type='category', tickmode='array', tickvals=x_strings[::max(1, len(x_strings)//10)], ticktext=x_display[::max(1, len(x_display)//10)], showgrid=False),
             xaxis_rangeslider_visible=False
         )

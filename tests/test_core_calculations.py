@@ -1740,6 +1740,19 @@ def test_fibonacci_initial_view_is_core_zero_to_one_range():
     assert view(100, 100) == (None, None)
 
 
+def test_fibo_stock_price_format_keeps_significant_trailing_zeroes():
+    symbols = load_app_symbols(
+        "get_taiwan_tick_size", "round_to_tick", "_round_fibo_asset_price",
+        "_format_fibo_number", "_format_fibo_trade_price",
+    )
+    # A whole-number stock price must never be rendered as 54 by stripping
+    # the significant trailing zero from 540.
+    assert symbols["_format_fibo_trade_price"](540, "stock") == "540.00"
+    assert symbols["_format_fibo_trade_price"](550, "stock") == "550.00"
+    assert symbols["_format_fibo_trade_price"](45958.6, "futures") == "45,959"
+    assert symbols["_format_fibo_number"](540, 0) == "540"
+
+
 def test_nested_google_sheet_payload_restores_fibo_tags():
     symbols = load_app_symbols(
         "_is_valid_data_cache_payload", "_decode_data_cache_payload",
