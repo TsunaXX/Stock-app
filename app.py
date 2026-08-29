@@ -14440,7 +14440,13 @@ def _ranking_average(values):
 
 
 def _ranking_fundamental_component(stock_context, is_daytrade=False):
-    """Latest valid revenue/EPS/profitability/valuation; missing groups reweight."""
+    """Latest valid revenue/EPS/profitability/valuation; missing groups reweight.
+
+    The current official snapshot does not fetch debt ratio, ROE, gross margin or
+    EPS growth consistently. Do not keep permanently unavailable fields in the
+    coverage denominator; supplied values still contribute through the four
+    supported groups below.
+    """
     pe = _ranking_number(stock_context.get('pe'))
     pb = _ranking_number(stock_context.get('pb'))
     dividend_yield = _ranking_number(stock_context.get('yield'))
@@ -14452,7 +14458,6 @@ def _ranking_fundamental_component(stock_context, is_daytrade=False):
     gross_margin = _ranking_number(stock_context.get('gross_margin'))
     operating_margin = _ranking_number(stock_context.get('operating_margin'))
     roe = _ranking_number(stock_context.get('roe'))
-    debt_ratio = _ranking_number(stock_context.get('debt_ratio'))
 
     revenue_signal = _ranking_average([
         _ranking_clamp(revenue_yoy / 30) if revenue_yoy is not None else None,
@@ -14476,7 +14481,6 @@ def _ranking_fundamental_component(stock_context, is_daytrade=False):
         (0.45 if dividend_yield >= 4 else 0.2 if dividend_yield >= 2 else -0.15)
         if dividend_yield is not None else None,
     ])
-    debt_signal = _ranking_clamp((60 - debt_ratio) / 40) if debt_ratio is not None else None
 
     revenue_label = (
         f'營收YoY {round(revenue_yoy, 1):+g}%' if revenue_yoy is not None else
@@ -14497,25 +14501,24 @@ def _ranking_fundamental_component(stock_context, is_daytrade=False):
         f'殖利率 {round(dividend_yield, 1):g}%' if dividend_yield is not None else ''
     )
     weights = (
-        {'revenue': 3, 'eps': 3, 'profit': 2, 'valuation': 2, 'debt': 0}
+        {'revenue': 3, 'eps': 3, 'profit': 2, 'valuation': 2}
         if is_daytrade else
-        {'revenue': 8, 'eps': 8, 'profit': 7, 'valuation': 4, 'debt': 3}
+        {'revenue': 9, 'eps': 8, 'profit': 8, 'valuation': 5}
     )
     return _ranking_component_from_items([
         (revenue_signal, weights['revenue'], revenue_label),
         (eps_signal, weights['eps'], eps_label),
         (profit_signal, weights['profit'], profit_label),
         (valuation_signal, weights['valuation'], valuation_label),
-        (debt_signal, weights['debt'], f'負債比 {round(debt_ratio, 1):g}%' if debt_ratio is not None else ''),
     ], label_limit=3)
 
 
 def _ranking_chip_component(stock_context, scales, is_daytrade=True):
     """Separate foreign/trust/dealer flows; use total only as a compatibility fallback."""
     weights = (
-        {'foreign': 12, 'trust': 8, 'dealer': 5, 'continuity': 5, 'margin': 5}
+        {'foreign': 14, 'trust': 9, 'dealer': 6, 'margin': 6}
         if is_daytrade else
-        {'foreign': 9, 'trust': 7, 'dealer': 3, 'continuity': 6, 'margin': 5}
+        {'foreign': 11, 'trust': 8, 'dealer': 4, 'margin': 7}
     )
     items = []
     individual_available = False
@@ -14540,11 +14543,6 @@ def _ranking_chip_component(stock_context, scales, is_daytrade=True):
                 f'法人{institutional / 1000:+.0f}張' if institutional is not None else '',
             )
         ]
-    streak = _ranking_number(stock_context.get('institutional_streak'))
-    items.append((
-        _ranking_clamp(streak / 5) if streak is not None else None,
-        weights['continuity'], f'法人連續 {streak:+g}日' if streak is not None else '',
-    ))
     margin_delta = _ranking_number(stock_context.get('margin_delta'))
     short_delta = _ranking_number(stock_context.get('short_delta'))
     margin_signal = None
@@ -14626,11 +14624,10 @@ def _stock_ranking_technical_component(row, is_daytrade):
     else:
         items = [
             (ma_signal, 12, '均線偏多' if ma_signal is not None and ma_signal >= 0 else '均線偏空' if ma_signal is not None else ''),
-            (structure_signal, 10, structure_label),
+            (structure_signal, 11, structure_label),
             (position_signal, 7, f'收盤位置 {round(close_position, 1):g}%' if close_position is not None else ''),
             (atr_signal, 5, f'ATR {round(atr_percent, 1):g}%' if atr_percent is not None else ''),
-            (None, 2, ''),  # CDP 未在主表保存時不計分，權重自動重配。
-            (change_signal, 4, f'動能 {change:+g}%' if change is not None else ''),
+            (change_signal, 5, f'動能 {change:+g}%' if change is not None else ''),
         ]
     bonus = min(10, max(0, ((volume_ratio or 1) - 0.8) * 10)) if is_daytrade else 0
     return _ranking_component_from_items(items, bonus=bonus, label_limit=3)
@@ -14679,8 +14676,6 @@ def _futures_ranking_technical_component(row, is_daytrade):
         range_position = _ranking_clamp(((close - low) / (high - low) - 0.5) * 2)
         structure_signal = range_position
         structure_text = f'日內位置 {(close - low) / (high - low) * 100:.0f}%'
-    cdp_text = str(row.get('CDP', '') or row.get('CDP狀態', ''))
-    cdp_signal = 0.5 if '多' in cdp_text else (-0.5 if '空' in cdp_text else None)
     directional = [value for value in (change_signal, open_signal, vwap_signal, price_oi_signal) if value is not None]
     base_direction = 1 if sum(directional) >= 0 else -1
     atr_percent = atr / close * 100 if atr is not None and close not in (None, 0) else None
@@ -14701,20 +14696,18 @@ def _futures_ranking_technical_component(row, is_daytrade):
     if is_daytrade:
         items = [
             (vwap_signal, 15, ('站上' if vwap_signal is not None and vwap_signal >= 0 else '跌破') + 'VWAP' if vwap_signal is not None else ''),
-            (price_oi_signal, 10, f'價格×OI {oi_change:+g}' if price_oi_signal is not None else ''),
-            (cdp_signal, 8, cdp_text),
-            (structure_signal, 7, structure_text),
+            (price_oi_signal, 14, f'價格×OI {oi_change:+g}' if price_oi_signal is not None else ''),
+            (structure_signal, 11, structure_text),
             (_ranking_average([open_signal, change_signal]), 5, '站上開盤' if open_signal is not None and open_signal >= 0 else '跌破開盤' if open_signal is not None else ''),
             (atr_signal, 5, volatility_label),
         ]
     else:
         items = [
             (open_signal, 10, '中期價格偏多' if open_signal is not None and open_signal >= 0 else '中期價格偏空' if open_signal is not None else ''),
-            (structure_signal, 10, structure_text),
-            (price_oi_signal, 7, f'價格×OI {oi_change:+g}' if price_oi_signal is not None else ''),
+            (structure_signal, 11, structure_text),
+            (price_oi_signal, 8, f'價格×OI {oi_change:+g}' if price_oi_signal is not None else ''),
             (atr_signal, 4, volatility_label),
-            (cdp_signal, 1, cdp_text),
-            (change_signal, 3, f'動能 {change:+g}%' if change is not None else ''),
+            (change_signal, 2, f'動能 {change:+g}%' if change is not None else ''),
         ]
     return _ranking_component_from_items(items, label_limit=3)
 
@@ -14727,17 +14720,22 @@ def _futures_contract_chip_component(row, market_context):
         'TE': '電子期貨', 'TF': '金融期貨', 'ZEF': '小型電子期貨',
         'ZFF': '小型金融期貨', 'XIF': '非金電期貨', 'SHF': '半導體30期貨',
     }
-    if product_type == '股票':
-        product_name = '股票期貨'
-    elif product_type == 'ETF':
-        product_name = 'ETF期貨'
-    else:
-        product_name = product_names.get(root, str(row.get('名稱', '')).strip())
+    # TAIFEX publishes only an aggregate institutional row for all stock
+    # futures (and one aggregate ETF-futures row). Applying that total to each
+    # individual contract made unrelated products show identical positions.
+    if product_type in {'股票', 'ETF'}:
+        return None
+    product_name = product_names.get(root, str(row.get('名稱', '')).strip())
     return market_context.get('futures_products', {}).get(product_name)
 
 
-def _combine_ranking_components(components, weights, penalty=0):
-    available = {key: value for key, value in components.items() if value is not None}
+def _combine_ranking_components(components, weights, penalty=0, applicable_keys=None):
+    """Combine categories and exclude genuinely inapplicable ones from coverage."""
+    applicable = set(applicable_keys or weights)
+    available = {
+        key: value for key, value in components.items()
+        if key in applicable and value is not None
+    }
     available_weight = sum(weights.get(key, 0) for key in available)
     if available_weight <= 0:
         return None
@@ -14747,7 +14745,7 @@ def _combine_ranking_components(components, weights, penalty=0):
     quality = sum(
         value['quality'] * weights[key] for key, value in available.items()
     ) / available_weight
-    total_weight = max(sum(weights.values()), 0.01)
+    total_weight = max(sum(weights.get(key, 0) for key in applicable), 0.01)
     coverage = min(1.0, sum(
         weights[key] * _ranking_clamp(value.get('coverage', 1), 0, 1)
         for key, value in available.items()
@@ -14836,36 +14834,28 @@ def _score_futures_post_close(row, strategy_mode, market_context, row_scales):
     ):
         basis = close - underlying_close
     basis_scale = max(abs(close or 0) * 0.01, 1)
-    institutional_change = _ranking_number(
-        row.get('法人OI增減') or row.get('_institutional_oi_change')
-    )
-    institutional_streak = _ranking_number(
-        row.get('法人連續增倉') or row.get('_institutional_oi_streak')
-    )
-    subweights = (
-        {'position': 12, 'change': 8, 'streak': 7, 'basis': 7,
-         'term': 5, 'volume_oi': 3, 'underlying': 3}
-        if is_daytrade else
-        {'position': 13, 'change': 10, 'streak': 8, 'basis': 7,
-         'term': 5, 'volume_oi': 3, 'underlying': 4}
-    )
-    chips = _ranking_component_from_items([
-        (
+    product_type = str(row.get('商品類型', '')).strip()
+    is_stock_future = product_type == '股票'
+    if product_type in {'股票', 'ETF'}:
+        # Individual stock/ETF futures have no official per-contract
+        # institutional position. Use only contract and underlying signals.
+        subweights = (
+            {'basis': 12, 'term': 8, 'volume_oi': 8, 'underlying': 17}
+            if is_daytrade else
+            {'basis': 10, 'term': 8, 'volume_oi': 8, 'underlying': 24}
+        )
+        chip_items = []
+    else:
+        subweights = (
+            {'position': 20, 'basis': 10, 'term': 8, 'volume_oi': 7}
+            if is_daytrade else
+            {'position': 24, 'basis': 10, 'term': 8, 'volume_oi': 8}
+        )
+        chip_items = [(
             contract_chip['signal'] if contract_chip else None,
             subweights['position'], contract_chip['text'] if contract_chip else '',
-        ),
-        (
-            _ranking_clamp(institutional_change / max(open_interest, 1))
-            if institutional_change is not None else None,
-            subweights['change'],
-            f'法人OI {institutional_change:+,.0f}口' if institutional_change is not None else '',
-        ),
-        (
-            _ranking_clamp(institutional_streak / 5)
-            if institutional_streak is not None else None,
-            subweights['streak'],
-            f'法人連續 {institutional_streak:+g}日' if institutional_streak is not None else '',
-        ),
+        )]
+    chip_items.extend([
         (
             _ranking_clamp(basis / basis_scale) if basis is not None else None,
             subweights['basis'], f'基差 {basis:+g}' if basis is not None else '',
@@ -14881,13 +14871,14 @@ def _score_futures_post_close(row, strategy_mode, market_context, row_scales):
         ),
         (
             underlying_chip['signal'] if underlying_chip else None,
-            subweights['underlying'],
+            subweights.get('underlying', 0),
             f"現股{underlying_chip['text']}" if underlying_chip else '',
         ),
-    ], bonus=liquidity * 8, label_limit=3)
+    ])
+    chips = _ranking_component_from_items(chip_items, bonus=liquidity * 8, label_limit=3)
     fundamental = (
         _ranking_fundamental_component(underlying_context, is_daytrade)
-        if str(row.get('商品類型', '')) == '股票' else None
+        if is_stock_future else None
     )
     components = {'technical': technical, 'chips': chips, 'fundamental': fundamental}
     weights = strategy_ranking_weights('futures', strategy_mode)
@@ -14896,7 +14887,12 @@ def _score_futures_post_close(row, strategy_mode, market_context, row_scales):
         penalty += 18
     if str(row.get('資料狀態', '')).startswith(('🔴', '⛔')):
         penalty += 12
-    combined = _combine_ranking_components(components, weights, penalty)
+    applicable_keys = {'technical', 'chips'}
+    if is_stock_future:
+        applicable_keys.add('fundamental')
+    combined = _combine_ranking_components(
+        components, weights, penalty, applicable_keys=applicable_keys,
+    )
     if combined is None:
         return None
     reasons = []
@@ -14906,7 +14902,10 @@ def _score_futures_post_close(row, strategy_mode, market_context, row_scales):
             direction = '多' if component['signal'] >= 0 else '空'
             reasons.append(f"{label}偏{direction} {component['quality']:.0f}（{component['text']}）")
     if fundamental is None:
-        reasons.append('基本未取得（權重已重配）')
+        reasons.append(
+            '基本未取得（權重已重配）'
+            if is_stock_future else '基本不適用（不計入覆蓋率）'
+        )
     combined['reason'] = '｜'.join(reasons)
     return combined
 
@@ -14999,7 +14998,7 @@ def render_strategy_ranking(rows, strategy_mode, room_label):
     indicator_summary = (
         (
             "<span class='ranking-tech-text'>技術</span>：VWAP、價格×OI、價位結構、ATR　"
-            "<span class='ranking-chip-text'>籌碼</span>：法人淨OI、基差、近遠月、量/OI、現股　"
+            "<span class='ranking-chip-text'>籌碼</span>：契約OI、基差、近遠月、量/OI、現股；指數期另含法人淨OI　"
             "<span class='ranking-basic-text'>基本</span>：標的股票最新資料"
         )
         if asset_type == 'futures' else
@@ -15036,7 +15035,7 @@ def render_strategy_ranking(rows, strategy_mode, room_label):
             f"<div class='ranking-explanation'><div class='ranking-identity'>{identity_html} "
             f"<span style='color:{color};font-weight:700'>{html.escape(entry['direction'])}方</span></div>"
             f"<div class='ranking-reasons'>{reason_html} "
-            f"<span class='ranking-coverage'>資料 {entry['coverage']}%</span></div></div>"
+            f"<span class='ranking-coverage'>有效資料 {entry['coverage']}%</span></div></div>"
         )
     st.markdown(
         "<style>"
@@ -15085,6 +15084,7 @@ def render_strategy_ranking(rows, strategy_mode, room_label):
     st.caption(
         source_text + error_text + fallback_text
         + ' 基本面採最新有效月／季資料；缺項會在分類內重配權重。'
+        + ' 個股／ETF期貨不套用「股票期貨／ETF期貨」市場總部位，避免各檔顯示相同法人數字。'
         + ' 排名是獨立比較，不會更動表格順序；分數代表當沖／波段適配度，不是勝率。'
     )
 

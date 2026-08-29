@@ -1,0 +1,32 @@
+name: Streamlit Keepalive
+
+on:
+  schedule:
+    # Community Cloud sleeps apps after 12 hours without traffic. A six-hour
+    # health check is frequent enough while keeping Actions usage very small.
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: streamlit-keepalive
+  cancel-in-progress: true
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Ping Streamlit health endpoint
+        env:
+          STREAMLIT_HEALTH_URL: https://stock-app-qjzbqsoqs4hylyypaddep4.streamlit.app/_stcore/health
+        run: |
+          status="$(curl --silent --show-error --location \
+            --retry 2 --retry-all-errors --connect-timeout 10 --max-time 45 \
+            --output /tmp/streamlit-health.txt --write-out '%{http_code}' \
+            "$STREAMLIT_HEALTH_URL")"
+          cat /tmp/streamlit-health.txt
+          test "$status" -ge 200
+          test "$status" -lt 400

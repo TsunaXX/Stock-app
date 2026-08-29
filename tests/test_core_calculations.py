@@ -770,7 +770,7 @@ def test_futures_ranking_derives_curve_oi_range_and_spot_basis_without_fake_valu
         {"契約鍵": "CDF:202609", "期貨代碼": "CDF", "契約月份": "202609",
          "月份順位": 0, "商品類型": "股票", "標的代號": "2330", "名稱": "台積電期貨",
          "收盤價": 100, "開盤價": 98, "當日高": 105, "當日低": 95,
-         "漲跌幅": 2, "當日成交口數": 5000, "未平倉量": 1000},
+         "漲跌幅": 2, "當日成交口數": 5000, "未平倉量": 1000, "方向": "偏多"},
         {"契約鍵": "CDF:202610", "期貨代碼": "CDF", "契約月份": "202610",
          "月份順位": 1, "商品類型": "股票", "標的代號": "2330", "名稱": "台積電期貨",
          "收盤價": 99, "開盤價": 98, "當日高": 102, "當日低": 96,
@@ -812,6 +812,16 @@ def test_futures_ranking_derives_curve_oi_range_and_spot_basis_without_fake_valu
     assert "日內位置" in improved["reason"]
     assert "價格×OI" in improved["reason"]
     assert "基差" in improved["reason"] or "近遠月" in improved["reason"]
+    assert "外資淨部位+1,000口" not in improved["reason"]
+    assert improved["coverage"] >= 95
+
+    # TAIFEX's stock-futures row is an aggregate, not a per-stock-future row.
+    assert symbols["_futures_contract_chip_component"](current.iloc[0], context) is None
+    index_context = {"futures_products": {
+        "臺股期貨": {"signal": 0.4, "quality": 65, "text": "外資淨部位+2,000口"},
+    }}
+    index_row = pd.Series({"期貨代碼": "TX", "商品類型": "指數", "名稱": "臺股期貨"})
+    assert symbols["_futures_contract_chip_component"](index_row, index_context)["signal"] == 0.4
 
 
 def test_limit_note_uses_the_candles_own_previous_close():
