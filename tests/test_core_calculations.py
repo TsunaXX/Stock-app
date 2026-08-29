@@ -880,6 +880,7 @@ def test_partial_market_risk_refresh_keeps_last_complete_lists():
 def test_disposition_preview_uses_next_market_day_not_calendar_tomorrow():
     source = APP_PATH.read_text(encoding="utf-8")
     assert "adjust_to_next_market_day(" in source
+    assert "_tpex_verified_session()" in source
     assert "'🔶 下個開盤日處置'" in source
     assert "'🔶 明天處置'" not in source
 

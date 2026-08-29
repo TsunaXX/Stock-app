@@ -13687,7 +13687,11 @@ def fetch_market_risk_lists():
     }
     def fetch_json(name, url, expected_type, request_params=None):
         """官方站偶發回空頁或 5xx；每個 API 獨立執行重試。"""
-        session = requests.Session()
+        session = (
+            _tpex_verified_session()
+            if str(url).startswith(_TPEX_ORIGIN)
+            else requests.Session()
+        )
         last_error = None
 
         try:
