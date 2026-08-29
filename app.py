@@ -13642,6 +13642,34 @@ def disposition_period_status(period_raw, target_date=None):
     return 'next_open' if start_date == next_open_date else None
 
 
+def parse_tpex_disposition_page_payload(payload, target_date=None):
+    """解析櫃買中心公告頁即時資料，補足 OpenAPI 延後更新的公告。"""
+    disposition_codes = set()
+    next_open_codes = set()
+    if not isinstance(payload, dict):
+        return disposition_codes, next_open_codes
+
+    for table in payload.get('tables', []):
+        if not isinstance(table, dict):
+            continue
+        for values in table.get('data', []):
+            # 官方公告頁固定欄位：2=證券代號、5=處置起迄時間。
+            if not isinstance(values, (list, tuple)) or len(values) <= 5:
+                continue
+            code_match = re.search(r'\d{4,6}', str(values[2]).strip())
+            if not code_match:
+                continue
+            code = code_match.group(0)
+            if len(code) != 4:
+                continue
+            status = disposition_period_status(values[5], target_date=target_date)
+            if status == 'today':
+                disposition_codes.add(code)
+            elif status == 'next_open':
+                next_open_codes.add(code)
+    return disposition_codes, next_open_codes
+
+
 @st.cache_data(ttl=900, max_entries=1, show_spinner=False)
 def fetch_market_risk_lists():
     """取得上市、上櫃注意／處置名單，短重試後交由最後成功資料接手。"""
@@ -13657,7 +13685,7 @@ def fetch_market_risk_lists():
         'Accept-Language': 'zh-TW,zh;q=0.9,en;q=0.8',
         'Cache-Control': 'no-cache',
     }
-    def fetch_json(name, url, expected_type):
+    def fetch_json(name, url, expected_type, request_params=None):
         """官方站偶發回空頁或 5xx；每個 API 獨立執行重試。"""
         session = requests.Session()
         last_error = None
@@ -13665,10 +13693,13 @@ def fetch_market_risk_lists():
         try:
             for attempt in range(3):
                 try:
+                    params = dict(request_params or {})
+                    if attempt:
+                        params['_'] = int(time.time() * 1000)
                     response = session.get(
                         url,
                         headers=headers,
-                        params={'_': int(time.time() * 1000)} if attempt else None,
+                        params=params or None,
                         timeout=(3, 8),
                     )
                     response.raise_for_status()
@@ -13783,48 +13814,74 @@ def fetch_market_risk_lists():
                 elif disposition_state == 'next_open':
                     disposition_tomorrow_codes.add(code)
 
-    # 6 個官方名單 API 同時抓取，避免逐一等待造成更新按鈕卡頓。
+    # 官方名單 API 與公告頁即時端點同時抓取，避免逐一等待造成按鈕卡頓。
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
+    target_date = datetime.now(pytz.timezone('Asia/Taipei')).date()
+    next_open_date = adjust_to_next_market_day(target_date + timedelta(days=1))
+
+    def roc_date_text(value):
+        return f'{value.year - 1911:03d}/{value.month:02d}/{value.day:02d}'
+
+    tpex_page_params = {
+        'startDate': roc_date_text(target_date),
+        'endDate': roc_date_text(next_open_date),
+        'type': 'all',
+        'reason': '-1',
+        'measure': '-1',
+        'order': 'date',
+    }
     fetch_jobs = [
         (
             '上市注意',
             'https://openapi.twse.com.tw/v1/announcement/notice',
             list,
+            None,
         ),
         (
             '上市處置',
             'https://openapi.twse.com.tw/v1/announcement/punish',
             list,
+            None,
         ),
         (
             '上市注意累計異常',
             'https://openapi.twse.com.tw/v1/announcement/notetrans',
             list,
+            None,
         ),
         (
             '上櫃注意',
             'https://www.tpex.org.tw/openapi/v1/tpex_trading_warning_information',
             list,
+            None,
         ),
         (
             '上櫃注意累計異常',
             'https://www.tpex.org.tw/openapi/v1/tpex_trading_warning_note',
             list,
+            None,
         ),
         (
             '上櫃處置',
             'https://www.tpex.org.tw/openapi/v1/tpex_disposal_information',
             list,
+            None,
+        ),
+        (
+            '上櫃處置公告頁',
+            'https://www.tpex.org.tw/www/zh-tw/bulletin/disposal',
+            dict,
+            tpex_page_params,
         ),
     ]
 
     fetched = {}
 
-    with ThreadPoolExecutor(max_workers=6) as executor:
+    with ThreadPoolExecutor(max_workers=len(fetch_jobs)) as executor:
         future_map = {
-            executor.submit(fetch_json, name, url, expected_type): name
-            for name, url, expected_type in fetch_jobs
+            executor.submit(fetch_json, name, url, expected_type, params): name
+            for name, url, expected_type, params in fetch_jobs
         }
 
         for future in as_completed(future_map):
@@ -14021,6 +14078,18 @@ def fetch_market_risk_lists():
             errors.append(
                 f'{name}: {exc}'
             )
+
+    tpex_disposition_page = fetched.get('上櫃處置公告頁')
+    if tpex_disposition_page is not None:
+        try:
+            page_current, page_next = parse_tpex_disposition_page_payload(
+                tpex_disposition_page,
+                target_date=target_date,
+            )
+            disposition_codes.update(page_current)
+            disposition_tomorrow_codes.update(page_next)
+        except Exception as exc:
+            errors.append(f'上櫃處置公告頁解析失敗: {exc}')
 
     return (
         attention_counts,
@@ -15308,13 +15377,20 @@ def calculate_risk_filter_result(row, direction, max_extension_atr, attention_co
     confirmation_score = 15 if has_breakout else 5
     score = trend_score + extension_score + candle_score + risk_score + confirmation_score
     too_extended = extension > max_extension_atr
-    eligible = not is_disposed and (not block_attention or attention_count < 2) and not too_extended
+    eligible = (
+        not is_disposed
+        and not is_tomorrow_disposition
+        and (not block_attention or attention_count < 2)
+        and not too_extended
+    )
     if is_long:
         rule = '突破昨高後站穩' if has_breakout else '回踩 5／10 日線止穩'
     else:
         rule = '跌破昨低後確認' if has_breakout else '反彈不過 5／10 日線'
     if is_disposed:
         rule = '排除：處置中'
+    elif is_tomorrow_disposition:
+        rule = '排除：下個開盤日處置'
     elif attention_count >= 2 and block_attention:
         rule = '排除：注意累計偏高'
     elif attention_count >= 2:
@@ -17812,7 +17888,8 @@ if tab1.open and stock_strategy_tab.open:
                     st.session_state['risk_filter_strategy_mode'] = '當沖'
                 if 'risk_filter_market_data' not in st.session_state:
                     st.session_state.risk_filter_market_data = {
-                        'attention': {}, 'disposition': [], 'updated': None, 'errors': []
+                        'attention': {}, 'disposition': [], 'disposition_tomorrow': [],
+                        'updated': None, 'errors': []
                     }
 
                 reopen_strategy_settings = st.session_state.pop(
@@ -18532,7 +18609,8 @@ if tab1.open and stock_strategy_tab.open:
                     st.session_state['indep_strategy_mode'] = '當沖'
                 if 'risk_filter_market_data' not in st.session_state:
                     st.session_state.risk_filter_market_data = {
-                        'attention': {}, 'disposition': [], 'updated': None, 'errors': []
+                        'attention': {}, 'disposition': [], 'disposition_tomorrow': [],
+                        'updated': None, 'errors': []
                     }
                 indep_ctrl1, indep_ctrl2, indep_ctrl3 = st.columns(3)
                 with indep_ctrl1:
@@ -18659,6 +18737,9 @@ if tab1.open and stock_strategy_tab.open:
                         indep_market_risk_data = st.session_state.risk_filter_market_data
                         indep_attention_counts = indep_market_risk_data.get('attention', {})
                         indep_disposition_codes = indep_market_risk_data.get('disposition', [])
+                        indep_disposition_tomorrow_codes = indep_market_risk_data.get(
+                            'disposition_tomorrow', []
+                        )
                         indep_market_lists_updated = bool(indep_market_risk_data.get('updated')) and not indep_market_risk_data.get('errors')
                         if indep_is_daytrade and (not sj_logged or sj_api_obj is None):
                             st.info("當沖需要登入永豐 Shioaji 才能取得即時串流與分 K；目前仍會顯示日 K 資料，但盤中條件會標示為資料不足。")
@@ -18696,13 +18777,15 @@ if tab1.open and stock_strategy_tab.open:
                                 indep_market_lists_updated, indep_block_attention
                             ) if indep_is_daytrade else calculate_risk_filter_result(
                                 row, row_direction, indep_max_extension, indep_attention_counts, indep_disposition_codes,
-                                indep_market_lists_updated, indep_block_attention
+                                indep_market_lists_updated, indep_block_attention,
+                                disposition_tomorrow_codes=indep_disposition_tomorrow_codes,
                             )
                             code = str(row.get('代號', ''))
                             if indep_is_daytrade:
                                 daily_risk = calculate_risk_filter_result(
                                     row, row_direction, indep_max_extension, indep_attention_counts, indep_disposition_codes,
-                                    indep_market_lists_updated, indep_block_attention
+                                    indep_market_lists_updated, indep_block_attention,
+                                    disposition_tomorrow_codes=indep_disposition_tomorrow_codes,
                                 )
                                 if not daily_risk['eligible']:
                                     result['eligible'] = False
@@ -21039,7 +21122,9 @@ with tab_db:
         if 'disposal_refresh_idx' not in st.session_state:
             st.session_state.disposal_refresh_idx = 0
             
-        refresh_col, official_twse_col, official_tpex_col = st.columns([1.3, 1.45, 1.45])
+        refresh_col, official_twse_col, official_tpex_col = st.columns(
+            3, gap='small', vertical_alignment='center'
+        )
         with refresh_col:
             if st.button("🔄 重新整理處置股", key="btn_refresh_disposal", width='stretch'):
                 st.session_state.disposal_refresh_idx += 1

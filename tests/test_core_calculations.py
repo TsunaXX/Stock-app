@@ -894,6 +894,45 @@ def test_disposition_period_status_skips_weekend_to_next_open_day():
     assert status("115/08/24～115/08/28", date(2026, 8, 24)) == "today"
 
 
+def test_tpex_live_disposition_page_fills_delayed_openapi_announcement():
+    symbols = load_app_symbols(
+        "get_holidays", "is_market_closed_func", "adjust_to_next_market_day",
+        "disposition_period_status", "parse_tpex_disposition_page_payload",
+    )
+    parse = symbols["parse_tpex_disposition_page_payload"]
+    payload = {
+        "tables": [{
+            "data": [[
+                1, "115/08/28", "3441", "聯一光", 4,
+                "115/08/31~115/09/04", "處置原因",
+            ]],
+        }],
+    }
+    current, next_open = parse(payload, target_date=date(2026, 8, 29))
+    assert current == set()
+    assert next_open == {"3441"}
+
+
+def test_next_open_disposition_is_visible_and_not_eligible():
+    symbols = load_app_symbols(
+        "_as_float", "_format_compact_number", "calculate_risk_filter_result",
+    )
+    calculate = symbols["calculate_risk_filter_result"]
+    row = {
+        "代號": "3441", "收盤價": 130, "_ma5": 125,
+        "_risk_ma20": 120, "_risk_ma20_slope": 1,
+        "_risk_atr14": 10, "_risk_close_position": 70,
+        "_risk_prev_high": 128, "_risk_prev_low": 110,
+    }
+    result = calculate(
+        row, "多頭", 2.0, market_lists_updated=True,
+        disposition_tomorrow_codes=["3441"],
+    )
+    assert result["risk"] == "🔶 下個開盤日處置"
+    assert result["eligible"] is False
+    assert result["rule"] == "排除：下個開盤日處置"
+
+
 def test_company_sync_is_deduplicated_capped_and_section_bounded():
     symbols = load_app_symbols(
         "COMPANY_SYNC_MAX_TICKERS", "fetch_company_event_sections",
@@ -1434,6 +1473,7 @@ def test_requested_futures_controls_and_company_tab_order_are_present():
     source = APP_PATH.read_text(encoding="utf-8")
     assert "🚨 官方上市處置公告" in source
     assert "🚨 官方上櫃處置公告" in source
+    assert "st.columns(\n            3, gap='small', vertical_alignment='center'\n        )" in source
     assert "taiwan_tab, us_tab, earnings_tab = st.tabs" in source
     assert "只顯示夜盤期貨" in source
     assert source.index("只顯示夜盤期貨") > source.index("只顯示小型股票期貨")
