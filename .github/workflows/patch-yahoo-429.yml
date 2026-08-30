@@ -1,0 +1,132 @@
+name: Patch Yahoo 429
+
+on:
+  push:
+    branches:
+      - codex/fix-yahoo-429
+    paths:
+      - '.github/workflows/patch-yahoo-429.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/fix-yahoo-429
+          fetch-depth: 0
+
+      - name: Patch Yahoo index fetcher
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('app.py')
+          text = path.read_text(encoding='utf-8')
+
+          if 'import yfinance as yf' not in text:
+              anchor = 'import pandas as pd\n'
+              if anchor not in text:
+                  raise SystemExit('Cannot find pandas import anchor')
+              text = text.replace(anchor, anchor + 'import yfinance as yf\n', 1)
+
+          start = text.index('def fetch_yahoo_us_index_close_signals(')
+          end = text.index('\ndef fetch_nasdaq_us_close_signals(', start)
+
+          replacement = '''def fetch_yahoo_us_index_close_signals(trading_day, expected_date, requested_keys=None):
+              \"\"\"取得真正美股指數日線；改由 yfinance 逐檔抓取以降低 Yahoo 429 限流。\"\"\"
+              errors = []
+              instruments = {
+                  'DJI': ('道瓊工業指數', '^DJI'),
+                  'NASDAQ': ('Nasdaq 綜合指數', '^IXIC'),
+                  'SP500': ('標普 500 指數', '^GSPC'),
+                  'SOX': ('費城半導體指數', '^SOX'),
+              }
+              if requested_keys is not None:
+                  instruments = {key: value for key, value in instruments.items() if key in requested_keys}
+
+              start_date = expected_date - timedelta(days=12)
+              end_date = trading_day + timedelta(days=1)
+              rows = []
+
+              for key, (label, symbol) in instruments.items():
+                  try:
+                      history = yf.Ticker(symbol).history(
+                          start=start_date,
+                          end=end_date,
+                          interval='1d',
+                          auto_adjust=False,
+                          actions=False,
+                          prepost=False,
+                          timeout=8,
+                      )
+                      if history is None or history.empty or 'Close' not in history.columns:
+                          raise ValueError('收盤資料不足')
+
+                      close_series = pd.to_numeric(history['Close'], errors='coerce').dropna()
+                      if len(close_series) < 2:
+                          raise ValueError('收盤資料不足')
+
+                      parsed = []
+                      for idx, close in close_series.items():
+                          try:
+                              trade_date = idx.date()
+                          except AttributeError:
+                              trade_date = pd.Timestamp(idx).date()
+                          close = _safe_number(close)
+                          if close is not None and close > 0:
+                              parsed.append((trade_date, close))
+
+                      parsed.sort(key=lambda pair: pair[0], reverse=True)
+                      if len(parsed) < 2:
+                          raise ValueError('收盤資料不足')
+
+                      latest_date, latest = parsed[0]
+                      _, previous = parsed[1]
+                      if latest_date != expected_date:
+                          raise ValueError(
+                              f'資料停在 {latest_date:%m/%d}，應為 {expected_date:%m/%d}，已排除評分'
+                          )
+                      if previous <= 0:
+                          raise ValueError('前一交易日收盤價格無效')
+
+                      rows.append({
+                          'key': key,
+                          'label': label,
+                          'group': '美股收盤',
+                          'price': latest,
+                          'pct': (latest / previous - 1) * 100,
+                          'time': f'{latest_date:%m/%d} 收盤',
+                          'weight': OPENING_SIGNAL_WEIGHTS[key],
+                          'source': f'Yahoo Finance｜{label}',
+                      })
+                  except Exception as exc:
+                      errors.append(f'{label}：{exc}')
+
+              return rows, errors
+          '''
+          replacement = '\n'.join(line[12:] if line.startswith('            ') else line for line in replacement.splitlines())
+          text = text[:start] + replacement.rstrip() + '\n' + text[end:]
+          path.write_text(text, encoding='utf-8')
+          PY
+
+      - name: Validate syntax and diff
+        shell: bash
+        run: |
+          python -m py_compile app.py
+          git diff --check
+          git diff -- app.py
+
+      - name: Commit patch and remove workflow
+        shell: bash
+        run: |
+          rm .github/workflows/patch-yahoo-429.yml
+          git config user.name 'ChatGPT'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add app.py .github/workflows/patch-yahoo-429.yml
+          git commit -m 'Fix Yahoo index 429 handling'
+          git push origin HEAD:codex/fix-yahoo-429
