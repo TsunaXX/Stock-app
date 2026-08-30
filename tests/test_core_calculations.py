@@ -1318,6 +1318,27 @@ def test_mobile_layout_prevents_metrics_and_table_cells_from_overlapping():
     assert "compact-metric-grid index-short-risk-grid" in source
 
 
+def test_index_operation_plan_colors_entry_stop_target_and_reward_risk_metrics():
+    source = APP_PATH.read_text(encoding="utf-8")
+    function_source = ast.get_source_segment(
+        source,
+        next(
+            node for node in ast.parse(source).body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "render_index_plan_metric_cards"
+        ),
+    )
+    assert "label_color" in function_source
+    assert "index-plan-main-label' style='color:" in function_source
+    assert "index-plan-main-value' style='color:" in function_source
+    assert "'label': '觀察進場區', 'label_color': '#40c4ff'" in source
+    assert "'label': '失效／停損', 'label_color': '#ffc107'" in source
+    assert "'label': '短波進場區', 'label_color': '#40c4ff'" in source
+    assert "'label': '短波停損', 'label_color': '#ffc107'" in source
+    assert "entry_rr_color" in source
+    assert "short_rr_color" in source
+
+
 def test_phone_charts_keep_payoff_levels_outside_the_plot_canvas():
     source = APP_PATH.read_text(encoding="utf-8")
     tree = ast.parse(source)

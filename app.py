@@ -1999,14 +1999,23 @@ def compact_table_column_config(frame, min_width=44, max_width=180):
 
 
 def render_index_plan_metric_cards(items):
-    """指數計畫主數值採較小字級；補充風險資訊維持原尺寸。"""
-    cards = ''.join(
-        "<div class='index-plan-main-card'>"
-        f"<div class='index-plan-main-label'>{html.escape(str(label))}</div>"
-        f"<div class='index-plan-main-value'>{html.escape(str(value))}</div>"
-        "</div>"
-        for label, value in items
-    )
+    """Render colour-coded entry, stop, target and reward/risk plan metrics."""
+    cards = []
+    for item in items:
+        if isinstance(item, dict):
+            label = item.get('label', '')
+            value = item.get('value', '—')
+            label_color = item.get('label_color', '#f4f6f8')
+            value_color = item.get('color', '#f7f8fa')
+        else:
+            label, value = item
+            label_color, value_color = '#f4f6f8', '#f7f8fa'
+        cards.append(
+            "<div class='index-plan-main-card'>"
+            f"<div class='index-plan-main-label' style='color:{html.escape(str(label_color))}'>{html.escape(str(label))}</div>"
+            f"<div class='index-plan-main-value' style='color:{html.escape(str(value_color))}'>{html.escape(str(value))}</div>"
+            "</div>"
+        )
     st.markdown(
         "<style>"
         ".index-plan-main-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:1rem;margin:.2rem 0 .75rem}"
@@ -2015,7 +2024,7 @@ def render_index_plan_metric_cards(items):
         ".index-plan-main-value{font-size:27px;line-height:1.22;font-weight:650;color:#f7f8fa;white-space:nowrap}"
         "@media(max-width:700px){.index-plan-main-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:.55rem}.index-plan-main-value{font-size:23px}}"
         "</style>"
-        f"<div class='index-plan-main-grid'>{cards}</div>",
+        f"<div class='index-plan-main-grid'>{''.join(cards)}</div>",
         unsafe_allow_html=True,
     )
 
@@ -20327,15 +20336,38 @@ with tab_fibo:
                 key="trade_plan_position_count",
                 help="此設定會連動更新進出依據與短波當沖的停損金額及預估收益。",
             )
+            execution_direction = trade_state.get('execution_direction') or plan.get('direction')
+            execution_color = (
+                '#ff4b4b' if execution_direction == '偏多'
+                else ('#00c853' if execution_direction == '偏空' else '#ffc107')
+            )
+            entry_rr_color = (
+                '#40c4ff' if (trade_state['rr_ratio'] or 0) >= 1.25 else '#ffc107'
+            )
             render_index_plan_metric_cards([
-                ("觀察進場區", _format_compact_number(trade_state['entry_level'], 0)),
-                ("失效／停損", _format_compact_number(trade_state['invalidation'], 0)),
-                ("第一目標", _format_compact_number(trade_state['target'], 0)),
-                (
-                    "預估風報比",
-                    f"1 : {_format_compact_number(trade_state['rr_ratio'], 2)}"
-                    if trade_state['rr_ratio'] is not None else "—",
-                ),
+                {
+                    'label': '觀察進場區', 'label_color': '#40c4ff',
+                    'value': _format_compact_number(trade_state['entry_level'], 0),
+                    'color': execution_color,
+                },
+                {
+                    'label': '失效／停損', 'label_color': '#ffc107',
+                    'value': _format_compact_number(trade_state['invalidation'], 0),
+                    'color': '#ffc107',
+                },
+                {
+                    'label': '第一目標', 'label_color': '#40c4ff',
+                    'value': _format_compact_number(trade_state['target'], 0),
+                    'color': execution_color,
+                },
+                {
+                    'label': '預估風報比', 'label_color': '#40c4ff',
+                    'value': (
+                        f"1 : {_format_compact_number(trade_state['rr_ratio'], 2)}"
+                        if trade_state['rr_ratio'] is not None else "—"
+                    ),
+                    'color': entry_rr_color,
+                },
             ])
             entry_risk_level, entry_risk_color, entry_risk_ratio = get_trade_risk_level(
                 trade_state['risk_points'], plan['atr'],
@@ -20407,18 +20439,34 @@ with tab_fibo:
             st.caption(f"{short_direction_note}。短波採 EMA5 或前根高低點即時觸發，不等待完整 5 分 K 收盤。")
             short_wave = get_cached_short_wave_plan(st.session_state.get('sj_api'), short_wave_direction)
             if short_wave:
+                short_rr_color = '#40c4ff' if (short_wave['rr'] or 0) >= 1.25 else '#ffc107'
                 render_index_plan_metric_cards([
-                    (
-                        "短波進場區",
-                        f"{_format_compact_number(short_wave['entry'], 0)} ± {_format_compact_number(short_wave['zone'], 0)}",
-                    ),
-                    ("短波停損", _format_compact_number(short_wave['stop'], 0)),
-                    ("短波目標", _format_compact_number(short_wave['target'], 0)),
-                    (
-                        "短波風報比",
-                        f"1 : {_format_compact_number(short_wave['rr'], 2)}"
-                        if short_wave['rr'] is not None else "—",
-                    ),
+                    {
+                        'label': '短波進場區', 'label_color': '#40c4ff',
+                        'value': (
+                            f"{_format_compact_number(short_wave['entry'], 0)} ± "
+                            f"{_format_compact_number(short_wave['zone'], 0)}"
+                        ),
+                        'color': short_color,
+                    },
+                    {
+                        'label': '短波停損', 'label_color': '#ffc107',
+                        'value': _format_compact_number(short_wave['stop'], 0),
+                        'color': '#ffc107',
+                    },
+                    {
+                        'label': '短波目標', 'label_color': '#40c4ff',
+                        'value': _format_compact_number(short_wave['target'], 0),
+                        'color': short_color,
+                    },
+                    {
+                        'label': '短波風報比', 'label_color': '#40c4ff',
+                        'value': (
+                            f"1 : {_format_compact_number(short_wave['rr'], 2)}"
+                            if short_wave['rr'] is not None else "—"
+                        ),
+                        'color': short_rr_color,
+                    },
                 ])
                 st.info(f"**快速進場條件：** {short_wave['trigger']}")
                 momentum_label = "已達快速觸發" if short_wave['momentum_ready'] else "接近觸發，等待穿越前根高低點"
