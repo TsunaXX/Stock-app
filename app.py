@@ -11911,18 +11911,46 @@ def render_stock_data_source_controls():
     render_stock_external_resources()
     return uploaded_file, selected_sheet, search_selection
 
+def stock_strategy_display_columns(
+    enhanced_layer, is_daytrade, compact_table, include_remove=True,
+):
+    """Return one shared column order for the main and independent stock tables."""
+    prefix = ['移除'] if include_remove else []
+    if not enhanced_layer:
+        return prefix + [
+            '代號', '名稱', '戰略備註', '收盤價', '漲跌幅', '狀態',
+            '成交價價差', '5日線價差', '當日漲停價', '當日跌停價', '期貨',
+        ]
+    if compact_table:
+        return prefix + [
+            '代號', '名稱', '戰略備註', '收盤價', '漲跌幅', '建議方向',
+            '進出場預判', '支撐壓力', '方向依據', '5日線價差', '信心分',
+            '信心判讀', '訊號狀態', '市場一致', '風險', '資料狀態',
+        ]
+    mode_columns = (
+        ['風險', 'VWAP 狀態', '開盤區間', '量能', '信心分', '信心判讀',
+         '支撐壓力', '盤中觸發', '方向依據', '訊號狀態', '市場一致']
+        if is_daytrade else
+        ['風險', '信心分', '信心判讀', '乖離', '支撐壓力', '隔日規則',
+         '方向依據', '訊號狀態', '市場一致']
+    )
+    return prefix + [
+        '代號', '名稱', '戰略備註', '收盤價', '漲跌幅', '建議方向',
+        '進出場預判', '狀態', '成交價價差', '5日線價差',
+    ] + mode_columns + [
+        '當日漲停價', '當日跌停價', '期貨', '資料狀態', '買賣價差',
+    ]
+
+
 def render_stock_strategy_explanation():
     """股票戰略室的靜態說明，與操作設定分開並預設折疊。"""
     with st.expander("📖 股票戰略室說明", expanded=False):
         st.markdown("""
-- **① 載入**：抓 Goodinfo 排行、上傳檔案，或直接輸入股票；再按「執行分析」。
-- **② 先看四欄**：`訊號狀態`、`進場信心`、`支撐壓力`、`進出場預判`。信心分代表條件是否一致，**不是勝率**。
-- **③ 等條件成立**：`✅ 已觸發` 或 `🔵 回測確認` 才進一步評估；`進／停／目` 是觀察進場、失效離場、第一目標，不會自動下單。
-- **🔴 多／🟢 空**：當沖看分 K、VWAP、開盤區間與量能；隔日／波段看日 K、5／20 日線與前高前低。方向依據只列最重要的兩項。
-- **買賣價差**：顯示最佳買價與最佳賣價的距離（跳數）；跳數越少通常越容易成交。`—` 代表目前沒有即時報價。
-- **ATR**：最近常見的波動幅度。乖離太大時不追價；**VWAP**：盤中平均成本，站上偏多、跌破偏空。
-- **⚠️ 注意／處置**：`注意 1` 是累計 1 次；`注意 2+` 是至少 2 次，預設排除；`🚫 處置中` 直接排除；`⚪ 未查核` 代表官方資料尚未讀完。
-- 原本的週轉率排序與戰略備註不變；附加分析只提供判讀與風險提醒。
+- **① 取得標的**：使用官方週轉率排行、上傳 CSV 或快速查詢，再按「執行分析」。
+- **② 選擇模式**：當沖看分 K、VWAP、開盤區間與量能；隔日／波段看日 K、均線與前高前低。系統會逐檔判斷多空。
+- **③ 依序判讀**：先看`方向`與`訊號狀態`，再看`進出場預判`、`支撐壓力`及`進場信心`。`進／停／目`分別是觀察進場、失效離場與第一目標。
+- **④ 控制風險**：信心分是條件一致度，**不是勝率**；`注意 2+`預設排除、`處置中`禁止進場、`未查核`代表官方名單尚未完整取得。
+- **⑤ 更新資料**：重抓日 K、更新盤中條件或更新注意／處置名單時，會一併更新可取得的即時報價。原排行與表格順序不會因此改變。
         """)
 
 def render_futures_strategy_explanation():
@@ -16569,9 +16597,9 @@ def refresh_persisted_stock_rows(
 
 
 def refresh_risk_metrics_for_codes(stock_data, futures_set, saved_notes_dict, name_map_dict, sj_logged_in=False, sj_api=None):
-    """手動重抓日 K，僅回填風險篩選所需欄位，保留原本的表格與備註資料。"""
+    """重抓日 K 指標，並以一個批次同步目前可取得的即時報價。"""
     if stock_data.empty or '代號' not in stock_data.columns:
-        return stock_data, 0
+        return stock_data, 0, 0
 
     futures_copy = dict(futures_set) if isinstance(futures_set, dict) else futures_set
     notes_copy = dict(saved_notes_dict or {})
@@ -16607,7 +16635,10 @@ def refresh_risk_metrics_for_codes(stock_data, futures_set, saved_notes_dict, na
         for column, value in metrics.items():
             refreshed.loc[row_mask, column] = value
         updated_count += int(row_mask.sum())
-    return refreshed, updated_count
+    refreshed, quote_count = refresh_stock_quotes_for_codes(
+        refreshed, sj_logged_in, sj_api,
+    )
+    return refreshed, updated_count, quote_count
 
 def fetch_stock_snapshot_map(api, codes):
     """以單一批次取得股票快照，避免逐檔重複請求。"""
@@ -16641,6 +16672,12 @@ def merge_realtime_stock_snapshots(stock_data, snapshot_map, points_map=None, qu
     if not isinstance(stock_data, pd.DataFrame) or stock_data.empty:
         return stock_data, 0
     refreshed = stock_data.copy()
+    # Snapshot values can contain decimals even when an earlier CSV load made
+    # the whole column integer.  Object dtype avoids pandas rejecting a valid
+    # quote such as a 1.5% change during an in-place update.
+    for numeric_column in ('收盤價', '漲跌幅', '成交價價差'):
+        if numeric_column in refreshed.columns:
+            refreshed[numeric_column] = refreshed[numeric_column].astype(object)
     quote_time = quote_time or datetime.now(
         pytz.timezone('Asia/Taipei')
     ).strftime('%Y/%m/%d %H:%M:%S')
@@ -16673,10 +16710,28 @@ def merge_realtime_stock_snapshots(stock_data, snapshot_map, points_map=None, qu
     return refreshed, updated_count
 
 
-def refresh_daytrade_metrics_for_codes(stock_data, sj_logged_in=False, sj_api=None):
-    """手動抓取盤中資料；09:00–09:15 採快照＋1 分 K，其後採 5 分 K。"""
-    if stock_data.empty or '代號' not in stock_data.columns or not sj_logged_in or sj_api is None:
+def refresh_stock_quotes_for_codes(
+    stock_data, sj_logged_in=False, sj_api=None, points_map=None, snapshot_map=None,
+):
+    """Update all visible stock quotes with one Shioaji snapshot batch."""
+    if (
+        not isinstance(stock_data, pd.DataFrame) or stock_data.empty
+        or '代號' not in stock_data.columns or not sj_logged_in or sj_api is None
+    ):
         return stock_data, 0
+    if snapshot_map is None:
+        snapshot_map = fetch_stock_snapshot_map(
+            sj_api, stock_data['代號'].astype(str).tolist(),
+        )
+    return merge_realtime_stock_snapshots(
+        stock_data, snapshot_map, points_map=points_map,
+    )
+
+
+def refresh_daytrade_metrics_for_codes(stock_data, sj_logged_in=False, sj_api=None):
+    """抓取盤中條件與同一批股票快照；開盤前段使用 1 分 K，其後使用 5 分 K。"""
+    if stock_data.empty or '代號' not in stock_data.columns or not sj_logged_in or sj_api is None:
+        return stock_data, 0, 0
 
     codes = stock_data['代號'].astype(str).tolist()
     now_tw = datetime.now(pytz.timezone('Asia/Taipei'))
@@ -16723,7 +16778,10 @@ def refresh_daytrade_metrics_for_codes(stock_data, sj_logged_in=False, sj_api=No
         for column, value in metrics.items():
             refreshed.loc[row_mask, column] = value
         updated_count += int(row_mask.sum())
-    return refreshed, updated_count
+    refreshed, quote_count = refresh_stock_quotes_for_codes(
+        refreshed, sj_logged_in, sj_api, snapshot_map=snapshot_map,
+    )
+    return refreshed, updated_count, quote_count
 
 # ==========================================
 # 處理待加回的忽略股票 (防止 NameError & 提速)
@@ -17182,29 +17240,31 @@ def render_futures_strategy_room():
                 else:
                     st.warning("找不到目前月份的實際契約；已重新讀取 Shioaji 契約檔，請確認合約月份仍在交易。")
 
+    futures_compact_columns = [
+        '忽略', '期貨代碼', '契約月份', '名稱', '收盤價', '漲跌幅', '方向',
+        '進出場點位', '支撐壓力', '訊號狀態', '信心分', '信心判讀', '市場一致',
+        '資料狀態', '可交易性', '交易時段', '當日成交口數', '未平倉量', '量倉比',
+        '到期提醒', '所需保證金'
+    ]
+    futures_full_columns = [
+        '忽略', '期貨代碼', '契約月份', '名稱', '收盤價', '漲跌幅', '方向',
+        '進出場點位', '支撐壓力', '觸發條件', '訊號狀態', '信心分', '信心判讀',
+        '當日漲停價', '當日跌停價',
+        '可交易性', '資料狀態', '市場一致', '買賣價差', '量倉比', '到期提醒',
+        '交易時段', '當日成交口數', '未平倉量', '所需保證金', '維持保證金'
+    ]
+    futures_basic_columns = [
+        '忽略', '期貨代碼', '契約月份', '名稱', '收盤價', '漲跌幅', '方向',
+        '進出場點位', '支撐壓力', '觸發條件', '當日漲停價', '當日跌停價',
+        '交易時段', '當日成交口數', '未平倉量', '所需保證金', '維持保證金'
+    ]
     if enhanced_layer:
         display_rows = enrich_futures_strategy_rows(display_rows, strategy_mode, market_bias)
-        if compact_futures_table:
-            futures_display_columns = [
-                '忽略', '期貨代碼', '契約月份', '名稱', '收盤價', '漲跌幅', '方向',
-                '進出場點位', '支撐壓力', '訊號狀態', '信心分', '信心判讀', '市場一致',
-                '資料狀態', '可交易性', '交易時段', '當日成交口數', '未平倉量', '量倉比',
-                '到期提醒', '所需保證金'
-            ]
-        else:
-            futures_display_columns = [
-                '忽略', '期貨代碼', '契約月份', '名稱', '收盤價', '漲跌幅', '方向',
-                '進出場點位', '支撐壓力', '觸發條件', '訊號狀態', '信心分', '信心判讀',
-                '當日漲停價', '當日跌停價',
-                '可交易性', '資料狀態', '市場一致', '買賣價差', '量倉比', '到期提醒',
-                '交易時段', '當日成交口數', '未平倉量', '所需保證金', '維持保證金'
-            ]
+        futures_display_columns = (
+            futures_compact_columns if compact_futures_table else futures_full_columns
+        )
     else:
-        futures_display_columns = [
-            '忽略', '期貨代碼', '契約月份', '名稱', '收盤價', '漲跌幅', '方向',
-            '進出場點位', '支撐壓力', '觸發條件', '當日漲停價', '當日跌停價',
-            '交易時段', '當日成交口數', '未平倉量', '所需保證金', '維持保證金'
-        ]
+        futures_display_columns = futures_basic_columns
 
     def style_futures_row(row):
         styles = [''] * len(row)
@@ -17377,28 +17437,10 @@ def render_futures_strategy_room():
             for _, row in display_rows.iterrows()
         }
         notify_signal_state_changes('futures', signal_states, futures_notify)
-        detail_map = {
-            f"{row['期貨代碼']} {row['契約月份']}｜{row['名稱']}": index
-            for index, row in display_rows.iterrows()
-        }
-        detail_col, record_col = st.columns([5, 2])
-        with detail_col:
-            selected_detail = st.selectbox(
-                '查看期貨策略信心明細', list(detail_map), key='futures_strategy_detail'
-            )
-            detail_row = display_rows.loc[detail_map[selected_detail]]
-            st.caption(
-                f"原分析：{detail_row.get('支撐壓力', '—')}｜{detail_row.get('觸發條件', '—')}｜"
-                f"進場信心 {detail_row.get('信心分', '—')} 分（{detail_row.get('信心判讀', '—')}）｜"
-                f"價差 {detail_row.get('買賣價差', '—')}｜量倉比 {detail_row.get('量倉比', '—')}｜"
-                f"到期 {detail_row.get('到期提醒', '—')}。{detail_row.get('_信心明細', '')}。"
-            )
-        with record_col:
-            st.markdown("<div style='margin-top:28px'></div>", unsafe_allow_html=True)
-            record_futures_signals = st.button(
-                '📝 記錄目前表格的已觸發期貨訊號', width='stretch', key='record_futures_strategy_signals',
-                help='一次記錄目前期貨表格中所有已觸發、且流動性未亮紅燈的契約；不是只記錄正在查看的單一契約。'
-            )
+        record_futures_signals = st.button(
+            '📝 記錄目前表格的已觸發期貨訊號', width='stretch', key='record_futures_strategy_signals',
+            help='一次記錄目前期貨表格中所有已觸發、且流動性未亮紅燈的契約。'
+        )
         if record_futures_signals:
             records = []
             for _, row in display_rows[display_rows['_附加可記錄'] == True].iterrows():
@@ -17478,6 +17520,11 @@ def render_futures_strategy_room():
         "快速查詢（中文名稱／期貨代碼）", list(option_map),
         key='futures_independent_search', placeholder='選擇一檔或多檔期貨'
     )
+    independent_compact_futures = st.checkbox(
+        "精簡主表（獨立計算）", value=True, key='futures_independent_compact_table',
+        disabled=not enhanced_layer,
+        help='欄位順序與上方期貨主表一致；關閉可查看完整分析欄位。',
+    )
     run_futures_independent = st.button(
         "🚀 執行期貨獨立分析", key='run_futures_independent'
     )
@@ -17525,7 +17572,15 @@ def render_futures_strategy_room():
         }
 
     if not independent_rows.empty:
-        independent_columns = [column for column in futures_display_columns if column != '忽略']
+        if enhanced_layer:
+            independent_source_columns = (
+                futures_compact_columns if independent_compact_futures else futures_full_columns
+            )
+        else:
+            independent_source_columns = futures_basic_columns
+        independent_columns = [
+            column for column in independent_source_columns if column != '忽略'
+        ]
         for column in independent_columns:
             if column not in independent_rows.columns:
                 independent_rows[column] = None
@@ -17932,7 +17987,6 @@ if tab1.open and stock_strategy_tab.open:
                 key="risk_filter_preview_enabled",
                 help="加入支撐壓力、進出場點位、訊號、信心、資料品質與成效紀錄；不改動週轉率排序或原始戰略備註。"
             )
-            risk_details = {}
             risk_show_only_eligible = False
             stock_compact_table = False
             stock_notify = False
@@ -17990,7 +18044,7 @@ if tab1.open and stock_strategy_tab.open:
                         if st.button("📊 重抓日 K 並計算策略指標", key="refresh_risk_filter_metrics"):
                             code_name_map, _ = load_local_stock_names()
                             with st.spinner("正在重抓日 K 並回填策略指標..."):
-                                refreshed_data, updated_count = refresh_risk_metrics_for_codes(
+                                refreshed_data, updated_count, quote_count = refresh_risk_metrics_for_codes(
                                     st.session_state.stock_data,
                                     st.session_state.get('futures_list', {}),
                                     st.session_state.get('saved_notes', {}),
@@ -17998,9 +18052,19 @@ if tab1.open and stock_strategy_tab.open:
                                     st.session_state.get('sj_logged_in', False),
                                     st.session_state.get('sj_api', None)
                                 )
-                            if updated_count:
+                            if updated_count or quote_count:
                                 st.session_state.stock_data = refreshed_data
-                                mark_stock_data_updated()
+                                if updated_count:
+                                    mark_stock_data_updated()
+                                if quote_count:
+                                    st.session_state.last_rt_update_time = datetime.now(
+                                        pytz.timezone('Asia/Taipei')
+                                    ).strftime("%Y/%m/%d %H:%M:%S")
+                                    update_strategy_signal_outcomes({
+                                        str(row['代號']): _safe_number(row.get('收盤價'))
+                                        for _, row in refreshed_data.iterrows()
+                                    })
+                                st.session_state.stock_strategy_editor_revision += 1
                                 cloud_sync_ok = save_data_cache(
                                     st.session_state.stock_data,
                                     st.session_state.ignored_stocks,
@@ -18013,7 +18077,10 @@ if tab1.open and stock_strategy_tab.open:
                                         "日 K 已更新，但 Google Sheet 尚未回讀確認；目前先保留本機最新資料。"
                                     )
                                 st.session_state['_reopen_stock_strategy_settings'] = True
-                                st.toast(f"已回填 {updated_count} 檔的 20 日趨勢與 ATR 指標。", icon="✅")
+                                st.toast(
+                                    f"已回填 {updated_count} 檔日 K 指標，並更新 {quote_count} 檔報價。",
+                                    icon="✅",
+                                )
                                 st.rerun()
                             else:
                                 st.warning("沒有可回填的資料；請確認標的至少有 20 個交易日的日 K。")
@@ -18023,14 +18090,24 @@ if tab1.open and stock_strategy_tab.open:
                                     st.warning("當沖需要先登入永豐 Shioaji，才能取得即時串流與分 K 資料。")
                                 else:
                                     with st.spinner("正在讀取即時串流與分 K、計算 VWAP 與開盤條件..."):
-                                        refreshed_data, updated_count = refresh_daytrade_metrics_for_codes(
+                                        refreshed_data, updated_count, quote_count = refresh_daytrade_metrics_for_codes(
                                             st.session_state.stock_data,
                                             st.session_state.get('sj_logged_in', False),
                                             st.session_state.get('sj_api', None)
                                         )
-                                    if updated_count:
+                                    if updated_count or quote_count:
                                         st.session_state.stock_data = refreshed_data
-                                        mark_stock_data_updated()
+                                        if updated_count:
+                                            mark_stock_data_updated()
+                                        if quote_count:
+                                            st.session_state.last_rt_update_time = datetime.now(
+                                                pytz.timezone('Asia/Taipei')
+                                            ).strftime("%Y/%m/%d %H:%M:%S")
+                                            update_strategy_signal_outcomes({
+                                                str(row['代號']): _safe_number(row.get('收盤價'))
+                                                for _, row in refreshed_data.iterrows()
+                                            })
+                                        st.session_state.stock_strategy_editor_revision += 1
                                         cloud_sync_ok = save_data_cache(
                                             st.session_state.stock_data,
                                             st.session_state.ignored_stocks,
@@ -18043,7 +18120,10 @@ if tab1.open and stock_strategy_tab.open:
                                                 "盤中資料已更新，但 Google Sheet 尚未回讀確認；目前先保留本機最新資料。"
                                             )
                                         st.session_state['_reopen_stock_strategy_settings'] = True
-                                        st.toast(f"已更新 {updated_count} 檔的即時成交、VWAP 與開盤條件", icon="📈")
+                                        st.toast(
+                                            f"已更新 {updated_count} 檔盤中條件與 {quote_count} 檔報價。",
+                                            icon="📈",
+                                        )
                                         st.rerun()
                                     else:
                                         st.warning("沒有取得足夠的盤中 5 分 K；請確認 Shioaji 連線與交易時段資料。")
@@ -18055,6 +18135,22 @@ if tab1.open and stock_strategy_tab.open:
                                 st.session_state.get('risk_filter_market_data', {}),
                                 attention, disposition, disposition_tomorrow, errors,
                             )
+                            refreshed_quotes, quote_count = refresh_stock_quotes_for_codes(
+                                st.session_state.stock_data,
+                                st.session_state.get('sj_logged_in', False),
+                                st.session_state.get('sj_api'),
+                                points_map=points_map,
+                            )
+                            if quote_count:
+                                st.session_state.stock_data = refreshed_quotes
+                                st.session_state.last_rt_update_time = datetime.now(
+                                    pytz.timezone('Asia/Taipei')
+                                ).strftime("%Y/%m/%d %H:%M:%S")
+                                update_strategy_signal_outcomes({
+                                    str(row['代號']): _safe_number(row.get('收盤價'))
+                                    for _, row in refreshed_quotes.iterrows()
+                                })
+                                st.session_state.stock_strategy_editor_revision += 1
                             save_data_cache(
                                 st.session_state.stock_data,
                                 st.session_state.ignored_stocks,
@@ -18063,6 +18159,7 @@ if tab1.open and stock_strategy_tab.open:
                                 replace_stock_data=True,
                             )
                             st.session_state['_reopen_stock_strategy_settings'] = True
+                            st.toast(f"注意／處置名單已更新，並更新 {quote_count} 檔報價。", icon="🔄")
                             st.rerun()
 
                     cache_sync_notice = st.session_state.pop('_stock_cache_sync_notice', '')
@@ -18156,7 +18253,6 @@ if tab1.open and stock_strategy_tab.open:
                             df_display.at[i, '隔日規則'] = result['rule']
                     result['trade_plan'] = trade_plan
                     result['direction_info'] = direction_info
-                    risk_details[code] = result
                     df_display.at[i, '建議方向'] = direction_info['label']
                     df_display.at[i, '方向依據'] = direction_info['basis']
                     df_display.at[i, '_系統方向'] = row_direction
@@ -18209,18 +18305,11 @@ if tab1.open and stock_strategy_tab.open:
                     if df_display.empty:
                         st.warning("目前沒有符合門檻的候選；可降低最低評分、放寬最大乖離，或切換回原表。")
 
-                if stock_compact_table:
-                    input_cols = [
-                        "移除", "代號", "名稱", "戰略備註", "收盤價", "漲跌幅",
-                        "建議方向", "進出場預判", "支撐壓力", "方向依據", "5日線價差", "信心分", "信心判讀",
-                        "訊號狀態", "市場一致", "風險", "資料狀態"
-                    ]
-                elif is_daytrade_mode:
-                    input_cols = ["移除", "代號", "名稱", "戰略備註", "收盤價", "漲跌幅", "建議方向", "進出場預判", "狀態", "成交價價差", "5日線價差", "風險", "VWAP 狀態", "開盤區間", "量能", "信心分", "信心判讀", "支撐壓力", "盤中觸發", "方向依據", "訊號狀態", "市場一致", "當日漲停價", "當日跌停價", "期貨", "資料狀態", "買賣價差"]
-                else:
-                    input_cols = ["移除", "代號", "名稱", "戰略備註", "收盤價", "漲跌幅", "建議方向", "進出場預判", "狀態", "成交價價差", "5日線價差", "風險", "信心分", "信心判讀", "乖離", "支撐壓力", "隔日規則", "方向依據", "訊號狀態", "市場一致", "當日漲停價", "當日跌停價", "期貨", "資料狀態", "買賣價差"]
+                input_cols = stock_strategy_display_columns(
+                    True, is_daytrade_mode, stock_compact_table,
+                )
             else:
-                input_cols = ["移除", "代號", "名稱", "戰略備註", "收盤價", "漲跌幅", "狀態", "成交價價差", "5日線價差", "當日漲停價", "當日跌停價", "期貨"]
+                input_cols = stock_strategy_display_columns(False, False, False)
             for col in input_cols:
                 if col not in df_display.columns: df_display[col] = None
 
@@ -18447,37 +18536,10 @@ if tab1.open and stock_strategy_tab.open:
 
             render_strategy_ranking(df_display, strategy_mode, '股票')
 
-            if risk_preview_enabled and risk_details:
-                detail_options = {
-                    f"{row['代號']} {row['名稱']}": str(row['代號'])
-                    for _, row in df_display.iterrows()
-                }
-                if detail_options:
-                    selected_risk_label = st.selectbox("查看策略信心明細", list(detail_options), key="risk_filter_detail_code")
-                    selected_risk = risk_details[detail_options[selected_risk_label]]
-                    rule_label = "盤中觸發" if is_daytrade_mode else "隔日規則"
-                    data_time_text = f"｜盤中資料更新：{selected_risk['data_time']}" if is_daytrade_mode and selected_risk.get('data_time') else ""
-                    plan_text = selected_risk.get('trade_plan', {}).get('detail', '尚未預判點位。')
-                    confidence_detail = selected_risk.get('confidence', {})
-                    direction_detail = selected_risk.get('direction_info', {})
-                    st.caption(
-                        f"{direction_detail.get('label', '方向未判定')}｜{direction_detail.get('basis', '方向依據不足')}｜"
-                        f"進場信心 {confidence_detail.get('score', '—')} 分（{confidence_detail.get('label', '—')}）｜"
-                        f"{selected_risk['detail']}｜{rule_label}：{selected_risk['rule']}｜進出場預判：{plan_text}{data_time_text}。"
-                        "信心分代表條件一致度，不是勝率；僅供策略觀察與回測。"
-                    )
-                    selected_code = detail_options[selected_risk_label]
-                    selected_rows = df_display[df_display['代號'].astype(str) == selected_code]
-                    if not selected_rows.empty:
-                        selected_row = selected_rows.iloc[0]
-                        st.caption(
-                            f"附加狀態：{selected_row.get('訊號狀態', '—')}｜{selected_row.get('市場一致', '—')}｜"
-                            f"{selected_row.get('資料狀態', '—')}｜買賣價差 {selected_row.get('買賣價差', '—')}。"
-                        )
-
+            if risk_preview_enabled:
                 if st.button(
                     '📝 記錄目前表格的已觸發股票訊號', key='record_stock_strategy_signals',
-                    help='一次記錄目前股票表格中所有已觸發或回測確認、且達最低進場信心的個股；不是只記錄單一個股。'
+                    help='一次記錄目前股票表格中所有已觸發或回測確認、且達最低進場信心的個股。'
                 ):
                     records = []
                     recordable_rows = df_display[df_display.get('_附加可記錄', False) == True]
@@ -18609,11 +18671,10 @@ if tab1.open and stock_strategy_tab.open:
                 if st.session_state.get('sj_logged_in', False) and st.session_state.get('sj_api'):
                     sj_api = st.session_state.sj_api
                     with st.spinner("正在透過永豐API更新報價..."):
-                        quote_codes = st.session_state.stock_data['代號'].astype(str).tolist()
-                        snapshot_map = fetch_stock_snapshot_map(sj_api, quote_codes)
-                        refreshed_quotes, updated_count = merge_realtime_stock_snapshots(
+                        refreshed_quotes, updated_count = refresh_stock_quotes_for_codes(
                             st.session_state.stock_data,
-                            snapshot_map,
+                            True,
+                            sj_api,
                             points_map=points_map,
                         )
                     if updated_count:
@@ -18666,6 +18727,7 @@ if tab1.open and stock_strategy_tab.open:
 
             st.markdown("### ⚡獨立計算")
             indep_strategy_mode = None
+            indep_compact_table = False
             if risk_preview_enabled:
                 if st.session_state.get('indep_strategy_mode') == '當沖預覽':
                     st.session_state['indep_strategy_mode'] = '當沖'
@@ -18694,6 +18756,10 @@ if tab1.open and stock_strategy_tab.open:
                 with indep_ctrl3:
                     indep_block_attention = st.checkbox("封鎖注意累計 ≥ 2", value=True, key="indep_risk_block_attention")
                     indep_show_only_eligible = st.checkbox("只顯示可操作候選", value=False, key="indep_risk_show_eligible")
+                    indep_compact_table = st.checkbox(
+                        "精簡主表（獨立計算）", value=True, key="indep_stock_compact_table",
+                        help="欄位順序與上方股票主表一致；關閉可查看完整分析欄位。",
+                    )
                     if st.button("🔄 更新注意／處置名單", key="refresh_indep_market_risk_data"):
                         fetch_market_risk_lists.clear()
                         with st.spinner("正在更新上市／上櫃注意與處置名單..."):
@@ -18793,8 +18859,6 @@ if tab1.open and stock_strategy_tab.open:
                 if indep_data:
                     df_indep = pd.DataFrame(indep_data)
                     indep_is_daytrade = risk_preview_enabled and indep_strategy_mode == "當沖"
-                    indep_risk_details = {}
-
                     if risk_preview_enabled:
                         indep_market_risk_data = st.session_state.risk_filter_market_data
                         indep_attention_counts = indep_market_risk_data.get('attention', {})
@@ -18900,7 +18964,6 @@ if tab1.open and stock_strategy_tab.open:
                                 data_health, market_alignment, result.get('detail', '')
                             )
                             result['confidence'] = confidence
-                            indep_risk_details[code] = result
                             df_indep.at[i, '建議方向'] = direction_info['label']
                             df_indep.at[i, '方向依據'] = direction_info['basis']
                             df_indep.at[i, '進出場預判'] = trade_plan['summary']
@@ -18921,12 +18984,14 @@ if tab1.open and stock_strategy_tab.open:
                             if df_indep.empty:
                                 st.warning("目前沒有符合門檻的候選；可降低最低評分、放寬最大乖離，或改看完整結果。")
 
-                        if indep_is_daytrade:
-                            input_cols = ["代號", "名稱", "戰略備註", "收盤價", "漲跌幅", "建議方向", "進出場預判", "成交價價差", "5日線價差", "風險", "VWAP 狀態", "開盤區間", "量能", "訊號狀態", "信心分", "信心判讀", "支撐壓力", "盤中觸發", "方向依據", "市場一致", "當日漲停價", "當日跌停價", "期貨", "資料狀態", "買賣價差"]
-                        else:
-                            input_cols = ["代號", "名稱", "戰略備註", "收盤價", "漲跌幅", "建議方向", "進出場預判", "成交價價差", "5日線價差", "風險", "訊號狀態", "信心分", "信心判讀", "乖離", "支撐壓力", "隔日規則", "方向依據", "市場一致", "當日漲停價", "當日跌停價", "期貨", "資料狀態", "買賣價差"]
+                        input_cols = stock_strategy_display_columns(
+                            True, indep_is_daytrade, indep_compact_table,
+                            include_remove=False,
+                        )
                     else:
-                        input_cols = ["代號", "名稱", "戰略備註", "收盤價", "漲跌幅", "成交價價差", "5日線價差", "當日漲停價", "當日跌停價", "期貨"]
+                        input_cols = stock_strategy_display_columns(
+                            False, False, False, include_remove=False,
+                        )
                     for col in input_cols:
                         if col not in df_indep.columns: df_indep[col] = None
 
@@ -19023,25 +19088,6 @@ if tab1.open and stock_strategy_tab.open:
                     render_strategy_ranking(
                         df_indep, indep_strategy_mode, '股票獨立計算',
                     )
-
-                    if indep_risk_details and not df_indep.empty:
-                        detail_options = {
-                            f"{row['代號']} {row['名稱']}": str(row['代號'])
-                            for _, row in df_indep.iterrows()
-                        }
-                        selected_label = st.selectbox("查看獨立計算信心明細", list(detail_options), key="indep_risk_detail_code")
-                        selected_result = indep_risk_details[detail_options[selected_label]]
-                        rule_label = "盤中觸發" if indep_is_daytrade else "隔日規則"
-                        data_time_text = f"｜盤中資料更新：{selected_result['data_time']}" if indep_is_daytrade and selected_result.get('data_time') else ""
-                        plan_text = selected_result.get('trade_plan', {}).get('detail', '尚未預判點位。')
-                        confidence_detail = selected_result.get('confidence', {})
-                        direction_detail = selected_result.get('direction_info', {})
-                        st.caption(
-                            f"{direction_detail.get('label', '方向未判定')}｜{direction_detail.get('basis', '方向依據不足')}｜"
-                            f"進場信心 {confidence_detail.get('score', '—')} 分（{confidence_detail.get('label', '—')}）｜"
-                            f"{selected_result['detail']}｜{rule_label}：{selected_result['rule']}｜"
-                            f"進出場預判：{plan_text}{data_time_text}。信心分代表條件一致度，不是勝率。"
-                        )
 
 with tab2:
     tab2_1, tab2_2, tab2_3 = st.tabs(

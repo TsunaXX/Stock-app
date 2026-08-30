@@ -859,6 +859,71 @@ def test_realtime_stock_snapshots_merge_one_batch_without_network_calls():
     assert merged.at[0, "_quote_time"] == "2026/08/21 10:00:00"
 
 
+def test_stock_quote_refresh_uses_one_snapshot_batch_for_all_rows():
+    symbols = load_app_symbols(
+        "_safe_number", "snapshot_change_rate", "price_change_amount",
+        "fetch_stock_snapshot_map", "merge_realtime_stock_snapshots",
+        "refresh_stock_quotes_for_codes",
+    )
+
+    class Snapshot:
+        def __init__(self, code, close):
+            self.code = code
+            self.close = close
+            self.change_rate = 1.5
+            self.buy_price = close - 0.5
+            self.sell_price = close
+
+    class Contracts:
+        Stocks = {"2330": object(), "2317": object()}
+
+    api = type("API", (), {})()
+    api.Contracts = Contracts()
+
+    calls = []
+    symbols["get_stream_quotes"] = lambda _api, contracts: (
+        calls.append(list(contracts)) or [Snapshot("2330", 101), Snapshot("2317", 202)]
+    )
+    source = pd.DataFrame([
+        {"代號": "2330", "收盤價": 100, "漲跌幅": 0},
+        {"代號": "2317", "收盤價": 200, "漲跌幅": 0},
+    ])
+    refreshed, count = symbols["refresh_stock_quotes_for_codes"](
+        source, True, api,
+    )
+    assert count == 2
+    assert len(calls) == 1
+    assert refreshed["收盤價"].tolist() == [101, 202]
+
+
+def test_stock_main_and_independent_tables_share_column_order_and_compact_mode():
+    columns = load_app_symbols("stock_strategy_display_columns")[
+        "stock_strategy_display_columns"
+    ]
+    main_compact = columns(True, True, True, include_remove=True)
+    independent_compact = columns(True, True, True, include_remove=False)
+    assert main_compact[1:] == independent_compact
+    assert main_compact[:7] == [
+        "移除", "代號", "名稱", "戰略備註", "收盤價", "漲跌幅", "建議方向",
+    ]
+    full = columns(True, True, False, include_remove=False)
+    assert full.index("訊號狀態") < full.index("市場一致")
+    assert "盤中觸發" in full
+    source = APP_PATH.read_text(encoding="utf-8")
+    assert 'key="indep_stock_compact_table"' in source
+    assert "stock_strategy_display_columns(\n                            True, indep_is_daytrade" in source
+
+
+def test_stock_refresh_actions_also_refresh_available_quotes_and_explanation_matches():
+    source = APP_PATH.read_text(encoding="utf-8")
+    assert "重抓日 K、更新盤中條件或更新注意／處置名單時，會一併更新可取得的即時報價" in source
+    assert "updated_count, quote_count = refresh_risk_metrics_for_codes" in source
+    assert "updated_count, quote_count = refresh_daytrade_metrics_for_codes" in source
+    market_button = source.index('key="refresh_risk_filter_market_data"')
+    market_end = source.index("cache_sync_notice =", market_button)
+    assert "refresh_stock_quotes_for_codes" in source[market_button:market_end]
+
+
 def test_partial_market_risk_refresh_keeps_last_complete_lists():
     merge = load_app_symbols("merge_market_risk_refresh")["merge_market_risk_refresh"]
     previous = {
@@ -1072,12 +1137,13 @@ def test_independent_tables_use_the_same_post_21_ranking():
     assert "df_indep, indep_strategy_mode, '股票獨立計算'" in source
     main_futures_table = source.index("edited = st.data_editor(", source.index("def futures_column_config"))
     main_futures_rank = source.index("render_strategy_ranking(display_rows, strategy_mode, '期貨')")
-    main_futures_detail = source.index("'查看期貨策略信心明細'")
-    assert main_futures_table < main_futures_rank < main_futures_detail
+    assert main_futures_table < main_futures_rank
     main_stock_table = source.index("edited_df = st.data_editor(", source.index("stock_editor_key ="))
     main_stock_rank = source.index("render_strategy_ranking(df_display, strategy_mode, '股票')")
-    main_stock_detail = source.index('"查看策略信心明細"', main_stock_table)
-    assert main_stock_table < main_stock_rank < main_stock_detail
+    assert main_stock_table < main_stock_rank
+    assert "查看策略信心明細" not in source
+    assert "查看期貨策略信心明細" not in source
+    assert "查看獨立計算信心明細" not in source
 
 
 def test_streamlit_magic_ast_rewrite_is_disabled_for_large_app():
@@ -1106,7 +1172,7 @@ def test_calendar_http_has_a_short_single_attempt_deadline():
     assert "timeout=(3, 9)" in tradingview_source
 
 
-def test_daily_risk_refresh_skips_redundant_live_quote_fetches():
+def test_daily_risk_refresh_uses_one_separate_batched_quote_update():
     source = APP_PATH.read_text(encoding="utf-8")
     tree = ast.parse(source)
     raw_fetch = next(
@@ -1122,6 +1188,8 @@ def test_daily_risk_refresh_skips_redundant_live_quote_fetches():
     assert "include_live_quote=True" in raw_source
     assert "include_live_quote and re.fullmatch" in raw_source
     assert "include_live_quote=False" in risk_source
+    assert "refresh_stock_quotes_for_codes" in risk_source
+    assert "fetch_stock_snapshot_map" not in risk_source
 
 
 def test_goodinfo_fetch_uses_legacy_user_agent_without_browser_or_crawler_retries():
@@ -1500,11 +1568,13 @@ def test_requested_futures_controls_and_company_tab_order_are_present():
     assert "只顯示夜盤期貨" in source
     assert source.index("只顯示夜盤期貨") > source.index("只顯示小型股票期貨")
     assert source.index("只顯示夜盤期貨") < source.index("隱藏小型期貨")
-    compact_start = source.index("if compact_futures_table:")
-    compact_end = source.index("else:\n            futures_display_columns", compact_start)
+    compact_start = source.index("futures_compact_columns = [")
+    compact_end = source.index("futures_full_columns = [", compact_start)
     compact_columns = source[compact_start:compact_end]
     assert compact_columns.index("'收盤價'") < compact_columns.index("'方向'")
     assert compact_columns.index("'進出場點位'") < compact_columns.index("'支撐壓力'")
+    assert "精簡主表（獨立計算）" in source
+    assert "futures_independent_compact_table" in source
 
 
 def test_directional_option_quality_rejects_negative_or_unreachable_trades():
