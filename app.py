@@ -13170,7 +13170,7 @@ def _expected_us_close_date(taiwan_trading_day):
 
 
 def fetch_yahoo_us_index_close_signals(trading_day, expected_date, requested_keys=None):
-    """取得真正美股指數日線；資料日期不正確時一律不採用。"""
+    """取得真正美股指數日線；改由 yfinance 逐檔抓取以降低 Yahoo 429 限流。"""
     errors = []
     instruments = {
         'DJI': ('道瓊工業指數', '^DJI'),
@@ -13180,67 +13180,66 @@ def fetch_yahoo_us_index_close_signals(trading_day, expected_date, requested_key
     }
     if requested_keys is not None:
         instruments = {key: value for key, value in instruments.items() if key in requested_keys}
-    period_start = int(pytz.UTC.localize(
-        datetime.combine(expected_date - timedelta(days=12), dt_time.min)
-    ).timestamp())
-    period_end = int(pytz.UTC.localize(
-        datetime.combine(trading_day + timedelta(days=1), dt_time.min)
-    ).timestamp())
 
-    def fetch_one(item):
-        key, (label, symbol) = item
+    start_date = expected_date - timedelta(days=12)
+    end_date = trading_day + timedelta(days=1)
+    rows = []
+
+    for key, (label, symbol) in instruments.items():
         try:
-            response = requests.get(
-                f'https://query1.finance.yahoo.com/v8/finance/chart/{symbol}',
-                params={
-                    'period1': period_start, 'period2': period_end,
-                    'interval': '1d', 'includePrePost': 'false',
-                },
-                headers={'User-Agent': NASDAQ_MARKET_HEADERS['User-Agent']}, timeout=8,
+            history = yf.Ticker(symbol).history(
+                start=start_date,
+                end=end_date,
+                interval='1d',
+                auto_adjust=False,
+                actions=False,
+                prepost=False,
+                timeout=8,
             )
-            response.raise_for_status()
-            result = (response.json().get('chart', {}).get('result') or [None])[0] or {}
-            timestamps = result.get('timestamp') or []
-            closes = (result.get('indicators', {}).get('quote') or [{}])[0].get('close') or []
+            if history is None or history.empty or 'Close' not in history.columns:
+                raise ValueError('收盤資料不足')
+
+            close_series = pd.to_numeric(history['Close'], errors='coerce').dropna()
+            if len(close_series) < 2:
+                raise ValueError('收盤資料不足')
+
             parsed = []
-            for timestamp, close in zip(timestamps, closes):
+            for idx, close in close_series.items():
                 try:
-                    trade_date = datetime.fromtimestamp(
-                        float(timestamp), tz=pytz.utc,
-                    ).date()
-                except (TypeError, ValueError, OverflowError, OSError):
-                    continue
+                    trade_date = idx.date()
+                except AttributeError:
+                    trade_date = pd.Timestamp(idx).date()
                 close = _safe_number(close)
                 if close is not None and close > 0:
                     parsed.append((trade_date, close))
+
             parsed.sort(key=lambda pair: pair[0], reverse=True)
             if len(parsed) < 2:
                 raise ValueError('收盤資料不足')
+
             latest_date, latest = parsed[0]
             _, previous = parsed[1]
             if latest_date != expected_date:
                 raise ValueError(
                     f'資料停在 {latest_date:%m/%d}，應為 {expected_date:%m/%d}，已排除評分'
                 )
-            return {
-                'key': key, 'label': label, 'group': '美股收盤',
-                'price': latest, 'pct': (latest / previous - 1) * 100,
+            if previous <= 0:
+                raise ValueError('前一交易日收盤價格無效')
+
+            rows.append({
+                'key': key,
+                'label': label,
+                'group': '美股收盤',
+                'price': latest,
+                'pct': (latest / previous - 1) * 100,
                 'time': f'{latest_date:%m/%d} 收盤',
-                'weight': OPENING_SIGNAL_WEIGHTS[key], 'source': f'Yahoo Finance｜{label}',
-            }, None
+                'weight': OPENING_SIGNAL_WEIGHTS[key],
+                'source': f'Yahoo Finance｜{label}',
+            })
         except Exception as exc:
-            return None, f'{label}：{exc}'
+            errors.append(f'{label}：{exc}')
 
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        results = list(executor.map(fetch_one, instruments.items()))
-    rows = []
-    for row, error in results:
-        if row:
-            rows.append(row)
-        elif error:
-            errors.append(error)
     return rows, errors
-
 
 def fetch_nasdaq_us_close_signals(trading_day, requested_keys=None):
     """從 Nasdaq 取得最近美股收盤，並拒絕早於最近應有交易日的資料。"""
