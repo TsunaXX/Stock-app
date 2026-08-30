@@ -24,6 +24,7 @@ jobs:
         run: |
           python - <<'PY'
           from pathlib import Path
+          from textwrap import dedent
 
           path = Path('app.py')
           text = path.read_text(encoding='utf-8')
@@ -37,7 +38,8 @@ jobs:
           start = text.index('def fetch_yahoo_us_index_close_signals(')
           end = text.index('\ndef fetch_nasdaq_us_close_signals(', start)
 
-          replacement = '''def fetch_yahoo_us_index_close_signals(trading_day, expected_date, requested_keys=None):
+          replacement = dedent('''\
+          def fetch_yahoo_us_index_close_signals(trading_day, expected_date, requested_keys=None):
               \"\"\"取得真正美股指數日線；改由 yfinance 逐檔抓取以降低 Yahoo 429 限流。\"\"\"
               errors = []
               instruments = {
@@ -108,9 +110,8 @@ jobs:
                       errors.append(f'{label}：{exc}')
 
               return rows, errors
-          '''
-          replacement = '\n'.join(line[12:] if line.startswith('            ') else line for line in replacement.splitlines())
-          text = text[:start] + replacement.rstrip() + '\n' + text[end:]
+          ''')
+          text = text[:start] + replacement.rstrip() + '\n\n' + text[end + 1:]
           path.write_text(text, encoding='utf-8')
           PY
 
