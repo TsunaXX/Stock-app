@@ -107,6 +107,34 @@ def test_rsi_for_uninterrupted_rise_is_100():
     assert result["rsi"] == 100.0
 
 
+def test_option_wall_scores_use_otm_open_interest_as_primary_signal():
+    calculate = load_app_symbols("calculate_option_wall_scores")["calculate_option_wall_scores"]
+    rows = [
+        {"right": "P", "strike": 21900, "open_interest": 800, "volume": 100, "ask_volume": 10},
+        {"right": "P", "strike": 21800, "open_interest": 5000, "volume": 500, "ask_volume": 80},
+        {"right": "P", "strike": 22100, "open_interest": 99999, "volume": 9999, "ask_volume": 999},
+        {"right": "C", "strike": 22100, "open_interest": 10, "volume": 5, "ask_volume": 1},
+        {"right": "C", "strike": 22300, "open_interest": 20, "volume": 10, "ask_volume": 2},
+    ]
+    result = calculate(rows, spot=22000, window_points=700)
+    assert result["support"] == 21800
+    assert result["resistance"] == 22300
+    assert result["balance"] > 0
+    assert result["status"] == "SP 支撐偏強"
+    assert all(row["strike"] != 22100 for row in result["rows"] if row["right"] == "P")
+
+
+def test_option_wall_scores_require_both_sides_and_real_wall_evidence():
+    calculate = load_app_symbols("calculate_option_wall_scores")["calculate_option_wall_scores"]
+    assert calculate([
+        {"right": "P", "strike": 21900, "open_interest": 100},
+    ], spot=22000) is None
+    assert calculate([
+        {"right": "P", "strike": 21900},
+        {"right": "C", "strike": 22100},
+    ], spot=22000) is None
+
+
 def test_futures_ticks_follow_product_specification():
     symbols = load_app_symbols("_safe_number", "FUTURES_FIXED_TICK_SIZES", "get_futures_tick_size")
     get_tick = symbols["get_futures_tick_size"]
