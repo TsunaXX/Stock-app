@@ -970,6 +970,22 @@ def test_partial_market_risk_refresh_keeps_last_complete_lists():
     assert result["using_last_success"] is True
 
 
+def test_partial_market_risk_refresh_keeps_new_confirmed_next_open_disposition():
+    merge = load_app_symbols("merge_market_risk_refresh")["merge_market_risk_refresh"]
+    previous = {
+        "attention": {"6226": 4}, "disposition": [],
+        "disposition_tomorrow": [], "updated": "2026/08/31 17:00:00",
+        "errors": [],
+    }
+    result = merge(
+        previous, {}, [], ["6226"], ["上櫃注意: timeout"],
+        attempted_at="2026/08/31 18:00:00",
+    )
+    assert result["attention"] == {"6226": 4}
+    assert result["disposition_tomorrow"] == ["6226"]
+    assert result["using_last_success"] is True
+
+
 def test_disposition_preview_uses_next_market_day_not_calendar_tomorrow():
     source = APP_PATH.read_text(encoding="utf-8")
     assert "adjust_to_next_market_day(" in source
@@ -1005,6 +1021,72 @@ def test_tpex_live_disposition_page_fills_delayed_openapi_announcement():
     current, next_open = parse(payload, target_date=date(2026, 8, 29))
     assert current == set()
     assert next_open == {"3441"}
+
+
+def test_twse_live_disposition_page_fills_delayed_openapi_announcement():
+    symbols = load_app_symbols(
+        "get_holidays", "is_market_closed_func", "adjust_to_next_market_day",
+        "disposition_period_status", "parse_twse_disposition_page_payload",
+    )
+    parse = symbols["parse_twse_disposition_page_payload"]
+    payload = {
+        "fields": ["序號", "公布日期", "證券代號", "證券名稱", "累計", "原因", "處置起迄時間"],
+        "data": [[
+            3, "*115/08/31", "6226", "光鼎", 1,
+            "連續三次", "115/09/01～115/09/07",
+        ]],
+    }
+    current, next_open = parse(payload, target_date=date(2026, 8, 31))
+    assert current == set()
+    assert next_open == {"6226"}
+
+
+def test_attention_count_label_is_explicit_and_next_open_has_priority():
+    symbols = load_app_symbols(
+        "_as_float", "_format_compact_number", "calculate_risk_filter_result",
+    )
+    calculate = symbols["calculate_risk_filter_result"]
+    row = {
+        "代號": "6226", "收盤價": 22, "_ma5": 21,
+        "_risk_ma20": 20, "_risk_ma20_slope": 1,
+        "_risk_atr14": 1, "_risk_close_position": 70,
+        "_risk_prev_high": 21.5, "_risk_prev_low": 19,
+    }
+    attention = calculate(
+        row, "多頭", 2.0, attention_counts={"6226": 4},
+        market_lists_updated=True,
+    )
+    assert attention["risk"] == "🔴 注意累計 4 次"
+    next_open = calculate(
+        row, "多頭", 2.0, attention_counts={"6226": 4},
+        disposition_tomorrow_codes=["6226"], market_lists_updated=True,
+    )
+    assert next_open["risk"] == "🔶 下個開盤日處置"
+
+
+def test_stock_ranking_and_option_plan_skip_redundant_fetches():
+    source = APP_PATH.read_text(encoding="utf-8")
+    ranking_start = source.index("def fetch_post_close_stock_ranking_context")
+    ranking_end = source.index("def resolve_post_close_ranking_context", ranking_start)
+    ranking_source = source[ranking_start:ranking_end]
+    assert "'twse_daily'" not in ranking_source
+    assert "'tpex_daily'" not in ranking_source
+    assert "if asset_type in ('futures', 'combined')" in ranking_source
+
+    option_start = source.index("if refresh_option_plan or not option_cache")
+    option_end = source.index("directional_quote = option_cache.get", option_start)
+    option_source = source[option_start:option_end]
+    assert option_source.count("select_txo_expiry(") == 1
+    assert option_source.count("expiry_selection=expiry_selection") == 2
+
+    pressure_start = source.index("def get_taifex_txo_open_interest_rows_nonblocking")
+    pressure_end = source.index("def build_txo_pressure_rows", pressure_start)
+    pressure_source = source[pressure_start:pressure_end]
+    assert "daemon=True" in pressure_source
+    build_pressure_end = source.index("def append_txo_pressure_history", pressure_end)
+    assert "get_taifex_txo_open_interest_rows_nonblocking()" in source[
+        pressure_end:build_pressure_end
+    ]
 
 
 def test_next_open_disposition_is_visible_and_not_eligible():

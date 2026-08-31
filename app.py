@@ -5315,11 +5315,17 @@ def _select_txo_spread_hedge(contracts, short_contract, is_bull_put, preferred_w
     return None
 
 
-def get_txo_spread_quote(api, plan, expiry_choice, preferred_width=100):
+def get_txo_spread_quote(
+    api, plan, expiry_choice, preferred_width=100, expiry_selection=None,
+):
     """Find an OTM defined-risk credit spread for the selected TXO expiry."""
     if api is None or plan is None or plan['direction'] not in ('偏多', '偏空'):
         return None
-    expiry_options, selected_expiry, source = select_txo_expiry(api, expiry_choice)
+    expiry_options, selected_expiry, source = (
+        expiry_selection
+        if expiry_selection is not None
+        else select_txo_expiry(api, expiry_choice)
+    )
     if not expiry_options:
         return None
 
@@ -5398,11 +5404,18 @@ def get_txo_spread_quote(api, plan, expiry_choice, preferred_width=100):
     }
 
 
-def get_txo_directional_quote(api, plan, expiry_choice, moneyness_preference='自動評選'):
+def get_txo_directional_quote(
+    api, plan, expiry_choice, moneyness_preference='自動評選',
+    expiry_selection=None,
+):
     """Compare BC/BP candidates across ITM, ATM and OTM using live quotes."""
     if api is None or plan is None or plan['direction'] not in ('偏多', '偏空'):
         return None
-    expiry_options, selected_expiry, source = select_txo_expiry(api, expiry_choice)
+    expiry_options, selected_expiry, source = (
+        expiry_selection
+        if expiry_selection is not None
+        else select_txo_expiry(api, expiry_choice)
+    )
     if not expiry_options:
         return None
 
@@ -5715,9 +5728,8 @@ def _taifex_number(value):
         return None
 
 
-@st.cache_data(ttl=600, max_entries=1, show_spinner=False)
-def fetch_taifex_txo_open_interest_rows():
-    """Read the latest regular-session TXO OI as a low-frequency wall baseline."""
+def _fetch_taifex_txo_open_interest_rows_sync():
+    """Read the latest regular-session TXO OI without blocking page orchestration."""
     try:
         response = requests.get(
             'https://www.taifex.com.tw/cht/3/optDailyMarketExcel?marketCode=0',
@@ -5757,6 +5769,47 @@ def fetch_taifex_txo_open_interest_rows():
         return []
 
 
+@st.cache_data(ttl=600, max_entries=1, show_spinner=False)
+def fetch_taifex_txo_open_interest_rows():
+    """Synchronous compatibility entry used by diagnostics and explicit refreshes."""
+    return _fetch_taifex_txo_open_interest_rows_sync()
+
+
+def get_taifex_txo_open_interest_rows_nonblocking(max_age_seconds=600):
+    """Return last OI immediately and refresh it once in a bounded daemon thread."""
+    shared, shared_lock = get_shared_market_data_cache()
+    now_mono = time.monotonic()
+    with shared_lock:
+        state = shared.setdefault('option_pressure_oi', {
+            'rows': [], 'loaded_at': 0.0, 'loading': False,
+        })
+        rows = list(state.get('rows') or [])
+        is_fresh = bool(rows) and now_mono - float(state.get('loaded_at', 0)) < max_age_seconds
+        if is_fresh:
+            return rows
+        should_start = not bool(state.get('loading'))
+        if should_start:
+            state['loading'] = True
+
+    if should_start:
+        def refresh_worker():
+            refreshed_rows = _fetch_taifex_txo_open_interest_rows_sync()
+            completed_at = time.monotonic()
+            with shared_lock:
+                current = shared.setdefault('option_pressure_oi', {})
+                if refreshed_rows:
+                    current['rows'] = list(refreshed_rows)
+                    current['loaded_at'] = completed_at
+                current['loading'] = False
+
+        threading.Thread(
+            target=refresh_worker,
+            name='txo-oi-refresh',
+            daemon=True,
+        ).start()
+    return rows
+
+
 def build_txo_pressure_rows(api, contracts, expiry, spot, window_points=700):
     """Join a small live OTM quote set to the cached official OI baseline."""
     selected = select_txo_pressure_contracts(
@@ -5765,7 +5818,7 @@ def build_txo_pressure_rows(api, contracts, expiry, spot, window_points=700):
     if not selected:
         return [], 0
     quotes = get_txo_snapshot_quotes(api, selected)
-    official_rows = fetch_taifex_txo_open_interest_rows()
+    official_rows = get_taifex_txo_open_interest_rows_nonblocking()
     official_map = {
         (row['expiry'], row['right'], float(row['strike'])): row
         for row in official_rows
@@ -5921,6 +5974,14 @@ def render_txo_pressure_indicator(api, fallback_spot, expiry_choice):
     rows, subscription_count = build_txo_pressure_rows(
         api, contracts, expiry, spot, window_points=window_points,
     )
+    shared_market_cache, shared_market_lock = get_shared_market_data_cache()
+    with shared_market_lock:
+        oi_state = dict(shared_market_cache.get('option_pressure_oi', {}))
+    oi_note = (
+        "期交所 OI 背景更新中，先顯示即時量價。"
+        if oi_state.get('loading') and not oi_state.get('rows')
+        else "期交所 OI 已採 10 分鐘快取。"
+    )
     result = calculate_option_wall_scores(rows, spot, window_points=window_points)
     if result is None:
         st.warning("附近價外 Put／Call 報價不足，暫不顯示支撐壓力，避免用單邊資料誤判。")
@@ -5964,7 +6025,7 @@ def render_txo_pressure_indicator(api, fallback_spot, expiry_choice):
         )
     st.caption(
         f"到期日：{expiry:%Y/%m/%d}｜契約來源：{source}｜每 12 秒只重繪本區。"
-        "僅訂閱期貨上下 700 點內、各 6 檔價外 Put／Call；期交所未平倉量快取 10 分鐘。"
+        f"僅訂閱期貨上下 700 點內、各 6 檔價外 Put／Call；{oi_note}"
     )
     with st.expander("SP／SC 指標怎麼看"):
         st.markdown(
@@ -12215,7 +12276,11 @@ def render_stock_strategy_controls():
         st.markdown("#### 資料管理")
         if st.session_state.ignored_stocks:
             ignored_list = sorted(st.session_state.ignored_stocks)
-            option_map = {f"{code} {get_stock_name_online(code)}": code for code in ignored_list}
+            local_names, _ = load_local_stock_names()
+            option_map = {
+                f"{code} {local_names.get(code, code)}": code
+                for code in ignored_list
+            }
             selected = st.multiselect(
                 "忽略名單（取消勾選以復原）", list(option_map),
                 default=list(option_map),
@@ -12377,7 +12442,7 @@ def render_stock_strategy_explanation():
 - **① 取得標的**：使用官方週轉率排行、上傳 CSV 或快速查詢，再按「執行分析」。
 - **② 選擇模式**：當沖看分 K、VWAP、開盤區間與量能；隔日／波段看日 K、均線與前高前低。系統會逐檔判斷多空。
 - **③ 依序判讀**：先看`方向`與`訊號狀態`，再看`進出場預判`、`支撐壓力`及`進場信心`。`進／停／目`分別是觀察進場、失效離場與第一目標。
-- **④ 控制風險**：信心分是條件一致度，**不是勝率**；`注意 2+`預設排除、`處置中`禁止進場、`未查核`代表官方名單尚未完整取得。
+- **④ 控制風險**：信心分是條件一致度，**不是勝率**；`注意累計 N 次`表示近期連續／累計達注意標準的次數。若已公告下個交易日開始處置，會優先顯示`下個開盤日處置`；`未查核`代表官方名單尚未完整取得。
 - **⑤ 更新資料**：重抓日 K、更新盤中條件或更新注意／處置名單時，會一併更新可取得的即時報價。原排行與表格順序不會因此改變。
         """)
 
@@ -14184,6 +14249,32 @@ def parse_tpex_disposition_page_payload(payload, target_date=None):
     return disposition_codes, next_open_codes
 
 
+def parse_twse_disposition_page_payload(payload, target_date=None):
+    """解析證交所處置公告頁 JSON，補足 OpenAPI 當日晚間尚未更新的公告。"""
+    disposition_codes = set()
+    next_open_codes = set()
+    if not isinstance(payload, dict):
+        return disposition_codes, next_open_codes
+
+    # TWSE rwd 公告頁目前固定為：2=證券代號、6=處置起迄時間。
+    # 官方回應偶爾未正確宣告 Big5 charset，故不可只依賴中文欄名。
+    for values in payload.get('data', []):
+        if not isinstance(values, (list, tuple)) or len(values) <= 6:
+            continue
+        code_match = re.search(r'\d{4,6}', str(values[2]).strip())
+        if not code_match:
+            continue
+        code = code_match.group(0)
+        if len(code) != 4:
+            continue
+        status = disposition_period_status(values[6], target_date=target_date)
+        if status == 'today':
+            disposition_codes.add(code)
+        elif status == 'next_open':
+            next_open_codes.add(code)
+    return disposition_codes, next_open_codes
+
+
 @st.cache_data(ttl=900, max_entries=1, show_spinner=False)
 def fetch_market_risk_lists():
     """取得上市、上櫃注意／處置名單，短重試後交由最後成功資料接手。"""
@@ -14363,6 +14454,12 @@ def fetch_market_risk_lists():
             None,
         ),
         (
+            '上市處置公告頁',
+            'https://www.twse.com.tw/rwd/zh/announcement/punish',
+            dict,
+            {'response': 'json'},
+        ),
+        (
             '上市注意累計異常',
             'https://openapi.twse.com.tw/v1/announcement/notetrans',
             list,
@@ -14456,6 +14553,18 @@ def fetch_market_risk_lists():
 
         except Exception as exc:
             errors.append(f'上市處置解析失敗: {exc}')
+
+    twse_disposition_page = fetched.get('上市處置公告頁')
+    if twse_disposition_page is not None:
+        try:
+            page_current, page_next = parse_twse_disposition_page_payload(
+                twse_disposition_page,
+                target_date=target_date,
+            )
+            disposition_codes.update(page_current)
+            disposition_tomorrow_codes.update(page_next)
+        except Exception as exc:
+            errors.append(f'上市處置公告頁解析失敗: {exc}')
 
     twse_accumulated = fetched.get('上市注意累計異常')
     if twse_accumulated is not None:
@@ -14628,6 +14737,12 @@ def merge_market_risk_refresh(
     previous = dict(previous_state or {})
     error_list = list(errors or [])
     if error_list and previous.get('updated'):
+        # 部分來源失敗時仍保留最後完整名單；但公告頁已確認的「下個
+        # 開盤日處置」屬較高風險新資訊，必須立即併入，不能被其他
+        # 非關聯 API 的 timeout 一起丟棄。
+        confirmed_next_open = set(previous.get('disposition_tomorrow', []))
+        confirmed_next_open.update(disposition_tomorrow or [])
+        previous['disposition_tomorrow'] = sorted(confirmed_next_open)
         previous['errors'] = error_list
         previous['last_attempt'] = attempted_at
         previous['using_last_success'] = True
@@ -14691,9 +14806,9 @@ def _post_close_target_date(now_value=None):
     return current, target
 
 
-@st.cache_data(ttl=1800, max_entries=3, show_spinner=False)
-def fetch_post_close_stock_ranking_context(target_date_text):
-    """Fetch official post-close chips and valuation data once per 30-minute cache."""
+@st.cache_data(ttl=3600, max_entries=6, show_spinner=False)
+def fetch_post_close_stock_ranking_context(target_date_text, asset_type='combined'):
+    """Fetch only applicable post-close sources and reuse them for one hour."""
     target_date_text = _ranking_market_date(target_date_text)
     if not target_date_text:
         raise ValueError('盤後排名資料日格式錯誤')
@@ -14703,11 +14818,6 @@ def fetch_post_close_stock_ranking_context(target_date_text):
         'User-Agent': 'Mozilla/5.0 (compatible; StockApp/1.0)',
     }
     jobs = {
-        'twse_daily': (
-            _TWSE_DAILY_QUOTES_URL,
-            {'date': target_date_text, 'type': 'ALLBUT0999', 'response': 'json'},
-        ),
-        'tpex_daily': (_TPEX_DAILY_QUOTES_URL, None),
         'twse_institutional': (
             'https://www.twse.com.tw/rwd/zh/fund/T86',
             {'date': target_date_text, 'selectType': 'ALLBUT0999', 'response': 'json'},
@@ -14728,15 +14838,16 @@ def fetch_post_close_stock_ranking_context(target_date_text):
         'tpex_valuation': (
             'https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis', None,
         ),
-        'taifex_institutional': (
-            'https://openapi.taifex.com.tw/v1/'
-            'MarketDataOfMajorInstitutionalTradersDetailsOfFuturesContractsBytheDate', None,
-        ),
         'twse_revenue': (TWSE_MONTHLY_REVENUE_URL, None),
         'tpex_revenue': (TPEX_MONTHLY_REVENUE_URL, None),
         'twse_eps': ('https://openapi.twse.com.tw/v1/opendata/t187ap14_L', None),
         'tpex_eps': ('https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap14_O', None),
     }
+    if asset_type in ('futures', 'combined'):
+        jobs['taifex_institutional'] = (
+            'https://openapi.taifex.com.tw/v1/'
+            'MarketDataOfMajorInstitutionalTradersDetailsOfFuturesContractsBytheDate', None,
+        )
 
     def fetch_one(item):
         name, (url, params) = item
@@ -14785,30 +14896,6 @@ def fetch_post_close_stock_ranking_context(target_date_text):
 
     def field_index(fields, *candidates):
         return next((fields.index(name) for name in candidates if name in fields), -1)
-
-    twse_daily = payloads.get('twse_daily')
-    if isinstance(twse_daily, dict) and require_target_date('上市行情', twse_daily.get('date')):
-        daily_table = next((
-            table for table in twse_daily.get('tables', [])
-            if '證券代號' in table.get('fields', []) and '收盤價' in table.get('fields', [])
-        ), {})
-        fields = list(daily_table.get('fields', []))
-        code_index = field_index(fields, '證券代號')
-        close_index = field_index(fields, '收盤價')
-        for values in daily_table.get('data', []):
-            if code_index < 0 or close_index < 0 or len(values) <= max(code_index, close_index):
-                continue
-            record = stock_record(values[code_index])
-            if record is not None:
-                record['close'] = _ranking_number(values[close_index])
-
-    tpex_daily = payloads.get('tpex_daily')
-    if isinstance(tpex_daily, list) and tpex_daily:
-        if require_target_date('上櫃行情', tpex_daily[0].get('Date')):
-            for item in tpex_daily:
-                record = stock_record(item.get('SecuritiesCompanyCode'))
-                if record is not None:
-                    record['close'] = _ranking_number(item.get('Close'))
 
     twse_inst = payloads.get('twse_institutional')
     if isinstance(twse_inst, dict) and require_target_date('上市法人', twse_inst.get('date')):
@@ -14981,19 +15068,22 @@ def fetch_post_close_stock_ranking_context(target_date_text):
     }
 
 
-def resolve_post_close_ranking_context(now_value=None):
+def resolve_post_close_ranking_context(now_value=None, asset_type='combined'):
     """Use current official data, falling back to this session's last usable snapshot."""
     current, target = _post_close_target_date(now_value)
+    fallback_key = f'_post_close_ranking_last_success_{asset_type}'
     try:
-        context = fetch_post_close_stock_ranking_context(target.strftime('%Y%m%d'))
+        context = fetch_post_close_stock_ranking_context(
+            target.strftime('%Y%m%d'), asset_type=asset_type,
+        )
     except Exception as exc:
         logger.warning('Post-close ranking context failed: %s', type(exc).__name__)
         context = {}
     if context.get('stocks') or context.get('futures_products'):
         context['using_last_success'] = False
-        st.session_state['_post_close_ranking_last_success'] = context
+        st.session_state[fallback_key] = context
         return context
-    fallback = dict(st.session_state.get('_post_close_ranking_last_success', {}))
+    fallback = dict(st.session_state.get(fallback_key, {}))
     if fallback:
         fallback['using_last_success'] = True
     return fallback
@@ -15586,7 +15676,10 @@ def render_strategy_ranking(rows, strategy_mode, room_label):
     current, target_date = _post_close_target_date()
     if rows is None or rows.empty:
         return
-    market_context = resolve_post_close_ranking_context(current)
+    asset_type = 'futures' if room_label == '期貨' else 'stock'
+    market_context = resolve_post_close_ranking_context(
+        current, asset_type=asset_type,
+    )
     entries = build_strategy_ranking_entries(
         rows, strategy_mode, now_value=current, market_context=market_context,
     )
@@ -15594,7 +15687,6 @@ def render_strategy_ranking(rows, strategy_mode, room_label):
         return
     ranking_title = '當沖排名' if strategy_mode == '當沖' else '波段排名'
     period_label = '今日盤後' if target_date == current.date() else '前一交易日盤後'
-    asset_type = 'futures' if room_label == '期貨' else 'stock'
     weights = strategy_ranking_weights(asset_type, strategy_mode)
     indicator_summary = (
         (
@@ -15883,9 +15975,9 @@ def calculate_risk_filter_result(row, direction, max_extension_atr, attention_co
     elif is_tomorrow_disposition:
         risk_label, risk_score = '🔶 下個開盤日處置', 0
     elif attention_count >= 2:
-        risk_label, risk_score = f'🔴 注意 {attention_count}', 0
+        risk_label, risk_score = f'🔴 注意累計 {attention_count} 次', 0
     elif attention_count == 1:
-        risk_label, risk_score = '🟡 注意 1', 10
+        risk_label, risk_score = '🟡 注意累計 1 次', 10
     elif market_lists_updated:
         risk_label, risk_score = '🟢 官方名單未列示', 20
     else:
@@ -18903,7 +18995,7 @@ if tab1.open and stock_strategy_tab.open:
                 risk_column_config = {
                     "建議方向": st.column_config.TextColumn(width=stock_content_width('建議方向', 56, 90), disabled=True, help="系統自動時逐檔判斷；紅色為建議多、綠色為建議空。選擇手動多／空時會標示為手動。"),
                     "方向依據": st.column_config.TextColumn(width=stock_content_width('方向依據', 86), disabled=True, help="當沖優先列出分 K、VWAP、開盤區間與量能；隔日／波段列出日 K 均線、前高前低及 K 棒位置。括號為多空條件分數。"),
-                    "風險": st.column_config.TextColumn("處置／注意", width=stock_content_width('風險', 64, 110), disabled=True, help="官方注意與處置查核結果；不預測漲跌方向。"),
+                    "風險": st.column_config.TextColumn("處置／注意", width=stock_content_width('風險', 64, 120), disabled=True, help="注意累計 N 次＝近期連續／累計達官方注意標準的次數；已公告下個交易日處置時，會優先顯示「下個開盤日處置」。"),
                     "訊號狀態": st.column_config.TextColumn(width=stock_content_width('訊號狀態', 56, 140), disabled=True, help="將原條件濃縮為等待、接近、觸發或暫停；原規則仍在明細。"),
                     "市場一致": st.column_config.TextColumn(width=stock_content_width('市場一致', 56, 120), disabled=True, help="目前方向是否與近月臺指期環境一致；不改變原排序。"),
                     "資料狀態": st.column_config.TextColumn(width=stock_content_width('資料狀態', 56, 150), disabled=True, help="顯示即時、手動／暫存、官方日行情或資料過期。"),
@@ -19461,7 +19553,7 @@ if tab1.open and stock_strategy_tab.open:
                         indep_column_config.update({
                             "建議方向": st.column_config.TextColumn(width=indep_content_width('建議方向', 56, 90), disabled=True, help="紅色為建議多、綠色為建議空；手動指定時會顯示手動。"),
                             "方向依據": st.column_config.TextColumn(width=indep_content_width('方向依據', 86), disabled=True, help="列出本檔採用的分 K／日 K、VWAP 與支撐壓力判斷。"),
-                            "風險": st.column_config.TextColumn("處置／注意", width=indep_content_width('風險', 64, 110), disabled=True, help="官方注意與處置查核結果；不預測漲跌方向。"),
+                            "風險": st.column_config.TextColumn("處置／注意", width=indep_content_width('風險', 64, 120), disabled=True, help="注意累計 N 次＝近期連續／累計達官方注意標準的次數；已公告下個交易日處置時，會優先顯示「下個開盤日處置」。"),
                             "訊號狀態": st.column_config.TextColumn(width=indep_content_width('訊號狀態', 56, 140), disabled=True),
                             "信心分": st.column_config.ProgressColumn("進場信心", min_value=0, max_value=100, format="%d", width=82, help="條件一致度，不是勝率。"),
                             "信心判讀": st.column_config.TextColumn(width=indep_content_width('信心判讀', 48, 96), disabled=True),
@@ -21089,13 +21181,18 @@ with tab_fibo:
                 if refresh_option_plan or not option_cache or option_cache.get('signature') != quote_signature:
                     directional_quote = None
                     spread_quote = None
+                    expiry_selection = select_txo_expiry(
+                        st.session_state.get('sj_api'), expiry_choice,
+                    )
                     if option_mode.startswith("自動") or option_mode.startswith("單買"):
                         directional_quote = get_txo_directional_quote(
                             st.session_state.get('sj_api'), quote_plan, expiry_choice, moneyness_preference,
+                            expiry_selection=expiry_selection,
                         )
                     if option_mode.startswith("自動") or option_mode.startswith("價差單"):
                         spread_quote = get_txo_spread_quote(
                             st.session_state.get('sj_api'), quote_plan, expiry_choice, spread_width,
+                            expiry_selection=expiry_selection,
                         )
                     option_cache = {
                         'signature': quote_signature, 'directional': directional_quote,
