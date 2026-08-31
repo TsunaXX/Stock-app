@@ -114,6 +114,8 @@ def get_shared_market_data_cache():
         'temperature': {},
         'intraday': {},
         'short_wave': {},
+        'option_contracts': {},
+        'option_pressure': {},
         'shioaji_usage': {},
     }, threading.RLock()
 
@@ -4918,6 +4920,170 @@ def get_txo_snapshot_quotes(api, contracts):
     return quotes
 
 
+def get_cached_txo_expiry_contracts(api, expiry_choice, max_age_seconds=900):
+    """Cache the expiry catalog, while leaving quote subscriptions demand-driven."""
+    if api is None:
+        return [], None, "永豐 Shioaji 尚未登入"
+    specs = get_txo_target_contract_specs(expiry_choice)
+    spec_key = tuple((item.get('root'), item.get('delivery_month')) for item in specs)
+    cache_key = (id(api), str(expiry_choice), spec_key)
+    shared, shared_lock = get_shared_market_data_cache()
+    now_mono = time.monotonic()
+    with shared_lock:
+        cache = shared.setdefault('option_contracts', {})
+        cached = cache.get(cache_key)
+        if cached and now_mono - cached.get('loaded_at', 0) < max_age_seconds:
+            return cached['contracts'], cached['expiry'], cached['source']
+
+    contracts, expiry, source = select_txo_expiry(api, expiry_choice)
+    if contracts:
+        with shared_lock:
+            cache = shared.setdefault('option_contracts', {})
+            cache[cache_key] = {
+                'contracts': contracts, 'expiry': expiry, 'source': source,
+                'loaded_at': now_mono,
+            }
+            # Login objects and weekly expiries change over time; keep this resource bounded.
+            if len(cache) > 12:
+                stale_keys = sorted(
+                    cache, key=lambda key: cache[key].get('loaded_at', 0)
+                )[:-12]
+                for stale_key in stale_keys:
+                    cache.pop(stale_key, None)
+    return contracts, expiry, source
+
+
+def select_txo_pressure_contracts(contracts, spot, max_each_side=6, window_points=700):
+    """Select only nearby OTM puts/calls so the indicator stays below 12 streams."""
+    try:
+        spot = float(spot)
+    except (TypeError, ValueError):
+        return []
+    if not np.isfinite(spot) or spot <= 0:
+        return []
+
+    selected = []
+    for right in ('P', 'C'):
+        candidates = []
+        for contract in contracts or []:
+            if txo_right_value(contract) != right:
+                continue
+            try:
+                strike = float(getattr(contract, 'strike_price'))
+            except (TypeError, ValueError, AttributeError):
+                continue
+            if not np.isfinite(strike):
+                continue
+            is_otm = strike <= spot if right == 'P' else strike >= spot
+            if not is_otm or abs(strike - spot) > float(window_points):
+                continue
+            candidates.append((abs(strike - spot), strike, contract))
+        # One contract per strike is enough for the selected expiry.
+        unique = {}
+        for distance, strike, contract in sorted(candidates, key=lambda item: item[:2]):
+            unique.setdefault(strike, (distance, contract))
+        selected.extend(
+            contract for _, contract in list(unique.values())[:max_each_side]
+        )
+    return selected
+
+
+def calculate_option_wall_scores(rows, spot, window_points=700):
+    """Estimate OTM SP support and SC resistance concentration.
+
+    Open interest is the slow baseline; current volume and ask-side depth only
+    adjust it intraday.  The result is deliberately called an estimate because
+    public quote/OI data cannot identify which participant initiated the short.
+    """
+    try:
+        spot = float(spot)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(spot) or spot <= 0:
+        return None
+
+    cleaned = []
+    for row in rows or []:
+        right = str(row.get('right', '')).upper()
+        try:
+            strike = float(row.get('strike'))
+        except (TypeError, ValueError):
+            continue
+        if right not in ('P', 'C') or not np.isfinite(strike):
+            continue
+        if (right == 'P' and strike > spot) or (right == 'C' and strike < spot):
+            continue
+        distance = abs(strike - spot)
+        if distance > float(window_points):
+            continue
+
+        def positive_number(field):
+            try:
+                value = float(row.get(field, 0) or 0)
+                return value if np.isfinite(value) and value > 0 else 0.0
+            except (TypeError, ValueError):
+                return 0.0
+
+        item = dict(row)
+        item.update({
+            'right': right, 'strike': strike, 'distance': distance,
+            'open_interest': positive_number('open_interest'),
+            'volume': positive_number('volume'),
+            'ask_volume': positive_number('ask_volume'),
+        })
+        cleaned.append(item)
+    if not cleaned or not {item['right'] for item in cleaned}.issuperset({'P', 'C'}):
+        return None
+
+    feature_max = {}
+    for field in ('open_interest', 'volume', 'ask_volume'):
+        feature_max[field] = max(math.log1p(item[field]) for item in cleaned) or 1.0
+
+    for item in cleaned:
+        oi_score = math.log1p(item['open_interest']) / feature_max['open_interest']
+        volume_score = math.log1p(item['volume']) / feature_max['volume']
+        depth_score = math.log1p(item['ask_volume']) / feature_max['ask_volume']
+        item['strength'] = round(
+            100 * (0.60 * oi_score + 0.25 * volume_score + 0.15 * depth_score), 2
+        )
+        proximity = 1.0 - 0.30 * min(item['distance'] / max(float(window_points), 1.0), 1.0)
+        item['wall_score'] = item['strength'] * proximity
+
+    puts = [item for item in cleaned if item['right'] == 'P']
+    calls = [item for item in cleaned if item['right'] == 'C']
+    support_row = max(puts, key=lambda item: (item['wall_score'], item['strike']))
+    resistance_row = max(calls, key=lambda item: (item['wall_score'], -item['strike']))
+    put_total = sum(item['wall_score'] for item in puts)
+    call_total = sum(item['wall_score'] for item in calls)
+    total = put_total + call_total
+    if total <= 0:
+        return None
+    balance = ((put_total - call_total) / total * 100) if total > 0 else 0.0
+    if balance >= 15:
+        status, status_color = 'SP 支撐偏強', '#40c4ff'
+    elif balance <= -15:
+        status, status_color = 'SC 壓力偏強', '#ff5252'
+    else:
+        status, status_color = 'SP／SC 大致平衡', '#ffc107'
+
+    oi_coverage = sum(item['open_interest'] > 0 for item in cleaned) / len(cleaned)
+    live_coverage = sum(
+        bool(item['volume'] > 0 or item['ask_volume'] > 0 or item.get('last'))
+        for item in cleaned
+    ) / len(cleaned)
+    side_coverage = min(len(puts), 3) / 3 * 0.5 + min(len(calls), 3) / 3 * 0.5
+    confidence = round(45 * oi_coverage + 35 * live_coverage + 20 * side_coverage)
+    confidence = max(0, min(100, confidence))
+
+    return {
+        'spot': spot, 'support': support_row['strike'],
+        'resistance': resistance_row['strike'], 'balance': balance,
+        'put_total': put_total, 'call_total': call_total,
+        'status': status, 'status_color': status_color,
+        'confidence': confidence, 'rows': cleaned,
+    }
+
+
 def _normal_cdf(value):
     return 0.5 * (1.0 + math.erf(float(value) / math.sqrt(2.0)))
 
@@ -5547,6 +5713,268 @@ def _taifex_number(value):
         return float(text)
     except ValueError:
         return None
+
+
+@st.cache_data(ttl=600, max_entries=1, show_spinner=False)
+def fetch_taifex_txo_open_interest_rows():
+    """Read the latest regular-session TXO OI as a low-frequency wall baseline."""
+    try:
+        response = requests.get(
+            'https://www.taifex.com.tw/cht/3/optDailyMarketExcel?marketCode=0',
+            timeout=15,
+        )
+        response.raise_for_status()
+        soup = BeautifulSoup(response.content, 'html.parser')
+        records = []
+        for table_row in soup.find_all('tr'):
+            cells = [
+                cell.get_text(' ', strip=True)
+                for cell in table_row.find_all(['td', 'th'])
+            ]
+            # Regular-session layout: total volume=14, OI=15, bid=16, ask=17.
+            if len(cells) < 18 or cells[0] != 'TXO':
+                continue
+            try:
+                expiry = datetime.strptime(str(cells[2]).strip(), '%Y%m%d').date()
+            except ValueError:
+                continue
+            right_text = str(cells[4]).strip().lower()
+            right = 'C' if right_text == 'call' else ('P' if right_text == 'put' else '')
+            strike = _taifex_number(cells[3])
+            if not right or strike is None:
+                continue
+            records.append({
+                'delivery_month': str(cells[1]).strip().upper(),
+                'expiry': expiry, 'strike': strike, 'right': right,
+                'last': _taifex_number(cells[8]),
+                'volume': _taifex_number(cells[14]) or 0.0,
+                'open_interest': _taifex_number(cells[15]) or 0.0,
+                'bid': _taifex_number(cells[16]),
+                'ask': _taifex_number(cells[17]),
+            })
+        return records
+    except (requests.RequestException, ValueError, TypeError):
+        return []
+
+
+def build_txo_pressure_rows(api, contracts, expiry, spot, window_points=700):
+    """Join a small live OTM quote set to the cached official OI baseline."""
+    selected = select_txo_pressure_contracts(
+        contracts, spot, max_each_side=6, window_points=window_points,
+    )
+    if not selected:
+        return [], 0
+    quotes = get_txo_snapshot_quotes(api, selected)
+    official_rows = fetch_taifex_txo_open_interest_rows()
+    official_map = {
+        (row['expiry'], row['right'], float(row['strike'])): row
+        for row in official_rows
+    }
+    rows = []
+    for contract, quote in zip(selected, quotes):
+        try:
+            strike = float(getattr(contract, 'strike_price'))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        right = txo_right_value(contract)
+        official = official_map.get((expiry, right, strike), {})
+        live_volume = float(quote.get('volume', 0) or 0)
+        official_volume = float(official.get('volume', 0) or 0)
+        rows.append({
+            'right': right, 'strike': strike,
+            'open_interest': float(official.get('open_interest', 0) or 0),
+            'volume': max(live_volume, official_volume),
+            'ask_volume': float(quote.get('ask_volume', 0) or 0),
+            'bid': quote.get('bid') or official.get('bid'),
+            'ask': quote.get('ask') or official.get('ask'),
+            'last': quote.get('last') or official.get('last'),
+        })
+    return rows, len(selected)
+
+
+def append_txo_pressure_history(history_key, result, min_interval_seconds=8, max_points=180):
+    """Store a bounded live curve only while the pressure fragment is visible."""
+    shared, shared_lock = get_shared_market_data_cache()
+    now = datetime.now(pytz.timezone('Asia/Taipei')).replace(tzinfo=None)
+    with shared_lock:
+        histories = shared.setdefault('option_pressure', {})
+        history = histories.setdefault(str(history_key), [])
+        history[:] = [
+            row for row in history
+            if (now - row['time']).total_seconds() <= 7200
+        ]
+        if not history or (now - history[-1]['time']).total_seconds() >= min_interval_seconds:
+            history.append({
+                'time': now, 'spot': float(result['spot']),
+                'support': float(result['support']),
+                'resistance': float(result['resistance']),
+                'balance': float(result['balance']),
+            })
+        if len(history) > max_points:
+            del history[:-max_points]
+        return [row.copy() for row in history]
+
+
+def build_txo_pressure_profile_chart(result):
+    """Plot the nearby strike concentration curve for SP and SC."""
+    fig = go.Figure()
+    series = (
+        ('P', 'SP 支撐曲線', '#40c4ff'),
+        ('C', 'SC 壓力曲線', '#ff5252'),
+    )
+    for right, name, color in series:
+        rows = sorted(
+            (row for row in result['rows'] if row['right'] == right),
+            key=lambda row: row['strike'],
+        )
+        fig.add_trace(go.Scatter(
+            x=[row['strike'] for row in rows],
+            y=[row['strength'] for row in rows],
+            mode='lines+markers', name=name,
+            line=dict(color=color, width=3), marker=dict(size=8),
+            customdata=[
+                [row['open_interest'], row['volume'], row['ask_volume']]
+                for row in rows
+            ],
+            hovertemplate=(
+                '履約價 %{x:,.0f}<br>牆分數 %{y:.1f}'
+                '<br>未平倉 %{customdata[0]:,.0f}'
+                '<br>成交量 %{customdata[1]:,.0f}'
+                '<br>賣方掛單量 %{customdata[2]:,.0f}<extra></extra>'
+            ),
+        ))
+    fig.add_vline(
+        x=result['spot'], line_width=2, line_dash='dash', line_color='#f5f5f5',
+        annotation_text=f"期貨 {result['spot']:,.0f}", annotation_position='top',
+    )
+    fig.update_layout(
+        template='plotly_dark', height=390, margin=dict(l=45, r=25, t=35, b=45),
+        xaxis_title='履約價', yaxis_title='相對牆分數（0–100）',
+        hovermode='x unified', legend=dict(orientation='h', y=1.14, x=0),
+    )
+    return fig
+
+
+def build_txo_pressure_history_chart(history):
+    """Plot live support/resistance levels and the SP-SC balance curve."""
+    if not history:
+        return None
+    frame = pd.DataFrame(history)
+    fig = make_subplots(
+        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
+        row_heights=[0.68, 0.32],
+    )
+    for field, name, color in (
+        ('spot', '期貨', '#f5f5f5'),
+        ('support', 'SP 支撐', '#40c4ff'),
+        ('resistance', 'SC 壓力', '#ff5252'),
+    ):
+        fig.add_trace(go.Scatter(
+            x=frame['time'], y=frame[field], mode='lines', name=name,
+            line=dict(color=color, width=2.4),
+        ), row=1, col=1)
+    balance_colors = [
+        '#40c4ff' if value >= 0 else '#ff5252' for value in frame['balance']
+    ]
+    fig.add_trace(go.Bar(
+        x=frame['time'], y=frame['balance'], name='SP－SC 強弱',
+        marker_color=balance_colors, opacity=0.75,
+        hovertemplate='%{y:.1f}<extra></extra>',
+    ), row=2, col=1)
+    fig.add_hline(y=0, line_dash='dot', line_color='#888', row=2, col=1)
+    fig.update_layout(
+        template='plotly_dark', height=500, margin=dict(l=45, r=25, t=35, b=40),
+        hovermode='x unified', legend=dict(orientation='h', y=1.12, x=0),
+    )
+    fig.update_yaxes(title_text='指數點位', row=1, col=1)
+    fig.update_yaxes(title_text='淨強弱', range=[-100, 100], row=2, col=1)
+    return fig
+
+
+@st.fragment(run_every=12)
+def render_txo_pressure_indicator(api, fallback_spot, expiry_choice):
+    """Render the live SP/SC indicator without rerunning the rest of the app."""
+    st.markdown("#### 🧱 選擇權 SP／SC 支撐壓力")
+    if api is None:
+        st.warning("請先登入永豐 Shioaji；此區不會因此影響其他分頁載入。")
+        return
+
+    live_snapshot = get_live_futures_snapshot(api, 'TXF')
+    spot = live_snapshot['price'] if live_snapshot else fallback_spot
+    try:
+        spot = float(spot)
+    except (TypeError, ValueError):
+        spot = 0.0
+    if not np.isfinite(spot) or spot <= 0:
+        st.warning("目前尚未取得臺指期即時價格，暫時無法建立履約價觀察窗。")
+        return
+
+    contracts, expiry, source = get_cached_txo_expiry_contracts(api, expiry_choice)
+    if not contracts or expiry is None:
+        st.warning(f"尚未取得「{expiry_choice}」選擇權契約；請稍後重新開啟此分頁。")
+        diagnostic = st.session_state.get('txo_contract_diagnostic')
+        if diagnostic:
+            st.caption(f"契約讀取診斷：{diagnostic}")
+        return
+
+    window_points = 700
+    rows, subscription_count = build_txo_pressure_rows(
+        api, contracts, expiry, spot, window_points=window_points,
+    )
+    result = calculate_option_wall_scores(rows, spot, window_points=window_points)
+    if result is None:
+        st.warning("附近價外 Put／Call 報價不足，暫不顯示支撐壓力，避免用單邊資料誤判。")
+        return
+
+    history_key = f"{expiry:%Y%m%d}:{expiry_choice}"
+    history = append_txo_pressure_history(history_key, result)
+    render_compact_metric_card_grid([
+        {
+            'label': 'SP 主要支撐', 'value': f"{result['support']:,.0f}",
+            'detail': f"距期貨 {result['support'] - result['spot']:+,.0f} 點",
+            'color': '#40c4ff',
+        },
+        {
+            'label': 'SC 主要壓力', 'value': f"{result['resistance']:,.0f}",
+            'detail': f"距期貨 {result['resistance'] - result['spot']:+,.0f} 點",
+            'color': '#ff5252',
+        },
+        {
+            'label': 'SP－SC 淨強弱', 'value': f"{result['balance']:+.1f}",
+            'detail': result['status'], 'color': result['status_color'],
+        },
+        {
+            'label': '資料信心', 'value': f"{result['confidence']}%",
+            'detail': f"附近 {subscription_count} 檔契約", 'color': '#ffc107',
+        },
+    ], columns=4, class_name='compact-metric-grid txo-pressure-grid')
+
+    st.plotly_chart(
+        build_txo_pressure_profile_chart(result), width='stretch',
+        config={'displayModeBar': False, 'scrollZoom': False},
+        key='txo_pressure_profile_chart',
+    )
+    history_chart = build_txo_pressure_history_chart(history)
+    if history_chart is not None:
+        st.markdown("##### 即時支撐／壓力軌跡")
+        st.plotly_chart(
+            history_chart, width='stretch',
+            config={'displayModeBar': False, 'scrollZoom': False},
+            key='txo_pressure_history_chart',
+        )
+    st.caption(
+        f"到期日：{expiry:%Y/%m/%d}｜契約來源：{source}｜每 12 秒只重繪本區。"
+        "僅訂閱期貨上下 700 點內、各 6 檔價外 Put／Call；期交所未平倉量快取 10 分鐘。"
+    )
+    with st.expander("SP／SC 指標怎麼看"):
+        st.markdown(
+            """
+            - **SP 支撐**：價外 Put 的未平倉量為主，盤中成交量與賣方掛單量為輔；分數集中處視為支撐牆。
+            - **SC 壓力**：價外 Call 使用相同算法；分數集中處視為壓力牆。
+            - **淨強弱為正**代表 SP 支撐相對強，為負代表 SC 壓力相對強；必須搭配期貨價格是否守住／突破牆位。
+            - 未平倉量本身無法辨識主動賣方身分，因此這是「牆位集中度推估」，不是券商真實 SP／SC 部位。
+            """
+        )
 
 
 @st.cache_data(ttl=60, max_entries=1, show_spinner=False)
@@ -20908,6 +21336,30 @@ with tab_fibo:
                 temperature_frame,
                 column_config=compact_table_column_config(temperature_frame),
                 width='stretch', hide_index=True,
+            )
+
+        if tab_fibo_thermometer.open:
+            st.divider()
+            pressure_control_col, pressure_note_col = st.columns([1.2, 2.8])
+            with pressure_control_col:
+                pressure_expiry_choice = st.selectbox(
+                    "SP／SC 觀察到期別",
+                    ["最近到期", "週三選", "週五選", "月選"],
+                    key="txo_pressure_expiry_choice",
+                )
+            with pressure_note_col:
+                st.caption(
+                    "即時區塊獨立更新；切到其他分頁後便停止重繪，不會重新下載整個選擇權契約檔。"
+                )
+            futures_temperature = next(
+                (item for item in thermometer_data if item[1] == 'TWF=F'), None
+            )
+            fallback_spot = (
+                futures_temperature[4].get('close')
+                if futures_temperature and futures_temperature[4] else None
+            )
+            render_txo_pressure_indicator(
+                st.session_state.get('sj_api'), fallback_spot, pressure_expiry_choice,
             )
 
         with st.expander("溫度計判讀規則"):
