@@ -158,26 +158,87 @@ def test_option_flow_strength_maps_call_put_trade_sides():
     ]) is None
 
 
-def test_option_flow_interval_series_uses_rolling_deltas_and_ignores_counter_resets():
+def test_option_flow_tracker_uses_per_contract_baselines_and_ignores_counter_resets():
+    symbols = load_app_symbols(
+        "_stream_number", "_stream_datetime", "_apply_txo_flow_counter_update",
+    )
+    apply_update = symbols["_apply_txo_flow_counter_update"]
+    start = datetime(2026, 9, 1, 9, 0, 0)
+    tracker = {
+        "active_codes": {
+            "CALL": {"right": "C"},
+            "PUT": {"right": "P"},
+        },
+        "baselines": {},
+        "components": {"BC": 0.0, "BP": 0.0, "SC": 0.0, "SP": 0.0},
+    }
+    assert apply_update(tracker, "CALL", 100, 50, start) is False
+    assert tracker["components"] == {"BC": 0.0, "BP": 0.0, "SC": 0.0, "SP": 0.0}
+    assert apply_update(tracker, "CALL", 112, 57, start + timedelta(seconds=1)) is True
+    assert tracker["components"]["BC"] == 12
+    assert tracker["components"]["SC"] == 7
+    # A newly selected Put starts from its current counter and cannot jump.
+    assert apply_update(tracker, "PUT", 800, 900, start + timedelta(seconds=2)) is False
+    assert apply_update(tracker, "PUT", 805, 911, start + timedelta(seconds=3)) is True
+    assert tracker["components"]["BP"] == 5
+    assert tracker["components"]["SP"] == 11
+    # Exchange counter reset replaces the baseline without subtracting flow.
+    assert apply_update(tracker, "CALL", 2, 1, start + timedelta(seconds=4)) is False
+    assert tracker["components"]["BC"] == 12
+    assert tracker["components"]["SC"] == 7
+
+
+def test_option_flow_tracker_refreshes_baseline_when_selected_strikes_change():
+    symbols = load_app_symbols(
+        "_stream_number", "_stream_datetime", "_txo_flow_session_date",
+        "_new_txo_flow_tracker", "_apply_txo_flow_counter_update",
+        "register_txo_flow_tracker",
+    )
+    shared = {"option_flow_trackers": {}}
+    lock = threading.RLock()
+    symbols["get_shared_market_data_cache"] = lambda: (shared, lock)
+    register = symbols["register_txo_flow_tracker"]
+    apply_update = symbols["_apply_txo_flow_counter_update"]
+    api = object()
+    start = datetime(2026, 9, 1, 9, 0, 0)
+
+    key = register(api, "202609|weekly", [{
+        "code": "OLD_CALL", "right": "C", "strike": 22000,
+        "active_buy": 100, "active_sell": 70,
+    }], now=start)
+    tracker = shared["option_flow_trackers"][key]
+    assert tracker["baselines"]["OLD_CALL"] == {"buy": 100, "sell": 70}
+
+    register(api, "202609|weekly", [{
+        "code": "NEW_CALL", "right": "C", "strike": 22100,
+        "active_buy": 900, "active_sell": 800,
+    }], now=start + timedelta(seconds=5))
+    assert "OLD_CALL" not in tracker["baselines"]
+    assert tracker["baselines"]["NEW_CALL"] == {"buy": 900, "sell": 800}
+    assert tracker["components"] == {"BC": 0.0, "BP": 0.0, "SC": 0.0, "SP": 0.0}
+
+    assert apply_update(
+        tracker, "NEW_CALL", 906, 803, start + timedelta(seconds=6),
+    ) is True
+    assert tracker["components"]["BC"] == 6
+    assert tracker["components"]["SC"] == 3
+
+
+def test_option_flow_series_is_continuous_intraday_accumulation():
     calculate = load_app_symbols(
-        "calculate_txo_flow_interval_series",
-    )["calculate_txo_flow_interval_series"]
+        "calculate_txo_cumulative_flow_series",
+    )["calculate_txo_cumulative_flow_series"]
     start = datetime(2026, 9, 1, 9, 0, 0)
     history = [
-        {"time": start, "spot": 22000, "bullish": 100, "bearish": 80, "seller": 60},
-        {"time": start + timedelta(seconds=5), "spot": 22005, "bullish": 110, "bearish": 90, "seller": 68},
-        {"time": start + timedelta(seconds=20), "spot": 22018, "bullish": 150, "bearish": 120, "seller": 92},
-        {"time": start + timedelta(seconds=35), "spot": 22010, "bullish": 5, "bearish": 4, "seller": 3},
+        {"time": start, "spot": 22000, "BC": 0, "BP": 0, "SC": 0, "SP": 0},
+        {"time": start + timedelta(seconds=5), "spot": 22005, "BC": 10, "BP": 4, "SC": 6, "SP": 8},
+        {"time": start + timedelta(seconds=35), "spot": 22018, "BC": 25, "BP": 9, "SC": 11, "SP": 17},
     ]
-    result = calculate(history, window_seconds=30)
-    assert list(result["spot"]) == [22000, 22005, 22018, 22010]
-    assert result.iloc[2]["bullish_delta"] == 50
-    assert result.iloc[2]["bearish_delta"] == 40
-    assert result.iloc[2]["bearish_plot"] == -40
-    assert result.iloc[2]["net_force"] == 10
-    # Reconnected cumulative counters must not create a false force spike.
-    assert result.iloc[3]["bullish_delta"] == 40
-    assert result.iloc[3]["bearish_delta"] == 30
+    result = calculate(history)
+    assert list(result["bullish_curve"]) == [0, 18, 42]
+    assert list(result["bearish_curve"]) == [0, -10, -20]
+    assert list(result["seller_curve"]) == [0, 14, 28]
+    assert list(result["net_force"]) == [0, 8, 22]
 
 
 def test_strategy_market_environment_distinguishes_sideways_and_unconfirmed():
@@ -1197,18 +1258,29 @@ def test_option_flow_and_swing_credit_use_mobile_safe_refresh_and_layout():
     assert "bullish = components['BC'] + components['SP']" in calculate_source
     assert "bearish = components['SC'] + components['BP']" in calculate_source
     assert "seller = components['SC'] + components['SP']" in calculate_source
-    history_start = source.index("def append_txo_flow_history")
+    history_start = source.index("def _new_txo_flow_tracker")
     history_end = source.index("def fetch_taifex_txo_daily_quotes", history_start)
     flow_source = source[history_start:history_end]
-    assert "min_interval_seconds=5" in flow_source
+    assert "def _update_txo_flow_trackers_from_stream" in flow_source
+    assert "def register_txo_flow_tracker" in flow_source
+    assert "newly selected strike starts at its current exchange counter" in flow_source.lower()
     assert "max_points=5000" in flow_source
     assert "@st.fragment(run_every=5)" in flow_source
     assert "def render_txo_flow_indicator" in flow_source
-    assert "calculate_txo_flow_interval_series(history, window_seconds=30)" in flow_source
+    assert "calculate_txo_cumulative_flow_series(history)" in flow_source
+    assert "盤中累積力量（口）" in flow_source
     assert "name='台指期'" in flow_source
     assert "autorange=True" in flow_source
     assert "range=[0, 100]" not in flow_source
     assert "最近 6 個履約價的 Call／Put" in flow_source
+    assert "snapshot_fallback=False" in source[
+        source.index("def build_txo_flow_rows"):history_start
+    ]
+    stream_payload_start = source.index("def _stream_payload")
+    stream_payload_end = source.index("def _install_stream_callbacks", stream_payload_start)
+    assert "_update_txo_flow_trackers_from_stream" in source[
+        stream_payload_start:stream_payload_end
+    ]
 
     swing_start = source.index('with tab2_2:')
     swing_end = source.index('with tab2_3:', swing_start)

@@ -116,6 +116,7 @@ def get_shared_market_data_cache():
         'short_wave': {},
         'option_contracts': {},
         'option_pressure': {},
+        'option_flow_trackers': {},
         'shioaji_usage': {},
     }, threading.RLock()
 
@@ -249,6 +250,9 @@ def _stream_payload(api, payload, security_type):
         for requested, target in list(state['aliases'].items()):
             if target == code:
                 state['quotes'][requested] = previous
+    flow_updater = globals().get('_update_txo_flow_trackers_from_stream')
+    if security_type == 'FOP' and callable(flow_updater):
+        flow_updater(api, code, values, updated_at)
 
 
 def _install_stream_callbacks(api):
@@ -4874,12 +4878,14 @@ def get_txo_snapshot_prices(api, contracts, sides):
     return prices
 
 
-def get_txo_snapshot_quotes(api, contracts):
+def get_txo_snapshot_quotes(api, contracts, snapshot_fallback=True):
     """Read executable option quotes and liquidity fields from the shared stream."""
     quotes = []
     try:
         snapshot_contracts = [getattr(contract, 'shioaji_contract', contract) for contract in contracts]
-        snapshots = get_stream_quotes(api, snapshot_contracts)
+        snapshots = get_stream_quotes(
+            api, snapshot_contracts, snapshot_fallback=snapshot_fallback,
+        )
     except Exception:
         snapshots = []
     for index, contract in enumerate(contracts):
@@ -5947,7 +5953,9 @@ def build_txo_flow_rows(api, contracts, spot, window_points=700):
     )
     if not selected:
         return [], 0
-    quotes = get_txo_snapshot_quotes(api, selected)
+    # Flow must come from the live callback. Repeated snapshot fallback would
+    # make the curve jump every 30 seconds and consume unnecessary API traffic.
+    quotes = get_txo_snapshot_quotes(api, selected, snapshot_fallback=False)
     rows = []
     for contract, quote in zip(selected, quotes):
         try:
@@ -6076,84 +6084,225 @@ def build_txo_pressure_history_chart(history):
     return fig
 
 
-def append_txo_flow_history(
-    history_key, result, spot=None, min_interval_seconds=5,
-    max_points=5000, max_age_seconds=86400,
+def _txo_flow_session_date(now):
+    """Map the 15:00 night session and following early morning to one date."""
+    now = _stream_datetime(now)
+    if now.time() >= dt_time(15, 0):
+        return (now + timedelta(days=1)).date().isoformat()
+    return now.date().isoformat()
+
+
+def _new_txo_flow_tracker(history_key, api, now, spot=None, max_points=5000):
+    return {
+        'history_key': str(history_key), 'api_id': id(api),
+        'session_date': _txo_flow_session_date(now),
+        'active_codes': {}, 'baselines': {},
+        'components': {'BC': 0.0, 'BP': 0.0, 'SC': 0.0, 'SP': 0.0},
+        'history': [{
+            'time': _stream_datetime(now),
+            'spot': float(spot) if spot is not None else np.nan,
+            'BC': 0.0, 'BP': 0.0, 'SC': 0.0, 'SP': 0.0,
+        }],
+        'spot': float(spot) if spot is not None else np.nan,
+        'last_history_at': _stream_datetime(now), 'last_stream_at': None,
+        'stream_updates': 0, 'max_points': int(max_points),
+    }
+
+
+def _apply_txo_flow_counter_update(tracker, code, active_buy, active_sell, now):
+    """Apply one contract's cumulative counters without mixing contract sets."""
+    metadata = tracker.get('active_codes', {}).get(str(code))
+    if not metadata:
+        return False
+    buy = _stream_number(active_buy)
+    sell = _stream_number(active_sell)
+    if buy is None or sell is None or buy < 0 or sell < 0:
+        return False
+
+    baselines = tracker.setdefault('baselines', {})
+    previous = baselines.get(str(code))
+    baselines[str(code)] = {'buy': buy, 'sell': sell}
+    tracker['last_stream_at'] = _stream_datetime(now)
+    tracker['stream_updates'] = int(tracker.get('stream_updates', 0)) + 1
+    if previous is None:
+        # A newly selected strike starts at its current exchange counter. Its
+        # existing day volume is not new flow and must never create a jump.
+        return False
+
+    buy_delta = buy - float(previous.get('buy', buy))
+    sell_delta = sell - float(previous.get('sell', sell))
+    # Negative differences are counter resets/reconnections, not opposite flow.
+    buy_delta = buy_delta if buy_delta >= 0 else 0.0
+    sell_delta = sell_delta if sell_delta >= 0 else 0.0
+    right = str(metadata.get('right', '')).upper()
+    components = tracker.setdefault(
+        'components', {'BC': 0.0, 'BP': 0.0, 'SC': 0.0, 'SP': 0.0},
+    )
+    if right == 'C':
+        components['BC'] += buy_delta
+        components['SC'] += sell_delta
+    elif right == 'P':
+        components['BP'] += buy_delta
+        components['SP'] += sell_delta
+    else:
+        return False
+    return bool(buy_delta or sell_delta)
+
+
+def register_txo_flow_tracker(
+    api, history_key, rows, spot=None, now=None, max_points=5000,
 ):
-    """Store bounded calculated flow points in the server-wide market cache.
-
-    Only cumulative BC/BP/SC/SP results and the index price are retained. Raw
-    ticks are deliberately discarded so phone/desktop sessions share one small
-    history without increasing Shioaji traffic or Streamlit memory over time.
-    """
+    """Register the current ATM contract set; new strikes only set baselines."""
+    if api is None:
+        return None
+    now = _stream_datetime(now)
+    tracker_key = (id(api), str(history_key))
+    active_rows = {
+        str(row.get('code', '')).strip(): row for row in (rows or [])
+        if str(row.get('code', '')).strip()
+        and str(row.get('right', '')).upper() in ('C', 'P')
+    }
     shared, shared_lock = get_shared_market_data_cache()
-    now = datetime.now(pytz.timezone('Asia/Taipei')).replace(tzinfo=None)
     with shared_lock:
-        histories = shared.setdefault('option_flow', {})
-        history = histories.setdefault(str(history_key), [])
-        history[:] = [
-            row for row in history
-            if (now - row['time']).total_seconds() <= max_age_seconds
-        ]
-        if not history or (now - history[-1]['time']).total_seconds() >= min_interval_seconds:
-            history.append({
-                'time': now,
-                'spot': float(spot) if spot is not None else np.nan,
-                'bullish': float(result['bullish']),
-                'bearish': float(result['bearish']),
-                'seller': float(result['seller']),
-                'bullish_share': float(result['bullish_share']),
-                'bearish_share': float(result['bearish_share']),
-                'seller_share': float(result['seller_share']),
-            })
-        if len(history) > max_points:
-            del history[:-max_points]
-        return [row.copy() for row in history]
+        trackers = shared.setdefault('option_flow_trackers', {})
+        tracker = trackers.get(tracker_key)
+        if (
+            tracker is None
+            or tracker.get('session_date') != _txo_flow_session_date(now)
+        ):
+            tracker = _new_txo_flow_tracker(
+                history_key, api, now, spot=spot, max_points=max_points,
+            )
+            trackers[tracker_key] = tracker
+        if spot is not None and _stream_number(spot) is not None:
+            tracker['spot'] = float(spot)
+
+        previous_codes = set(tracker.get('active_codes', {}))
+        current_codes = set(active_rows)
+        tracker['active_codes'] = {
+            code: {
+                'right': str(row.get('right', '')).upper(),
+                'strike': _stream_number(row.get('strike')),
+            }
+            for code, row in active_rows.items()
+        }
+        # Removed strikes no longer contribute. If selected again later they
+        # receive a fresh baseline, preventing a cross-universe volume jump.
+        for removed_code in previous_codes - current_codes:
+            tracker.get('baselines', {}).pop(removed_code, None)
+        for code in current_codes - previous_codes:
+            row = active_rows[code]
+            buy = _stream_number(row.get('active_buy'))
+            sell = _stream_number(row.get('active_sell'))
+            if buy is not None and sell is not None and buy >= 0 and sell >= 0:
+                tracker.setdefault('baselines', {})[code] = {
+                    'buy': buy, 'sell': sell,
+                }
+        # Keep only the currently selected contract baselines.
+        tracker['baselines'] = {
+            code: value for code, value in tracker.get('baselines', {}).items()
+            if code in current_codes
+        }
+        if len(trackers) > 6:
+            stale_keys = list(trackers)[:-6]
+            for stale_key in stale_keys:
+                trackers.pop(stale_key, None)
+        return tracker_key
 
 
-def calculate_txo_flow_interval_series(history, window_seconds=30):
-    """Convert cumulative flow counters to a rolling interval-force series."""
-    required = {'time', 'spot', 'bullish', 'bearish', 'seller'}
+def _append_txo_flow_tracker_point(tracker, now, min_interval_seconds=5):
+    now = _stream_datetime(now)
+    last = _stream_datetime(tracker.get('last_history_at'))
+    if (now - last).total_seconds() < min_interval_seconds:
+        return
+    components = tracker.get('components', {})
+    tracker.setdefault('history', []).append({
+        'time': now, 'spot': _stream_number(tracker.get('spot'), np.nan),
+        **{field: float(components.get(field, 0) or 0) for field in ('BC', 'BP', 'SC', 'SP')},
+    })
+    tracker['last_history_at'] = now
+    max_points = max(60, int(tracker.get('max_points', 5000) or 5000))
+    if len(tracker['history']) > max_points:
+        del tracker['history'][:-max_points]
+
+
+def _update_txo_flow_trackers_from_stream(api, code, values, updated_at=None):
+    """Background callback sink: update every active option contract separately."""
+    shared, shared_lock = get_shared_market_data_cache()
+    now = _stream_datetime(updated_at)
+    with shared_lock:
+        trackers = shared.setdefault('option_flow_trackers', {})
+        for tracker_key, tracker in list(trackers.items()):
+            if tracker_key[0] != id(api):
+                continue
+            if tracker.get('session_date') != _txo_flow_session_date(now):
+                continue
+            if str(code).upper().startswith('TXF'):
+                spot = _stream_number(values.get('close'))
+                if spot is not None and spot > 0:
+                    tracker['spot'] = spot
+                continue
+            if str(code) not in tracker.get('active_codes', {}):
+                continue
+            _apply_txo_flow_counter_update(
+                tracker, code,
+                values.get('ask_side_total_vol'),
+                values.get('bid_side_total_vol'), now,
+            )
+            _append_txo_flow_tracker_point(tracker, now)
+
+
+def get_txo_flow_tracker_snapshot(api, history_key):
+    """Return a copy for rendering; Streamlit sessions never own the history."""
+    shared, shared_lock = get_shared_market_data_cache()
+    tracker_key = (id(api), str(history_key))
+    with shared_lock:
+        tracker = shared.setdefault('option_flow_trackers', {}).get(tracker_key)
+        if not tracker:
+            return [], {}
+        return (
+            [row.copy() for row in tracker.get('history', [])],
+            {
+                'active_contracts': len(tracker.get('active_codes', {})),
+                'stream_updates': int(tracker.get('stream_updates', 0)),
+                'last_stream_at': tracker.get('last_stream_at'),
+            },
+        )
+
+
+def calculate_txo_cumulative_flow_series(history):
+    """Build continuous intraday curves from already de-duplicated contract deltas."""
+    required = {'time', 'spot', 'BC', 'BP', 'SC', 'SP'}
     if not history:
         return pd.DataFrame()
     frame = pd.DataFrame(history)
     if not required.issubset(frame.columns):
         return pd.DataFrame()
     frame['time'] = pd.to_datetime(frame['time'], errors='coerce')
-    for field in ('spot', 'bullish', 'bearish', 'seller'):
+    for field in ('spot', 'BC', 'BP', 'SC', 'SP'):
         frame[field] = pd.to_numeric(frame[field], errors='coerce')
-    frame = (
-        frame.dropna(subset=['time'])
-        .sort_values('time')
-        .drop_duplicates('time', keep='last')
-        .set_index('time')
-    )
+    frame = frame.dropna(subset=['time']).sort_values('time').drop_duplicates('time')
     if frame.empty:
         return pd.DataFrame()
-
-    window = f"{max(5, int(window_seconds or 30))}s"
-    for field in ('bullish', 'bearish', 'seller'):
-        # A negative change means that a quote counter was reset/reconnected;
-        # it is not genuine opposite-side flow and must not create a spike.
-        increment = frame[field].diff().clip(lower=0).fillna(0)
-        frame[f'{field}_delta'] = increment.rolling(window, min_periods=1).sum()
-    frame['bearish_plot'] = -frame['bearish_delta']
-    frame['net_force'] = frame['bullish_delta'] - frame['bearish_delta']
+    frame['bullish_curve'] = frame['BC'].fillna(0) + frame['SP'].fillna(0)
+    frame['bearish_curve'] = -(frame['SC'].fillna(0) + frame['BP'].fillna(0))
+    frame['seller_curve'] = frame['SC'].fillna(0) + frame['SP'].fillna(0)
+    frame['net_force'] = frame['bullish_curve'] + frame['bearish_curve']
     frame['spot'] = frame['spot'].ffill().bfill()
-    return frame.reset_index()
+    return frame.reset_index(drop=True)
 
 
 def build_txo_flow_history_chart(history):
-    """Plot 30-second option-flow force together with the Taiwan index future."""
-    frame = calculate_txo_flow_interval_series(history, window_seconds=30)
+    """Plot continuous intraday option flow together with the Taiwan index future."""
+    frame = calculate_txo_cumulative_flow_series(history)
     if frame.empty:
         return None
     fig = make_subplots(specs=[[{'secondary_y': True}]])
     for field, name, color, dash, width in (
-        ('bullish_delta', '多方增量 BC＋SP', '#ff4b4b', 'solid', 2.6),
-        ('bearish_plot', '空方增量 SC＋BP', '#00c853', 'solid', 2.6),
-        ('net_force', '多空淨力道', '#40c4ff', 'solid', 3.2),
-        ('seller_delta', '賣方增量 SC＋SP', '#ffc107', 'dot', 1.9),
+        ('bullish_curve', '多方累積 BC＋SP', '#ff4b4b', 'solid', 2.8),
+        ('bearish_curve', '空方累積 SC＋BP', '#00c853', 'solid', 2.8),
+        ('net_force', '多空淨力道', '#40c4ff', 'solid', 3.3),
+        ('seller_curve', '賣方累積 SC＋SP', '#ffc107', 'dot', 1.9),
     ):
         fig.add_trace(go.Scatter(
             x=frame['time'], y=frame[field], mode='lines', name=name,
@@ -6169,10 +6318,10 @@ def build_txo_flow_history_chart(history):
     fig.update_layout(
         template='plotly_dark', height=430, margin=dict(l=48, r=58, t=36, b=42),
         hovermode='x unified', legend=dict(orientation='h', y=1.16, x=0),
-        xaxis=dict(title='臺北時間'), uirevision='txo-flow-force-v2',
+        xaxis=dict(title='臺北時間'), uirevision='txo-flow-force-v3',
     )
     fig.update_yaxes(
-        title_text='最近 30 秒力量（口）', autorange=True,
+        title_text='盤中累積力量（口）', autorange=True,
         zeroline=True, secondary_y=False,
     )
     fig.update_yaxes(
@@ -6211,17 +6360,25 @@ def render_txo_flow_indicator(api, fallback_spot, expiry_choice):
     rows, subscription_count = build_txo_flow_rows(
         api, contracts, spot, window_points=700,
     )
+    history_key = f"{expiry:%Y%m%d}:{expiry_choice}"
+    register_txo_flow_tracker(api, history_key, rows, spot=spot)
+    history, tracker_status = get_txo_flow_tracker_snapshot(api, history_key)
     result = calculate_option_flow_strength(rows)
     if result is None:
         st.info("附近 Call／Put 串流正在累積成交方向；取得 Bid／Ask 端累計成交量後會自動顯示。")
+        history_chart = build_txo_flow_history_chart(history)
+        if history_chart is not None:
+            st.plotly_chart(
+                history_chart, width='stretch',
+                config={'displayModeBar': False, 'scrollZoom': False},
+                key='txo_flow_history_chart_warming',
+            )
         st.caption(
             f"到期日：{expiry:%Y/%m/%d}｜契約來源：{source}｜已訂閱 {subscription_count} 檔；"
-            "不以委託掛單量冒充實際成交方向。"
+            "新契約第一筆只建立基準，不以委託掛單量或既有累積量冒充新成交。"
         )
         return
 
-    history_key = f"{expiry:%Y%m%d}:{expiry_choice}"
-    history = append_txo_flow_history(history_key, result, spot=spot)
     render_compact_metric_card_grid([
         {
             'label': '台指期', 'value': f"{spot:,.0f} 點",
@@ -6265,11 +6422,18 @@ def render_txo_flow_indicator(api, fallback_spot, expiry_choice):
             config={'displayModeBar': False, 'scrollZoom': False},
             key='txo_flow_history_chart',
         )
+    last_stream_at = tracker_status.get('last_stream_at')
+    stream_time = (
+        _stream_datetime(last_stream_at).strftime('%H:%M:%S')
+        if last_stream_at is not None else '等待首筆'
+    )
     st.caption(
         f"到期日：{expiry:%Y/%m/%d}｜契約來源：{source}｜每 5 秒只重繪本區。"
         f"僅訂閱期貨上下 700 點內、最近 6 個履約價的 Call／Put，共 {subscription_count} 檔；"
-        "力量線為最近 30 秒成交增量，台指期使用右側刻度；Y 軸自動縮放、不做過度平滑，"
-        "且只保留伺服器共用的計算結果，不保存原始 Tick、不增加 API 查詢頻率。"
+        f"背景串流更新 {tracker_status.get('stream_updates', 0):,} 次，最後更新 {stream_time}。"
+        "曲線以每個契約自己的新增成交做盤中累積；履約價更換只建立新基準，不會產生假跳動。"
+        "台指期使用右側刻度；只保存最多 5,000 個共用計算點，不保存原始 Tick，"
+        "且此區不使用選擇權 snapshot 輪詢。"
     )
     with st.expander("BC／BP／SC／SP 怎麼看"):
         st.markdown(
