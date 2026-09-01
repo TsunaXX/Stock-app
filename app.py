@@ -410,7 +410,7 @@ def _stream_store_snapshot(api, contract, snapshot):
         'open', 'high', 'low', 'close', 'avg_price', 'amount', 'total_amount',
         'amount_sum', 'volume', 'total_volume', 'vol_sum', 'reference',
         'underlying_price', 'change_price', 'change_rate', 'buy_price', 'sell_price',
-        'buy_volume', 'sell_volume',
+        'buy_volume', 'sell_volume', 'bid_side_total_vol', 'ask_side_total_vol',
     )
     values = {
         'code': snapshot_code or (requested_codes[0] if requested_codes else ''),
@@ -4461,6 +4461,7 @@ def get_live_futures_snapshot(api, product='TMF'):
             'color': '#ff4b4b' if change > 0 else ('#00c853' if change < 0 else '#dfe6e9'),
             'arrow': '▲' if change > 0 else ('▼' if change < 0 else '◆'),
             'contract_code': getattr(contract, 'code', 'TMF'),
+            'updated': getattr(snapshot, 'updated_at', None),
         }
     except Exception:
         return None
@@ -4903,6 +4904,13 @@ def get_txo_snapshot_quotes(api, contracts):
         ask_volume = number('sell_volume') or 0.0
         book_total = bid_volume + ask_volume
         book_balance = (bid_volume - ask_volume) / book_total if book_total > 0 else 0.0
+        def cumulative_volume(field):
+            try:
+                value = float(getattr(snapshot, field, 0))
+                return value if np.isfinite(value) and value >= 0 else None
+            except (TypeError, ValueError):
+                return None
+
         if ask is None:
             liquidity = '報價不足'
         elif bid is None or spread_pct is None or spread_pct > 25:
@@ -4915,6 +4923,8 @@ def get_txo_snapshot_quotes(api, contracts):
             'contract': contract, 'bid': bid, 'ask': ask, 'last': last,
             'premium': premium, 'spread': spread, 'spread_pct': spread_pct,
             'volume': volume, 'bid_volume': bid_volume, 'ask_volume': ask_volume,
+            'bid_side_total_vol': cumulative_volume('bid_side_total_vol'),
+            'ask_side_total_vol': cumulative_volume('ask_side_total_vol'),
             'book_balance': book_balance, 'liquidity': liquidity,
         })
     return quotes
@@ -4986,6 +4996,87 @@ def select_txo_pressure_contracts(contracts, spot, max_each_side=6, window_point
             contract for _, contract in list(unique.values())[:max_each_side]
         )
     return selected
+
+
+def select_txo_flow_contracts(contracts, spot, max_strikes=6, window_points=700):
+    """Select the same nearby strikes for Call and Put flow comparisons."""
+    try:
+        spot = float(spot)
+    except (TypeError, ValueError):
+        return []
+    if not np.isfinite(spot) or spot <= 0:
+        return []
+
+    by_strike = {}
+    for contract in contracts or []:
+        right = txo_right_value(contract)
+        if right not in ('P', 'C'):
+            continue
+        try:
+            strike = float(getattr(contract, 'strike_price'))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if not np.isfinite(strike) or abs(strike - spot) > float(window_points):
+            continue
+        by_strike.setdefault(strike, {}).setdefault(right, contract)
+    paired_strikes = [
+        strike for strike, pair in by_strike.items() if {'P', 'C'}.issubset(pair)
+    ]
+    paired_strikes.sort(key=lambda strike: (abs(strike - spot), strike))
+    selected = []
+    for strike in paired_strikes[:max_strikes]:
+        selected.extend([by_strike[strike]['C'], by_strike[strike]['P']])
+    return selected
+
+
+def calculate_option_flow_strength(rows):
+    """Estimate BC/BP/SC/SP from cumulative ask-side and bid-side trade volume."""
+    components = {'BC': 0.0, 'BP': 0.0, 'SC': 0.0, 'SP': 0.0}
+    valid_rows = 0
+    rights = set()
+    for row in rows or []:
+        right = str(row.get('right', '')).upper()
+        if right not in ('P', 'C'):
+            continue
+        buy = _safe_number(row.get('active_buy'))
+        sell = _safe_number(row.get('active_sell'))
+        if buy is None or sell is None or buy < 0 or sell < 0:
+            continue
+        rights.add(right)
+        valid_rows += 1
+        if right == 'C':
+            components['BC'] += buy
+            components['SC'] += sell
+        else:
+            components['BP'] += buy
+            components['SP'] += sell
+    if rights != {'P', 'C'} or valid_rows < 2:
+        return None
+
+    bullish = components['BC'] + components['SP']
+    bearish = components['SC'] + components['BP']
+    total = bullish + bearish
+    if total <= 0:
+        return None
+    seller = components['SC'] + components['SP']
+    bullish_share = bullish / total * 100
+    bearish_share = bearish / total * 100
+    seller_share = seller / total * 100
+    net = bullish_share - bearish_share
+    if net >= 10:
+        status, status_color = '偏多', '#ff4b4b'
+    elif net <= -10:
+        status, status_color = '偏空', '#00c853'
+    else:
+        status, status_color = '多空接近', '#ffc107'
+    return {
+        **components,
+        'bullish': bullish, 'bearish': bearish, 'seller': seller,
+        'bullish_share': bullish_share, 'bearish_share': bearish_share,
+        'seller_share': seller_share, 'net': net,
+        'status': status, 'status_color': status_color,
+        'coverage': valid_rows,
+    }
 
 
 def calculate_option_wall_scores(rows, spot, window_points=700):
@@ -5849,6 +5940,30 @@ def build_txo_pressure_rows(api, contracts, expiry, spot, window_points=700):
     return rows, len(selected)
 
 
+def build_txo_flow_rows(api, contracts, spot, window_points=700):
+    """Read nearby Call/Put cumulative trade-side volume from the shared stream."""
+    selected = select_txo_flow_contracts(
+        contracts, spot, max_strikes=6, window_points=window_points,
+    )
+    if not selected:
+        return [], 0
+    quotes = get_txo_snapshot_quotes(api, selected)
+    rows = []
+    for contract, quote in zip(selected, quotes):
+        try:
+            strike = float(getattr(contract, 'strike_price'))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        rows.append({
+            'code': str(getattr(contract, 'code', '') or ''),
+            'right': txo_right_value(contract), 'strike': strike,
+            # 成交在 Ask 端視為主動買進，成交在 Bid 端視為主動賣出。
+            'active_buy': quote.get('ask_side_total_vol'),
+            'active_sell': quote.get('bid_side_total_vol'),
+        })
+    return rows, len(selected)
+
+
 def append_txo_pressure_history(history_key, result, min_interval_seconds=5, max_points=360):
     """Store a bounded live curve only while the pressure fragment is visible."""
     shared, shared_lock = get_shared_market_data_cache()
@@ -5961,10 +6076,61 @@ def build_txo_pressure_history_chart(history):
     return fig
 
 
+def append_txo_flow_history(history_key, result, min_interval_seconds=5, max_points=360):
+    """Store a bounded option-flow ratio series only while this fragment is visible."""
+    shared, shared_lock = get_shared_market_data_cache()
+    now = datetime.now(pytz.timezone('Asia/Taipei')).replace(tzinfo=None)
+    with shared_lock:
+        histories = shared.setdefault('option_flow', {})
+        history = histories.setdefault(str(history_key), [])
+        history[:] = [
+            row for row in history if (now - row['time']).total_seconds() <= 7200
+        ]
+        if not history or (now - history[-1]['time']).total_seconds() >= min_interval_seconds:
+            history.append({
+                'time': now,
+                'bullish_share': float(result['bullish_share']),
+                'bearish_share': float(result['bearish_share']),
+                'seller_share': float(result['seller_share']),
+            })
+        if len(history) > max_points:
+            del history[:-max_points]
+        return [row.copy() for row in history]
+
+
+def build_txo_flow_history_chart(history):
+    """Plot smoothed bullish, bearish and seller option-flow shares."""
+    if not history:
+        return None
+    frame = pd.DataFrame(history)
+    fig = go.Figure()
+    for field, name, color in (
+        ('bullish_share', '多方 BC＋SP', '#ff4b4b'),
+        ('bearish_share', '空方 SC＋BP', '#00c853'),
+        ('seller_share', '賣方 SC＋SP', '#ffc107'),
+    ):
+        raw = pd.to_numeric(frame[field], errors='coerce')
+        smoothed = raw.ewm(span=4, adjust=False).mean()
+        fig.add_trace(go.Scatter(
+            x=frame['time'], y=smoothed, mode='lines', name=name,
+            line=dict(color=color, width=2.8),
+            customdata=raw,
+            hovertemplate='%{y:.1f}%（原始 %{customdata:.1f}%）<extra></extra>',
+        ))
+    fig.add_hline(y=50, line_dash='dot', line_color='#888')
+    fig.update_layout(
+        template='plotly_dark', height=410, margin=dict(l=48, r=22, t=30, b=42),
+        hovermode='x unified', legend=dict(orientation='h', y=1.13, x=0),
+        yaxis=dict(title='推估力量占比', range=[0, 100], ticksuffix='%'),
+        xaxis=dict(title='臺北時間'),
+    )
+    return fig
+
+
 @st.fragment(run_every=5)
-def render_txo_pressure_indicator(api, fallback_spot, expiry_choice):
-    """Render the live SP/SC indicator without rerunning the rest of the app."""
-    st.markdown("#### 🧱 選擇權 SP／SC 支撐壓力")
+def render_txo_flow_indicator(api, fallback_spot, expiry_choice):
+    """Render live BC/BP/SC/SP flow without rerunning the rest of the app."""
+    st.markdown("#### ⚖️ 選擇權多空／賣方力量")
     if api is None:
         st.warning("請先登入永豐 Shioaji；此區不會因此影響其他分頁載入。")
         return
@@ -5987,70 +6153,66 @@ def render_txo_pressure_indicator(api, fallback_spot, expiry_choice):
             st.caption(f"契約讀取診斷：{diagnostic}")
         return
 
-    window_points = 700
-    rows, subscription_count = build_txo_pressure_rows(
-        api, contracts, expiry, spot, window_points=window_points,
+    rows, subscription_count = build_txo_flow_rows(
+        api, contracts, spot, window_points=700,
     )
-    shared_market_cache, shared_market_lock = get_shared_market_data_cache()
-    with shared_market_lock:
-        oi_state = dict(shared_market_cache.get('option_pressure_oi', {}))
-    oi_note = (
-        "期交所 OI 背景更新中，先顯示即時量價。"
-        if oi_state.get('loading') and not oi_state.get('rows')
-        else "期交所 OI 已採 10 分鐘快取。"
-    )
-    result = calculate_option_wall_scores(rows, spot, window_points=window_points)
+    result = calculate_option_flow_strength(rows)
     if result is None:
-        st.warning("附近價外 Put／Call 報價不足，暫不顯示支撐壓力，避免用單邊資料誤判。")
+        st.info("附近 Call／Put 串流正在累積成交方向；取得 Bid／Ask 端累計成交量後會自動顯示。")
+        st.caption(
+            f"到期日：{expiry:%Y/%m/%d}｜契約來源：{source}｜已訂閱 {subscription_count} 檔；"
+            "不以委託掛單量冒充實際成交方向。"
+        )
         return
 
     history_key = f"{expiry:%Y%m%d}:{expiry_choice}"
-    history = append_txo_pressure_history(history_key, result)
+    history = append_txo_flow_history(history_key, result)
     render_compact_metric_card_grid([
         {
-            'label': 'SP 主要支撐', 'value': f"{result['support']:,.0f}",
-            'detail': f"距期貨 {result['support'] - result['spot']:+,.0f} 點",
-            'color': '#40c4ff',
+            'label': '多方力量', 'value': f"{result['bullish_share']:.1f}%",
+            'detail': 'BC＋SP', 'color': '#ff4b4b',
         },
         {
-            'label': 'SC 主要壓力', 'value': f"{result['resistance']:,.0f}",
-            'detail': f"距期貨 {result['resistance'] - result['spot']:+,.0f} 點",
-            'color': '#ff5252',
+            'label': '空方力量', 'value': f"{result['bearish_share']:.1f}%",
+            'detail': 'SC＋BP', 'color': '#00c853',
         },
         {
-            'label': 'SP－SC 淨強弱', 'value': f"{result['balance']:+.1f}",
+            'label': '選擇權方向', 'value': result['status'],
             'detail': result['status'], 'color': result['status_color'],
         },
         {
-            'label': '資料信心', 'value': f"{result['confidence']}%",
-            'detail': f"附近 {subscription_count} 檔契約", 'color': '#ffc107',
+            'label': '賣方力量', 'value': f"{result['seller_share']:.1f}%",
+            'detail': 'SC＋SP', 'color': '#ffc107',
         },
-    ], columns=4, class_name='compact-metric-grid txo-pressure-grid')
-
-    st.plotly_chart(
-        build_txo_pressure_profile_chart(result), width='stretch',
-        config={'displayModeBar': False, 'scrollZoom': False},
-        key='txo_pressure_profile_chart',
+    ], columns=4, class_name='compact-metric-grid txo-flow-grid')
+    st.markdown(
+        "<div style='display:flex;flex-wrap:wrap;gap:8px 18px;margin:4px 0 8px;'>"
+        f"<span style='color:#ff8a80;font-weight:700;'>BC {result['BC']:,.0f} 口</span>"
+        f"<span style='color:#ff8a80;font-weight:700;'>SP {result['SP']:,.0f} 口</span>"
+        f"<span style='color:#69f0ae;font-weight:700;'>SC {result['SC']:,.0f} 口</span>"
+        f"<span style='color:#69f0ae;font-weight:700;'>BP {result['BP']:,.0f} 口</span>"
+        "</div>",
+        unsafe_allow_html=True,
     )
-    history_chart = build_txo_pressure_history_chart(history)
+    history_chart = build_txo_flow_history_chart(history)
     if history_chart is not None:
-        st.markdown("##### 即時支撐／壓力軌跡")
         st.plotly_chart(
             history_chart, width='stretch',
             config={'displayModeBar': False, 'scrollZoom': False},
-            key='txo_pressure_history_chart',
+            key='txo_flow_history_chart',
         )
     st.caption(
         f"到期日：{expiry:%Y/%m/%d}｜契約來源：{source}｜每 5 秒只重繪本區。"
-        f"僅訂閱期貨上下 700 點內、各 6 檔價外 Put／Call；{oi_note}"
+        f"僅訂閱期貨上下 700 點內、最近 6 個履約價的 Call／Put，共 {subscription_count} 檔；"
+        "曲線採 4 點 EMA 平滑比例，不增加 API 查詢頻率。"
     )
-    with st.expander("SP／SC 指標怎麼看"):
+    with st.expander("BC／BP／SC／SP 怎麼看"):
         st.markdown(
             """
-            - **SP 支撐**：價外 Put 的未平倉量為主，盤中成交量與賣方掛單量為輔；分數集中處視為支撐牆。
-            - **SC 壓力**：價外 Call 使用相同算法；分數集中處視為壓力牆。
-            - **淨強弱為正**代表 SP 支撐相對強，為負代表 SC 壓力相對強；必須搭配期貨價格是否守住／突破牆位。
-            - 未平倉量本身無法辨識主動賣方身分，因此這是「牆位集中度推估」，不是券商真實 SP／SC 部位。
+            - **BC／BP**：成交較接近 Ask 端時，分別視為主動買進 Call／Put。
+            - **SC／SP**：成交較接近 Bid 端時，分別視為主動賣出 Call／Put。
+            - **多方力量＝BC＋SP**；**空方力量＝SC＋BP**；**賣方力量＝SC＋SP**。
+            - 這是附近履約價成交方向的即時推估，無法辨識開倉／平倉或交易者身分，因此不標示「主力／散戶」。
             """
         )
 
@@ -9410,9 +9572,95 @@ def build_data_health(data_time=None, required_ready=True, live_expected=False):
 def calculate_market_alignment(direction, market_bias):
     """比較策略方向與臺指期環境，只作附加標示，不改動原選股排序。"""
     normalized_direction = '偏多' if direction in ('多頭', '偏多') else '偏空'
+    if market_bias == '盤整':
+        return '⚪ 盤整'
     if market_bias not in ('偏多', '偏空'):
-        return '⚪ 盤整／未確認'
+        return '⚪ 未確認'
     return '🟢 同向' if normalized_direction == market_bias else '🟡 逆勢'
+
+
+def strategy_market_environment_from_inputs(live_snapshot=None, futures_rows=None):
+    """Build one stock/futures market bias, preferring the live front TX quote."""
+    if isinstance(live_snapshot, dict):
+        change = _safe_number(live_snapshot.get('change_pct'))
+        price = _safe_number(live_snapshot.get('price'))
+        if change is not None and price is not None and price > 0:
+            bias = '偏多' if change >= 0.3 else ('偏空' if change <= -0.3 else '盤整')
+            return {
+                'bias': bias,
+                'source': str(live_snapshot.get('contract_code') or '近月臺指期') + ' 即時',
+                'change': change,
+                'updated': str(live_snapshot.get('updated') or '即時串流'),
+                'confirmed': True,
+            }
+
+    frame = futures_rows.copy() if isinstance(futures_rows, pd.DataFrame) else pd.DataFrame(futures_rows or [])
+    required = {'期貨代碼', '契約月份', '漲跌幅'}
+    if frame.empty or not required.issubset(frame.columns):
+        return {
+            'bias': '未確認', 'source': '近月臺指期資料不足', 'change': None,
+            'updated': '', 'confirmed': False,
+        }
+    if '月份順位' in frame.columns:
+        month_rank = pd.to_numeric(frame['月份順位'], errors='coerce')
+        frame = frame[month_rank.fillna(99) == 0]
+    frame = frame[frame['期貨代碼'].astype(str).isin(['TX', 'MTX', 'TMF'])].copy()
+    if frame.empty:
+        return {
+            'bias': '未確認', 'source': '近月臺指期資料不足', 'change': None,
+            'updated': '', 'confirmed': False,
+        }
+    frame['_環境優先'] = frame['期貨代碼'].astype(str).map({'TX': 0, 'MTX': 1, 'TMF': 2})
+    row = frame.sort_values(['_環境優先']).iloc[0]
+    change = _safe_number(row.get('漲跌幅'))
+    if change is None:
+        return {
+            'bias': '未確認', 'source': '近月臺指期漲跌幅不足', 'change': None,
+            'updated': str(row.get('資料日期') or ''), 'confirmed': False,
+        }
+    bias = '偏多' if change >= 0.3 else ('偏空' if change <= -0.3 else '盤整')
+    return {
+        'bias': bias,
+        'source': f"{row.get('期貨代碼')} {row.get('契約月份')} 盤後",
+        'change': change,
+        'updated': str(row.get('資料日期') or ''),
+        'confirmed': True,
+    }
+
+
+def resolve_strategy_market_environment(api=None, futures_rows=None, max_age_seconds=15):
+    """Resolve and briefly cache the shared market environment for both strategy rooms."""
+    now_mono = time.monotonic()
+    cached = st.session_state.get('_strategy_market_environment_live', {})
+    if (
+        isinstance(cached, dict) and cached.get('environment')
+        and now_mono - float(cached.get('loaded_at', 0) or 0) < max_age_seconds
+    ):
+        environment = dict(cached['environment'])
+        st.session_state.strategy_market_environment = environment
+        return environment
+
+    live_snapshot = get_live_futures_snapshot(api, 'TXF') if api is not None else None
+    fallback_rows = futures_rows
+    if fallback_rows is None:
+        local_state = st.session_state.get('_cached_futures_strategy_state', {})
+        fallback_rows = local_state.get('universe', []) if isinstance(local_state, dict) else []
+        if not fallback_rows and os.path.exists(FUTURES_STATE_CACHE_FILE):
+            try:
+                with _RUNTIME_FILE_LOCK:
+                    with open(FUTURES_STATE_CACHE_FILE, 'r', encoding='utf-8') as file:
+                        fallback_rows = (json.load(file) or {}).get('universe', [])
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                fallback_rows = []
+    environment = strategy_market_environment_from_inputs(live_snapshot, fallback_rows)
+    previous = st.session_state.get('strategy_market_environment', {})
+    if not environment.get('confirmed') and isinstance(previous, dict) and previous.get('confirmed'):
+        environment = dict(previous)
+    st.session_state['_strategy_market_environment_live'] = {
+        'loaded_at': now_mono, 'environment': dict(environment),
+    }
+    st.session_state.strategy_market_environment = dict(environment)
+    return environment
 
 def futures_expiry_date(contract_month):
     """以月契約第三個星期三估算到期日；休市時順延至次一交易日。"""
@@ -11998,9 +12246,8 @@ if 'limit_rows' not in st.session_state:
         cached_stock_display_settings or saved_config
     )['limit_rows']
 if 'stock_hide_non_stock' not in st.session_state:
-    st.session_state.stock_hide_non_stock = normalize_stock_display_settings(
-        cached_stock_display_settings
-    )['hide_non_stock']
+    # 每個新工作階段預設先排除 ETF／權證／債券；使用者仍可手動取消。
+    st.session_state.stock_hide_non_stock = True
 if 'allow_warrant_search' not in st.session_state:
     st.session_state.allow_warrant_search = normalize_stock_display_settings(
         cached_stock_display_settings
@@ -17675,22 +17922,11 @@ def render_futures_strategy_room():
             "否則暫用目前可用成交口數。"
         )
 
-    front_index_rows = universe[
-        universe['期貨代碼'].isin(['TX', 'MTX', 'TMF']) & (universe['月份順位'] == 0)
-    ].copy()
-    if not front_index_rows.empty:
-        front_index_rows['_環境優先'] = front_index_rows['期貨代碼'].map({'TX': 0, 'MTX': 1, 'TMF': 2})
-        market_row = front_index_rows.sort_values(['_環境優先', '當日成交口數'], ascending=[True, False]).iloc[0]
-        market_change = _safe_number(market_row.get('漲跌幅'), 0) or 0
-        market_bias = '偏多' if market_change >= 0.3 else ('偏空' if market_change <= -0.3 else '盤整')
-        st.session_state.strategy_market_environment = {
-            'bias': market_bias,
-            'source': f"{market_row['期貨代碼']} {market_row['契約月份']}",
-            'change': market_change,
-            'updated': official_date,
-        }
-    else:
-        market_bias = str(st.session_state.get('strategy_market_environment', {}).get('bias', '盤整'))
+    market_environment = resolve_strategy_market_environment(
+        st.session_state.get('sj_api') if st.session_state.get('sj_logged_in', False) else None,
+        futures_rows=universe,
+    )
+    market_bias = str(market_environment.get('bias', '盤整'))
 
     filter_options = {
         'only_small': only_small, 'hide_index': hide_index, 'hide_etf': hide_etf,
@@ -18175,17 +18411,17 @@ tab1, tab_fibo, tab2, tab_db, tab_company, tab3 = st.tabs([
 with tab1:
     if tab1.open:
         render_opening_direction_prompt()
-    stock_strategy_tab, futures_strategy_tab, validation_strategy_tab = st.tabs([
-        "📈 股票戰略室", "🧭 期貨戰略室", "📊 策略驗證"
-    ], key="strategy_room_active_tab", on_change="rerun")
+    if st.session_state.get('strategy_room_active_tab') == "📊 策略驗證":
+        st.session_state.strategy_room_active_tab = "📈 股票戰略室"
+    stock_strategy_tab, futures_strategy_tab = st.tabs(
+        ["📈 股票戰略室", "🧭 期貨戰略室"],
+        key="strategy_room_active_tab", on_change="rerun",
+    )
     with stock_strategy_tab:
         stock_strategy_container = st.container()
     with futures_strategy_tab:
         if tab1.open and futures_strategy_tab.open:
             render_futures_strategy_room()
-    with validation_strategy_tab:
-        if tab1.open and validation_strategy_tab.open:
-            render_strategy_validation_room()
 
 if tab1.open and stock_strategy_tab.open:
     with stock_strategy_container:
@@ -18572,40 +18808,56 @@ if tab1.open and stock_strategy_tab.open:
                         'updated': None, 'errors': []
                     }
 
-                reopen_strategy_settings = st.session_state.pop(
-                    '_reopen_stock_strategy_settings', False,
-                )
-                with st.expander(
+                risk_direction = str(st.session_state.get('risk_filter_direction', '系統自動'))
+                if risk_direction in ('多頭', '空頭'):
+                    risk_direction = '多' if risk_direction == '多頭' else '空'
+                    st.session_state['risk_filter_direction'] = risk_direction
+                risk_min_score = int(st.session_state.get('risk_filter_min_score', 75) or 75)
+                risk_max_extension = float(st.session_state.get('risk_filter_max_extension', 2.0) or 2.0)
+                risk_block_attention = bool(st.session_state.get('risk_filter_block_attention', True))
+                risk_show_only_eligible = bool(st.session_state.get('risk_filter_show_eligible', False))
+                stock_compact_table = bool(st.session_state.get('stock_strategy_compact_table', True))
+                stock_notify = bool(st.session_state.get('stock_strategy_notify', True))
+                st.session_state.pop('_reopen_stock_strategy_settings', None)
+                strategy_settings_open = st.toggle(
                     "🧭 選股條件與進場信心設定",
-                    expanded=reopen_strategy_settings,
-                ):
-                    strategy_mode = st.radio(
-                        "策略模式", ["當沖", "隔日／波段"], horizontal=True,
-                        key="risk_filter_strategy_mode",
-                        help="隔日／波段維持原有規則；09:00–09:15 採即時串流＋1 分 K，之後採 5 分 K、VWAP 與完整開盤區間，不會自動下單。"
-                    )
-                    is_daytrade_mode = strategy_mode == "當沖"
+                    key='stock_strategy_settings_open',
+                    help='手動開啟或收合；更新資料與頁面重新執行後會維持目前狀態。',
+                )
+                if strategy_settings_open:
                     if st.session_state.get('risk_filter_direction') in ('多頭', '空頭'):
                         st.session_state['risk_filter_direction'] = '多' if st.session_state['risk_filter_direction'] == '多頭' else '空'
-                    risk_col1, risk_col2, risk_col3 = st.columns(3)
+                    risk_col1, risk_col2, risk_col3, risk_col4 = st.columns(
+                        [1.2, 1, 1, 1.35], gap='small', vertical_alignment='top',
+                    )
                     with risk_col1:
+                        strategy_mode = st.radio(
+                            "策略模式", ["當沖", "隔日／波段"], horizontal=True,
+                            key="risk_filter_strategy_mode",
+                            help="隔日／波段維持原有規則；09:00–09:15 採即時串流＋1 分 K，之後採 5 分 K、VWAP 與完整開盤區間，不會自動下單。"
+                        )
+                        is_daytrade_mode = strategy_mode == "當沖"
                         risk_direction = st.radio(
                             "判斷方向", ["系統自動", "多", "空"], horizontal=True,
                             key="risk_filter_direction",
                             help="系統自動會逐檔判斷：當沖以分 K、VWAP、開盤區間及量能為主；隔日／波段以日 K 均線、前高前低與支撐壓力為主。選多或空可強制整表使用指定方向。"
                         )
-                        risk_min_score = st.slider("最低進場信心", min_value=60, max_value=90, value=75, key="risk_filter_min_score")
                     with risk_col2:
+                        risk_min_score = st.slider("最低進場信心", min_value=60, max_value=90, value=75, key="risk_filter_min_score")
                         risk_max_extension = st.slider("最大乖離（ATR）", min_value=1.0, max_value=3.0, value=2.0, step=0.1, key="risk_filter_max_extension")
+                    with risk_col3:
                         risk_block_attention = st.checkbox("封鎖注意累計 ≥ 2", value=True, key="risk_filter_block_attention")
+                        risk_show_only_eligible = st.checkbox("只顯示可操作候選", value=False, key="risk_filter_show_eligible")
                         stock_compact_table = st.checkbox(
                             "精簡主表", value=True, key='stock_strategy_compact_table',
                             help='戰略備註維持原樣；其餘細節移到個股明細。'
                         )
-                    with risk_col3:
-                        risk_show_only_eligible = st.checkbox("只顯示可操作候選", value=False, key="risk_filter_show_eligible")
+                    with risk_col4:
                         stock_notify = st.checkbox("🔔 訊號變化提醒", value=True, key='stock_strategy_notify')
-                        if st.button("📊 重抓日 K 並計算策略指標", key="refresh_risk_filter_metrics"):
+                        if st.button(
+                            "📊 重抓日 K 並計算策略指標",
+                            key="refresh_risk_filter_metrics", width='stretch',
+                        ):
                             code_name_map, _ = load_local_stock_names()
                             with st.spinner("正在重抓日 K 並回填策略指標..."):
                                 refreshed_data, updated_count, quote_count = refresh_risk_metrics_for_codes(
@@ -18640,7 +18892,6 @@ if tab1.open and stock_strategy_tab.open:
                                     st.session_state['_stock_cache_sync_notice'] = (
                                         "日 K 已更新，但 Google Sheet 尚未回讀確認；目前先保留本機最新資料。"
                                     )
-                                st.session_state['_reopen_stock_strategy_settings'] = True
                                 st.toast(
                                     f"已回填 {updated_count} 檔日 K 指標，並更新 {quote_count} 檔報價。",
                                     icon="✅",
@@ -18649,7 +18900,10 @@ if tab1.open and stock_strategy_tab.open:
                             else:
                                 st.warning("沒有可回填的資料；請確認標的至少有 20 個交易日的日 K。")
                         if is_daytrade_mode:
-                            if st.button("📈 更新盤中資料與當沖條件", key="refresh_daytrade_filter_metrics"):
+                            if st.button(
+                                "📈 更新盤中資料與當沖條件",
+                                key="refresh_daytrade_filter_metrics", width='stretch',
+                            ):
                                 if not st.session_state.get('sj_logged_in', False) or st.session_state.get('sj_api') is None:
                                     st.warning("當沖需要先登入永豐 Shioaji，才能取得即時串流與分 K 資料。")
                                 else:
@@ -18683,7 +18937,6 @@ if tab1.open and stock_strategy_tab.open:
                                             st.session_state['_stock_cache_sync_notice'] = (
                                                 "盤中資料已更新，但 Google Sheet 尚未回讀確認；目前先保留本機最新資料。"
                                             )
-                                        st.session_state['_reopen_stock_strategy_settings'] = True
                                         st.toast(
                                             f"已更新 {updated_count} 檔盤中條件與 {quote_count} 檔報價。",
                                             icon="📈",
@@ -18691,7 +18944,10 @@ if tab1.open and stock_strategy_tab.open:
                                         st.rerun()
                                     else:
                                         st.warning("沒有取得足夠的盤中 5 分 K；請確認 Shioaji 連線與交易時段資料。")
-                        if st.button("🔄 更新上市／上櫃注意與處置名單", key="refresh_risk_filter_market_data"):
+                        if st.button(
+                            "🔄 更新上市／上櫃注意與處置名單",
+                            key="refresh_risk_filter_market_data", width='stretch',
+                        ):
                             fetch_market_risk_lists.clear()
                             with st.spinner("正在更新上市／上櫃注意與處置名單..."):
                                 attention, disposition, disposition_tomorrow, errors = fetch_market_risk_lists()
@@ -18722,7 +18978,6 @@ if tab1.open and stock_strategy_tab.open:
                                 st.session_state.saved_notes,
                                 replace_stock_data=True,
                             )
-                            st.session_state['_reopen_stock_strategy_settings'] = True
                             st.toast(f"注意／處置名單已更新，並更新 {quote_count} 檔報價。", icon="🔄")
                             st.rerun()
 
@@ -18765,7 +19020,10 @@ if tab1.open and stock_strategy_tab.open:
                 disposition_codes = market_risk_data.get('disposition', [])
                 disposition_tomorrow_codes = market_risk_data.get('disposition_tomorrow', [])
                 market_lists_updated = bool(market_risk_data.get('updated')) and not market_risk_data.get('errors')
-                market_environment = st.session_state.get('strategy_market_environment', {})
+                market_environment = resolve_strategy_market_environment(
+                    st.session_state.get('sj_api')
+                    if st.session_state.get('sj_logged_in', False) else None,
+                )
                 market_bias = str(market_environment.get('bias', '盤整'))
                 market_source = str(market_environment.get('source', '臺指期資料不足'))
                 market_change = _safe_number(market_environment.get('change'))
@@ -21550,7 +21808,7 @@ with tab_fibo:
             pressure_control_col, pressure_note_col = st.columns([1.2, 2.8])
             with pressure_control_col:
                 pressure_expiry_choice = st.selectbox(
-                    "SP／SC 觀察到期別",
+                    "選擇權力量到期別",
                     ["最近到期", "週三選", "週五選", "月選"],
                     key="txo_pressure_expiry_choice",
                 )
@@ -21565,7 +21823,7 @@ with tab_fibo:
                 futures_temperature[4].get('close')
                 if futures_temperature and futures_temperature[4] else None
             )
-            render_txo_pressure_indicator(
+            render_txo_flow_indicator(
                 st.session_state.get('sj_api'), fallback_spot, pressure_expiry_choice,
             )
 

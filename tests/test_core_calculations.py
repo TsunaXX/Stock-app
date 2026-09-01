@@ -137,6 +137,50 @@ def test_option_wall_scores_require_both_sides_and_real_wall_evidence():
     ], spot=22000) is None
 
 
+def test_option_flow_strength_maps_call_put_trade_sides():
+    symbols = load_app_symbols("_safe_number", "calculate_option_flow_strength")
+    calculate = symbols["calculate_option_flow_strength"]
+    result = calculate([
+        {"right": "C", "active_buy": 70, "active_sell": 30},
+        {"right": "P", "active_buy": 20, "active_sell": 80},
+    ])
+    assert result["BC"] == 70
+    assert result["SC"] == 30
+    assert result["BP"] == 20
+    assert result["SP"] == 80
+    assert result["bullish"] == 150
+    assert result["bearish"] == 50
+    assert result["bullish_share"] == 75
+    assert round(result["seller_share"], 6) == 55
+    assert result["status"] == "偏多"
+    assert calculate([
+        {"right": "C", "active_buy": 70, "active_sell": 30},
+    ]) is None
+
+
+def test_strategy_market_environment_distinguishes_sideways_and_unconfirmed():
+    symbols = load_app_symbols(
+        "_safe_number", "calculate_market_alignment",
+        "strategy_market_environment_from_inputs",
+    )
+    build = symbols["strategy_market_environment_from_inputs"]
+    align = symbols["calculate_market_alignment"]
+    live = build({"price": 22000, "change_pct": 0.1, "contract_code": "TXFI6"})
+    assert live["bias"] == "盤整"
+    assert live["confirmed"] is True
+    assert align("多頭", live["bias"]) == "⚪ 盤整"
+    missing = build(None, [])
+    assert missing["bias"] == "未確認"
+    assert missing["confirmed"] is False
+    assert align("多頭", missing["bias"]) == "⚪ 未確認"
+    fallback = build(None, [{
+        "期貨代碼": "TX", "契約月份": "202609", "漲跌幅": -0.8,
+        "月份順位": 0, "資料日期": "2026-09-01",
+    }])
+    assert fallback["bias"] == "偏空"
+    assert align("空頭", fallback["bias"]) == "🟢 同向"
+
+
 def test_futures_ticks_follow_product_specification():
     symbols = load_app_symbols("_safe_number", "FUTURES_FIXED_TICK_SIZES", "get_futures_tick_size")
     get_tick = symbols["get_futures_tick_size"]
@@ -1121,17 +1165,23 @@ def test_stock_ranking_and_option_plan_skip_redundant_fetches():
     ]
 
 
-def test_option_pressure_and_swing_credit_use_mobile_safe_refresh_and_layout():
+def test_option_flow_and_swing_credit_use_mobile_safe_refresh_and_layout():
     source = APP_PATH.read_text(encoding="utf-8")
-    pressure_start = source.index("def append_txo_pressure_history")
-    pressure_end = source.index("def render_txo_pressure_indicator", pressure_start)
-    pressure_source = source[pressure_start:pressure_end]
-    assert "min_interval_seconds=5" in pressure_source
-    assert "('support', 'SP 實際支撐', '#40c4ff', 'hv')" in pressure_source
-    assert "shape=shape" in pressure_source
-    assert "support_center" in pressure_source
-    assert "resistance_center" in pressure_source
-    assert "@st.fragment(run_every=5)" in source
+    select_start = source.index("def select_txo_flow_contracts")
+    select_end = source.index("def calculate_option_flow_strength", select_start)
+    assert "max_strikes=6" in source[select_start:select_end]
+    calculate_end = source.index("def calculate_option_wall_scores", select_end)
+    calculate_source = source[select_end:calculate_end]
+    assert "bullish = components['BC'] + components['SP']" in calculate_source
+    assert "bearish = components['SC'] + components['BP']" in calculate_source
+    assert "seller = components['SC'] + components['SP']" in calculate_source
+    history_start = source.index("def append_txo_flow_history")
+    history_end = source.index("def fetch_taifex_txo_daily_quotes", history_start)
+    flow_source = source[history_start:history_end]
+    assert "min_interval_seconds=5" in flow_source
+    assert "@st.fragment(run_every=5)" in flow_source
+    assert "def render_txo_flow_indicator" in flow_source
+    assert "最近 6 個履約價的 Call／Put" in flow_source
 
     swing_start = source.index('with tab2_2:')
     swing_end = source.index('with tab2_3:', swing_start)
@@ -1294,6 +1344,16 @@ def test_heavy_hidden_sources_require_an_active_keyed_tab():
     assert 'if tab1.open and stock_strategy_tab.open:' in source
     assert 'schedule_calendar_source_preload(' in source
     assert "calendar_preload_task['event'].wait(timeout=12)" in source
+
+
+def test_stock_strategy_settings_are_manual_and_strategy_validation_tab_is_removed():
+    source = APP_PATH.read_text(encoding="utf-8")
+    assert "key='stock_strategy_settings_open'" in source
+    assert "手動開啟或收合；更新資料與頁面重新執行後會維持目前狀態" in source
+    assert "_reopen_stock_strategy_settings = True" not in source
+    assert '["📈 股票戰略室", "🧭 期貨戰略室"]' in source
+    assert "validation_strategy_tab" not in source
+    assert "st.session_state.stock_hide_non_stock = True" in source
 
 
 def test_independent_tables_use_the_same_post_21_ranking():
