@@ -5056,8 +5056,10 @@ def calculate_option_wall_scores(rows, spot, window_points=700):
     put_total = sum(item['wall_score'] for item in puts)
     call_total = sum(item['wall_score'] for item in calls)
     total = put_total + call_total
-    if total <= 0:
+    if put_total <= 0 or call_total <= 0:
         return None
+    support_center = sum(item['strike'] * item['wall_score'] for item in puts) / put_total
+    resistance_center = sum(item['strike'] * item['wall_score'] for item in calls) / call_total
     balance = ((put_total - call_total) / total * 100) if total > 0 else 0.0
     if balance >= 15:
         status, status_color = 'SP 支撐偏強', '#40c4ff'
@@ -5077,7 +5079,9 @@ def calculate_option_wall_scores(rows, spot, window_points=700):
 
     return {
         'spot': spot, 'support': support_row['strike'],
-        'resistance': resistance_row['strike'], 'balance': balance,
+        'resistance': resistance_row['strike'],
+        'support_center': support_center, 'resistance_center': resistance_center,
+        'balance': balance,
         'put_total': put_total, 'call_total': call_total,
         'status': status, 'status_color': status_color,
         'confidence': confidence, 'rows': cleaned,
@@ -5845,7 +5849,7 @@ def build_txo_pressure_rows(api, contracts, expiry, spot, window_points=700):
     return rows, len(selected)
 
 
-def append_txo_pressure_history(history_key, result, min_interval_seconds=8, max_points=180):
+def append_txo_pressure_history(history_key, result, min_interval_seconds=5, max_points=360):
     """Store a bounded live curve only while the pressure fragment is visible."""
     shared, shared_lock = get_shared_market_data_cache()
     now = datetime.now(pytz.timezone('Asia/Taipei')).replace(tzinfo=None)
@@ -5861,6 +5865,8 @@ def append_txo_pressure_history(history_key, result, min_interval_seconds=8, max
                 'time': now, 'spot': float(result['spot']),
                 'support': float(result['support']),
                 'resistance': float(result['resistance']),
+                'support_center': float(result['support_center']),
+                'resistance_center': float(result['resistance_center']),
                 'balance': float(result['balance']),
             })
         if len(history) > max_points:
@@ -5917,14 +5923,25 @@ def build_txo_pressure_history_chart(history):
         rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
         row_heights=[0.68, 0.32],
     )
-    for field, name, color in (
-        ('spot', '期貨', '#f5f5f5'),
-        ('support', 'SP 支撐', '#40c4ff'),
-        ('resistance', 'SC 壓力', '#ff5252'),
+    for field, name, color, shape in (
+        ('spot', '期貨', '#f5f5f5', 'linear'),
+        ('support', 'SP 實際支撐', '#40c4ff', 'hv'),
+        ('resistance', 'SC 實際壓力', '#ff5252', 'hv'),
     ):
         fig.add_trace(go.Scatter(
             x=frame['time'], y=frame[field], mode='lines', name=name,
-            line=dict(color=color, width=2.4),
+            line=dict(color=color, width=2.4, shape=shape),
+        ), row=1, col=1)
+    for field, name, color in (
+        ('support_center', 'SP 支撐重心', '#80d8ff'),
+        ('resistance_center', 'SC 壓力重心', '#ff8a80'),
+    ):
+        if field not in frame.columns:
+            continue
+        smoothed = pd.to_numeric(frame[field], errors='coerce').ewm(span=4, adjust=False).mean()
+        fig.add_trace(go.Scatter(
+            x=frame['time'], y=smoothed, mode='lines', name=name,
+            line=dict(color=color, width=1.8, dash='dot'), opacity=0.9,
         ), row=1, col=1)
     balance_colors = [
         '#40c4ff' if value >= 0 else '#ff5252' for value in frame['balance']
@@ -5944,7 +5961,7 @@ def build_txo_pressure_history_chart(history):
     return fig
 
 
-@st.fragment(run_every=12)
+@st.fragment(run_every=5)
 def render_txo_pressure_indicator(api, fallback_spot, expiry_choice):
     """Render the live SP/SC indicator without rerunning the rest of the app."""
     st.markdown("#### 🧱 選擇權 SP／SC 支撐壓力")
@@ -6024,7 +6041,7 @@ def render_txo_pressure_indicator(api, fallback_spot, expiry_choice):
             key='txo_pressure_history_chart',
         )
     st.caption(
-        f"到期日：{expiry:%Y/%m/%d}｜契約來源：{source}｜每 12 秒只重繪本區。"
+        f"到期日：{expiry:%Y/%m/%d}｜契約來源：{source}｜每 5 秒只重繪本區。"
         f"僅訂閱期貨上下 700 點內、各 6 檔價外 Put／Call；{oi_note}"
     )
     with st.expander("SP／SC 指標怎麼看"):
@@ -19875,10 +19892,10 @@ with tab2:
                 calculate_stop_loss_price(swing_calc_price, swing_stop_loss_percent, swing_is_long)
                 if swing_calc_price is not None else 0.0
             )
-            swing_stop_direction = "下跌" if swing_is_long else "上漲"
+            swing_stop_delta = -swing_stop_loss_percent if swing_is_long else swing_stop_loss_percent
             st.metric(
                 "停損價", fmt_price(swing_stop_price) if swing_calc_price is not None else "—",
-                f"{swing_stop_direction} {swing_stop_loss_percent:g}%"
+                f"{swing_stop_delta:+g}%", delta_color="inverse"
             )
 
         # --- 目標價快速試算區 ---
@@ -20092,22 +20109,33 @@ with tab2:
                 return ['color: gray'] * len(row)
 
             if not df_swing_calc.empty:
+                swing_column_widths = {
+                    "成交價": 78, "漲跌": 66, "預估損益": 94, "報酬率%": 84,
+                    "手續費": 72, "交易稅": 72, "借券費": 72, "利息": 68,
+                    "維持率%": 84, "強制回補價": 104,
+                }
+                visible_swing_columns = [
+                    column for column in df_swing_calc.columns if not column.startswith('_')
+                ]
+                swing_table_width = sum(
+                    swing_column_widths.get(column, 84) for column in visible_swing_columns
+                ) + 6
                 st.dataframe(
                     df_swing_calc.style.apply(style_swing_row, axis=1), 
-                    width='stretch',
+                    width=swing_table_width,
                     hide_index=True, 
                     height=(len(df_swing_calc) + 1) * 35,
                     column_config={
-                        "成交價": st.column_config.TextColumn(width="small"),
-                        "漲跌": st.column_config.TextColumn(width="small"),
-                        "預估損益": st.column_config.NumberColumn(width="small"),
-                        "報酬率%": st.column_config.TextColumn(width="small"),
-                        "手續費": st.column_config.NumberColumn(width="small"),
-                        "交易稅": st.column_config.NumberColumn(width="small"),
-                        "借券費": st.column_config.NumberColumn(width="small"),
-                        "利息": st.column_config.NumberColumn(width="small"),
-                        "維持率%": st.column_config.TextColumn(width="small"),
-                        "強制回補價": st.column_config.TextColumn(width="small"),
+                        "成交價": st.column_config.TextColumn(width=78),
+                        "漲跌": st.column_config.TextColumn(width=66),
+                        "預估損益": st.column_config.NumberColumn(width=94),
+                        "報酬率%": st.column_config.TextColumn(width=84),
+                        "手續費": st.column_config.NumberColumn(width=72),
+                        "交易稅": st.column_config.NumberColumn(width=72),
+                        "借券費": st.column_config.NumberColumn(width=72),
+                        "利息": st.column_config.NumberColumn(width=68),
+                        "維持率%": st.column_config.TextColumn(width=84),
+                        "強制回補價": st.column_config.TextColumn(width=104),
                         "_profit": None, "_is_base": None, "_is_target": None, "_call": None
                     }
                 )

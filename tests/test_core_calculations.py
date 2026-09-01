@@ -121,6 +121,8 @@ def test_option_wall_scores_use_otm_open_interest_as_primary_signal():
     assert result["resistance"] == 22300
     assert result["balance"] > 0
     assert result["status"] == "SP 支撐偏強"
+    assert 21800 < result["support_center"] < 21900
+    assert 22100 < result["resistance_center"] < 22300
     assert all(row["strike"] != 22100 for row in result["rows"] if row["right"] == "P")
 
 
@@ -1117,6 +1119,29 @@ def test_stock_ranking_and_option_plan_skip_redundant_fetches():
     assert "get_taifex_txo_open_interest_rows_nonblocking()" in source[
         pressure_end:build_pressure_end
     ]
+
+
+def test_option_pressure_and_swing_credit_use_mobile_safe_refresh_and_layout():
+    source = APP_PATH.read_text(encoding="utf-8")
+    pressure_start = source.index("def append_txo_pressure_history")
+    pressure_end = source.index("def render_txo_pressure_indicator", pressure_start)
+    pressure_source = source[pressure_start:pressure_end]
+    assert "min_interval_seconds=5" in pressure_source
+    assert "('support', 'SP 實際支撐', '#40c4ff', 'hv')" in pressure_source
+    assert "shape=shape" in pressure_source
+    assert "support_center" in pressure_source
+    assert "resistance_center" in pressure_source
+    assert "@st.fragment(run_every=5)" in source
+
+    swing_start = source.index('with tab2_2:')
+    swing_end = source.index('with tab2_3:', swing_start)
+    swing_source = source[swing_start:swing_end]
+    assert 'delta_color="inverse"' in swing_source
+    assert "swing_stop_delta = -swing_stop_loss_percent if swing_is_long" in swing_source
+    table_start = swing_source.index("if not df_swing_calc.empty:")
+    table_source = swing_source[table_start:]
+    assert "width=swing_table_width" in table_source
+    assert "width='stretch'" not in table_source
 
 
 def test_next_open_disposition_is_visible_and_not_eligible():
