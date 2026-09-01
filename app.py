@@ -12649,6 +12649,25 @@ def price_change_amount(price, change_rate):
     return current_price - current_price / denominator
 
 
+def stock_snapshot_limit_context(snapshot, price, change_rate=None, now_tw=None):
+    """Derive the active session's stock limits from the live quote reference."""
+    current_price = _safe_number(price)
+    if current_price is None or current_price <= 0:
+        return None
+    change = _safe_number(
+        getattr(snapshot, 'change_price', getattr(snapshot, 'change', None))
+    )
+    reference = current_price - change if change is not None else None
+    rate = _safe_number(change_rate)
+    if (reference is None or reference <= 0) and rate is not None:
+        denominator = 1 + rate / 100
+        reference = current_price / denominator if denominator > 0 else None
+    if reference is None or reference <= 0:
+        return None
+    reference = round(reference, 8)
+    return stock_limit_context(reference, current_price, now_tw=now_tw)
+
+
 FUTURES_FIXED_TICK_SIZES = {
     'TX': 1.0, 'MTX': 1.0, 'TMF': 1.0,
     'TE': 0.05, 'TF': 0.2, 'GTF': 0.05,
@@ -17222,6 +17241,14 @@ def merge_realtime_stock_snapshots(stock_data, snapshot_map, points_map=None, qu
             getattr(snapshot, 'sell_price', None)
         )
         refreshed.at[row_index, '_quote_time'] = quote_time
+        limit_context = stock_snapshot_limit_context(snapshot, price, change_rate)
+        if limit_context:
+            # 名稱底色永遠比對盤中當日限制價；14:30 後表面欄位仍可
+            # 獨立顯示下一個交易日的預估限制價。
+            refreshed.at[row_index, '_交易日漲停價'] = limit_context['today_up']
+            refreshed.at[row_index, '_交易日跌停價'] = limit_context['today_down']
+            refreshed.at[row_index, '當日漲停價'] = limit_context['display_up']
+            refreshed.at[row_index, '當日跌停價'] = limit_context['display_down']
         if points_map is not None:
             refreshed.at[row_index, '狀態'] = recalculate_row(
                 refreshed.loc[row_index], points_map,
@@ -19699,6 +19726,14 @@ with tab2:
                 
             st.markdown(html_str, unsafe_allow_html=True)
         st.markdown("---")
+        target_tick_price = apply_tick_rules(target_p) if target_p is not None else None
+        previous_target = st.session_state.get('_daytrade_table_target')
+        if target_tick_price is not None and (
+            previous_target is None
+            or not math.isclose(float(previous_target), float(target_tick_price))
+        ):
+            st.session_state.calc_view_price = target_tick_price
+        st.session_state['_daytrade_table_target'] = target_tick_price
         
         limit_up, limit_down = calculate_limits(st.session_state.calc_base_price)
         b1, b2, _ = st.columns([1, 1, 6])
@@ -19752,19 +19787,23 @@ with tab2:
             if abs(p - limit_up) < 0.001: note_type = "up"
             elif abs(p - limit_down) < 0.001: note_type = "down"
             is_base = (abs(p - base_p) < 0.001)
+            is_target = target_tick_price is not None and abs(p - target_tick_price) < 0.001
             
             calc_data.append({
                 "成交價": fmt_price(p), "漲跌": diff_str, "預估損益": int(profit), "報酬率%": f"{_format_compact_number(roi, 2, signed=True)}%",
-                "手續費": int(total_fee), "交易稅": int(tax), "_profit": profit, "_note_type": note_type, "_is_base": is_base
+                "手續費": int(total_fee), "交易稅": int(tax), "_profit": profit, "_note_type": note_type,
+                "_is_base": is_base, "_is_target": is_target
             })
             
         df_calc = pd.DataFrame(calc_data)
         
         def style_calc_row(row):
             is_base = row['_is_base']
+            is_target = row['_is_target']
             prof = row['_profit']
             
             if is_base: return ['background-color: #ffffcc; color: black; font-weight: bold; border: 2px solid #ffd700;'] * len(row)
+            if is_target: return ['background-color: #123b52; color: #40c4ff; font-weight: bold; border: 2px solid #40c4ff;'] * len(row)
             if prof > 0: return ['color: #ff4b4b; font-weight: bold'] * len(row) 
             if prof < 0: return ['color: #00cc00; font-weight: bold'] * len(row) 
             return ['color: gray'] * len(row)
@@ -19776,7 +19815,7 @@ with tab2:
                 width=425, 
                 hide_index=True, 
                 height=table_height,
-                column_config={"_profit": None, "_note_type": None, "_is_base": None}
+                column_config={"_profit": None, "_note_type": None, "_is_base": None, "_is_target": None}
             )
 
     with tab2_2:
@@ -19849,6 +19888,8 @@ with tab2:
                 t_interest = 0
                 t_borrow_fee = 0
                 t_roi = 0
+                t_maintenance_ratio = 0.0
+                t_call_price = 0.0
                 
                 if swing_type == "個股":
                     t_cost = t_stock_value_buy + t_buy_fee
@@ -19861,6 +19902,8 @@ with tab2:
                     t_interest = round(t_margin_loan * (annual_rate/100) * (swing_days/365))
                     t_net_sell = t_stock_value_sell - t_sell_fee - t_tax - t_margin_loan - t_interest
                     t_profit = t_net_sell - t_self_prepare
+                    t_maintenance_ratio = (t_stock_value_sell / t_margin_loan) * 100 if t_margin_loan > 0 else 0
+                    t_call_price = (t_margin_loan * 1.3) / swing_shares if t_margin_loan > 0 else 0
                     t_roi = (t_profit / t_self_prepare * 100) if t_self_prepare > 0 else 0
                 elif swing_type == "融券(空)":
                     t_margin_deposit = math.ceil(t_stock_value_sell * (margin_ratio/100) / 100) * 100
@@ -19870,6 +19913,8 @@ with tab2:
                     t_buy_cost = t_stock_value_buy + t_buy_fee
                     t_refund = t_margin_deposit + t_sell_guaranty + t_interest - t_buy_cost
                     t_profit = t_refund - t_margin_deposit
+                    t_maintenance_ratio = ((t_margin_deposit + t_sell_guaranty) / t_stock_value_buy) * 100 if t_stock_value_buy > 0 else 0
+                    t_call_price = (t_margin_deposit + t_sell_guaranty) / (1.3 * swing_shares) if swing_shares > 0 else 0
                     t_roi = (t_profit / t_margin_deposit * 100) if t_margin_deposit > 0 else 0
 
                 t_color = "#ff4b4b" if t_profit > 0 else ("#00e676" if t_profit < 0 else "white")
@@ -19884,6 +19929,13 @@ with tab2:
                 )
                 if swing_type in ["融資(多)", "融券(空)"]:
                     swing_html_str += f"<div>利息: <span style='color: #cccccc;'>{int(t_interest):,}</span></div>"
+                    maintenance_color = '#ff4b4b' if t_maintenance_ratio >= 166 else ('#ffd166' if t_maintenance_ratio >= 130 else '#00e676')
+                    swing_html_str += (
+                        f"<div>維持率: <span style='color: {maintenance_color}; font-weight: bold;'>"
+                        f"{_format_compact_number(t_maintenance_ratio, 1)}%</span></div>"
+                        f"<div>強制回補價: <span style='color: #ffd166; font-weight: bold;'>"
+                        f"{_format_compact_number(t_call_price, 2)}</span></div>"
+                    )
                     if swing_type == "融券(空)":
                         swing_html_str += f"<div>借券費: <span style='color: #cccccc;'>{int(t_borrow_fee):,}</span></div>"
                 swing_html_str += f"<div>價差: <span style='color: {t_diff_color}; font-weight: bold;'>{_format_compact_number(t_diff_val, 2, signed=True)}</span></div></div>"
@@ -19898,6 +19950,14 @@ with tab2:
                 </div>
                 """, unsafe_allow_html=True)
         st.markdown("---")
+        swing_target_tick_price = apply_tick_rules(swing_target_p) if swing_target_p is not None else None
+        previous_swing_target = st.session_state.get('_swing_table_target')
+        if swing_target_tick_price is not None and (
+            previous_swing_target is None
+            or not math.isclose(float(previous_swing_target), float(swing_target_tick_price))
+        ):
+            st.session_state.swing_view_price = swing_target_tick_price
+        st.session_state['_swing_table_target'] = swing_target_tick_price
 
         if swing_calc_price is not None:
             if swing_calc_price != st.session_state.get('swing_base_price', 0):
@@ -19975,6 +20035,7 @@ with tab2:
                 if diff > 0 and not diff_str.startswith('+'): diff_str = "+" + diff_str
                 
                 is_base = (abs(p - s_base_p) < 0.001)
+                is_target = swing_target_tick_price is not None and abs(p - swing_target_tick_price) < 0.001
                 
                 row_data = {
                     "成交價": fmt_price(p), "漲跌": diff_str, "預估損益": int(profit), "報酬率%": f"{_format_compact_number(roi, 2, signed=True)}%",
@@ -19989,6 +20050,7 @@ with tab2:
                     
                 row_data["_profit"] = profit
                 row_data["_is_base"] = is_base
+                row_data["_is_target"] = is_target
                 if swing_type in ["融資(多)", "融券(空)"]:
                     row_data["_call"] = True if maintenance_ratio > 0 and maintenance_ratio < 130 else False
                 else:
@@ -20000,10 +20062,12 @@ with tab2:
             
             def style_swing_row(row):
                 is_base = row['_is_base']
+                is_target = row['_is_target']
                 prof = row['_profit']
                 is_call = row['_call']
                 
                 if is_base: return ['background-color: #ffffcc; color: black; font-weight: bold; border: 2px solid #ffd700;'] * len(row)
+                if is_target: return ['background-color: #123b52; color: #40c4ff; font-weight: bold; border: 2px solid #40c4ff;'] * len(row)
                 if is_call: return ['background-color: #ffcccc; color: #ff0000; font-weight: bold'] * len(row)
                 if prof > 0: return ['color: #ff4b4b; font-weight: bold'] * len(row) 
                 if prof < 0: return ['color: #00cc00; font-weight: bold'] * len(row) 
@@ -20026,7 +20090,7 @@ with tab2:
                         "利息": st.column_config.NumberColumn(width="small"),
                         "維持率%": st.column_config.TextColumn(width="small"),
                         "強制回補價": st.column_config.TextColumn(width="small"),
-                        "_profit": None, "_is_base": None, "_call": None
+                        "_profit": None, "_is_base": None, "_is_target": None, "_call": None
                     }
                 )
 

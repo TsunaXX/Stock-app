@@ -867,13 +867,15 @@ def test_limit_note_uses_the_candles_own_previous_close():
 
 def test_realtime_stock_snapshots_merge_one_batch_without_network_calls():
     symbols = load_app_symbols(
-        "_safe_number", "snapshot_change_rate", "price_change_amount",
+        "_safe_number", "get_tick_size", "calculate_limits", "stock_limit_context",
+        "snapshot_change_rate", "price_change_amount", "stock_snapshot_limit_context",
         "merge_realtime_stock_snapshots",
     )
 
     class Snapshot:
         close = 110
         change_rate = 10
+        change_price = 10
         buy_price = 109.5
         sell_price = 110
 
@@ -885,11 +887,36 @@ def test_realtime_stock_snapshots_merge_one_batch_without_network_calls():
     assert merged.at[0, "收盤價"] == 110
     assert merged.at[0, "漲跌幅"] == 10
     assert merged.at[0, "_quote_time"] == "2026/08/21 10:00:00"
+    assert merged.at[0, "_交易日漲停價"] == 110
+    assert merged.at[0, "_交易日跌停價"] == 90
+
+
+def test_live_stock_limit_context_can_fall_back_to_change_rate():
+    symbols = load_app_symbols(
+        "_safe_number", "get_tick_size", "calculate_limits", "stock_limit_context",
+        "stock_snapshot_limit_context",
+    )
+    snapshot = type("Snapshot", (), {"change_price": None, "change": None})()
+    context = symbols["stock_snapshot_limit_context"](
+        snapshot, 110, 10, now_tw=datetime(2026, 8, 21, 10, 0),
+    )
+    assert (context["today_up"], context["today_down"]) == (110, 90)
+
+
+def test_profit_rooms_center_and_highlight_the_entered_target_price():
+    source = APP_PATH.read_text(encoding="utf-8")
+    assert "st.session_state.calc_view_price = target_tick_price" in source
+    assert "st.session_state.swing_view_price = swing_target_tick_price" in source
+    assert '"_is_target": is_target' in source
+    assert "border: 2px solid #40c4ff" in source
+    assert "<div>維持率:" in source
+    assert "<div>強制回補價:" in source
 
 
 def test_stock_quote_refresh_uses_one_snapshot_batch_for_all_rows():
     symbols = load_app_symbols(
-        "_safe_number", "snapshot_change_rate", "price_change_amount",
+        "_safe_number", "get_tick_size", "calculate_limits", "stock_limit_context",
+        "snapshot_change_rate", "price_change_amount", "stock_snapshot_limit_context",
         "fetch_stock_snapshot_map", "merge_realtime_stock_snapshots",
         "refresh_stock_quotes_for_codes",
     )
