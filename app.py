@@ -6076,19 +6076,32 @@ def build_txo_pressure_history_chart(history):
     return fig
 
 
-def append_txo_flow_history(history_key, result, min_interval_seconds=5, max_points=360):
-    """Store a bounded option-flow ratio series only while this fragment is visible."""
+def append_txo_flow_history(
+    history_key, result, spot=None, min_interval_seconds=5,
+    max_points=5000, max_age_seconds=86400,
+):
+    """Store bounded calculated flow points in the server-wide market cache.
+
+    Only cumulative BC/BP/SC/SP results and the index price are retained. Raw
+    ticks are deliberately discarded so phone/desktop sessions share one small
+    history without increasing Shioaji traffic or Streamlit memory over time.
+    """
     shared, shared_lock = get_shared_market_data_cache()
     now = datetime.now(pytz.timezone('Asia/Taipei')).replace(tzinfo=None)
     with shared_lock:
         histories = shared.setdefault('option_flow', {})
         history = histories.setdefault(str(history_key), [])
         history[:] = [
-            row for row in history if (now - row['time']).total_seconds() <= 7200
+            row for row in history
+            if (now - row['time']).total_seconds() <= max_age_seconds
         ]
         if not history or (now - history[-1]['time']).total_seconds() >= min_interval_seconds:
             history.append({
                 'time': now,
+                'spot': float(spot) if spot is not None else np.nan,
+                'bullish': float(result['bullish']),
+                'bearish': float(result['bearish']),
+                'seller': float(result['seller']),
                 'bullish_share': float(result['bullish_share']),
                 'bearish_share': float(result['bearish_share']),
                 'seller_share': float(result['seller_share']),
@@ -6098,31 +6111,73 @@ def append_txo_flow_history(history_key, result, min_interval_seconds=5, max_poi
         return [row.copy() for row in history]
 
 
-def build_txo_flow_history_chart(history):
-    """Plot smoothed bullish, bearish and seller option-flow shares."""
+def calculate_txo_flow_interval_series(history, window_seconds=30):
+    """Convert cumulative flow counters to a rolling interval-force series."""
+    required = {'time', 'spot', 'bullish', 'bearish', 'seller'}
     if not history:
-        return None
+        return pd.DataFrame()
     frame = pd.DataFrame(history)
-    fig = go.Figure()
-    for field, name, color in (
-        ('bullish_share', '多方 BC＋SP', '#ff4b4b'),
-        ('bearish_share', '空方 SC＋BP', '#00c853'),
-        ('seller_share', '賣方 SC＋SP', '#ffc107'),
+    if not required.issubset(frame.columns):
+        return pd.DataFrame()
+    frame['time'] = pd.to_datetime(frame['time'], errors='coerce')
+    for field in ('spot', 'bullish', 'bearish', 'seller'):
+        frame[field] = pd.to_numeric(frame[field], errors='coerce')
+    frame = (
+        frame.dropna(subset=['time'])
+        .sort_values('time')
+        .drop_duplicates('time', keep='last')
+        .set_index('time')
+    )
+    if frame.empty:
+        return pd.DataFrame()
+
+    window = f"{max(5, int(window_seconds or 30))}s"
+    for field in ('bullish', 'bearish', 'seller'):
+        # A negative change means that a quote counter was reset/reconnected;
+        # it is not genuine opposite-side flow and must not create a spike.
+        increment = frame[field].diff().clip(lower=0).fillna(0)
+        frame[f'{field}_delta'] = increment.rolling(window, min_periods=1).sum()
+    frame['bearish_plot'] = -frame['bearish_delta']
+    frame['net_force'] = frame['bullish_delta'] - frame['bearish_delta']
+    frame['spot'] = frame['spot'].ffill().bfill()
+    return frame.reset_index()
+
+
+def build_txo_flow_history_chart(history):
+    """Plot 30-second option-flow force together with the Taiwan index future."""
+    frame = calculate_txo_flow_interval_series(history, window_seconds=30)
+    if frame.empty:
+        return None
+    fig = make_subplots(specs=[[{'secondary_y': True}]])
+    for field, name, color, dash, width in (
+        ('bullish_delta', '多方增量 BC＋SP', '#ff4b4b', 'solid', 2.6),
+        ('bearish_plot', '空方增量 SC＋BP', '#00c853', 'solid', 2.6),
+        ('net_force', '多空淨力道', '#40c4ff', 'solid', 3.2),
+        ('seller_delta', '賣方增量 SC＋SP', '#ffc107', 'dot', 1.9),
     ):
-        raw = pd.to_numeric(frame[field], errors='coerce')
-        smoothed = raw.ewm(span=4, adjust=False).mean()
         fig.add_trace(go.Scatter(
-            x=frame['time'], y=smoothed, mode='lines', name=name,
-            line=dict(color=color, width=2.8),
-            customdata=raw,
-            hovertemplate='%{y:.1f}%（原始 %{customdata:.1f}%）<extra></extra>',
-        ))
-    fig.add_hline(y=50, line_dash='dot', line_color='#888')
+            x=frame['time'], y=frame[field], mode='lines', name=name,
+            line=dict(color=color, width=width, dash=dash),
+            hovertemplate='%{y:,.0f} 口<extra></extra>',
+        ), secondary_y=False)
+    fig.add_trace(go.Scatter(
+        x=frame['time'], y=frame['spot'], mode='lines', name='台指期',
+        line=dict(color='#f5f5f5', width=2.1), opacity=0.9,
+        hovertemplate='%{y:,.0f} 點<extra></extra>',
+    ), secondary_y=True)
+    fig.add_hline(y=0, line_dash='dot', line_color='#7f8c8d')
     fig.update_layout(
-        template='plotly_dark', height=410, margin=dict(l=48, r=22, t=30, b=42),
-        hovermode='x unified', legend=dict(orientation='h', y=1.13, x=0),
-        yaxis=dict(title='推估力量占比', range=[0, 100], ticksuffix='%'),
-        xaxis=dict(title='臺北時間'),
+        template='plotly_dark', height=430, margin=dict(l=48, r=58, t=36, b=42),
+        hovermode='x unified', legend=dict(orientation='h', y=1.16, x=0),
+        xaxis=dict(title='臺北時間'), uirevision='txo-flow-force-v2',
+    )
+    fig.update_yaxes(
+        title_text='最近 30 秒力量（口）', autorange=True,
+        zeroline=True, secondary_y=False,
+    )
+    fig.update_yaxes(
+        title_text='台指期（點）', autorange=True, showgrid=False,
+        secondary_y=True,
     )
     return fig
 
@@ -6166,8 +6221,17 @@ def render_txo_flow_indicator(api, fallback_spot, expiry_choice):
         return
 
     history_key = f"{expiry:%Y%m%d}:{expiry_choice}"
-    history = append_txo_flow_history(history_key, result)
+    history = append_txo_flow_history(history_key, result, spot=spot)
     render_compact_metric_card_grid([
+        {
+            'label': '台指期', 'value': f"{spot:,.0f} 點",
+            'detail': (
+                f"{live_snapshot['arrow']} {live_snapshot['change']:+,.0f} "
+                f"({live_snapshot['change_pct']:+.2f}%)"
+                if live_snapshot else '即時指標'
+            ),
+            'color': live_snapshot['color'] if live_snapshot else '#f5f5f5',
+        },
         {
             'label': '多方力量', 'value': f"{result['bullish_share']:.1f}%",
             'detail': 'BC＋SP', 'color': '#ff4b4b',
@@ -6184,7 +6248,7 @@ def render_txo_flow_indicator(api, fallback_spot, expiry_choice):
             'label': '賣方力量', 'value': f"{result['seller_share']:.1f}%",
             'detail': 'SC＋SP', 'color': '#ffc107',
         },
-    ], columns=4, class_name='compact-metric-grid txo-flow-grid')
+    ], columns=5, class_name='compact-metric-grid txo-flow-grid')
     st.markdown(
         "<div style='display:flex;flex-wrap:wrap;gap:8px 18px;margin:4px 0 8px;'>"
         f"<span style='color:#ff8a80;font-weight:700;'>BC {result['BC']:,.0f} 口</span>"
@@ -6204,7 +6268,8 @@ def render_txo_flow_indicator(api, fallback_spot, expiry_choice):
     st.caption(
         f"到期日：{expiry:%Y/%m/%d}｜契約來源：{source}｜每 5 秒只重繪本區。"
         f"僅訂閱期貨上下 700 點內、最近 6 個履約價的 Call／Put，共 {subscription_count} 檔；"
-        "曲線採 4 點 EMA 平滑比例，不增加 API 查詢頻率。"
+        "力量線為最近 30 秒成交增量，台指期使用右側刻度；Y 軸自動縮放、不做過度平滑，"
+        "且只保留伺服器共用的計算結果，不保存原始 Tick、不增加 API 查詢頻率。"
     )
     with st.expander("BC／BP／SC／SP 怎麼看"):
         st.markdown(
@@ -19937,10 +20002,13 @@ with tab2:
                 step=0.5, format="%.12g", key="day_stop_loss_percent"
             )
         with stop_col2:
-            day_is_long = "多" in direction
+            day_is_long = direction.startswith("當沖多")
             day_stop_price = calculate_stop_loss_price(calc_price, day_stop_loss_percent, day_is_long)
-            stop_direction = "下跌" if day_is_long else "上漲"
-            st.metric("停損價", fmt_price(day_stop_price), f"{stop_direction} {day_stop_loss_percent:g}%")
+            day_stop_delta = -day_stop_loss_percent if day_is_long else day_stop_loss_percent
+            st.metric(
+                "停損價", fmt_price(day_stop_price), f"{day_stop_delta:+g}%",
+                delta_color="inverse",
+            )
         
         # --- 新增：目標價快速試算區 ---
         st.markdown("##### 🎯 目標價快速試算")

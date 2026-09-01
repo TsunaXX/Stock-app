@@ -158,6 +158,28 @@ def test_option_flow_strength_maps_call_put_trade_sides():
     ]) is None
 
 
+def test_option_flow_interval_series_uses_rolling_deltas_and_ignores_counter_resets():
+    calculate = load_app_symbols(
+        "calculate_txo_flow_interval_series",
+    )["calculate_txo_flow_interval_series"]
+    start = datetime(2026, 9, 1, 9, 0, 0)
+    history = [
+        {"time": start, "spot": 22000, "bullish": 100, "bearish": 80, "seller": 60},
+        {"time": start + timedelta(seconds=5), "spot": 22005, "bullish": 110, "bearish": 90, "seller": 68},
+        {"time": start + timedelta(seconds=20), "spot": 22018, "bullish": 150, "bearish": 120, "seller": 92},
+        {"time": start + timedelta(seconds=35), "spot": 22010, "bullish": 5, "bearish": 4, "seller": 3},
+    ]
+    result = calculate(history, window_seconds=30)
+    assert list(result["spot"]) == [22000, 22005, 22018, 22010]
+    assert result.iloc[2]["bullish_delta"] == 50
+    assert result.iloc[2]["bearish_delta"] == 40
+    assert result.iloc[2]["bearish_plot"] == -40
+    assert result.iloc[2]["net_force"] == 10
+    # Reconnected cumulative counters must not create a false force spike.
+    assert result.iloc[3]["bullish_delta"] == 40
+    assert result.iloc[3]["bearish_delta"] == 30
+
+
 def test_strategy_market_environment_distinguishes_sideways_and_unconfirmed():
     symbols = load_app_symbols(
         "_safe_number", "calculate_market_alignment",
@@ -1179,8 +1201,13 @@ def test_option_flow_and_swing_credit_use_mobile_safe_refresh_and_layout():
     history_end = source.index("def fetch_taifex_txo_daily_quotes", history_start)
     flow_source = source[history_start:history_end]
     assert "min_interval_seconds=5" in flow_source
+    assert "max_points=5000" in flow_source
     assert "@st.fragment(run_every=5)" in flow_source
     assert "def render_txo_flow_indicator" in flow_source
+    assert "calculate_txo_flow_interval_series(history, window_seconds=30)" in flow_source
+    assert "name='台指期'" in flow_source
+    assert "autorange=True" in flow_source
+    assert "range=[0, 100]" not in flow_source
     assert "最近 6 個履約價的 Call／Put" in flow_source
 
     swing_start = source.index('with tab2_2:')
@@ -1192,6 +1219,14 @@ def test_option_flow_and_swing_credit_use_mobile_safe_refresh_and_layout():
     table_source = swing_source[table_start:]
     assert "width=swing_table_width" in table_source
     assert "width='stretch'" not in table_source
+
+    day_start = source.index('with tab2:')
+    day_end = source.index('with tab2_2:', day_start)
+    day_source = source[day_start:day_end]
+    assert 'day_is_long = direction.startswith("當沖多")' in day_source
+    assert "day_stop_delta = -day_stop_loss_percent if day_is_long" in day_source
+    assert 'f"{day_stop_delta:+g}%"' in day_source
+    assert 'delta_color="inverse"' in day_source
 
 
 def test_next_open_disposition_is_visible_and_not_eligible():
