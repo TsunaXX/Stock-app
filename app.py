@@ -6121,12 +6121,23 @@ def _apply_txo_flow_counter_update(tracker, code, active_buy, active_sell, now):
 
     baselines = tracker.setdefault('baselines', {})
     previous = baselines.get(str(code))
-    baselines[str(code)] = {'buy': buy, 'sell': sell}
+    baselines[str(code)] = {
+        'buy': buy, 'sell': sell,
+        # Some Shioaji option subscriptions emit one zero-filled quote before
+        # the exchange's current day counters arrive.  That second seed is not
+        # new flow, so a zero baseline stays unready until a non-zero sample.
+        'ready': bool(buy or sell),
+    }
     tracker['last_stream_at'] = _stream_datetime(now)
     tracker['stream_updates'] = int(tracker.get('stream_updates', 0)) + 1
     if previous is None:
         # A newly selected strike starts at its current exchange counter. Its
         # existing day volume is not new flow and must never create a jump.
+        return False
+
+    if not previous.get('ready', True):
+        # Warm-up transition: 0 -> today's cumulative counters.  Keep the
+        # counters as the real baseline and start counting from the next tick.
         return False
 
     buy_delta = buy - float(previous.get('buy', buy))
@@ -6196,7 +6207,7 @@ def register_txo_flow_tracker(
             sell = _stream_number(row.get('active_sell'))
             if buy is not None and sell is not None and buy >= 0 and sell >= 0:
                 tracker.setdefault('baselines', {})[code] = {
-                    'buy': buy, 'sell': sell,
+                    'buy': buy, 'sell': sell, 'ready': bool(buy or sell),
                 }
         # Keep only the currently selected contract baselines.
         tracker['baselines'] = {

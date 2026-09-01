@@ -188,6 +188,26 @@ def test_option_flow_tracker_uses_per_contract_baselines_and_ignores_counter_res
     assert tracker["components"]["SC"] == 7
 
 
+def test_option_flow_tracker_treats_zero_to_day_total_as_warmup_seed():
+    symbols = load_app_symbols(
+        "_stream_number", "_stream_datetime", "_apply_txo_flow_counter_update",
+    )
+    apply_update = symbols["_apply_txo_flow_counter_update"]
+    tracker = {
+        "active_codes": {"CALL": {"right": "C"}},
+        "baselines": {},
+        "components": {"BC": 0.0, "BP": 0.0, "SC": 0.0, "SP": 0.0},
+    }
+    start = datetime(2026, 9, 1, 20, 0, 0)
+    assert apply_update(tracker, "CALL", 0, 0, start) is False
+    assert apply_update(tracker, "CALL", 3800, 3100, start + timedelta(seconds=1)) is False
+    assert tracker["components"]["BC"] == 0
+    assert tracker["components"]["SC"] == 0
+    assert apply_update(tracker, "CALL", 3804, 3102, start + timedelta(seconds=2)) is True
+    assert tracker["components"]["BC"] == 4
+    assert tracker["components"]["SC"] == 2
+
+
 def test_option_flow_tracker_refreshes_baseline_when_selected_strikes_change():
     symbols = load_app_symbols(
         "_stream_number", "_stream_datetime", "_txo_flow_session_date",
@@ -207,14 +227,18 @@ def test_option_flow_tracker_refreshes_baseline_when_selected_strikes_change():
         "active_buy": 100, "active_sell": 70,
     }], now=start)
     tracker = shared["option_flow_trackers"][key]
-    assert tracker["baselines"]["OLD_CALL"] == {"buy": 100, "sell": 70}
+    assert tracker["baselines"]["OLD_CALL"] == {
+        "buy": 100, "sell": 70, "ready": True,
+    }
 
     register(api, "202609|weekly", [{
         "code": "NEW_CALL", "right": "C", "strike": 22100,
         "active_buy": 900, "active_sell": 800,
     }], now=start + timedelta(seconds=5))
     assert "OLD_CALL" not in tracker["baselines"]
-    assert tracker["baselines"]["NEW_CALL"] == {"buy": 900, "sell": 800}
+    assert tracker["baselines"]["NEW_CALL"] == {
+        "buy": 900, "sell": 800, "ready": True,
+    }
     assert tracker["components"] == {"BC": 0.0, "BP": 0.0, "SC": 0.0, "SP": 0.0}
 
     assert apply_update(
