@@ -911,6 +911,9 @@ def test_profit_rooms_center_and_highlight_the_entered_target_price():
     assert "border: 2px solid #40c4ff" in source
     assert "<div>維持率:" in source
     assert "<div>強制回補價:" in source
+    assert "on_change=sync_swing_credit_defaults" in source
+    assert "st.session_state.margin_ratio = 60.0" in source
+    assert "st.session_state.margin_ratio = 90.0" in source
 
 
 def test_stock_quote_refresh_uses_one_snapshot_batch_for_all_rows():

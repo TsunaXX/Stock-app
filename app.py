@@ -19827,9 +19827,27 @@ with tab2:
         with c2_4: swing_min_fee = st.number_input("最低手續費 (元)", min_value=0, value=20, step=1, key="swing_min_fee")
         with c2_5: swing_tick_count = st.number_input("顯示檔數 (檔)", value=10, min_value=1, max_value=50, step=1, key="swing_tick_count")
         
+        def sync_swing_credit_defaults():
+            selected_type = st.session_state.get('swing_type', '個股')
+            if selected_type == '融資(多)':
+                st.session_state.margin_ratio = 60.0
+                st.session_state.annual_rate = 6.25
+                st.session_state.short_fee_rate = 0.0
+            elif selected_type == '融券(空)':
+                st.session_state.margin_ratio = 90.0
+                st.session_state.annual_rate = 0.2
+                st.session_state.short_fee_rate = 8.0
+            else:
+                st.session_state.margin_ratio = 0.0
+                st.session_state.annual_rate = 0.0
+                st.session_state.short_fee_rate = 0.0
+
         c2_type, c2_margin, c2_rate, c2_days, c2_fee_rate = st.columns(5)
         with c2_type:
-            swing_type = st.selectbox("交易選項", ["個股", "融資(多)", "融券(空)"], key="swing_type")
+            swing_type = st.selectbox(
+                "交易選項", ["個股", "融資(多)", "融券(空)"], key="swing_type",
+                on_change=sync_swing_credit_defaults,
+            )
         with c2_margin:
             margin_ratio = st.number_input("融資/券成數(%)", min_value=0.0, max_value=100.0, value=60.0 if swing_type == "融資(多)" else (90.0 if swing_type == "融券(空)" else 0.0), step=10.0, key="margin_ratio")
         with c2_rate:
