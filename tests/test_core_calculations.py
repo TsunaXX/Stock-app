@@ -158,6 +158,28 @@ def test_option_flow_strength_maps_call_put_trade_sides():
     ]) is None
 
 
+def test_option_flow_operation_advice_matches_direction_and_seller_context():
+    symbols = load_app_symbols(
+        "_safe_number", "calculate_option_flow_strength", "build_option_flow_operation_advice",
+    )
+    calculate = symbols["calculate_option_flow_strength"]
+    advice = symbols["build_option_flow_operation_advice"]
+    bullish = advice(calculate([
+        {"right": "C", "active_buy": 70, "active_sell": 30},
+        {"right": "P", "active_buy": 20, "active_sell": 80},
+    ]))
+    assert bullish["tone"] == "bullish"
+    assert "support" not in bullish["operation"].lower()
+    assert bullish["seller_note"]
+
+    neutral = advice(calculate([
+        {"right": "C", "active_buy": 50, "active_sell": 50},
+        {"right": "P", "active_buy": 50, "active_sell": 50},
+    ]))
+    assert neutral["tone"] == "neutral"
+    assert neutral["operation"] != bullish["operation"]
+
+
 def test_option_flow_tracker_uses_per_contract_baselines_and_ignores_counter_resets():
     symbols = load_app_symbols(
         "_stream_number", "_stream_datetime", "_apply_txo_flow_counter_update",
@@ -1291,6 +1313,8 @@ def test_option_flow_and_swing_credit_use_mobile_safe_refresh_and_layout():
     assert "max_points=5000" in flow_source
     assert "@st.fragment(run_every=5)" in flow_source
     assert "def render_txo_flow_indicator" in flow_source
+    assert "build_option_flow_operation_advice(result)" in flow_source
+    assert "訊號與操作判讀說明" in flow_source
     assert "calculate_txo_cumulative_flow_series(history)" in flow_source
     assert "盤中累積力量（口）" in flow_source
     assert "name='台指期'" in flow_source

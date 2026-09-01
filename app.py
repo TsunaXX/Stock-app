@@ -5085,6 +5085,56 @@ def calculate_option_flow_strength(rows):
     }
 
 
+def build_option_flow_operation_advice(result):
+    """Translate the option-flow status into a concise, risk-aware trading plan."""
+    if not result:
+        return None
+
+    bullish_share = float(result.get('bullish_share', 0) or 0)
+    bearish_share = float(result.get('bearish_share', 0) or 0)
+    seller_share = float(result.get('seller_share', 0) or 0)
+    net = bullish_share - bearish_share
+    status = str(result.get('status', '多空接近'))
+
+    if status == '偏多':
+        advice = {
+            'tone': 'bullish', 'icon': '🔴', 'color': '#ff6b6b', 'background': '#35191d',
+            'title': '偏多，但以回測支撐後順勢為主',
+            'operation': '優先等待臺指期回測短線支撐後止穩，再偏多操作；不在急漲時追價。',
+            'risk': '若跌破支撐，或多空淨差明顯收斂，先減碼或觀望。',
+        }
+    elif status == '偏空':
+        advice = {
+            'tone': 'bearish', 'icon': '🟢', 'color': '#35d07f', 'background': '#123326',
+            'title': '偏空，等反彈受壓後順勢為主',
+            'operation': '優先等待臺指期反彈到短線壓力未過，再偏空操作；不在急跌時追空。',
+            'risk': '若站回壓力，或多空淨差明顯收斂，先回補或觀望。',
+        }
+    else:
+        advice = {
+            'tone': 'neutral', 'icon': '🟡', 'color': '#ffd54f', 'background': '#3a3212',
+            'title': '多空接近，先以區間／觀望處理',
+            'operation': '等多空淨差擴大，且臺指期同步突破壓力或跌破支撐後，再決定方向。',
+            'risk': '訊號未確認前降低部位，避免在區間中央追價或追空。',
+        }
+
+    if seller_share >= 58:
+        seller_note = '賣方成交偏高，較可能出現區間拉鋸；賣方力量不等於多方或空方。'
+    elif seller_share <= 42:
+        seller_note = '買方主動成交較多；仍須由臺指期價格與多空淨差同步確認突破是否延續。'
+    else:
+        seller_note = '買賣方成交接近；仍以臺指期支撐壓力與多空淨差的變化為主。'
+
+    advice.update({
+        'status_summary': (
+            f"多方 {bullish_share:.1f}%／空方 {bearish_share:.1f}%，"
+            f"淨差 {net:+.1f} 個百分點；賣方 {seller_share:.1f}%。"
+        ),
+        'seller_note': seller_note,
+    })
+    return advice
+
+
 def calculate_option_wall_scores(rows, spot, window_points=700):
     """Estimate OTM SP support and SC resistance concentration.
 
@@ -6426,6 +6476,20 @@ def render_txo_flow_indicator(api, fallback_spot, expiry_choice):
         "</div>",
         unsafe_allow_html=True,
     )
+    advice = build_option_flow_operation_advice(result)
+    if advice:
+        st.markdown(
+            "<div style='margin:8px 0 10px;padding:10px 12px;border-left:4px solid "
+            f"{advice['color']};border-radius:8px;background:{advice['background']};line-height:1.6;'>"
+            f"<div style='font-weight:800;color:{advice['color']};font-size:1rem;'>"
+            f"{advice['icon']} 操作解讀｜{advice['title']}</div>"
+            f"<div style='color:#e8eaed;font-size:.92rem;'>狀態：{advice['status_summary']}</div>"
+            f"<div style='color:#f5f5f5;font-size:.92rem;'><b>操作：</b>{advice['operation']}</div>"
+            f"<div style='color:#c7cbd1;font-size:.9rem;'><b>風控：</b>{advice['risk']}</div>"
+            f"<div style='color:#c7cbd1;font-size:.88rem;'><b>賣方判讀：</b>{advice['seller_note']}</div>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
     history_chart = build_txo_flow_history_chart(history)
     if history_chart is not None:
         st.plotly_chart(
@@ -6439,20 +6503,18 @@ def render_txo_flow_indicator(api, fallback_spot, expiry_choice):
         if last_stream_at is not None else '等待首筆'
     )
     st.caption(
-        f"到期日：{expiry:%Y/%m/%d}｜契約來源：{source}｜每 5 秒只重繪本區。"
-        f"僅訂閱期貨上下 700 點內、最近 6 個履約價的 Call／Put，共 {subscription_count} 檔；"
-        f"背景串流更新 {tracker_status.get('stream_updates', 0):,} 次，最後更新 {stream_time}。"
-        "曲線以每個契約自己的新增成交做盤中累積；履約價更換只建立新基準，不會產生假跳動。"
-        "台指期使用右側刻度；只保存最多 5,000 個共用計算點，不保存原始 Tick，"
-        "且此區不使用選擇權 snapshot 輪詢。"
+        f"到期日：{expiry:%Y/%m/%d}｜契約來源：{source}｜最近 6 個履約價的 Call／Put，共 {subscription_count} 檔。"
+        f"每 5 秒更新本區；背景串流已更新 {tracker_status.get('stream_updates', 0):,} 次，最後更新 {stream_time}。"
+        "圖中只累積各契約的新成交；首次讀取與履約價更換只建立基準，因此不會把既有成交量誤算成新訊號。"
     )
-    with st.expander("BC／BP／SC／SP 怎麼看"):
+    with st.expander("訊號與操作判讀說明"):
         st.markdown(
             """
-            - **BC／BP**：成交較接近 Ask 端時，分別視為主動買進 Call／Put。
-            - **SC／SP**：成交較接近 Bid 端時，分別視為主動賣出 Call／Put。
-            - **多方力量＝BC＋SP**；**空方力量＝SC＋BP**；**賣方力量＝SC＋SP**。
-            - 這是附近履約價成交方向的即時推估，無法辨識開倉／平倉或交易者身分，因此不標示「主力／散戶」。
+            - **BC／BP**：成交較接近 Ask 端時，分別視為主動買進 Call／Put；**SC／SP**：成交較接近 Bid 端時，分別視為主動賣出 Call／Put。
+            - **多方力量＝BC＋SP**，**空方力量＝SC＋BP**，兩者差距達 10 個百分點才顯示「偏多／偏空」；不足時為「多空接近」。
+            - **賣方力量＝SC＋SP**，用來觀察賣方成交比重；它本身不代表看多或看空，需搭配多空淨差與臺指期支撐／壓力。
+            - 操作解讀只用於決定「偏多、偏空或先觀望」的優先順序；仍要等價格確認後進場，並依支撐／壓力設定停損，不是自動買賣訊號。
+            - 這是附近履約價成交方向的即時推估，不能辨識開倉／平倉或交易者身分，因此不標示「主力／散戶」。
             """
         )
 
