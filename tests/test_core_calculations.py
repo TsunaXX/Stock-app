@@ -472,6 +472,39 @@ def test_monthly_revenue_prefers_latest_official_month_for_each_company():
     assert rows["2408"]["營業收入-當月營收"] == "110"
 
 
+def test_mops_monthly_revenue_probes_early_announcements_before_deadline():
+    symbols = load_app_symbols(
+        "_latest_completed_roc_month_for_date", "_mops_monthly_revenue_probe_months",
+    )
+    probe_months = symbols["_mops_monthly_revenue_probe_months"]
+    # 9 月初即可看到部分公司提前公布的 8 月營收，並以 7 月作為完整公告備援。
+    assert probe_months(date(2026, 9, 2)) == [(115, 8), (115, 7)]
+    # 到申報期限後只需查上一曆月，避免產生不必要的重複 MOPS 請求。
+    assert probe_months(date(2026, 9, 11)) == [(115, 8)]
+
+
+def test_mops_monthly_revenue_parser_rejects_security_page_and_keeps_source():
+    symbols = load_app_symbols(
+        "_roc_month_text", "_parse_mops_company_monthly_revenue_response",
+    )
+    parse = symbols["_parse_mops_company_monthly_revenue_response"]
+    assert parse("FOR SECURITY REASONS", "2408", 115, 8, "MOPS+") is None
+    page = """
+        <div>民國115年08月 本資料由 (2408)南亞科技 公司提供</div>
+        <table>
+          <tr><td>本月</td><td>123</td></tr>
+          <tr><td>去年同期</td><td>100</td></tr>
+          <tr><td>增減百分比</td><td>23.0</td></tr>
+          <tr><td>本年累計</td><td>800</td></tr>
+          <tr><td>去年累計</td><td>700</td></tr>
+          <tr><td>增減百分比</td><td>14.3</td></tr>
+        </table>
+    """
+    row = parse(page, "2408", 115, 8, "MOPS+")
+    assert row["資料年月"] == "11508"
+    assert row["_source"] == "MOPS+ 單一公司月營收"
+
+
 def test_finmind_monthly_revenue_fallback_converts_july_data():
     symbols = load_app_symbols(
         "_to_number", "_roc_month_text", "build_finmind_monthly_revenue_row",

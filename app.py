@@ -1921,8 +1921,20 @@ def fetch_earnings_events(inputs):
 
 TWSE_MONTHLY_REVENUE_URL = "https://openapi.twse.com.tw/v1/opendata/t187ap05_L"
 TPEX_MONTHLY_REVENUE_URL = "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap05_O"
-MOPS_MONTHLY_REVENUE_PAGE_URL = "https://mopsov.twse.com.tw/mops/web/t05st10_ifrs"
-MOPS_MONTHLY_REVENUE_QUERY_URL = "https://mopsov.twse.com.tw/mops/web/ajax_t05st10_ifrs"
+# MOPS+ 是公告發布後最先出現單一公司月營收的來源。舊 mopsov 鏡像保留為
+# 連線備援，避免主站短暫安全驗證或維護時讓既有行事曆資料全部失效。
+MOPS_MONTHLY_REVENUE_SOURCES = (
+    (
+        "MOPS+",
+        "https://mops.twse.com.tw/mops/web/t05st10_ifrs",
+        "https://mops.twse.com.tw/mops/web/ajax_t05st10_ifrs",
+    ),
+    (
+        "MOPS 備援鏡像",
+        "https://mopsov.twse.com.tw/mops/web/t05st10_ifrs",
+        "https://mopsov.twse.com.tw/mops/web/ajax_t05st10_ifrs",
+    ),
+)
 
 
 def _to_number(value):
@@ -2111,9 +2123,30 @@ def _signed_percent(value):
 def _latest_completed_roc_month():
     """回傳依月營收申報期限可期待的最新民國年月。"""
     today = datetime.now(pytz.timezone("Asia/Taipei")).date()
+    return _latest_completed_roc_month_for_date(today)
+
+
+def _mops_monthly_revenue_probe_months(today=None):
+    """由新到舊列出 MOPS 應查的月營收月份。
+
+    月營收法定期限雖在次月 10 日，但公司可提前公告。10 日前先對追蹤公司
+    查詢上個曆月，讓 MOPS+ 已公布的資料立即可見；未公布者則直接沿用已完整
+    的官方彙總月份，不把尚未公告誤報為缺資料。
+    """
+    today = today or datetime.now(pytz.timezone("Asia/Taipei")).date()
+    completed_year, completed_month = _latest_completed_roc_month_for_date(today)
+    previous_calendar_day = today.replace(day=1) - timedelta(days=1)
+    announced_year = previous_calendar_day.year - 1911
+    announced_month = previous_calendar_day.month
+    months = [(announced_year, announced_month)]
+    if (completed_year, completed_month) not in months:
+        months.append((completed_year, completed_month))
+    return months
+
+
+def _latest_completed_roc_month_for_date(today):
+    """可測試版：依指定台灣日期取得完整申報月份。"""
     last_day = today.replace(day=1) - timedelta(days=1)
-    # 月營收通常在次月 10 日前公告；10 日以前維持前一個已完整公告月份，
-    # 11 日起才要求前一個曆月，避免把仍可用的最新資料誤判為過期。
     if today.day <= 10:
         last_day = last_day.replace(day=1) - timedelta(days=1)
     return last_day.year - 1911, last_day.month
@@ -2129,43 +2162,9 @@ def _roc_month_text(roc_year, month):
     return f"{int(roc_year):03d}{int(month):02d}"
 
 
-@st.cache_data(ttl=60 * 60 * 4, max_entries=128, show_spinner=False)
-def fetch_mops_company_monthly_revenue(code, roc_year, month, market_type):
-    """補查 MOPS 單一公司月營收，處理 TWSE 彙總 OpenAPI 更新落後的公告空窗。"""
-    payload = {
-        "step": "1",
-        "firstin": "1",
-        "off": "1",
-        "queryName": "co_id",
-        "inpuType": "co_id",
-        # MOPS 單一公司查詢可同時辨識上市與上櫃；傳 sii／otc 會使部分代號
-        # 在資料彙總更新前查不到最新月份。
-        "TYPEK": "all",
-        "isnew": "false",
-        "co_id": str(code),
-        "year": str(roc_year),
-        "month": f"{int(month):02d}",
-    }
-    headers = {
-        **CALENDAR_HTTP_HEADERS,
-        "Referer": MOPS_MONTHLY_REVENUE_PAGE_URL,
-        "X-Requested-With": "XMLHttpRequest",
-    }
-    try:
-        with requests.Session() as session:
-            session.headers.update(CALENDAR_HTTP_HEADERS)
-            session.get(MOPS_MONTHLY_REVENUE_PAGE_URL, timeout=12)
-            response = session.post(
-                MOPS_MONTHLY_REVENUE_QUERY_URL,
-                data=payload,
-                headers=headers,
-                timeout=12,
-            )
-            response.raise_for_status()
-    except requests.RequestException:
-        return None
-
-    soup = BeautifulSoup(response.text, "html.parser")
+def _parse_mops_company_monthly_revenue_response(response_text, code, roc_year, month, source_name):
+    """解析 MOPS+ 單一公司頁；安全驗證頁與空白回應一律視為無資料。"""
+    soup = BeautifulSoup(response_text, "html.parser")
     page_text = soup.get_text(" ", strip=True)
     expected_month = f"民國{roc_year}年{int(month):02d}月"
     if expected_month not in page_text or "本資料由" not in page_text:
@@ -2201,9 +2200,49 @@ def fetch_mops_company_monthly_revenue(code, roc_year, month, market_type):
         "累計營業收入-前期比較增減(%)": values["增減百分比"][1] if len(values["增減百分比"]) > 1 else None,
         "備註": note_match.group(1).strip() if note_match else "-",
         "_mops_direct": True,
+        "_source": f"{source_name} 單一公司月營收",
         # MOPS 單一公司頁不提供出表日期，採系統首次偵測到資料的台灣日期標示。
         "_report_date": datetime.now(pytz.timezone("Asia/Taipei")).date().isoformat(),
     }
+
+
+@st.cache_data(ttl=60 * 15, max_entries=128, show_spinner=False)
+def fetch_mops_company_monthly_revenue(code, roc_year, month, market_type="all"):
+    """優先由 MOPS+ 補查最新公告；舊鏡像僅在主站不可用時備援。"""
+    payload = {
+        "step": "1",
+        "firstin": "1",
+        "off": "1",
+        "queryName": "co_id",
+        "inpuType": "co_id",
+        "TYPEK": "all",
+        "isnew": "false",
+        "co_id": str(code),
+        "year": str(roc_year),
+        "month": f"{int(month):02d}",
+    }
+    for source_name, page_url, query_url in MOPS_MONTHLY_REVENUE_SOURCES:
+        headers = {
+            **CALENDAR_HTTP_HEADERS,
+            "Referer": page_url,
+            "X-Requested-With": "XMLHttpRequest",
+        }
+        try:
+            with requests.Session() as session:
+                session.headers.update(CALENDAR_HTTP_HEADERS)
+                session.get(page_url, timeout=8)
+                response = session.post(
+                    query_url, data=payload, headers=headers, timeout=8,
+                )
+                response.raise_for_status()
+        except requests.RequestException:
+            continue
+        parsed = _parse_mops_company_monthly_revenue_response(
+            response.text, code, roc_year, month, source_name
+        )
+        if parsed:
+            return parsed
+    return None
 
 
 def _signed_percent_arrow(value):
@@ -2642,10 +2681,35 @@ def fetch_taiwan_monthly_revenue_events(inputs):
 
     revenue_rows = fetch_twse_monthly_revenue_rows()
     rows_by_code = select_latest_monthly_revenue_rows(revenue_rows)
-    target_roc_year, target_month = _latest_completed_roc_month()
+    # 10 日前仍可能已有公司提早公布上月營收；先查 MOPS+ 的最新可能月份，
+    # 沒有資料才自然退回既有的完整公告月份。
+    mops_probe_months = _mops_monthly_revenue_probe_months()
+    target_roc_year, target_month = mops_probe_months[0]
     target_month_text = _roc_month_text(target_roc_year, target_month)
     previous_roc_year, previous_month = _previous_roc_month(target_roc_year, target_month)
     previous_month_text = _roc_month_text(previous_roc_year, previous_month)
+    # 申報期限前，最多同時三筆 MOPS+ 單一公司查詢。這能看到提早公告，卻不會
+    # 因逐檔等待或瞬間大量請求而拖慢行事曆／觸發來源端限制。
+    early_direct_rows = {}
+    if len(mops_probe_months) > 1:
+        early_codes = [
+            code for code in input_by_code
+            if str(rows_by_code.get(code, {}).get("資料年月", "")).strip() < target_month_text
+        ]
+        if early_codes:
+            with ThreadPoolExecutor(max_workers=min(3, len(early_codes))) as executor:
+                future_map = {
+                    executor.submit(
+                        fetch_mops_company_monthly_revenue, code, target_roc_year, target_month
+                    ): code
+                    for code in early_codes
+                }
+                for future in as_completed(future_map):
+                    code = future_map[future]
+                    try:
+                        early_direct_rows[code] = future.result()
+                    except Exception:
+                        early_direct_rows[code] = None
     events, missing = [], []
     for code, item in input_by_code.items():
         row = rows_by_code.get(code)
@@ -2662,40 +2726,45 @@ def fetch_taiwan_monthly_revenue_events(inputs):
         )
         finmind_report_date = finmind_row.get("_report_date") if finmind_row else None
         direct_row = None
-        if not row or row_month < target_month_text:
-            for market_type in ("sii", "otc", "all"):
+        known_month = max(
+            row_month,
+            str(finmind_row.get("資料年月", "")).strip() if finmind_row else "",
+        )
+        for probe_year, probe_month in mops_probe_months:
+            probe_month_text = _roc_month_text(probe_year, probe_month)
+            if known_month >= probe_month_text:
+                continue
+            if (probe_year, probe_month) == mops_probe_months[0] and code in early_direct_rows:
+                direct_row = early_direct_rows[code]
+            else:
                 direct_row = fetch_mops_company_monthly_revenue(
-                    code, target_roc_year, target_month, market_type
+                    code, probe_year, probe_month
                 )
-                if direct_row:
-                    break
             if direct_row:
-                previous_row = None
-                finmind_month = str(finmind_row.get("資料年月", "")) if finmind_row else ""
-                if finmind_row and finmind_month == str(direct_row.get("資料年月", "")):
-                    direct_row["營業收入-上月營收"] = finmind_row.get("營業收入-上月營收")
-                    direct_row["營業收入-上月比較增減(%)"] = finmind_row.get(
-                        "營業收入-上月比較增減(%)"
+                break
+        if direct_row:
+            previous_row = None
+            finmind_month = str(finmind_row.get("資料年月", "")) if finmind_row else ""
+            if finmind_row and finmind_month == str(direct_row.get("資料年月", "")):
+                direct_row["營業收入-上月營收"] = finmind_row.get("營業收入-上月營收")
+                direct_row["營業收入-上月比較增減(%)"] = finmind_row.get(
+                    "營業收入-上月比較增減(%)"
+                )
+            elif row and str(row.get("資料年月", "")).strip() == previous_month_text:
+                previous_row = row
+            else:
+                previous_row = fetch_mops_company_monthly_revenue(
+                    code, previous_roc_year, previous_month
+                )
+            if not direct_row.get("營業收入-上月營收"):
+                previous_revenue = previous_row.get("營業收入-當月營收") if previous_row else None
+                direct_row["營業收入-上月營收"] = previous_revenue
+                current_number = _to_number(direct_row["營業收入-當月營收"])
+                previous_number = _to_number(previous_revenue)
+                if current_number is not None and previous_number not in (None, 0):
+                    direct_row["營業收入-上月比較增減(%)"] = (
+                        (current_number - previous_number) / previous_number * 100
                     )
-                elif row and str(row.get("資料年月", "")).strip() == previous_month_text:
-                    previous_row = row
-                else:
-                    previous_row = None
-                    for market_type in ("sii", "otc", "all"):
-                        previous_row = fetch_mops_company_monthly_revenue(
-                            code, previous_roc_year, previous_month, market_type
-                        )
-                        if previous_row:
-                            break
-                if not direct_row.get("營業收入-上月營收"):
-                    previous_revenue = previous_row.get("營業收入-當月營收") if previous_row else None
-                    direct_row["營業收入-上月營收"] = previous_revenue
-                    current_number = _to_number(direct_row["營業收入-當月營收"])
-                    previous_number = _to_number(previous_revenue)
-                    if current_number is not None and previous_number not in (None, 0):
-                        direct_row["營業收入-上月比較增減(%)"] = (
-                            (current_number - previous_number) / previous_number * 100
-                        )
 
         # 數值優先採 MOPS；若 MOPS 彙總尚未更新則採最新 FinMind。MOPS 單一
         # 公司頁未提供確切出表日，因此保留原本「系統偵測日」的誠實標示，不把
