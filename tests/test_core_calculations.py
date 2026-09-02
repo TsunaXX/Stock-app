@@ -119,6 +119,8 @@ def test_option_wall_scores_use_otm_open_interest_as_primary_signal():
     result = calculate(rows, spot=22000, window_points=700)
     assert result["support"] == 21800
     assert result["resistance"] == 22300
+    assert result["support_strength"] > 0
+    assert result["resistance_strength"] > 0
     assert result["balance"] > 0
     assert result["status"] == "SP 支撐偏強"
     assert 21800 < result["support_center"] < 21900
@@ -1316,14 +1318,29 @@ def test_option_flow_and_swing_credit_use_mobile_safe_refresh_and_layout():
     assert "build_option_flow_operation_advice(result)" in flow_source
     assert "訊號與操作判讀說明" in flow_source
     assert "calculate_txo_cumulative_flow_series(history)" in flow_source
+    assert "calculate_option_wall_scores(rows, spot, window_points=700)" in flow_source
+    assert "render_txo_pressure_profile(pressure_result)" in flow_source
+    pressure_renderer = source[
+        source.index("def render_txo_pressure_profile"):
+        source.index("def build_txo_pressure_history_chart")
+    ]
+    assert "SC／SP 履約價支撐壓力" in pressure_renderer
+    assert "未另外呼叫永豐快照" in pressure_renderer
     assert "盤中累積力量（口）" in flow_source
     assert "name='台指期'" in flow_source
     assert "autorange=True" in flow_source
     assert "range=[0, 100]" not in flow_source
     assert "最近 6 個履約價的 Call／Put" in flow_source
-    assert "snapshot_fallback=False" in source[
-        source.index("def build_txo_flow_rows"):history_start
+    shared_quote_source = source[source.index("def build_txo_flow_rows"):history_start]
+    assert "snapshot_fallback=False" in shared_quote_source
+    assert "get_taifex_txo_open_interest_rows_nonblocking()" in shared_quote_source
+    assert "build_txo_pressure_rows(" not in flow_source
+    oi_cache_source = source[
+        source.index("def get_taifex_txo_open_interest_rows_nonblocking"):
+        source.index("def build_txo_pressure_rows")
     ]
+    assert "retry_after" in oi_cache_source
+    assert "completed_at + 120.0" in oi_cache_source
     stream_payload_start = source.index("def _stream_payload")
     stream_payload_end = source.index("def _install_stream_callbacks", stream_payload_start)
     assert "_update_txo_flow_trackers_from_stream" in source[

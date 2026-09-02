@@ -5227,6 +5227,8 @@ def calculate_option_wall_scores(rows, spot, window_points=700):
     return {
         'spot': spot, 'support': support_row['strike'],
         'resistance': resistance_row['strike'],
+        'support_strength': support_row['wall_score'],
+        'resistance_strength': resistance_row['wall_score'],
         'support_center': support_center, 'resistance_center': resistance_center,
         'balance': balance,
         'put_total': put_total, 'call_total': call_total,
@@ -5932,13 +5934,16 @@ def get_taifex_txo_open_interest_rows_nonblocking(max_age_seconds=600):
     now_mono = time.monotonic()
     with shared_lock:
         state = shared.setdefault('option_pressure_oi', {
-            'rows': [], 'loaded_at': 0.0, 'loading': False,
+            'rows': [], 'loaded_at': 0.0, 'loading': False, 'retry_after': 0.0,
         })
         rows = list(state.get('rows') or [])
         is_fresh = bool(rows) and now_mono - float(state.get('loaded_at', 0)) < max_age_seconds
         if is_fresh:
             return rows
-        should_start = not bool(state.get('loading'))
+        should_start = (
+            not bool(state.get('loading'))
+            and now_mono >= float(state.get('retry_after', 0) or 0)
+        )
         if should_start:
             state['loading'] = True
 
@@ -5951,6 +5956,11 @@ def get_taifex_txo_open_interest_rows_nonblocking(max_age_seconds=600):
                 if refreshed_rows:
                     current['rows'] = list(refreshed_rows)
                     current['loaded_at'] = completed_at
+                    current['retry_after'] = 0.0
+                else:
+                    # The visible fragment runs every five seconds. Keep an
+                    # unavailable official source from becoming a retry loop.
+                    current['retry_after'] = completed_at + 120.0
                 current['loading'] = False
 
         threading.Thread(
@@ -5996,8 +6006,8 @@ def build_txo_pressure_rows(api, contracts, expiry, spot, window_points=700):
     return rows, len(selected)
 
 
-def build_txo_flow_rows(api, contracts, spot, window_points=700):
-    """Read nearby Call/Put cumulative trade-side volume from the shared stream."""
+def build_txo_flow_rows(api, contracts, spot, expiry=None, window_points=700):
+    """Read one shared nearby quote set for both flow and SC/SP pressure."""
     selected = select_txo_flow_contracts(
         contracts, spot, max_strikes=6, window_points=window_points,
     )
@@ -6006,18 +6016,34 @@ def build_txo_flow_rows(api, contracts, spot, window_points=700):
     # Flow must come from the live callback. Repeated snapshot fallback would
     # make the curve jump every 30 seconds and consume unnecessary API traffic.
     quotes = get_txo_snapshot_quotes(api, selected, snapshot_fallback=False)
+    official_rows = get_taifex_txo_open_interest_rows_nonblocking() if expiry else []
+    official_map = {
+        (row['expiry'], row['right'], float(row['strike'])): row
+        for row in official_rows
+    }
     rows = []
     for contract, quote in zip(selected, quotes):
         try:
             strike = float(getattr(contract, 'strike_price'))
         except (TypeError, ValueError, AttributeError):
             continue
+        right = txo_right_value(contract)
+        official = official_map.get((expiry, right, strike), {})
+        live_volume = float(quote.get('volume', 0) or 0)
+        official_volume = float(official.get('volume', 0) or 0)
         rows.append({
             'code': str(getattr(contract, 'code', '') or ''),
-            'right': txo_right_value(contract), 'strike': strike,
+            'right': right, 'strike': strike,
             # 成交在 Ask 端視為主動買進，成交在 Bid 端視為主動賣出。
             'active_buy': quote.get('ask_side_total_vol'),
             'active_sell': quote.get('bid_side_total_vol'),
+            # Reuse the same stream rows for the strike pressure profile. The
+            # official OI cache refreshes independently and never triggers a
+            # second Shioaji option snapshot round.
+            'open_interest': float(official.get('open_interest', 0) or 0),
+            'volume': max(live_volume, official_volume),
+            'ask_volume': float(quote.get('ask_volume', 0) or 0),
+            'last': quote.get('last') or official.get('last'),
         })
     return rows, len(selected)
 
@@ -6061,9 +6087,10 @@ def build_txo_pressure_profile_chart(result):
         )
         fig.add_trace(go.Scatter(
             x=[row['strike'] for row in rows],
-            y=[row['strength'] for row in rows],
+            y=[row['wall_score'] for row in rows],
             mode='lines+markers', name=name,
-            line=dict(color=color, width=3), marker=dict(size=8),
+            line=dict(color=color, width=3, shape='spline', smoothing=0.55),
+            marker=dict(size=8),
             customdata=[
                 [row['open_interest'], row['volume'], row['ask_volume']]
                 for row in rows
@@ -6080,11 +6107,57 @@ def build_txo_pressure_profile_chart(result):
         annotation_text=f"期貨 {result['spot']:,.0f}", annotation_position='top',
     )
     fig.update_layout(
-        template='plotly_dark', height=390, margin=dict(l=45, r=25, t=35, b=45),
+        template='plotly_dark', height=390, margin=dict(l=45, r=25, t=52, b=45),
         xaxis_title='履約價', yaxis_title='相對牆分數（0–100）',
-        hovermode='x unified', legend=dict(orientation='h', y=1.14, x=0),
+        hovermode='x unified', legend=dict(orientation='h', y=1.18, x=0),
+        uirevision='txo-pressure-profile-v2',
     )
     return fig
+
+
+def render_txo_pressure_profile(result):
+    """Render the current strike-based SP support and SC resistance profile."""
+    st.markdown("##### 🧱 SC／SP 履約價支撐壓力")
+    if result is None:
+        st.info("SC／SP 支撐壓力資料正在累積；取得附近履約價成交量或未平倉量後會自動顯示。")
+        return
+
+    render_compact_metric_card_grid([
+        {
+            'label': 'SP 主要支撐', 'value': f"{result['support']:,.0f}",
+            'detail': f"距期貨 {result['support'] - result['spot']:+,.0f} 點",
+            'color': '#40c4ff',
+        },
+        {
+            'label': 'SC 主要壓力', 'value': f"{result['resistance']:,.0f}",
+            'detail': f"距期貨 {result['resistance'] - result['spot']:+,.0f} 點",
+            'color': '#ff5252',
+        },
+        {
+            'label': 'SP 支撐重心', 'value': f"{result['support_center']:,.0f}",
+            'detail': f"強度 {result['support_strength']:.1f}",
+            'color': '#80d8ff',
+        },
+        {
+            'label': 'SC 壓力重心', 'value': f"{result['resistance_center']:,.0f}",
+            'detail': f"強度 {result['resistance_strength']:.1f}",
+            'color': '#ff8a80',
+        },
+        {
+            'label': '牆面狀態', 'value': result['status'],
+            'detail': f"資料完整度 {result['confidence']}%",
+            'color': result['status_color'],
+        },
+    ], columns=5, class_name='compact-metric-grid txo-pressure-grid')
+    st.plotly_chart(
+        build_txo_pressure_profile_chart(result), width='stretch',
+        config={'displayModeBar': False, 'scrollZoom': False},
+        key='txo_pressure_profile_chart',
+    )
+    st.caption(
+        "藍線高峰為較強 SP 支撐，紅線高峰為較強 SC 壓力；白色虛線是目前臺指期。"
+        "曲線使用同一批即時選擇權資料，未另外呼叫永豐快照。"
+    )
 
 
 def build_txo_pressure_history_chart(history):
@@ -6419,12 +6492,13 @@ def render_txo_flow_indicator(api, fallback_spot, expiry_choice):
         return
 
     rows, subscription_count = build_txo_flow_rows(
-        api, contracts, spot, window_points=700,
+        api, contracts, spot, expiry=expiry, window_points=700,
     )
     history_key = f"{expiry:%Y%m%d}:{expiry_choice}"
     register_txo_flow_tracker(api, history_key, rows, spot=spot)
     history, tracker_status = get_txo_flow_tracker_snapshot(api, history_key)
     result = calculate_option_flow_strength(rows)
+    pressure_result = calculate_option_wall_scores(rows, spot, window_points=700)
     if result is None:
         st.info("附近 Call／Put 串流正在累積成交方向；取得 Bid／Ask 端累計成交量後會自動顯示。")
         history_chart = build_txo_flow_history_chart(history)
@@ -6434,6 +6508,7 @@ def render_txo_flow_indicator(api, fallback_spot, expiry_choice):
                 config={'displayModeBar': False, 'scrollZoom': False},
                 key='txo_flow_history_chart_warming',
             )
+        render_txo_pressure_profile(pressure_result)
         st.caption(
             f"到期日：{expiry:%Y/%m/%d}｜契約來源：{source}｜已訂閱 {subscription_count} 檔；"
             "新契約第一筆只建立基準，不以委託掛單量或既有累積量冒充新成交。"
@@ -6497,6 +6572,7 @@ def render_txo_flow_indicator(api, fallback_spot, expiry_choice):
             config={'displayModeBar': False, 'scrollZoom': False},
             key='txo_flow_history_chart',
         )
+    render_txo_pressure_profile(pressure_result)
     last_stream_at = tracker_status.get('last_stream_at')
     stream_time = (
         _stream_datetime(last_stream_at).strftime('%H:%M:%S')
@@ -6513,6 +6589,8 @@ def render_txo_flow_indicator(api, fallback_spot, expiry_choice):
             - **BC／BP**：成交較接近 Ask 端時，分別視為主動買進 Call／Put；**SC／SP**：成交較接近 Bid 端時，分別視為主動賣出 Call／Put。
             - **多方力量＝BC＋SP**，**空方力量＝SC＋BP**，兩者差距達 10 個百分點才顯示「偏多／偏空」；不足時為「多空接近」。
             - **賣方力量＝SC＋SP**，用來觀察賣方成交比重；它本身不代表看多或看空，需搭配多空淨差與臺指期支撐／壓力。
+            - **SC／SP 履約價曲線**：藍線高峰代表較強 SP 支撐，紅線高峰代表較強 SC 壓力；主要價位依未平倉量 60%、成交量 25%、賣方掛單量 15% 估算，並對距離目前期貨較近的價位稍微加權。
+            - 支撐／壓力是可能出現反應的區域，不保證守住或壓回；臺指期有效突破壓力或跌破支撐時，應重新確認多空力量，不宜只看舊價位反向操作。
             - 操作解讀只用於決定「偏多、偏空或先觀望」的優先順序；仍要等價格確認後進場，並依支撐／壓力設定停損，不是自動買賣訊號。
             - 這是附近履約價成交方向的即時推估，不能辨識開倉／平倉或交易者身分，因此不標示「主力／散戶」。
             """
