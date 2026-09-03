@@ -17718,6 +17718,9 @@ def fetch_stock_data_raw(
              if latest_limit_touch['touched_up']:
                  tag_label = "漲停高" if (abs(limit_up_T - high_90_raw) < 0.05) else "漲停"
                  if note_floor <= limit_up_T <= note_ceiling: points.append({"val": limit_up_T, "tag": tag_label})
+             if latest_limit_touch['touched_down']:
+                 tag_label = "跌停低" if (abs(limit_down_T - low_90_raw) < 0.05) else "跌停"
+                 if note_floor <= limit_down_T <= note_ceiling: points.append({"val": limit_down_T, "tag": tag_label})
 
         if len(hist_strat) >= 2:
             high_T = hist_strat.iloc[-1]['High']
@@ -19188,8 +19191,16 @@ if tab1.open and stock_strategy_tab.open:
                 manual = st.session_state.saved_notes.get(code, "")
 
                 if not points:
+                    # 優先保留目前表格中的完整文字，避免 cached_notes 蓋掉使用者在自動備註任意位置插入的手動修改。
                     cached = st.session_state.get('cached_notes', {}).get(code, {})
-                    if cached and cached.get('note'):
+                    current_note_value = row.get('戰略備註', '')
+                    current_auto_value = row.get('_auto_note', '')
+                    current_note = '' if pd.isna(current_note_value) else str(current_note_value).strip()
+                    current_auto = '' if pd.isna(current_auto_value) else str(current_auto_value).strip()
+                    if current_note:
+                        new_full_note = current_note
+                        new_auto_note = current_auto or cached.get('auto', '')
+                    elif cached and cached.get('note'):
                         new_full_note = cached['note']
                         new_auto_note = cached.get('auto', '')
                     else:
