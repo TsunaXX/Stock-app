@@ -1,0 +1,106 @@
+name: Apply stock strategy note fix
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  fix-stock-strategy-notes:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Patch strategy note logic
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('app.py')
+          source = path.read_text(encoding='utf-8')
+
+          old_limit = '''        if len(hist_strat) >= 2:
+             if latest_limit_touch['touched_up']:
+                 tag_label = "漲停高" if (abs(limit_up_T - high_90_raw) < 0.05) else "漲停"
+                 if note_floor <= limit_up_T <= note_ceiling: points.append({"val": limit_up_T, "tag": tag_label})
+
+        if len(hist_strat) >= 2:
+'''
+          new_limit = '''        if len(hist_strat) >= 2:
+             if latest_limit_touch['touched_up']:
+                 tag_label = "漲停高" if (abs(limit_up_T - high_90_raw) < 0.05) else "漲停"
+                 if note_floor <= limit_up_T <= note_ceiling: points.append({"val": limit_up_T, "tag": tag_label})
+             if latest_limit_touch['touched_down']:
+                 tag_label = "跌停低" if (abs(limit_down_T - low_90_raw) < 0.05) else "跌停"
+                 if note_floor <= limit_down_T <= note_ceiling: points.append({"val": limit_down_T, "tag": tag_label})
+
+        if len(hist_strat) >= 2:
+'''
+          if old_limit not in source:
+              raise SystemExit('limit-note target block not found; aborting without modifying app.py')
+          source = source.replace(old_limit, new_limit, 1)
+
+          old_cache = '''                if not points:
+                    cached = st.session_state.get('cached_notes', {}).get(code, {})
+                    if cached and cached.get('note'):
+                        new_full_note = cached['note']
+                        new_auto_note = cached.get('auto', '')
+                    else:
+                        new_full_note, new_auto_note = generate_note_from_points(points, manual, show_3d_hilo)
+                else:
+                    new_full_note, new_auto_note = generate_note_from_points(points, manual, show_3d_hilo)
+'''
+          new_cache = '''                if not points:
+                    # 優先保留目前表格中的完整文字，避免 cached_notes 蓋掉使用者在
+                    # 自動備註任意位置插入的手動修改；只有目前列真的沒有備註時才回退快取。
+                    cached = st.session_state.get('cached_notes', {}).get(code, {})
+                    current_note_value = row.get('戰略備註', '')
+                    current_auto_value = row.get('_auto_note', '')
+                    current_note = '' if pd.isna(current_note_value) else str(current_note_value).strip()
+                    current_auto = '' if pd.isna(current_auto_value) else str(current_auto_value).strip()
+                    if current_note:
+                        new_full_note = current_note
+                        new_auto_note = current_auto or cached.get('auto', '')
+                    elif cached and cached.get('note'):
+                        new_full_note = cached['note']
+                        new_auto_note = cached.get('auto', '')
+                    else:
+                        new_full_note, new_auto_note = generate_note_from_points(points, manual, show_3d_hilo)
+                else:
+                    new_full_note, new_auto_note = generate_note_from_points(points, manual, show_3d_hilo)
+'''
+          if old_cache not in source:
+              raise SystemExit('cached-note target block not found; aborting without modifying app.py')
+          source = source.replace(old_cache, new_cache, 1)
+
+          path.write_text(source, encoding='utf-8')
+          PY
+
+      - name: Validate patch
+        shell: bash
+        run: |
+          python -m py_compile app.py
+          python - <<'PY'
+          from pathlib import Path
+          source = Path('app.py').read_text(encoding='utf-8')
+          assert 'tag_label = "跌停低" if (abs(limit_down_T - low_90_raw) < 0.05) else "跌停"' in source
+          assert "if current_note:" in source
+          assert 'if manual_note.startswith("[M]")' in source
+          PY
+
+      - name: Commit fix and remove temporary workflow
+        shell: bash
+        run: |
+          rm -f .github/workflows/fix_stock_strategy_notes.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app.py .github/workflows/fix_stock_strategy_notes.yml
+          git commit -m "Fix stock strategy note generation"
+          git push origin HEAD:main
