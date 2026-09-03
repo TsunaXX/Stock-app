@@ -22,64 +22,18 @@ jobs:
         run: |
           python - <<'PY'
           from pathlib import Path
-
           path = Path('app.py')
           source = path.read_text(encoding='utf-8')
-
-          old_limit = '''        if len(hist_strat) >= 2:
-             if latest_limit_touch['touched_up']:
-                 tag_label = "漲停高" if (abs(limit_up_T - high_90_raw) < 0.05) else "漲停"
-                 if note_floor <= limit_up_T <= note_ceiling: points.append({"val": limit_up_T, "tag": tag_label})
-
-        if len(hist_strat) >= 2:
-'''
-          new_limit = '''        if len(hist_strat) >= 2:
-             if latest_limit_touch['touched_up']:
-                 tag_label = "漲停高" if (abs(limit_up_T - high_90_raw) < 0.05) else "漲停"
-                 if note_floor <= limit_up_T <= note_ceiling: points.append({"val": limit_up_T, "tag": tag_label})
-             if latest_limit_touch['touched_down']:
-                 tag_label = "跌停低" if (abs(limit_down_T - low_90_raw) < 0.05) else "跌停"
-                 if note_floor <= limit_down_T <= note_ceiling: points.append({"val": limit_down_T, "tag": tag_label})
-
-        if len(hist_strat) >= 2:
-'''
+          old_limit = "        if len(hist_strat) >= 2:\n             if latest_limit_touch['touched_up']:\n                 tag_label = \"漲停高\" if (abs(limit_up_T - high_90_raw) < 0.05) else \"漲停\"\n                 if note_floor <= limit_up_T <= note_ceiling: points.append({\"val\": limit_up_T, \"tag\": tag_label})\n\n        if len(hist_strat) >= 2:\n"
+          new_limit = "        if len(hist_strat) >= 2:\n             if latest_limit_touch['touched_up']:\n                 tag_label = \"漲停高\" if (abs(limit_up_T - high_90_raw) < 0.05) else \"漲停\"\n                 if note_floor <= limit_up_T <= note_ceiling: points.append({\"val\": limit_up_T, \"tag\": tag_label})\n             if latest_limit_touch['touched_down']:\n                 tag_label = \"跌停低\" if (abs(limit_down_T - low_90_raw) < 0.05) else \"跌停\"\n                 if note_floor <= limit_down_T <= note_ceiling: points.append({\"val\": limit_down_T, \"tag\": tag_label})\n\n        if len(hist_strat) >= 2:\n"
           if old_limit not in source:
               raise SystemExit('limit-note target block not found; aborting without modifying app.py')
           source = source.replace(old_limit, new_limit, 1)
-
-          old_cache = '''                if not points:
-                    cached = st.session_state.get('cached_notes', {}).get(code, {})
-                    if cached and cached.get('note'):
-                        new_full_note = cached['note']
-                        new_auto_note = cached.get('auto', '')
-                    else:
-                        new_full_note, new_auto_note = generate_note_from_points(points, manual, show_3d_hilo)
-                else:
-                    new_full_note, new_auto_note = generate_note_from_points(points, manual, show_3d_hilo)
-'''
-          new_cache = '''                if not points:
-                    # 優先保留目前表格中的完整文字，避免 cached_notes 蓋掉使用者在
-                    # 自動備註任意位置插入的手動修改；只有目前列真的沒有備註時才回退快取。
-                    cached = st.session_state.get('cached_notes', {}).get(code, {})
-                    current_note_value = row.get('戰略備註', '')
-                    current_auto_value = row.get('_auto_note', '')
-                    current_note = '' if pd.isna(current_note_value) else str(current_note_value).strip()
-                    current_auto = '' if pd.isna(current_auto_value) else str(current_auto_value).strip()
-                    if current_note:
-                        new_full_note = current_note
-                        new_auto_note = current_auto or cached.get('auto', '')
-                    elif cached and cached.get('note'):
-                        new_full_note = cached['note']
-                        new_auto_note = cached.get('auto', '')
-                    else:
-                        new_full_note, new_auto_note = generate_note_from_points(points, manual, show_3d_hilo)
-                else:
-                    new_full_note, new_auto_note = generate_note_from_points(points, manual, show_3d_hilo)
-'''
+          old_cache = "                if not points:\n                    cached = st.session_state.get('cached_notes', {}).get(code, {})\n                    if cached and cached.get('note'):\n                        new_full_note = cached['note']\n                        new_auto_note = cached.get('auto', '')\n                    else:\n                        new_full_note, new_auto_note = generate_note_from_points(points, manual, show_3d_hilo)\n                else:\n                    new_full_note, new_auto_note = generate_note_from_points(points, manual, show_3d_hilo)\n"
+          new_cache = "                if not points:\n                    # 優先保留目前表格中的完整文字，避免 cached_notes 蓋掉使用者在自動備註任意位置插入的手動修改。\n                    cached = st.session_state.get('cached_notes', {}).get(code, {})\n                    current_note_value = row.get('戰略備註', '')\n                    current_auto_value = row.get('_auto_note', '')\n                    current_note = '' if pd.isna(current_note_value) else str(current_note_value).strip()\n                    current_auto = '' if pd.isna(current_auto_value) else str(current_auto_value).strip()\n                    if current_note:\n                        new_full_note = current_note\n                        new_auto_note = current_auto or cached.get('auto', '')\n                    elif cached and cached.get('note'):\n                        new_full_note = cached['note']\n                        new_auto_note = cached.get('auto', '')\n                    else:\n                        new_full_note, new_auto_note = generate_note_from_points(points, manual, show_3d_hilo)\n                else:\n                    new_full_note, new_auto_note = generate_note_from_points(points, manual, show_3d_hilo)\n"
           if old_cache not in source:
               raise SystemExit('cached-note target block not found; aborting without modifying app.py')
           source = source.replace(old_cache, new_cache, 1)
-
           path.write_text(source, encoding='utf-8')
           PY
 
@@ -91,7 +45,7 @@ jobs:
           from pathlib import Path
           source = Path('app.py').read_text(encoding='utf-8')
           assert 'tag_label = "跌停低" if (abs(limit_down_T - low_90_raw) < 0.05) else "跌停"' in source
-          assert "if current_note:" in source
+          assert 'if current_note:' in source
           assert 'if manual_note.startswith("[M]")' in source
           PY
 
