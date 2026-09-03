@@ -17616,7 +17616,12 @@ def fetch_stock_data_raw(
         if len(ma20_series.dropna()) >= 6:
             risk_ma20_slope = float(ma20_series.iloc[-1] - ma20_series.iloc[-6])
 
-    strategy_base_price = hist_strat.iloc[-1]['Close']
+    # 戰略備註與表格收盤價使用同一價格基準；歷史 K 棒仍保留原值供高低點與均線計算。
+    strategy_base_price = (
+        live_quote_price
+        if live_quote_price is not None and live_quote_price > 0
+        else live_base_price
+    )
     if len(hist_strat) >= 2: prev_of_base = hist_strat.iloc[-2]['Close']
     else: prev_of_base = strategy_base_price 
 
@@ -17749,7 +17754,7 @@ def fetch_stock_data_raw(
     # 兼容字典與舊版集合的判定
     has_futures = futures_set.get(code, "") if isinstance(futures_set, dict) else ("✅" if futures_set and code in futures_set else "")
     
-    display_price = live_quote_price if live_quote_price is not None and live_quote_price > 0 else live_base_price
+    display_price = strategy_base_price
     display_change_rate = live_quote_rate if live_quote_rate is not None else live_pct_change
     return {
         "代號": code, "名稱": final_name_display, "收盤價": round(display_price, 2), "漲跌幅": display_change_rate, "期貨": has_futures,
