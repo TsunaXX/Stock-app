@@ -182,6 +182,55 @@ def test_option_flow_operation_advice_matches_direction_and_seller_context():
     assert neutral["operation"] != bullish["operation"]
 
 
+def test_option_flow_direction_combines_recent_flow_price_and_walls():
+    symbols = load_app_symbols(
+        "_safe_number", "calculate_txo_cumulative_flow_series",
+        "calculate_option_flow_direction",
+    )
+    calculate = symbols["calculate_option_flow_direction"]
+    start = datetime(2026, 9, 1, 9, 0, 0)
+    history = [
+        {"time": start, "spot": 22000, "BC": 0, "BP": 0, "SC": 0, "SP": 0},
+        {"time": start + timedelta(minutes=10), "spot": 22030,
+         "BC": 70, "BP": 10, "SC": 20, "SP": 30},
+        {"time": start + timedelta(minutes=16), "spot": 22080,
+         "BC": 120, "BP": 15, "SC": 30, "SP": 60},
+    ]
+    result = calculate(history, {"balance": 20})
+    assert result["status"] == "偏多確認"
+    assert result["bullish_votes"] == 4
+    assert result["dominant_votes"] == 4
+    assert [signal["label"] for signal in result["signals"]] == [
+        "5分鐘", "15分鐘", "台指期", "牆面",
+    ]
+
+
+def test_expanded_option_pressure_uses_twelve_official_strikes_each_side():
+    symbols = load_app_symbols("build_txo_expanded_pressure_rows")
+    expand = symbols["build_txo_expanded_pressure_rows"]
+    expiry = date(2026, 9, 4)
+    official = []
+    for index in range(15):
+        official.extend([
+            {"expiry": expiry, "right": "P", "strike": 22000 - index * 50,
+             "open_interest": 100 + index, "volume": 10 + index, "last": 20},
+            {"expiry": expiry, "right": "C", "strike": 22000 + index * 50,
+             "open_interest": 200 + index, "volume": 20 + index, "last": 30},
+        ])
+    live = [{
+        "right": "C", "strike": 22000, "volume": 999,
+        "ask_volume": 18, "last": 31,
+    }]
+    rows = expand(live, official, expiry, 22000)
+    assert len([row for row in rows if row["right"] == "P"]) == 12
+    assert len([row for row in rows if row["right"] == "C"]) == 12
+    at_money_call = next(
+        row for row in rows if row["right"] == "C" and row["strike"] == 22000
+    )
+    assert at_money_call["volume"] == 999
+    assert at_money_call["ask_volume"] == 18
+
+
 def test_option_flow_tracker_uses_per_contract_baselines_and_ignores_counter_resets():
     symbols = load_app_symbols(
         "_stream_number", "_stream_datetime", "_apply_txo_flow_counter_update",
@@ -1348,17 +1397,19 @@ def test_option_flow_and_swing_credit_use_mobile_safe_refresh_and_layout():
     assert "max_points=5000" in flow_source
     assert "@st.fragment(run_every=5)" in flow_source
     assert "def render_txo_flow_indicator" in flow_source
-    assert "build_option_flow_operation_advice(result)" in flow_source
+    assert "build_option_flow_operation_advice(" in flow_source
     assert "訊號與操作判讀說明" in flow_source
     assert "calculate_txo_cumulative_flow_series(history)" in flow_source
-    assert "calculate_option_wall_scores(rows, spot, window_points=700)" in flow_source
+    assert "build_txo_expanded_pressure_rows(" in flow_source
+    assert "max_each_side=12, window_points=1200" in flow_source
+    assert "calculate_option_flow_direction(history, pressure_result)" in flow_source
     assert "render_txo_pressure_profile(pressure_result)" in flow_source
     pressure_renderer = source[
         source.index("def render_txo_pressure_profile"):
         source.index("def build_txo_pressure_history_chart")
     ]
     assert "SC／SP 履約價支撐壓力" in pressure_renderer
-    assert "未另外呼叫永豐快照" in pressure_renderer
+    assert "不增加永豐快照" in pressure_renderer
     assert "盤中累積力量（口）" in flow_source
     assert "name='台指期'" in flow_source
     assert "autorange=True" in flow_source

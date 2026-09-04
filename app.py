@@ -5154,8 +5154,115 @@ def calculate_option_flow_strength(rows):
     }
 
 
-def build_option_flow_operation_advice(result):
-    """Translate the option-flow status into a concise, risk-aware trading plan."""
+def calculate_option_flow_direction(history, pressure_result=None):
+    """Combine recent flow, TXF movement and option walls into one readable bias."""
+    frame = calculate_txo_cumulative_flow_series(history)
+    signals = []
+    votes = []
+    window_snapshots = {}
+
+    if not frame.empty and len(frame) >= 2:
+        latest = frame.iloc[-1]
+        latest_time = latest['time']
+        first_time = frame.iloc[0]['time']
+        for minutes in (5, 15):
+            cutoff = latest_time - pd.Timedelta(minutes=minutes)
+            earlier = frame[frame['time'] <= cutoff]
+            baseline = earlier.iloc[-1] if not earlier.empty else frame.iloc[0]
+            elapsed = max(0.0, (latest_time - first_time).total_seconds())
+            if elapsed < minutes * 60:
+                signals.append({
+                    'key': f'{minutes}m', 'label': f'{minutes}分鐘',
+                    'direction': 0, 'text': '累積中', 'color': '#b0bec5',
+                })
+                continue
+            bullish_delta = max(
+                0.0, float(latest['bullish_curve']) - float(baseline['bullish_curve'])
+            )
+            bearish_delta = max(
+                0.0, -(float(latest['bearish_curve']) - float(baseline['bearish_curve']))
+            )
+            total_delta = bullish_delta + bearish_delta
+            edge = (
+                (bullish_delta - bearish_delta) / total_delta * 100
+                if total_delta > 0 else 0.0
+            )
+            direction = 1 if edge >= 5 else (-1 if edge <= -5 else 0)
+            votes.append(direction)
+            window_snapshots[minutes] = (latest, baseline)
+            signals.append({
+                'key': f'{minutes}m', 'label': f'{minutes}分鐘',
+                'direction': direction,
+                'text': ('偏多' if direction > 0 else '偏空' if direction < 0 else '接近')
+                        + f' {edge:+.1f}',
+                'color': '#ff6b6b' if direction > 0 else '#35d07f' if direction < 0 else '#ffd54f',
+            })
+
+        price_pair = window_snapshots.get(5) or window_snapshots.get(15)
+        if price_pair:
+            latest, baseline = price_pair
+            price_delta = float(latest['spot']) - float(baseline['spot'])
+            price_gate = max(10.0, abs(float(latest['spot'])) * 0.0005)
+            price_direction = 1 if price_delta >= price_gate else (-1 if price_delta <= -price_gate else 0)
+            votes.append(price_direction)
+            signals.append({
+                'key': 'txf', 'label': '台指期', 'direction': price_direction,
+                'text': ('上漲' if price_direction > 0 else '下跌' if price_direction < 0 else '盤整')
+                        + f' {price_delta:+,.0f}點',
+                'color': '#ff6b6b' if price_direction > 0 else '#35d07f' if price_direction < 0 else '#ffd54f',
+            })
+    else:
+        signals.extend([
+            {'key': '5m', 'label': '5分鐘', 'direction': 0, 'text': '累積中', 'color': '#b0bec5'},
+            {'key': '15m', 'label': '15分鐘', 'direction': 0, 'text': '累積中', 'color': '#b0bec5'},
+            {'key': 'txf', 'label': '台指期', 'direction': 0, 'text': '累積中', 'color': '#b0bec5'},
+        ])
+
+    wall_balance = _safe_number((pressure_result or {}).get('balance'))
+    if wall_balance is None:
+        wall_direction = 0
+        wall_text = '資料累積中'
+        wall_color = '#b0bec5'
+    else:
+        wall_direction = 1 if wall_balance >= 12 else (-1 if wall_balance <= -12 else 0)
+        votes.append(wall_direction)
+        wall_text = (
+            'SP支撐強' if wall_direction > 0
+            else 'SC壓力強' if wall_direction < 0
+            else '大致平衡'
+        ) + f' {wall_balance:+.1f}'
+        wall_color = '#ff6b6b' if wall_direction > 0 else '#35d07f' if wall_direction < 0 else '#ffd54f'
+    signals.append({
+        'key': 'wall', 'label': '牆面', 'direction': wall_direction,
+        'text': wall_text, 'color': wall_color,
+    })
+
+    bullish_votes = sum(value > 0 for value in votes)
+    bearish_votes = sum(value < 0 for value in votes)
+    available = len(votes)
+    if bullish_votes >= 3 and bullish_votes > bearish_votes:
+        status, tone, color = '偏多確認', 'bullish', '#ff4b4b'
+    elif bearish_votes >= 3 and bearish_votes > bullish_votes:
+        status, tone, color = '偏空確認', 'bearish', '#00c853'
+    elif bullish_votes >= 2 and bullish_votes > bearish_votes:
+        status, tone, color = '弱偏多', 'bullish', '#ff8a80'
+    elif bearish_votes >= 2 and bearish_votes > bullish_votes:
+        status, tone, color = '弱偏空', 'bearish', '#69f0ae'
+    elif available < 2:
+        status, tone, color = '資料累積中', 'neutral', '#90a4ae'
+    else:
+        status, tone, color = '多空分歧', 'neutral', '#ffc107'
+    dominant_votes = max(bullish_votes, bearish_votes)
+    return {
+        'status': status, 'tone': tone, 'status_color': color,
+        'bullish_votes': bullish_votes, 'bearish_votes': bearish_votes,
+        'dominant_votes': dominant_votes, 'available': available,
+        'signals': signals,
+    }
+
+
+def build_option_flow_operation_advice(result, direction_result=None, pressure_result=None):
+    """Translate the combined option-flow state into a concise trading plan."""
     if not result:
         return None
 
@@ -5163,36 +5270,42 @@ def build_option_flow_operation_advice(result):
     bearish_share = float(result.get('bearish_share', 0) or 0)
     seller_share = float(result.get('seller_share', 0) or 0)
     net = bullish_share - bearish_share
-    status = str(result.get('status', '多空接近'))
+    status = str((direction_result or {}).get('status') or result.get('status', '多空接近'))
+    support = _safe_number((pressure_result or {}).get('support'))
+    resistance = _safe_number((pressure_result or {}).get('resistance'))
+    support_text = f'{support:,.0f}' if support is not None else 'SP 支撐'
+    resistance_text = f'{resistance:,.0f}' if resistance is not None else 'SC 壓力'
 
-    if status == '偏多':
+    if status in ('偏多', '偏多確認', '弱偏多'):
+        confirmed = status in ('偏多', '偏多確認')
         advice = {
             'tone': 'bullish', 'icon': '🔴', 'color': '#ff6b6b', 'background': '#35191d',
-            'title': '偏多，但以回測支撐後順勢為主',
-            'operation': '優先等待臺指期回測短線支撐後止穩，再偏多操作；不在急漲時追價。',
-            'risk': '若跌破支撐，或多空淨差明顯收斂，先減碼或觀望。',
+            'title': ('偏多確認' if confirmed else '弱偏多') + '｜等回測支撐',
+            'operation': f'台指期守住 {support_text} 並止穩，再偏多；突破 {resistance_text} 可續看。',
+            'risk': f'跌破 {support_text} 或短線力量轉空，停止偏多操作。',
         }
-    elif status == '偏空':
+    elif status in ('偏空', '偏空確認', '弱偏空'):
+        confirmed = status in ('偏空', '偏空確認')
         advice = {
             'tone': 'bearish', 'icon': '🟢', 'color': '#35d07f', 'background': '#123326',
-            'title': '偏空，等反彈受壓後順勢為主',
-            'operation': '優先等待臺指期反彈到短線壓力未過，再偏空操作；不在急跌時追空。',
-            'risk': '若站回壓力，或多空淨差明顯收斂，先回補或觀望。',
+            'title': ('偏空確認' if confirmed else '弱偏空') + '｜等反彈受壓',
+            'operation': f'台指期反彈不過 {resistance_text}，再偏空；跌破 {support_text} 可續看。',
+            'risk': f'站回 {resistance_text} 或短線力量轉多，停止偏空操作。',
         }
     else:
         advice = {
             'tone': 'neutral', 'icon': '🟡', 'color': '#ffd54f', 'background': '#3a3212',
-            'title': '多空接近，先以區間／觀望處理',
-            'operation': '等多空淨差擴大，且臺指期同步突破壓力或跌破支撐後，再決定方向。',
-            'risk': '訊號未確認前降低部位，避免在區間中央追價或追空。',
+            'title': ('資料累積中' if status == '資料累積中' else '訊號分歧') + '｜先等方向一致',
+            'operation': f'站上 {resistance_text} 且力量轉多才看多；跌破 {support_text} 且力量轉空才看空。',
+            'risk': '支撐與壓力之間先視為區間，不在中間追價。',
         }
 
     if seller_share >= 58:
-        seller_note = '賣方成交偏高，較可能出現區間拉鋸；賣方力量不等於多方或空方。'
+        seller_note = '賣方偏高：較可能震盪，不能單獨判多空。'
     elif seller_share <= 42:
-        seller_note = '買方主動成交較多；仍須由臺指期價格與多空淨差同步確認突破是否延續。'
+        seller_note = '買方偏高：波動可能放大，仍需台指期確認。'
     else:
-        seller_note = '買賣方成交接近；仍以臺指期支撐壓力與多空淨差的變化為主。'
+        seller_note = '買賣接近：以台指期與支撐壓力為準。'
 
     advice.update({
         'status_summary': (
@@ -5269,6 +5382,12 @@ def calculate_option_wall_scores(rows, spot, window_points=700):
     calls = [item for item in cleaned if item['right'] == 'C']
     support_row = max(puts, key=lambda item: (item['wall_score'], item['strike']))
     resistance_row = max(calls, key=lambda item: (item['wall_score'], -item['strike']))
+    support_levels = sorted(
+        puts, key=lambda item: (item['wall_score'], item['strike']), reverse=True,
+    )[:3]
+    resistance_levels = sorted(
+        calls, key=lambda item: (item['wall_score'], -item['strike']), reverse=True,
+    )[:3]
     put_total = sum(item['wall_score'] for item in puts)
     call_total = sum(item['wall_score'] for item in calls)
     total = put_total + call_total
@@ -5303,6 +5422,7 @@ def calculate_option_wall_scores(rows, spot, window_points=700):
         'put_total': put_total, 'call_total': call_total,
         'status': status, 'status_color': status_color,
         'confidence': confidence, 'rows': cleaned,
+        'support_levels': support_levels, 'resistance_levels': resistance_levels,
     }
 
 
@@ -6117,6 +6237,65 @@ def build_txo_flow_rows(api, contracts, spot, expiry=None, window_points=700):
     return rows, len(selected)
 
 
+def build_txo_expanded_pressure_rows(
+    live_rows, official_rows, expiry, spot, max_each_side=12, window_points=1200,
+):
+    """Expand SC/SP walls with cached TAIFEX rows, without another Shioaji request."""
+    try:
+        spot = float(spot)
+    except (TypeError, ValueError):
+        return list(live_rows or [])
+    if not np.isfinite(spot) or spot <= 0:
+        return list(live_rows or [])
+
+    live_map = {}
+    for row in live_rows or []:
+        try:
+            key = (str(row.get('right', '')).upper(), float(row.get('strike')))
+        except (TypeError, ValueError):
+            continue
+        live_map[key] = row
+
+    selected_official = []
+    for right in ('P', 'C'):
+        candidates = []
+        for source_row in official_rows or []:
+            if source_row.get('expiry') != expiry or str(source_row.get('right', '')).upper() != right:
+                continue
+            try:
+                strike = float(source_row.get('strike'))
+            except (TypeError, ValueError):
+                continue
+            is_otm = strike <= spot if right == 'P' else strike >= spot
+            distance = abs(strike - spot)
+            if not is_otm or distance > float(window_points):
+                continue
+            candidates.append((distance, strike, source_row))
+        candidates.sort(key=lambda item: (item[0], item[1]))
+        selected_official.extend(item[2] for item in candidates[:max_each_side])
+
+    if not selected_official:
+        return list(live_rows or [])
+
+    expanded = []
+    for official in selected_official:
+        right = str(official.get('right', '')).upper()
+        strike = float(official.get('strike'))
+        live = live_map.get((right, strike), {})
+        expanded.append({
+            'right': right,
+            'strike': strike,
+            'open_interest': float(official.get('open_interest', 0) or 0),
+            'volume': max(
+                float(official.get('volume', 0) or 0),
+                float(live.get('volume', 0) or 0),
+            ),
+            'ask_volume': float(live.get('ask_volume', 0) or 0),
+            'last': live.get('last') or official.get('last'),
+        })
+    return expanded
+
+
 def append_txo_pressure_history(history_key, result, min_interval_seconds=5, max_points=360):
     """Store a bounded live curve only while the pressure fragment is visible."""
     shared, shared_lock = get_shared_market_data_cache()
@@ -6218,14 +6397,29 @@ def render_txo_pressure_profile(result):
             'color': result['status_color'],
         },
     ], columns=5, class_name='compact-metric-grid txo-pressure-grid')
+    support_ladder = '　'.join(
+        f"S{index} {row['strike']:,.0f}"
+        for index, row in enumerate(result.get('support_levels', []), 1)
+    ) or '資料累積中'
+    resistance_ladder = '　'.join(
+        f"R{index} {row['strike']:,.0f}"
+        for index, row in enumerate(result.get('resistance_levels', []), 1)
+    ) or '資料累積中'
+    st.markdown(
+        "<div style='display:flex;flex-wrap:wrap;gap:6px 22px;margin:4px 0 8px;line-height:1.55;'>"
+        f"<span style='color:#40c4ff;font-weight:750;'>支撐｜{support_ladder}</span>"
+        f"<span style='color:#ff6b6b;font-weight:750;'>壓力｜{resistance_ladder}</span>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
     st.plotly_chart(
         build_txo_pressure_profile_chart(result), width='stretch',
         config={'displayModeBar': False, 'scrollZoom': False},
         key='txo_pressure_profile_chart',
     )
     st.caption(
-        "藍線高峰為較強 SP 支撐，紅線高峰為較強 SC 壓力；白色虛線是目前臺指期。"
-        "曲線使用同一批即時選擇權資料，未另外呼叫永豐快照。"
+        "藍線看 SP 支撐、紅線看 SC 壓力；S1／R1 最強，S2／R2、S3／R3 是其他主要區域。"
+        "白色虛線是台指期；資料擴大到兩側各最多 12 個履約價，且不增加永豐快照。"
     )
 
 
@@ -6567,7 +6761,14 @@ def render_txo_flow_indicator(api, fallback_spot, expiry_choice):
     register_txo_flow_tracker(api, history_key, rows, spot=spot)
     history, tracker_status = get_txo_flow_tracker_snapshot(api, history_key)
     result = calculate_option_flow_strength(rows)
-    pressure_result = calculate_option_wall_scores(rows, spot, window_points=700)
+    pressure_rows = build_txo_expanded_pressure_rows(
+        rows, get_taifex_txo_open_interest_rows_nonblocking(), expiry, spot,
+        max_each_side=12, window_points=1200,
+    )
+    pressure_result = calculate_option_wall_scores(
+        pressure_rows, spot, window_points=1200,
+    )
+    direction_result = calculate_option_flow_direction(history, pressure_result)
     if result is None:
         st.info("附近 Call／Put 串流正在累積成交方向；取得 Bid／Ask 端累計成交量後會自動顯示。")
         history_chart = build_txo_flow_history_chart(history)
@@ -6595,19 +6796,20 @@ def render_txo_flow_indicator(api, fallback_spot, expiry_choice):
             'color': live_snapshot['color'] if live_snapshot else '#f5f5f5',
         },
         {
-            'label': '多方力量', 'value': f"{result['bullish_share']:.1f}%",
+            'label': '多方成交', 'value': f"{result['bullish_share']:.1f}%",
             'detail': 'BC＋SP', 'color': '#ff4b4b',
         },
         {
-            'label': '空方力量', 'value': f"{result['bearish_share']:.1f}%",
+            'label': '空方成交', 'value': f"{result['bearish_share']:.1f}%",
             'detail': 'SC＋BP', 'color': '#00c853',
         },
         {
-            'label': '選擇權方向', 'value': result['status'],
-            'detail': result['status'], 'color': result['status_color'],
+            'label': '綜合方向', 'value': direction_result['status'],
+            'detail': f"{direction_result['dominant_votes']}／{direction_result['available']} 項同向",
+            'color': direction_result['status_color'],
         },
         {
-            'label': '賣方力量', 'value': f"{result['seller_share']:.1f}%",
+            'label': '賣方成交', 'value': f"{result['seller_share']:.1f}%",
             'detail': 'SC＋SP', 'color': '#ffc107',
         },
     ], columns=5, class_name='compact-metric-grid txo-flow-grid')
@@ -6620,7 +6822,21 @@ def render_txo_flow_indicator(api, fallback_spot, expiry_choice):
         "</div>",
         unsafe_allow_html=True,
     )
-    advice = build_option_flow_operation_advice(result)
+    signal_html = ''.join(
+        "<span style='padding:4px 8px;border:1px solid #3b4350;border-radius:7px;'>"
+        f"<b>{html.escape(signal['label'])}</b> "
+        f"<span style='color:{signal['color']};font-weight:750;'>"
+        f"{html.escape(signal['text'])}</span></span>"
+        for signal in direction_result['signals']
+    )
+    st.markdown(
+        "<div style='display:flex;flex-wrap:wrap;gap:6px 8px;margin:5px 0 8px;'>"
+        + signal_html + "</div>",
+        unsafe_allow_html=True,
+    )
+    advice = build_option_flow_operation_advice(
+        result, direction_result, pressure_result,
+    )
     if advice:
         st.markdown(
             "<div style='margin:8px 0 10px;padding:10px 12px;border-left:4px solid "
@@ -6648,20 +6864,18 @@ def render_txo_flow_indicator(api, fallback_spot, expiry_choice):
         if last_stream_at is not None else '等待首筆'
     )
     st.caption(
-        f"到期日：{expiry:%Y/%m/%d}｜契約來源：{source}｜最近 6 個履約價的 Call／Put，共 {subscription_count} 檔。"
+        f"到期日：{expiry:%Y/%m/%d}｜契約來源：{source}｜方向追蹤最近 6 個履約價的 Call／Put，共 {subscription_count} 檔。"
         f"每 5 秒更新本區；背景串流已更新 {tracker_status.get('stream_updates', 0):,} 次，最後更新 {stream_time}。"
-        "圖中只累積各契約的新成交；首次讀取與履約價更換只建立基準，因此不會把既有成交量誤算成新訊號。"
+        "支撐壓力另採期交所快取資料擴大到兩側各 12 檔，不增加永豐快照。"
     )
     with st.expander("訊號與操作判讀說明"):
         st.markdown(
             """
-            - **BC／BP**：成交較接近 Ask 端時，分別視為主動買進 Call／Put；**SC／SP**：成交較接近 Bid 端時，分別視為主動賣出 Call／Put。
-            - **多方力量＝BC＋SP**，**空方力量＝SC＋BP**，兩者差距達 10 個百分點才顯示「偏多／偏空」；不足時為「多空接近」。
-            - **賣方力量＝SC＋SP**，用來觀察賣方成交比重；它本身不代表看多或看空，需搭配多空淨差與臺指期支撐／壓力。
-            - **SC／SP 履約價曲線**：藍線高峰代表較強 SP 支撐，紅線高峰代表較強 SC 壓力；主要價位依未平倉量 60%、成交量 25%、賣方掛單量 15% 估算，並對距離目前期貨較近的價位稍微加權。
-            - 支撐／壓力是可能出現反應的區域，不保證守住或壓回；臺指期有效突破壓力或跌破支撐時，應重新確認多空力量，不宜只看舊價位反向操作。
-            - 操作解讀只用於決定「偏多、偏空或先觀望」的優先順序；仍要等價格確認後進場，並依支撐／壓力設定停損，不是自動買賣訊號。
-            - 這是附近履約價成交方向的即時推估，不能辨識開倉／平倉或交易者身分，因此不標示「主力／散戶」。
+            - **方向怎麼判斷：**綜合 5 分鐘、15 分鐘、台指期走勢及 SC／SP 牆面；3 項同向為確認，2 項同向為偏弱，其餘為分歧。
+            - **多方／空方成交：**多方＝BC＋SP，空方＝SC＋BP。這是成交方向推估，不代表開倉或特定交易人。
+            - **賣方成交：**SC＋SP 偏高表示賣方活躍，常見於拉鋸；它本身不判多空。
+            - **支撐壓力：**藍線是 SP 支撐、紅線是 SC 壓力；S1／R1 最強，S2／R2、S3／R3 是其他重要區域。
+            - **操作原則：**力量與台指同向才順勢；支撐、壓力之間先當區間，突破或跌破後再確認方向。
             """
         )
 
