@@ -15221,7 +15221,24 @@ def parse_twse_disposition_page_payload(payload, target_date=None):
     return disposition_codes, next_open_codes
 
 
-@st.cache_data(ttl=900, max_entries=1, show_spinner=False)
+def validate_market_risk_payload(payload, expected_type):
+    """Only explicit official data/empty results count as a successful check."""
+    if not isinstance(payload, expected_type):
+        raise ValueError('官方名單格式不符')
+    if isinstance(payload, list):
+        if any(not isinstance(record, dict) for record in payload):
+            raise ValueError('官方名單資料列格式不符')
+    else:
+        status = str(payload.get('stat', ''))
+        if '沒有符合' in status or '查無資料' in status:
+            return payload
+        if status and status != 'OK':
+            raise ValueError('官方名單查詢未成功')
+        if not any(isinstance(payload.get(key), list) for key in ('data', 'tables')):
+            raise ValueError('官方名單缺少資料列')
+    return payload
+
+
 def fetch_market_risk_lists():
     """取得上市、上櫃注意／處置名單，短重試後交由最後成功資料接手。"""
     attention_counts = {}
@@ -15236,7 +15253,7 @@ def fetch_market_risk_lists():
         'Accept-Language': 'zh-TW,zh;q=0.9,en;q=0.8',
         'Cache-Control': 'no-cache',
     }
-    def fetch_json(name, url, expected_type, request_params=None):
+    def fetch_json(name, url, expected_type, request_params=None, attempts=2):
         """官方站偶發回空頁或 5xx；每個 API 獨立執行重試。"""
         session = (
             _tpex_verified_session()
@@ -15246,7 +15263,7 @@ def fetch_market_risk_lists():
         last_error = None
 
         try:
-            for attempt in range(3):
+            for attempt in range(attempts):
                 try:
                     params = dict(request_params or {})
                     if attempt:
@@ -15261,18 +15278,7 @@ def fetch_market_risk_lists():
 
                     payload = response.json()
 
-                    if not isinstance(payload, expected_type):
-                        raise ValueError(
-                            f"回傳格式應為 {expected_type.__name__}"
-                        )
-
-                    if (
-                        isinstance(payload, dict)
-                        and not isinstance(payload.get('data', []), list)
-                    ):
-                        raise ValueError("缺少名單資料列")
-
-                    return payload
+                    return validate_market_risk_payload(payload, expected_type)
 
                 except (
                     requests.RequestException,
@@ -15281,11 +15287,11 @@ def fetch_market_risk_lists():
                 ) as exc:
                     last_error = exc
 
-                    if attempt < 2:
+                    if attempt < attempts - 1:
                         time.sleep(0.35 * (attempt + 1))
 
             raise RuntimeError(
-                f"{name} 已重試 3 次仍失敗：{last_error}"
+                f"{name} 暫時無法取得：{type(last_error).__name__}"
             )
         finally:
             session.close()
@@ -15438,6 +15444,7 @@ def fetch_market_risk_lists():
     ]
 
     fetched = {}
+    failed_jobs = {}
 
     with ThreadPoolExecutor(max_workers=len(fetch_jobs)) as executor:
         future_map = {
@@ -15450,7 +15457,22 @@ def fetch_market_risk_lists():
             try:
                 fetched[name] = future.result()
             except Exception as exc:
-                errors.append(f'{name}: {exc}')
+                failed_jobs[name] = str(exc)
+
+    # Give transient gateway failures a fresh connection after the first batch.
+    # Retry failed sources only; the entire operation remains at most 3 attempts/source.
+    if failed_jobs:
+        with ThreadPoolExecutor(max_workers=len(failed_jobs)) as executor:
+            recovery = {
+                executor.submit(fetch_json, name, url, expected_type, params, 1): name
+                for name, url, expected_type, params in fetch_jobs if name in failed_jobs
+            }
+            for future in as_completed(recovery):
+                name = recovery[future]
+                try:
+                    fetched[name] = future.result()
+                except Exception as exc:
+                    errors.append(f'{name}: {exc}')
 
     # TWSE OpenAPI 回傳 list；集中市場三個來源分開解析。
     twse_notice = fetched.get('上市注意')
@@ -15682,22 +15704,29 @@ def merge_market_risk_refresh(
     ).strftime('%Y/%m/%d %H:%M:%S')
     previous = dict(previous_state or {})
     error_list = list(errors or [])
-    if error_list and previous.get('updated'):
+    if error_list and any(previous.get(key) for key in (
+        'updated', 'attention', 'disposition', 'disposition_tomorrow',
+    )):
         # 部分來源失敗時仍保留最後完整名單；但公告頁已確認的「下個
         # 開盤日處置」屬較高風險新資訊，必須立即併入，不能被其他
         # 非關聯 API 的 timeout 一起丟棄。
         confirmed_next_open = set(previous.get('disposition_tomorrow', []))
         confirmed_next_open.update(disposition_tomorrow or [])
         previous['disposition_tomorrow'] = sorted(confirmed_next_open)
+        previous['disposition'] = sorted(set(previous.get('disposition', [])) | set(disposition or []))
+        merged_attention = dict(previous.get('attention', {}))
+        for code, count in (attention or {}).items():
+            merged_attention[code] = max(merged_attention.get(code, 0), count)
+        previous['attention'] = merged_attention
         previous['errors'] = error_list
         previous['last_attempt'] = attempted_at
-        previous['using_last_success'] = True
+        previous['using_last_success'] = bool(previous.get('updated'))
         return previous
     return {
         'attention': dict(attention or {}),
         'disposition': list(disposition or []),
         'disposition_tomorrow': list(disposition_tomorrow or []),
-        'updated': attempted_at,
+        'updated': '' if error_list else attempted_at,
         'last_attempt': attempted_at,
         'errors': error_list,
         'using_last_success': False,
@@ -19627,7 +19656,6 @@ if tab1.open and stock_strategy_tab.open:
                             "🔄 更新上市／上櫃注意與處置名單",
                             key="refresh_risk_filter_market_data", width='stretch',
                         ):
-                            fetch_market_risk_lists.clear()
                             with st.spinner("正在更新上市／上櫃注意與處置名單..."):
                                 attention, disposition, disposition_tomorrow, errors = fetch_market_risk_lists()
                             st.session_state.risk_filter_market_data = merge_market_risk_refresh(
@@ -19657,7 +19685,10 @@ if tab1.open and stock_strategy_tab.open:
                                 st.session_state.saved_notes,
                                 replace_stock_data=True,
                             )
-                            st.toast(f"注意／處置名單已更新，並更新 {quote_count} 檔報價。", icon="🔄")
+                            st.toast(
+                                f"名單{'部分來源未取得' if errors else '已更新'}；更新 {quote_count} 檔報價。",
+                                icon="⚠️" if errors else "🔄",
+                            )
                             st.rerun()
 
                     cache_sync_notice = st.session_state.pop('_stock_cache_sync_notice', '')
@@ -19667,6 +19698,9 @@ if tab1.open and stock_strategy_tab.open:
                     if market_risk_data.get('updated') and not market_risk_data.get('errors'):
                         st.caption(f"上市／上櫃注意與處置名單更新：{market_risk_data['updated']}。")
                     elif market_risk_data.get('errors'):
+                        with st.expander('查看未取得的來源', expanded=False):
+                            for source_error in market_risk_data['errors']:
+                                st.text(source_error)
                         if market_risk_data.get('using_last_success'):
                             st.warning(
                                 f"本次名單未完整取得，沿用 {market_risk_data.get('updated')} 的最後成功資料；"
@@ -20262,7 +20296,6 @@ if tab1.open and stock_strategy_tab.open:
                         help="欄位順序與上方股票主表一致；關閉可查看完整分析欄位。",
                     )
                     if st.button("🔄 更新注意／處置名單", key="refresh_indep_market_risk_data"):
-                        fetch_market_risk_lists.clear()
                         with st.spinner("正在更新上市／上櫃注意與處置名單..."):
                             attention, disposition, disposition_tomorrow, errors = fetch_market_risk_lists()
                         st.session_state.risk_filter_market_data = merge_market_risk_refresh(

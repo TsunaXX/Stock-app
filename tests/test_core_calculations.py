@@ -1241,6 +1241,63 @@ def test_stock_refresh_actions_also_refresh_available_quotes_and_explanation_mat
     assert "refresh_stock_quotes_for_codes" in source[market_button:market_end]
 
 
+def test_market_risk_rejects_error_pages_and_accepts_explicit_empty():
+    import pytest
+    validate = load_app_symbols('validate_market_risk_payload')['validate_market_risk_payload']
+    for payload in ({}, {'stat': '系統忙碌'}, {'data': None}):
+        with pytest.raises(ValueError):
+            validate(payload, dict)
+    assert validate({'stat': '很抱歉，沒有符合條件的資料!'}, dict)
+    assert validate([], list) == []
+
+
+def test_risk_fetch_recovers_failed_source_without_refetching_successes(monkeypatch):
+    import requests
+    from types import SimpleNamespace
+    symbols = load_app_symbols('fetch_market_risk_lists', 'validate_market_risk_payload',
+                               'parse_twse_disposition_page_payload', 'parse_tpex_disposition_page_payload')
+    counts = {}
+    sessions = []
+    class Session:
+        def __init__(self):
+            sessions.append(self)
+        def get(self, url, **kwargs):
+            counts[url] = counts.get(url, 0) + 1
+            if url.endswith('/announcement/notice') and counts[url] < 3:
+                raise requests.ConnectionError('temporary gateway failure')
+            payload = [] if '/v1/' in url else {'stat': 'OK', 'data': [], 'tables': []}
+            return SimpleNamespace(raise_for_status=lambda: None, json=lambda: payload)
+        def close(self):
+            pass
+    monkeypatch.setattr(requests, 'Session', Session)
+    symbols.update(requests=requests, _TPEX_ORIGIN='https://www.tpex.org.tw/',
+                   _tpex_verified_session=Session, adjust_to_next_market_day=lambda d: d)
+    monkeypatch.setattr(time, 'sleep', lambda _: None)
+    result = symbols['fetch_market_risk_lists']()
+    assert result == ({}, [], [], [])
+    assert sorted(counts.values()) == [1] * 7 + [3]
+    assert len(sessions) == 9
+
+
+def test_first_failed_risk_refresh_does_not_claim_success():
+    merge = load_app_symbols('merge_market_risk_refresh')['merge_market_risk_refresh']
+    result = merge({}, {'2330': 1}, ['2408'], [], ['上櫃未取得'], attempted_at='2026/09/05 12:00:00')
+    assert result['updated'] == ''
+    assert result['attention'] == {'2330': 1}
+    recovered = merge(result, {}, [], [], [], attempted_at='2026/09/05 12:01:00')
+    assert recovered['updated'] == '2026/09/05 12:01:00'
+    assert recovered['disposition'] == []
+
+
+def test_partial_refresh_preserves_new_current_risks():
+    merge = load_app_symbols('merge_market_risk_refresh')['merge_market_risk_refresh']
+    result = merge({'updated': 'yesterday', 'attention': {'2330': 2}, 'disposition': ['2408']},
+                   {'2330': 1, '6226': 4}, ['3441'], [], ['timeout'])
+    assert result['attention'] == {'2330': 2, '6226': 4}
+    assert result['disposition'] == ['2408', '3441']
+    assert result['updated'] == 'yesterday'
+
+
 def test_partial_market_risk_refresh_keeps_last_complete_lists():
     merge = load_app_symbols("merge_market_risk_refresh")["merge_market_risk_refresh"]
     previous = {
