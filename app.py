@@ -13679,6 +13679,7 @@ def fetch_futures_strategy_universe(rollover_key=None):
         'User-Agent': 'Mozilla/5.0 (compatible; StockApp/1.0; +https://openapi.taifex.com.tw/)',
         'Referer': 'https://openapi.taifex.com.tw/',
         'Cache-Control': 'no-cache',
+        'Referer': 'https://www.tpex.org.tw/zh-tw/announce/market/disposal.html',
     }
 
     def fetch_endpoint(endpoint):
@@ -15230,12 +15231,13 @@ def validate_market_risk_payload(payload, expected_type):
             raise ValueError('官方名單資料列格式不符')
     else:
         status = str(payload.get('stat', ''))
-        if '沒有符合' in status or '查無資料' in status:
+        if any(isinstance(payload.get(key), list) for key in ('data', 'tables')):
+            return payload
+        if '查無資料' in status or ('沒有' in status and ('符合' in status or '資料' in status)):
             return payload
         if status and status != 'OK':
             raise ValueError('官方名單查詢未成功')
-        if not any(isinstance(payload.get(key), list) for key in ('data', 'tables')):
-            raise ValueError('官方名單缺少資料列')
+        raise ValueError('官方名單缺少資料列')
     return payload
 
 
@@ -15246,6 +15248,7 @@ def fetch_market_risk_lists():
     # Keep the legacy state key for saved-session compatibility. It now means
     # the next actual exchange trading day, not the next calendar day.
     disposition_tomorrow_codes = set()
+    market_by_code = {}
     errors = []
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36',
@@ -15292,6 +15295,7 @@ def fetch_market_risk_lists():
 
             raise RuntimeError(
                 f"{name} 暫時無法取得：{type(last_error).__name__}"
+                + (f"（{str(last_error)[:120]}）" if str(last_error or '') else '')
             )
         finally:
             session.close()
@@ -15384,8 +15388,11 @@ def fetch_market_risk_lists():
     def roc_date_text(value):
         return f'{value.year - 1911:03d}/{value.month:02d}/{value.day:02d}'
 
+    page_start_date = target_date - timedelta(days=45)
     tpex_page_params = {
-        'startDate': roc_date_text(target_date),
+        # The public disposal page filters by announcement date. Look back far
+        # enough to retain treatments that started earlier and remain active.
+        'startDate': roc_date_text(page_start_date),
         'endDate': roc_date_text(next_open_date),
         'type': 'all',
         'reason': '-1',
@@ -15409,7 +15416,11 @@ def fetch_market_risk_lists():
             '上市處置公告頁',
             'https://www.twse.com.tw/rwd/zh/announcement/punish',
             dict,
-            {'response': 'json'},
+            {
+                'response': 'json',
+                'startDate': page_start_date.strftime('%Y%m%d'),
+                'endDate': next_open_date.strftime('%Y%m%d'),
+            },
         ),
         (
             '上市注意累計異常',
@@ -15440,6 +15451,18 @@ def fetch_market_risk_lists():
             'https://www.tpex.org.tw/www/zh-tw/bulletin/disposal',
             dict,
             tpex_page_params,
+        ),
+        (
+            '上市證券清單',
+            'https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL',
+            list,
+            None,
+        ),
+        (
+            '上櫃證券清單',
+            _TPEX_DAILY_QUOTES_URL,
+            list,
+            None,
         ),
     ]
 
@@ -15474,7 +15497,34 @@ def fetch_market_risk_lists():
                 except Exception as exc:
                     errors.append(f'{name}: {exc}')
 
+    # The public TPEx disposal page occasionally loses its JSON request while
+    # several OpenAPI calls run together. Give this safety-critical source one
+    # delayed, serial retry using the public page as referrer.
+    tpex_page_prefix = '上櫃處置公告頁:'
+    if any(error.startswith(tpex_page_prefix) for error in errors):
+        time.sleep(0.75)
+        try:
+            fetched['上櫃處置公告頁'] = fetch_json(
+                '上櫃處置公告頁',
+                'https://www.tpex.org.tw/www/zh-tw/bulletin/disposal',
+                dict,
+                tpex_page_params,
+                attempts=2,
+            )
+            errors = [error for error in errors if not error.startswith(tpex_page_prefix)]
+        except Exception:
+            pass
+
     # TWSE OpenAPI 回傳 list；集中市場三個來源分開解析。
+    for record in fetched.get('上市證券清單') or []:
+        code = str(record.get('Code', '')).strip()
+        if re.fullmatch(r'\d{4}', code):
+            market_by_code[code] = '上市'
+    for record in fetched.get('上櫃證券清單') or []:
+        code = str(record.get('SecuritiesCompanyCode', '')).strip()
+        if re.fullmatch(r'\d{4}', code):
+            market_by_code[code] = '上櫃'
+
     twse_notice = fetched.get('上市注意')
     if twse_notice is not None:
         try:
@@ -15690,12 +15740,14 @@ def fetch_market_risk_lists():
         attention_counts,
         sorted(disposition_codes),
         sorted(disposition_tomorrow_codes),
+        market_by_code,
         errors,
     )
 
 
 def merge_market_risk_refresh(
     previous_state, attention, disposition, disposition_tomorrow, errors,
+    market_by_code=None,
     attempted_at=None,
 ):
     """Keep the last complete official lists when a manual refresh is partial."""
@@ -15718,6 +15770,9 @@ def merge_market_risk_refresh(
         for code, count in (attention or {}).items():
             merged_attention[code] = max(merged_attention.get(code, 0), count)
         previous['attention'] = merged_attention
+        previous['market_by_code'] = {
+            **dict(previous.get('market_by_code', {})), **dict(market_by_code or {}),
+        }
         previous['errors'] = error_list
         previous['last_attempt'] = attempted_at
         previous['using_last_success'] = bool(previous.get('updated'))
@@ -15726,6 +15781,7 @@ def merge_market_risk_refresh(
         'attention': dict(attention or {}),
         'disposition': list(disposition or []),
         'disposition_tomorrow': list(disposition_tomorrow or []),
+        'market_by_code': dict(market_by_code or {}),
         'updated': '' if error_list else attempted_at,
         'last_attempt': attempted_at,
         'errors': error_list,
@@ -15741,6 +15797,8 @@ def market_risk_checked_for_row(row, state, api=None):
         return bool(state.get('updated'))
     market = str(row.get('市場', row.get('exchange', ''))).upper()
     code = str(row.get('代號', '')).strip()
+    plain_code = re.sub(r'\.(?:TW|TWO)$', '', code, flags=re.IGNORECASE)
+    market = str(state.get('market_by_code', {}).get(plain_code, market)).upper()
     if code.endswith('.TWO'):
         market = '上櫃'
     elif code.endswith('.TW'):
@@ -19684,10 +19742,11 @@ if tab1.open and stock_strategy_tab.open:
                             key="refresh_risk_filter_market_data", width='stretch',
                         ):
                             with st.spinner("正在更新上市／上櫃注意與處置名單..."):
-                                attention, disposition, disposition_tomorrow, errors = fetch_market_risk_lists()
+                                attention, disposition, disposition_tomorrow, market_by_code, errors = fetch_market_risk_lists()
                             st.session_state.risk_filter_market_data = merge_market_risk_refresh(
                                 st.session_state.get('risk_filter_market_data', {}),
                                 attention, disposition, disposition_tomorrow, errors,
+                                market_by_code=market_by_code,
                             )
                             st.session_state['_show_market_risk_errors'] = bool(errors)
                             refreshed_quotes, quote_count = refresh_stock_quotes_for_codes(
@@ -20329,7 +20388,7 @@ if tab1.open and stock_strategy_tab.open:
                     )
                     if st.button("🔄 更新注意／處置名單", key="refresh_indep_market_risk_data"):
                         with st.spinner("正在更新上市／上櫃注意與處置名單..."):
-                            attention, disposition, disposition_tomorrow, errors = fetch_market_risk_lists()
+                            attention, disposition, disposition_tomorrow, market_by_code, errors = fetch_market_risk_lists()
                         if errors:
                             with st.expander('查看未取得的來源', expanded=True):
                                 for source_error in errors:
@@ -20337,6 +20396,7 @@ if tab1.open and stock_strategy_tab.open:
                         st.session_state.risk_filter_market_data = merge_market_risk_refresh(
                             st.session_state.get('risk_filter_market_data', {}),
                             attention, disposition, disposition_tomorrow, errors,
+                            market_by_code=market_by_code,
                         )
                         save_data_cache(
                             st.session_state.stock_data,

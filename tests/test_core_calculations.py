@@ -1248,6 +1248,7 @@ def test_market_risk_rejects_error_pages_and_accepts_explicit_empty():
         with pytest.raises(ValueError):
             validate(payload, dict)
     assert validate({'stat': '很抱歉，沒有符合條件的資料!'}, dict)
+    assert validate({'stat': '查詢成功', 'tables': []}, dict)
     assert validate([], list) == []
 
 
@@ -1261,9 +1262,14 @@ def test_risk_verification_is_scoped_to_each_stock_market():
     assert checked({'市場': '上市', '代號': '2330'}, partial)
     assert not checked({'代號': '3441.TWO'}, partial)
     assert not checked({'代號': '2330'}, partial)
+    partial['market_by_code'] = {'2221': '上櫃'}
+    assert not checked({'代號': '2221'}, partial)
+    partial['errors'] = ['上市處置: HTTPError']
+    assert checked({'代號': '2221'}, partial)
     api = SimpleNamespace(Contracts=SimpleNamespace(Stocks={
         '2330': SimpleNamespace(exchange=SimpleNamespace(value='TSE')),
     }))
+    partial['errors'] = ['上櫃處置: HTTPError']
     assert checked({'代號': '2330'}, partial, api)
     partial['errors'] = ['未知錯誤']
     assert not checked({'市場': '上市'}, partial)
@@ -1291,12 +1297,13 @@ def test_risk_fetch_recovers_failed_source_without_refetching_successes(monkeypa
             pass
     monkeypatch.setattr(requests, 'Session', Session)
     symbols.update(requests=requests, _TPEX_ORIGIN='https://www.tpex.org.tw/',
+                   _TPEX_DAILY_QUOTES_URL='https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes',
                    _tpex_verified_session=Session, adjust_to_next_market_day=lambda d: d)
     monkeypatch.setattr(time, 'sleep', lambda _: None)
     result = symbols['fetch_market_risk_lists']()
-    assert result == ({}, [], [], [])
-    assert sorted(counts.values()) == [1] * 7 + [3]
-    assert len(sessions) == 9
+    assert result == ({}, [], [], {}, [])
+    assert sorted(counts.values()) == [1] * 9 + [3]
+    assert len(sessions) == 11
 
 
 def test_first_failed_risk_refresh_does_not_claim_success():
