@@ -1251,6 +1251,26 @@ def test_market_risk_rejects_error_pages_and_accepts_explicit_empty():
     assert validate([], list) == []
 
 
+def test_risk_verification_is_scoped_to_each_stock_market():
+    from types import SimpleNamespace
+    checked = load_app_symbols('market_risk_checked_for_row')['market_risk_checked_for_row']
+    partial = {'last_attempt': '2026/09/05', 'updated': '', 'errors': ['上市注意: HTTPError']}
+    assert not checked({'市場': '上市', '代號': '2330'}, partial)
+    assert checked({'市場': '上櫃', '代號': '3441'}, partial)
+    partial['errors'] = ['上櫃處置: HTTPError']
+    assert checked({'市場': '上市', '代號': '2330'}, partial)
+    assert not checked({'代號': '3441.TWO'}, partial)
+    assert not checked({'代號': '2330'}, partial)
+    api = SimpleNamespace(Contracts=SimpleNamespace(Stocks={
+        '2330': SimpleNamespace(exchange=SimpleNamespace(value='TSE')),
+    }))
+    assert checked({'代號': '2330'}, partial, api)
+    partial['errors'] = ['未知錯誤']
+    assert not checked({'市場': '上市'}, partial)
+    assert not checked({'市場': '上市'}, {})
+    assert checked({'代號': '2330'}, {'updated': '2026/09/05', 'errors': []})
+
+
 def test_risk_fetch_recovers_failed_source_without_refetching_successes(monkeypatch):
     import requests
     from types import SimpleNamespace

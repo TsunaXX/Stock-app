@@ -15732,6 +15732,33 @@ def merge_market_risk_refresh(
         'using_last_success': False,
     }
 
+def market_risk_checked_for_row(row, state, api=None):
+    """A failed OTC source must not invalidate a successfully checked TWSE stock."""
+    if not (state.get('updated') or state.get('last_attempt')):
+        return False
+    errors = list(state.get('errors') or [])
+    if not errors:
+        return bool(state.get('updated'))
+    market = str(row.get('市場', row.get('exchange', ''))).upper()
+    code = str(row.get('代號', '')).strip()
+    if code.endswith('.TWO'):
+        market = '上櫃'
+    elif code.endswith('.TW'):
+        market = '上市'
+    if market not in ('上市', '上櫃', 'TSE', 'OTC') and api is not None:
+        try:
+            exchange = api.Contracts.Stocks[code].exchange
+            market = str(getattr(exchange, 'value', exchange)).upper()
+        except (AttributeError, KeyError, TypeError):
+            pass
+    prefix = {'上市': '上市', 'TSE': '上市', '上櫃': '上櫃', 'OTC': '上櫃'}.get(market)
+    if prefix is None:
+        return False
+    # Unknown/global errors remain conservative; only explicitly other-market
+    # failures may be ignored. Never infer market membership from a stock number.
+    return all(str(error).startswith('上櫃' if prefix == '上市' else '上市') for error in errors)
+
+
 def _as_float(value, default=None):
     try:
         number = float(value)
@@ -19662,6 +19689,7 @@ if tab1.open and stock_strategy_tab.open:
                                 st.session_state.get('risk_filter_market_data', {}),
                                 attention, disposition, disposition_tomorrow, errors,
                             )
+                            st.session_state['_show_market_risk_errors'] = bool(errors)
                             refreshed_quotes, quote_count = refresh_stock_quotes_for_codes(
                                 st.session_state.stock_data,
                                 st.session_state.get('sj_logged_in', False),
@@ -19698,16 +19726,17 @@ if tab1.open and stock_strategy_tab.open:
                     if market_risk_data.get('updated') and not market_risk_data.get('errors'):
                         st.caption(f"上市／上櫃注意與處置名單更新：{market_risk_data['updated']}。")
                     elif market_risk_data.get('errors'):
-                        with st.expander('查看未取得的來源', expanded=False):
-                            for source_error in market_risk_data['errors']:
-                                st.text(source_error)
+                        if st.session_state.pop('_show_market_risk_errors', False):
+                            with st.expander('查看未取得的來源', expanded=True):
+                                for source_error in market_risk_data['errors']:
+                                    st.text(source_error)
                         if market_risk_data.get('using_last_success'):
                             st.warning(
                                 f"本次名單未完整取得，沿用 {market_risk_data.get('updated')} 的最後成功資料；"
                                 "不會以空名單覆蓋。"
                             )
                         else:
-                            st.warning("注意／處置名單暫時無法完整更新；本次不會將未查核資料誤標為安全。")
+                            st.warning("部分來源尚未取得；上市、上櫃分開查核，失敗市場或市場不明的股票仍標示未查核。")
                     else:
                         st.info("尚未更新上市／上櫃注意與處置名單；資料未查核時不會被誤判為安全。")
 
@@ -19744,6 +19773,9 @@ if tab1.open and stock_strategy_tab.open:
                 st.caption(f"市場環境：{market_bias}｜依據 {market_source}{market_change_text}；只提供順逆勢標示，不改動原選股順位。")
 
                 for i, row in df_display.iterrows():
+                    market_lists_updated = market_risk_checked_for_row(
+                        row, market_risk_data, st.session_state.get('sj_api'),
+                    )
                     direction_info = determine_stock_direction(row, is_daytrade_mode, risk_direction)
                     row_direction = direction_info['direction']
                     result = calculate_daytrade_filter_result(
@@ -20298,6 +20330,10 @@ if tab1.open and stock_strategy_tab.open:
                     if st.button("🔄 更新注意／處置名單", key="refresh_indep_market_risk_data"):
                         with st.spinner("正在更新上市／上櫃注意與處置名單..."):
                             attention, disposition, disposition_tomorrow, errors = fetch_market_risk_lists()
+                        if errors:
+                            with st.expander('查看未取得的來源', expanded=True):
+                                for source_error in errors:
+                                    st.text(source_error)
                         st.session_state.risk_filter_market_data = merge_market_risk_refresh(
                             st.session_state.get('risk_filter_market_data', {}),
                             attention, disposition, disposition_tomorrow, errors,
@@ -20430,6 +20466,9 @@ if tab1.open and stock_strategy_tab.open:
 
                     if risk_preview_enabled:
                         for i, row in df_indep.iterrows():
+                            indep_market_lists_updated = market_risk_checked_for_row(
+                                row, indep_market_risk_data, st.session_state.get('sj_api'),
+                            )
                             direction_info = determine_stock_direction(row, indep_is_daytrade, indep_direction)
                             row_direction = direction_info['direction']
                             result = calculate_daytrade_filter_result(
