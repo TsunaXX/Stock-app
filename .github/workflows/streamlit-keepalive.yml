@@ -28,7 +28,6 @@ jobs:
       - name: Visit Streamlit app with a real browser session
         env:
           STREAMLIT_APP_URL: https://stock-app-qjzbqsoqs4hylyypaddep4.streamlit.app/
-          STREAMLIT_HEALTH_URL: https://stock-app-qjzbqsoqs4hylyypaddep4.streamlit.app/_stcore/health
         run: |
           python - <<'PY'
           import os
@@ -39,9 +38,10 @@ jobs:
           from selenium import webdriver
           from selenium.webdriver.common.by import By
           from selenium.webdriver.chrome.options import Options
+          from selenium.webdriver.support.ui import WebDriverWait
+          from selenium.webdriver.support import expected_conditions as EC
 
           app_url = os.environ["STREAMLIT_APP_URL"]
-          health_url = os.environ["STREAMLIT_HEALTH_URL"]
           expected_host = urlparse(app_url).hostname
 
           chrome = shutil.which("google-chrome") or shutil.which("google-chrome-stable")
@@ -61,9 +61,8 @@ jobs:
           driver.set_page_load_timeout(60)
 
           try:
-              # Community Cloud now establishes even public anonymous sessions through
-              # JavaScript + cookies. A plain curl request can therefore be redirected
-              # through /-/auth/app even when the app is public.
+              # Community Cloud may establish even public anonymous sessions through
+              # JavaScript + cookies, so use a real browser instead of curl.
               driver.get(app_url)
               time.sleep(12)
 
@@ -88,19 +87,21 @@ jobs:
                       f"Browser did not finish an anonymous public Streamlit session: {driver.current_url}"
                   )
 
-              # Verify health using the SAME browser session/cookies established above.
-              driver.get(health_url)
-              time.sleep(5)
-              health_text = driver.find_element(By.TAG_NAME, "body").text.strip().lower()
-              health_current = urlparse(driver.current_url)
+              # Verify that the actual Streamlit application UI rendered. Navigating the
+              # browser directly to /_stcore/health can return the Community Cloud shell
+              # instead of plain 'ok', so it is not a reliable browser-session check.
+              WebDriverWait(driver, 45).until(
+                  EC.presence_of_element_located((By.CSS_SELECTOR, '[data-testid="stAppViewContainer"]'))
+              )
 
-              if health_current.hostname != expected_host or health_text != "ok":
-                  raise SystemExit(
-                      "Streamlit browser keepalive failed health verification: "
-                      f"url={driver.current_url!r}, body={health_text[:200]!r}"
-                  )
+              final_body = driver.find_element(By.TAG_NAME, "body").text.lower()
+              if "gone to sleep" in final_body or "get this app back up" in final_body:
+                  raise SystemExit("Streamlit app returned to the sleep screen after loading.")
 
-              print("Streamlit keepalive succeeded: browser session established and health returned ok.")
+              print(
+                  "Streamlit keepalive succeeded: anonymous browser session established "
+                  "and the Streamlit app UI rendered."
+              )
           finally:
               driver.quit()
           PY
