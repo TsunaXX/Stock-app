@@ -19022,32 +19022,6 @@ def render_futures_strategy_room():
             for _, row in display_rows.iterrows()
         }
         notify_signal_state_changes('futures', signal_states, futures_notify)
-        record_futures_signals = st.button(
-            '📝 記錄目前表格的已觸發期貨訊號', width='stretch', key='record_futures_strategy_signals',
-            help='一次記錄目前期貨表格中所有已觸發、且流動性未亮紅燈的契約。'
-        )
-        if record_futures_signals:
-            records = []
-            for _, row in display_rows[display_rows['_附加可記錄'] == True].iterrows():
-                plan = parse_trade_plan_numbers(row.get('進出場點位'))
-                records.append({
-                    '市場': '期貨', '商品鍵': str(row['契約鍵']), '代碼': str(row['期貨代碼']),
-                    '名稱': str(row['名稱']), '策略': strategy_mode, '方向': str(row.get('方向', '')),
-                    '訊號狀態': str(row.get('訊號狀態', '')), '評分': _safe_number(row.get('信心分')),
-                    '信心判讀': str(row.get('信心判讀', '')),
-                    '進場價': plan['entry'], '停損價': plan['stop'], '目標價': plan['target'],
-                    '最新價': _safe_number(row.get('收盤價')),
-                    '風險': str(row.get('可交易性', '')), '資料狀態': str(row.get('資料狀態', '')),
-                })
-            added, saved = register_strategy_signals(records)
-            if saved:
-                save_data_cache(
-                    st.session_state.stock_data, st.session_state.ignored_stocks,
-                    st.session_state.all_candidates, st.session_state.saved_notes
-                )
-                st.toast(f'已新增 {added} 筆期貨訊號；重複訊號不另建。', icon='📝')
-            else:
-                st.error('訊號紀錄儲存失敗，請確認檔案是否可寫入。')
 
     if refresh_live:
         refresh_futures_live_data()
@@ -20161,35 +20135,6 @@ if tab1.open and stock_strategy_tab.open:
             )
 
             render_strategy_ranking(df_display, strategy_mode, '股票')
-
-            if risk_preview_enabled:
-                if st.button(
-                    '📝 記錄目前表格的已觸發股票訊號', key='record_stock_strategy_signals',
-                    help='一次記錄目前股票表格中所有已觸發或回測確認、且達最低進場信心的個股。'
-                ):
-                    records = []
-                    recordable_rows = df_display[df_display.get('_附加可記錄', False) == True]
-                    for _, row in recordable_rows.iterrows():
-                        plan = parse_trade_plan_numbers(row.get('進出場預判'))
-                        score = row.get('信心分')
-                        records.append({
-                            '市場': '股票', '商品鍵': str(row['代號']), '代碼': str(row['代號']),
-                            '名稱': str(row['名稱']), '策略': strategy_mode, '方向': str(row.get('_系統方向', '')),
-                            '訊號狀態': str(row.get('訊號狀態', '')), '評分': _safe_number(score),
-                            '信心判讀': str(row.get('信心判讀', '')),
-                            '進場價': plan['entry'], '停損價': plan['stop'], '目標價': plan['target'],
-                            '最新價': _safe_number(row.get('收盤價')),
-                            '風險': str(row.get('風險', '')), '資料狀態': str(row.get('資料狀態', '')),
-                        })
-                    added, saved = register_strategy_signals(records)
-                    if saved:
-                        save_data_cache(
-                            st.session_state.stock_data, st.session_state.ignored_stocks,
-                            st.session_state.all_candidates, st.session_state.saved_notes,
-                        )
-                        st.toast(f'已新增 {added} 筆股票訊號；重複訊號不另建。', icon='📝')
-                    else:
-                        st.error('訊號紀錄儲存失敗，請確認檔案是否可寫入。')
 
             if not edited_df.empty:
                 trigger_rerun = False
@@ -23879,7 +23824,8 @@ with tab_company:
 
     company_ticker_input = st.text_input(
         "追蹤公司或代碼（用逗號分隔，例如 2408, 台積電, META, Google, Tesla）",
-        value=st.session_state.calendar_preferences.get("tickers", "2330.TW"),
+        value=(st.session_state.company_event_snapshot.get("tickers")
+               or st.session_state.calendar_preferences.get("tickers", "2330.TW")),
         key="company_data_tickers",
     )
     preview_inputs = [item.strip() for item in company_ticker_input.split(",") if item.strip()]
