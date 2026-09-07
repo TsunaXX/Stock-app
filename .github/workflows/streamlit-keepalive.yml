@@ -20,7 +20,7 @@ concurrency:
 jobs:
   ping:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 6
     steps:
       - name: Install Selenium
         run: python -m pip install --disable-pip-version-check --quiet "selenium>=4.26,<5"
@@ -29,7 +29,7 @@ jobs:
         env:
           STREAMLIT_APP_URL: https://stock-app-qjzbqsoqs4hylyypaddep4.streamlit.app/
         run: |
-          python - <<'PY'
+          xvfb-run -a python - <<'PY'
           import os
           import shutil
           import time
@@ -38,8 +38,6 @@ jobs:
           from selenium import webdriver
           from selenium.webdriver.common.by import By
           from selenium.webdriver.chrome.options import Options
-          from selenium.webdriver.support.ui import WebDriverWait
-          from selenium.webdriver.support import expected_conditions as EC
 
           app_url = os.environ["STREAMLIT_APP_URL"]
           expected_host = urlparse(app_url).hostname
@@ -50,57 +48,150 @@ jobs:
 
           options = Options()
           options.binary_location = chrome
-          options.add_argument("--headless=new")
           options.add_argument("--no-sandbox")
           options.add_argument("--disable-dev-shm-usage")
           options.add_argument("--disable-gpu")
           options.add_argument("--window-size=1280,900")
           options.add_argument("--lang=en-US")
+          options.add_argument("--disable-blink-features=AutomationControlled")
+          options.add_argument(
+              "--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
+          )
+          options.add_experimental_option("excludeSwitches", ["enable-automation"])
+          options.add_experimental_option("useAutomationExtension", False)
 
           driver = webdriver.Chrome(options=options)
-          driver.set_page_load_timeout(60)
+          driver.set_page_load_timeout(90)
+          driver.execute_cdp_cmd(
+              "Page.addScriptToEvaluateOnNewDocument",
+              {"source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"},
+          )
 
-          try:
-              # Community Cloud may establish even public anonymous sessions through
-              # JavaScript + cookies, so use a real browser instead of curl.
-              driver.get(app_url)
-              time.sleep(12)
+          selectors = (
+              '[data-testid="stAppViewContainer"]',
+              '[data-testid="stApp"]',
+              '.stApp',
+          )
 
-              # Self-heal if a scheduled run was missed and the app has already slept.
-              body_text = driver.find_element(By.TAG_NAME, "body").text.lower()
-              if "gone to sleep" in body_text or "get this app back up" in body_text:
-                  wake_button = None
-                  for button in driver.find_elements(By.TAG_NAME, "button"):
-                      if "get this app back up" in button.text.lower():
-                          wake_button = button
-                          break
-                  if wake_button is None:
-                      raise SystemExit("Streamlit app is sleeping but the wake button was not found.")
-                  wake_button.click()
-                  time.sleep(20)
-                  driver.get(app_url)
-                  time.sleep(10)
+          def top_body_text():
+              driver.switch_to.default_content()
+              try:
+                  return driver.find_element(By.TAG_NAME, "body").text
+              except Exception:
+                  return ""
 
-              current = urlparse(driver.current_url)
-              if current.hostname != expected_host or current.path.startswith("/-/login"):
-                  raise SystemExit(
-                      f"Browser did not finish an anonymous public Streamlit session: {driver.current_url}"
-                  )
+          def click_wake_if_present():
+              driver.switch_to.default_content()
+              for button in driver.find_elements(By.TAG_NAME, "button"):
+                  text = (button.text or "").strip().lower()
+                  if "get this app back up" in text:
+                      button.click()
+                      print("Sleep screen detected; clicked the Streamlit wake button.")
+                      return True
+              return False
 
-              # Verify that the actual Streamlit application UI rendered. Navigating the
-              # browser directly to /_stcore/health can return the Community Cloud shell
-              # instead of plain 'ok', so it is not a reliable browser-session check.
-              WebDriverWait(driver, 45).until(
-                  EC.presence_of_element_located((By.CSS_SELECTOR, '[data-testid="stAppViewContainer"]'))
+          def has_streamlit_app():
+              # Check the top document first.
+              driver.switch_to.default_content()
+              for selector in selectors:
+                  if driver.find_elements(By.CSS_SELECTOR, selector):
+                      return f"top document ({selector})"
+
+              # Community Cloud can wrap the running app in an iframe. Check each
+              # first-level frame instead of assuming the Streamlit DOM is top-level.
+              frames = driver.find_elements(By.TAG_NAME, "iframe")
+              for index in range(len(frames)):
+                  driver.switch_to.default_content()
+                  current_frames = driver.find_elements(By.TAG_NAME, "iframe")
+                  if index >= len(current_frames):
+                      continue
+                  try:
+                      driver.switch_to.frame(current_frames[index])
+                      for selector in selectors:
+                          if driver.find_elements(By.CSS_SELECTOR, selector):
+                              return f"iframe {index} ({selector})"
+                  except Exception:
+                      continue
+              driver.switch_to.default_content()
+              return None
+
+          def print_diagnostics():
+              driver.switch_to.default_content()
+              print(f"Final URL: {driver.current_url}")
+              print(f"Title: {driver.title}")
+              body = top_body_text().replace("\x00", " ")
+              print("Top-page text (first 1500 chars):")
+              print(body[:1500])
+
+              cookies = driver.get_cookies()
+              cookie_info = [
+                  f"{item.get('name')}@{item.get('domain')}"
+                  for item in cookies
+              ]
+              print(f"Cookies present ({len(cookie_info)}): {cookie_info}")
+
+              driver.switch_to.default_content()
+              frame_info = []
+              for frame in driver.find_elements(By.TAG_NAME, "iframe"):
+                  frame_info.append({
+                      "src": frame.get_attribute("src"),
+                      "title": frame.get_attribute("title"),
+                  })
+              print(f"Iframes ({len(frame_info)}): {frame_info}")
+
+              source = driver.page_source.lower()
+              print(
+                  "HTML markers: "
+                  f"stAppViewContainer={'stappviewcontainer' in source}, "
+                  f"streamlitApp={'streamlitapp' in source}, "
+                  f"auth_app={'/-/auth/app' in source}, "
+                  f"login={'/-/login' in source}"
               )
 
-              final_body = driver.find_element(By.TAG_NAME, "body").text.lower()
+          try:
+              driver.get(app_url)
+              deadline = time.time() + 120
+              wake_clicked = False
+              location = None
+
+              while time.time() < deadline:
+                  if click_wake_if_present():
+                      wake_clicked = True
+                      time.sleep(15)
+                      driver.get(app_url)
+
+                  location = has_streamlit_app()
+                  if location:
+                      break
+
+                  time.sleep(3)
+
+              if not location:
+                  print_diagnostics()
+                  body = top_body_text().lower()
+                  current = urlparse(driver.current_url)
+                  if "hosted with streamlit" in body:
+                      raise SystemExit(
+                          "Streamlit Community Cloud browser session stayed on the outer shell "
+                          "and never mounted the actual app. See diagnostics above."
+                      )
+                  if current.hostname != expected_host:
+                      raise SystemExit(
+                          f"Browser left the Streamlit app host: {driver.current_url}"
+                      )
+                  raise SystemExit(
+                      "Streamlit app did not mount within 120 seconds. See diagnostics above."
+                  )
+
+              driver.switch_to.default_content()
+              final_body = top_body_text().lower()
               if "gone to sleep" in final_body or "get this app back up" in final_body:
                   raise SystemExit("Streamlit app returned to the sleep screen after loading.")
 
               print(
-                  "Streamlit keepalive succeeded: anonymous browser session established "
-                  "and the Streamlit app UI rendered."
+                  "Streamlit keepalive succeeded: browser reached the running app at "
+                  f"{location}; wake_clicked={wake_clicked}."
               )
           finally:
               driver.quit()
