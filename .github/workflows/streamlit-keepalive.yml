@@ -1,46 +1,74 @@
-name: Streamlit Private App Access Check
+name: Streamlit Keepalive
 
 on:
-  # Community Cloud requires an authenticated viewer for private apps. An
-  # anonymous scheduled request cannot keep this app awake, so this workflow is
-  # intentionally manual and only diagnoses the public access boundary.
+  schedule:
+    # Community Cloud hibernates apps after 12 hours without traffic.
+    # Visit the app every 4 hours to leave a wide safety margin.
+    - cron: "17 */4 * * *"
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: streamlit-private-app-access-check
+  group: streamlit-keepalive
   cancel-in-progress: true
 
 jobs:
-  check:
+  ping:
     runs-on: ubuntu-latest
-    timeout-minutes: 1
+    timeout-minutes: 2
     steps:
-      - name: Check Streamlit access boundary
+      - name: Visit Streamlit app and verify health
         env:
+          STREAMLIT_APP_URL: https://stock-app-qjzbqsoqs4hylyypaddep4.streamlit.app/
           STREAMLIT_HEALTH_URL: https://stock-app-qjzbqsoqs4hylyypaddep4.streamlit.app/_stcore/health
         run: |
-          status="$(curl --silent --show-error \
-            --connect-timeout 10 --max-time 20 \
-            --dump-header /tmp/streamlit-headers.txt \
+          root_status="$(curl --silent --show-error \
+            --connect-timeout 10 --max-time 30 \
+            --dump-header /tmp/streamlit-root-headers.txt \
+            --output /tmp/streamlit-root.html --write-out '%{http_code}' \
+            -A 'Mozilla/5.0 Streamlit-Keepalive' \
+            "$STREAMLIT_APP_URL")"
+
+          if [ "$root_status" = "303" ] && grep --fixed-strings --ignore-case --quiet \
+            'location: https://share.streamlit.io/-/auth/app?' \
+            /tmp/streamlit-root-headers.txt; then
+            echo "::error::Streamlit app is private. Anonymous GitHub Actions traffic cannot keep it awake. Set the app to public in Streamlit Sharing settings."
+            exit 1
+          fi
+
+          if grep --ignore-case --quiet 'gone to sleep\|get this app back up' /tmp/streamlit-root.html; then
+            echo "::error::Streamlit app is already sleeping. Wake it once manually, then scheduled keepalive can prevent the next hibernation."
+            exit 1
+          fi
+
+          if [ "$root_status" -lt 200 ] || [ "$root_status" -ge 400 ]; then
+            cat /tmp/streamlit-root-headers.txt
+            echo "::error::Unexpected Streamlit root response (HTTP $root_status)."
+            exit 1
+          fi
+
+          health_status="$(curl --silent --show-error \
+            --retry 2 --retry-all-errors --retry-delay 5 \
+            --connect-timeout 10 --max-time 30 \
+            --dump-header /tmp/streamlit-health-headers.txt \
             --output /tmp/streamlit-health.txt --write-out '%{http_code}' \
             "$STREAMLIT_HEALTH_URL")"
 
-          if [ "$status" = "200" ] && grep --quiet --line-regexp 'ok' /tmp/streamlit-health.txt; then
-            echo "Streamlit health endpoint is publicly reachable and healthy."
+          if [ "$health_status" = "200" ] && grep --quiet --line-regexp 'ok' /tmp/streamlit-health.txt; then
+            echo "Streamlit keepalive succeeded: app visit HTTP $root_status, health HTTP 200 ok."
             exit 0
           fi
 
-          if [ "$status" = "303" ] && grep --fixed-strings --ignore-case --quiet \
+          if [ "$health_status" = "303" ] && grep --fixed-strings --ignore-case --quiet \
             'location: https://share.streamlit.io/-/auth/app?' \
-            /tmp/streamlit-headers.txt; then
-            echo "::notice::This is a private Streamlit app. Its authentication boundary is reachable, but anonymous GitHub Actions requests cannot inspect or keep the app process awake."
-            exit 0
+            /tmp/streamlit-health-headers.txt; then
+            echo "::error::Streamlit app is private. Anonymous GitHub Actions traffic cannot keep it awake. Set the app to public in Streamlit Sharing settings."
+            exit 1
           fi
 
-          cat /tmp/streamlit-headers.txt
+          cat /tmp/streamlit-health-headers.txt
           cat /tmp/streamlit-health.txt
-          echo "::error::Unexpected Streamlit response (HTTP $status)."
+          echo "::error::Streamlit health check failed (HTTP $health_status)."
           exit 1
