@@ -20234,36 +20234,61 @@ if tab1.open and stock_strategy_tab.open:
             st.markdown("---")
             # 重新配置欄位比例與順序
             col_rt_update, col_btn, col_clear = st.columns([2, 2.5, 2])
-            with col_rt_update: btn_rt_update = st.button("⏱️ 即時更新報價", width='stretch', type="primary")
+            with col_rt_update:
+                btn_rt_update = st.button(
+                    "⏱️ 即時更新報價＋戰略",
+                    width='stretch',
+                    type="primary",
+                    help="同步重抓目前清單的日 K 與即時報價，並重算戰略備註與排行指標。",
+                )
             with col_btn: btn_update = st.button("⚡ 執行更新&儲存手動備註", width='stretch')
             with col_clear: btn_clear_notes = st.button("🧹 清除手動備註", width='stretch', help="清除所有記憶的戰略備註內容")
 
             if btn_rt_update:
                 if st.session_state.get('sj_logged_in', False) and st.session_state.get('sj_api'):
                     sj_api = st.session_state.sj_api
-                    with st.spinner("正在透過永豐API更新報價..."):
-                        refreshed_quotes, updated_count = refresh_stock_quotes_for_codes(
+                    code_map_dict, _ = load_local_stock_names()
+                    total_count = len(st.session_state.stock_data)
+                    with st.spinner("正在同步更新報價、戰略備註與排行指標..."):
+                        refreshed_rows, updated_count = refresh_persisted_stock_rows(
                             st.session_state.stock_data,
+                            st.session_state.futures_list,
+                            st.session_state.saved_notes,
+                            code_map_dict,
                             True,
                             sj_api,
-                            points_map=points_map,
                         )
                     if updated_count:
-                        st.session_state.stock_data = refreshed_quotes
+                        st.session_state.stock_data = refreshed_rows
                         tz_tw = pytz.timezone('Asia/Taipei')
                         st.session_state.last_rt_update_time = datetime.now(tz_tw).strftime("%Y/%m/%d %H:%M:%S")
                         update_strategy_signal_outcomes({
                             str(row['代號']): _safe_number(row.get('收盤價'))
                             for _, row in st.session_state.stock_data.iterrows()
                         })
-                        save_data_cache(st.session_state.stock_data, st.session_state.ignored_stocks, st.session_state.all_candidates, st.session_state.saved_notes)
+                        save_data_cache(
+                            st.session_state.stock_data,
+                            st.session_state.ignored_stocks,
+                            st.session_state.all_candidates,
+                            st.session_state.saved_notes,
+                        )
                         st.session_state.stock_strategy_editor_revision += 1
-                        st.toast(f"已用單一批次更新 {updated_count} 檔報價。", icon="⏱️")
+                        if updated_count < total_count:
+                            st.session_state.stock_strategy_refresh_warning = (
+                                f"本次 {total_count} 檔中有 {total_count - updated_count} 檔未取得完整新資料；"
+                                "已標示為資料過期，不沿用舊戰略價位。"
+                            )
+                        else:
+                            st.session_state.pop('stock_strategy_refresh_warning', None)
+                        st.toast(
+                            f"已同步更新 {updated_count} 檔報價、戰略備註與排行指標。",
+                            icon="⏱️",
+                        )
                         st.rerun()
                     else:
-                        st.warning("目前未取得任何有效即時報價，原表格資料未變更。")
+                        st.warning("目前未取得任何完整最新資料，未沿用舊戰略價位。")
                 else:
-                    st.warning("⚠️ 請先登入永豐 API 才能使用即時更新報價功能。")
+                    st.warning("⚠️ 請先登入永豐 API 才能使用即時更新報價與戰略功能。")
 
             if btn_clear_notes:
                 st.session_state.saved_notes = {}
@@ -20277,8 +20302,12 @@ if tab1.open and stock_strategy_tab.open:
                 st.session_state.stock_strategy_editor_revision += 1
                 st.rerun()
 
+            refresh_warning = st.session_state.pop('stock_strategy_refresh_warning', None)
+            if refresh_warning:
+                st.warning(refresh_warning)
+
             if 'last_rt_update_time' in st.session_state:
-                st.markdown(f"<div style='text-align: left; color: #888; font-size: 14px; margin-top: 5px; margin-bottom: 10px;'>透過永豐API即時更新報價(更新時間:{st.session_state.last_rt_update_time})</div>", unsafe_allow_html=True)
+                st.markdown(f"<div style='text-align: left; color: #888; font-size: 14px; margin-top: 5px; margin-bottom: 10px;'>透過永豐API同步更新報價與戰略(更新時間:{st.session_state.last_rt_update_time})</div>", unsafe_allow_html=True)
 
             if btn_update:
                  update_map = edited_df.set_index('代號')[['戰略備註']].to_dict('index')
