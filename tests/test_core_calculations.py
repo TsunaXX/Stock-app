@@ -1965,6 +1965,16 @@ def test_index_operation_plan_colors_entry_stop_target_and_reward_risk_metrics()
     assert "label_color" in function_source
     assert "index-plan-main-label' style='color:" in function_source
     assert "index-plan-main-value' style='color:" in function_source
+
+
+def test_index_operation_plan_waits_and_retries_without_missing_data_warning():
+    source = APP_PATH.read_text(encoding='utf-8')
+    start = source.index('        if plan is None:')
+    end = source.index('        else:', start)
+    waiting_source = source[start:end]
+    assert '正在載入加權與期貨日 K' in waiting_source
+    assert "clear_index_market_data_cache()" in waiting_source
+    assert '目前缺少足夠的加權或期貨日 K' not in source
     assert "'label': '觀察進場區', 'label_color': '#40c4ff'" in source
     assert "'label': '失效／停損', 'label_color': '#ffc107'" in source
     assert "'label': '短波進場區', 'label_color': '#40c4ff'" in source
@@ -2568,12 +2578,17 @@ def test_cache_merge_preserves_remote_device_sections():
     assert merged["fibo_tags"] == remote["fibo_tags"]
     assert {row["dedupe_key"] for row in merged["strategy_signal_log"]} == {"remote-1", "local-1"}
     assert merged["company_event_snapshot"]["updated_at"] == "2026/08/11 10:00"
-    remote['stock_swing_snapshot'] = {'updated_at': '2026-09-09T08:29:00+08:00', 'entries': [{'score': 80}]}
-    local['stock_swing_snapshot'] = {'updated_at': '2026-09-09T08:00:00+08:00', 'entries': [{'score': 20}]}
+    remote['strategy_ranking_snapshots'] = {
+        'daytrade': {'updated_at': '2026-09-09T08:29:00+08:00', 'entries': [{'score': 80}]},
+        'swing': {'updated_at': '2026-09-09T08:00:00+08:00', 'entries': [{'score': 60}]},
+    }
+    local['strategy_ranking_snapshots'] = {
+        'daytrade': {'updated_at': '2026-09-09T08:00:00+08:00', 'entries': [{'score': 20}]},
+        'swing': {'updated_at': '2026-09-09T08:20:00+08:00', 'entries': [{'score': 70}]},
+    }
     merged = symbols['_merge_data_cache_payload'](remote, local)
-    assert merged['stock_swing_snapshot'] == remote['stock_swing_snapshot']
-    local['stock_swing_snapshot'] = {}
-    assert symbols['_merge_data_cache_payload'](remote, local)['stock_swing_snapshot'] == remote['stock_swing_snapshot']
+    assert merged['strategy_ranking_snapshots']['daytrade']['entries'][0]['score'] == 80
+    assert merged['strategy_ranking_snapshots']['swing']['entries'][0]['score'] == 70
 
 
 
@@ -2749,6 +2764,9 @@ def test_futures_state_uses_its_own_timestamp_during_device_merge():
             "rank_cache": {"MTX": {"當日成交口數": 12345}},
             "live_time": "2026/08/20 09:00:00",
             "live_cache": {"MTX": {"收盤價": 100}},
+            "strategy_ranking_snapshots": {
+                "daytrade": {"updated_at": "2026-08-20T08:29:00+08:00", "entries": [{"score": 80}]},
+            },
         },
     }
     local = {
@@ -2759,11 +2777,17 @@ def test_futures_state_uses_its_own_timestamp_during_device_merge():
             "rank_cache": {"MTX": {"當日成交口數": 100}},
             "live_time": "2026/08/20 09:06:00",
             "live_cache": {"MTX": {"收盤價": 105}},
+            "strategy_ranking_snapshots": {
+                "daytrade": {"updated_at": "2026-08-20T08:00:00+08:00", "entries": [{"score": 20}]},
+                "swing": {"updated_at": "2026-08-20T08:20:00+08:00", "entries": [{"score": 70}]},
+            },
         },
     }
     merged = symbols["_merge_data_cache_payload"](remote, local)
     assert merged["futures_strategy_state"]["rank_cache"]["MTX"]["當日成交口數"] == 12345
     assert merged["futures_strategy_state"]["live_cache"]["MTX"]["收盤價"] == 105
+    assert merged["futures_strategy_state"]["strategy_ranking_snapshots"]["daytrade"]["entries"][0]["score"] == 80
+    assert merged["futures_strategy_state"]["strategy_ranking_snapshots"]["swing"]["entries"][0]["score"] == 70
 
 
 def test_newer_empty_futures_cache_is_a_tombstone_not_resurrected_data():
@@ -2810,7 +2834,7 @@ def test_futures_cloud_snapshot_is_bounded_for_single_cell_storage():
         "updated_at": "2026-08-20T09:00:00+08:00",
     }
     compact = symbols["compact_futures_strategy_state"](state)
-    assert len(json.dumps(compact, ensure_ascii=False)) <= 14000
+    assert len(json.dumps(compact, ensure_ascii=False)) <= 45000
     assert "SSF:1800" in compact["manual"]
     assert len(compact["universe"]) < len(universe)
 
@@ -2918,8 +2942,8 @@ def test_daytrade_breakout_at_daily_limit_is_rejected_instead_of_moved_backwards
     assert short_plan["valid"] is False and short_plan["blocking_reason"] == "已到跌停"
 
 
-def test_stock_swing_freeze_boundaries():
-    ns = load_app_symbols('stock_swing_refresh_allowed')
+def test_stock_and_futures_ranking_freeze_boundaries():
+    ns = load_app_symbols('ranking_snapshot_refresh_allowed', 'stock_swing_refresh_allowed')
     ns['is_market_closed_func'] = lambda day: day.weekday() >= 5
     allowed = ns['stock_swing_refresh_allowed']
     assert allowed('2026-09-09 08:29:59')
@@ -2944,15 +2968,19 @@ def test_calendar_only_explicitly_selected_companies():
     assert ns['selected_company_calendar_snapshot'](snapshot)['earnings']['events'] == []
 
 
-def test_swing_snapshot_keeps_scores_during_intraday_analysis():
+def test_all_ranking_snapshots_keep_scores_during_intraday_analysis():
     from types import SimpleNamespace
-    ns = load_app_symbols('stock_swing_refresh_allowed', 'refresh_stock_swing_snapshot')
+    ns = load_app_symbols(
+        '_state_updated_at',
+        'ranking_snapshot_refresh_allowed', 'stock_swing_refresh_allowed',
+        'refresh_strategy_ranking_snapshots', 'refresh_stock_swing_snapshot',
+    )
     ns['is_market_closed_func'] = lambda day: False
     current = [pd.Timestamp('2026-09-09 08:29:00', tz='Asia/Taipei')]
     def timestamp(value):
         return pd.Timestamp(value)
     timestamp.now = lambda **kwargs: current[0]
-    ns['pd'] = SimpleNamespace(Timestamp=timestamp)
+    ns['pd'] = SimpleNamespace(Timestamp=timestamp, isna=pd.isna)
     state = {'stock_data': pd.DataFrame([{'代號': '2330', '收盤價': 100}])}
     ns['st'] = SimpleNamespace(session_state=state)
     ns['_post_close_target_date'] = lambda now: (now, date(2026, 9, 8))
@@ -2961,12 +2989,16 @@ def test_swing_snapshot_keeps_scores_during_intraday_analysis():
         {'code': '2330', 'score': int(rows.iloc[0]['收盤價'])}]
     refresh = ns['refresh_stock_swing_snapshot']
     assert refresh(analysis=True)
-    original = dict(state['stock_swing_snapshot'])
+    assert set(state['stock_strategy_ranking_snapshots']) == {'daytrade', 'swing'}
+    original = dict(state['stock_strategy_ranking_snapshots'])
     state['stock_data'].loc[0, '收盤價'] = 999
     current[0] = pd.Timestamp('2026-09-09 09:00', tz='Asia/Taipei')
     assert not refresh(analysis=True)
-    assert state['stock_swing_snapshot'] == original
+    assert state['stock_strategy_ranking_snapshots'] == original
     current[0] = pd.Timestamp('2026-09-09 13:30', tz='Asia/Taipei')
     assert refresh(analysis=True)
-    assert state['stock_swing_snapshot']['entries'][0]['score'] == 999
-    assert state['stock_swing_snapshot']['target_date'] == '2026-09-09'
+    assert state['stock_strategy_ranking_snapshots']['daytrade']['entries'][0]['score'] == 999
+    assert state['stock_strategy_ranking_snapshots']['swing']['target_date'] == '2026-09-09'
+    futures = pd.DataFrame([{'期貨代碼': 'TX', '收盤價': 200}])
+    assert ns['refresh_strategy_ranking_snapshots'](futures, 'futures', analysis=True)
+    assert set(state['futures_strategy_ranking_snapshots']) == {'daytrade', 'swing'}

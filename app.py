@@ -9525,7 +9525,13 @@ def _state_updated_at(value):
         return None
     try:
         timestamp = pd.Timestamp(value.get('updated_at'))
-        return None if pd.isna(timestamp) else timestamp
+        if pd.isna(timestamp):
+            return None
+        return (
+            timestamp.tz_localize('Asia/Taipei')
+            if timestamp.tzinfo is None
+            else timestamp.tz_convert('Asia/Taipei')
+        )
     except (TypeError, ValueError, OverflowError):
         return None
 
@@ -9579,6 +9585,10 @@ def save_futures_strategy_state(
             next_live_time = live_time if live_cache is not None else existing.get('live_time')
             rank_changed = _json_safe(next_rank_cache) != _json_safe(existing.get('rank_cache', {}))
             live_changed = _json_safe(next_live_cache) != _json_safe(existing.get('live_cache', {}))
+            ranking_snapshots = st.session_state.get(
+                'futures_strategy_ranking_snapshots',
+                existing.get('strategy_ranking_snapshots', {}),
+            )
             saved_state = _json_safe({
                 'universe': records,
                 'metadata': metadata or (existing.get('metadata', {}) if isinstance(existing, dict) else {}),
@@ -9593,6 +9603,7 @@ def save_futures_strategy_state(
                 'selection_updated_at': (
                     now_iso if selection_changed else existing.get('selection_updated_at', existing.get('updated_at'))
                 ),
+                'strategy_ranking_snapshots': ranking_snapshots,
                 'updated_at': now_iso,
             })
             saved_state, _ = prune_futures_settlement_state(saved_state)
@@ -9820,6 +9831,9 @@ def _merge_futures_strategy_state(remote, local):
     live_local = dict(local, _live_marker=local.get('live_updated_at') or local.get('live_time') or local.get('updated_at'))
     rank_source = _prefer_futures_state_section(rank_remote, rank_local, '_rank_marker')
     live_source = _prefer_futures_state_section(live_remote, live_local, '_live_marker')
+    ranking_keys = set(remote.get('strategy_ranking_snapshots', {})) | set(
+        local.get('strategy_ranking_snapshots', {})
+    )
 
     remote_universe = pd.DataFrame(remote.get('universe', []))
     local_universe = pd.DataFrame(local.get('universe', []))
@@ -9843,11 +9857,18 @@ def _merge_futures_strategy_state(remote, local):
         'selection_updated_at': selection_source.get(
             'selection_updated_at', selection_source.get('updated_at'),
         ),
+        'strategy_ranking_snapshots': {
+            key: _newer_timestamped_state(
+                remote.get('strategy_ranking_snapshots', {}).get(key),
+                local.get('strategy_ranking_snapshots', {}).get(key),
+            )
+            for key in ranking_keys
+        },
     })
     return compact_futures_strategy_state(_json_safe(merged))
 
 
-def compact_futures_strategy_state(state, max_chars=14000):
+def compact_futures_strategy_state(state, max_chars=45000):
     """保留常用／已更新契約，避免單一 Google Sheet 儲存格超過容量。"""
     state = state if isinstance(state, dict) else {}
     universe = pd.DataFrame(state.get('universe', []))
@@ -11200,6 +11221,7 @@ def _is_valid_data_cache_payload(value):
         'strategy_signal_deleted_keys': list,
         'stock_data_updated_at': str,
         'market_risk_data': dict,
+        'strategy_ranking_snapshots': dict,
         'company_event_snapshot': dict,
         'futures_strategy_state': dict,
         'display_settings': dict,
@@ -11961,9 +11983,16 @@ def _merge_data_cache_payload(
         or newest_stock_payload.get('updated_at')
         or datetime.now(pytz.timezone('Asia/Taipei')).isoformat()
     )
-    merged['stock_swing_snapshot'] = _newer_timestamped_state(
-        remote.get('stock_swing_snapshot'), local.get('stock_swing_snapshot'),
+    ranking_keys = set(remote.get('strategy_ranking_snapshots', {})) | set(
+        local.get('strategy_ranking_snapshots', {})
     )
+    merged['strategy_ranking_snapshots'] = {
+        key: _newer_timestamped_state(
+            remote.get('strategy_ranking_snapshots', {}).get(key),
+            local.get('strategy_ranking_snapshots', {}).get(key),
+        )
+        for key in ranking_keys
+    }
     merged['version'] = 3
     merged['updated_at'] = datetime.now(pytz.timezone('Asia/Taipei')).isoformat()
     return _json_safe(merged)
@@ -12148,7 +12177,9 @@ def save_data_cache(
             ),
             # Keep display settings with the stock scope so a Streamlit reboot
             # or another device does not reset the selected row count.
-            'stock_swing_snapshot': st.session_state.get('stock_swing_snapshot', {}),
+            'strategy_ranking_snapshots': st.session_state.get(
+                'stock_strategy_ranking_snapshots', {}
+            ),
             'display_settings': get_stock_display_settings(),
         })
 
@@ -12169,18 +12200,32 @@ def save_data_cache(
 
         if gsheet_api_url:
             with get_data_cache_sync_lock():
+                remote_payload, _ = _fetch_remote_scope(
+                    gsheet_api_url, GOOGLE_SCOPE_STOCK, timeout=8,
+                )
+                cloud_payload = _merge_data_cache_payload(
+                    remote_payload, local_payload,
+                    clear_stock_data=clear_stock_data,
+                    replace_ignored=replace_ignored,
+                    replace_stock_data=replace_stock_data,
+                )
                 sync_ok, _ = (
                     _save_remote_scope(
                         gsheet_api_url,
                         GOOGLE_SCOPE_STOCK,
-                        local_payload,
-                        updated_at=(
-                            stock_data_updated_at
-                        ),
+                        cloud_payload,
+                        updated_at=cloud_payload.get('updated_at'),
                         timeout=8,
                         verify=True,
                     )
                 )
+                if sync_ok:
+                    st.session_state['stock_strategy_ranking_snapshots'] = dict(
+                        cloud_payload.get('strategy_ranking_snapshots', {})
+                    )
+                    _write_json_atomic(
+                        STOCK_STRATEGY_CACHE_FILE, cloud_payload, indent=2,
+                    )
 
         st.session_state[
             '_data_cache_sync_status'
@@ -12432,7 +12477,22 @@ def load_data_cache():
         {},
     )
 
-    st.session_state['stock_swing_snapshot'] = data.get('stock_swing_snapshot', {})
+    ranking_keys = set(remote_payload.get('strategy_ranking_snapshots', {})) | set(
+        local_payload.get('strategy_ranking_snapshots', {})
+    ) if isinstance(remote_payload, dict) and isinstance(local_payload, dict) else set()
+    data['strategy_ranking_snapshots'] = {
+        key: _newer_timestamped_state(
+            remote_payload.get('strategy_ranking_snapshots', {}).get(key),
+            local_payload.get('strategy_ranking_snapshots', {}).get(key),
+        )
+        for key in ranking_keys
+    } or data.get('strategy_ranking_snapshots', {})
+    legacy_swing_snapshot = data.get('stock_swing_snapshot', {})
+    if legacy_swing_snapshot and 'swing' not in data['strategy_ranking_snapshots']:
+        data['strategy_ranking_snapshots']['swing'] = legacy_swing_snapshot
+    st.session_state['stock_strategy_ranking_snapshots'] = data.get(
+        'strategy_ranking_snapshots', {}
+    )
     st.session_state['_cached_stock_display_settings'] = (
         normalize_stock_display_settings(data.get('display_settings', {}))
         if isinstance(data.get('display_settings', {}), dict)
@@ -16757,7 +16817,7 @@ def format_ranking_entry_identity(rank, name, code, direction):
     )
 
 
-def stock_swing_refresh_allowed(now_value, analysis=False):
+def ranking_snapshot_refresh_allowed(now_value, analysis=False):
     current = pd.Timestamp(now_value)
     if current.tzinfo is not None:
         current = current.tz_convert('Asia/Taipei').tz_localize(None)
@@ -16765,27 +16825,55 @@ def stock_swing_refresh_allowed(now_value, analysis=False):
             or (analysis and (is_market_closed_func(current.date()) or current.time() >= dt_time(13, 30))))
 
 
-def refresh_stock_swing_snapshot(analysis=False):
+def stock_swing_refresh_allowed(now_value, analysis=False):
+    """Backward-compatible name for the shared stock/futures freeze rule."""
+    return ranking_snapshot_refresh_allowed(now_value, analysis)
+
+
+def refresh_strategy_ranking_snapshots(rows, asset_type, analysis=False):
+    """Refresh both modes together and retain their compact, cross-device result."""
     current = pd.Timestamp.now(tz='Asia/Taipei')
-    if not stock_swing_refresh_allowed(current, analysis):
+    if not ranking_snapshot_refresh_allowed(current, analysis):
         return False
-    previous = st.session_state.get('stock_swing_snapshot', {})
-    if not analysis and previous.get('updated_at') and (current - pd.Timestamp(previous['updated_at'])).total_seconds() < 60:
-        return False
-    rows = st.session_state.get('stock_data')
     if rows is None or rows.empty:
+        return False
+    state_key = f'{asset_type}_strategy_ranking_snapshots'
+    previous = dict(st.session_state.get(state_key, {}))
+    update_times = [_state_updated_at(item) for item in previous.values()]
+    latest_update = max((value for value in update_times if value is not None), default=None)
+    if not analysis and latest_update is not None and (current - latest_update).total_seconds() < 60:
         return False
     _, target = _post_close_target_date(current)
     if analysis and current.time() >= dt_time(13, 30) and not is_market_closed_func(current.date()):
         target = current.date()
-    context = resolve_post_close_ranking_context(current, asset_type='stock', target_date=target)
-    entries = build_strategy_ranking_entries(rows, '波段', market_context=context, asset_type='stock')
-    if not entries:
+    context = resolve_post_close_ranking_context(current, asset_type=asset_type, target_date=target)
+    refreshed = {}
+    for mode, key in (('當沖', 'daytrade'), ('波段', 'swing')):
+        entries = build_strategy_ranking_entries(
+            rows, mode, now_value=current, market_context=context, asset_type=asset_type,
+        )
+        if entries:
+            refreshed[key] = {
+                'updated_at': current.isoformat(),
+                'target_date': target.isoformat(),
+                'source_date': str(context.get('date', '')),
+                'source_dates': dict(context.get('source_dates', {})),
+                'errors': list(context.get('errors', [])),
+                'using_last_success': bool(context.get('using_last_success')),
+                'entries': entries[:50],
+            }
+    if not refreshed:
         return False
-    st.session_state['stock_swing_snapshot'] = {
-        'updated_at': current.isoformat(), 'target_date': target.isoformat(), 'entries': entries,
-    }
+    previous.update(refreshed)
+    st.session_state[state_key] = previous
     return True
+
+
+def refresh_stock_swing_snapshot(analysis=False):
+    """Keep old callers working while refreshing stock daytrade and swing together."""
+    return refresh_strategy_ranking_snapshots(
+        st.session_state.get('stock_data'), 'stock', analysis=analysis,
+    )
 
 
 def render_strategy_ranking(rows, strategy_mode, room_label):
@@ -16793,27 +16881,29 @@ def render_strategy_ranking(rows, strategy_mode, room_label):
     current, target_date = _post_close_target_date()
     if rows is None or rows.empty:
         return
-    asset_type = 'futures' if room_label == '期貨' else 'stock'
-    if room_label == '股票' and strategy_mode != '當沖':
-        if refresh_stock_swing_snapshot():
+    asset_type = 'futures' if room_label.startswith('期貨') else 'stock'
+    snapshot_key = 'daytrade' if strategy_mode == '當沖' else 'swing'
+    state_key = f'{asset_type}_strategy_ranking_snapshots'
+    refreshed = refresh_strategy_ranking_snapshots(rows, asset_type)
+    if refreshed:
+        if asset_type == 'stock':
             save_data_cache(st.session_state.stock_data, st.session_state.ignored_stocks,
                             st.session_state.all_candidates, st.session_state.saved_notes)
-        snapshot = st.session_state.get('stock_swing_snapshot', {})
-        if snapshot.get('target_date'):
-            target_date = date.fromisoformat(snapshot['target_date'])
-        codes = set(rows['代號'].astype(str))
-        entries = [e for e in snapshot.get('entries', []) if e['code'] in codes]
-        if not entries:
-            st.info('尚無盤前波段排名快照；請於 8:30 前或收盤後執行分析。')
-            return
-        st.caption(f"波段排名快照：{snapshot.get('updated_at', '')}｜8:30 起固定，收盤後執行分析才更新")
-    else:
-        market_context = resolve_post_close_ranking_context(current, asset_type=asset_type)
-        entries = build_strategy_ranking_entries(
-            rows, strategy_mode, now_value=current, market_context=market_context,
-        )
+        else:
+            save_futures_strategy_state()
+    snapshot = st.session_state.get(state_key, {}).get(snapshot_key, {})
+    if snapshot.get('target_date'):
+        target_date = date.fromisoformat(snapshot['target_date'])
+    code_column = '期貨代碼' if asset_type == 'futures' else '代號'
+    codes = set(rows[code_column].astype(str))
+    entries = [entry for entry in snapshot.get('entries', []) if entry['code'] in codes]
     if not entries:
+        st.info(f'尚無盤前{room_label}{"當沖" if snapshot_key == "daytrade" else "波段"}排名快照；正在等待資料。')
         return
+    st.caption(
+        f"排名快照：{snapshot.get('updated_at', '')}｜8:30 起固定，收盤後執行分析才更新｜"
+        "已同步 Google Sheet，可跨裝置讀取"
+    )
     ranking_title = '當沖排名' if strategy_mode == '當沖' else '波段排名'
     period_label = '今日盤後' if target_date == current.date() else '前一交易日盤後'
     weights = strategy_ranking_weights(asset_type, strategy_mode)
@@ -16897,7 +16987,8 @@ def render_strategy_ranking(rows, strategy_mode, room_label):
         f"{''.join(explanation_rows)}</div></div>",
         unsafe_allow_html=True,
     )
-    source_date = str(market_context.get('date', ''))
+    market_context = snapshot
+    source_date = str(snapshot.get('source_date', ''))
     source_text = (
         f"盤後籌碼／估值資料日 {source_date[:4]}/{source_date[4:6]}/{source_date[6:]}。"
         if len(source_date) == 8 else '盤後籌碼／估值來源暫未完整取得。'
@@ -18521,6 +18612,10 @@ def render_futures_strategy_room():
         st.session_state.futures_strategy_rank_cache = dict(persisted_futures_state.get('rank_cache', {}))
     if 'futures_strategy_rank_time' not in st.session_state:
         st.session_state.futures_strategy_rank_time = persisted_futures_state.get('rank_time')
+    if 'futures_strategy_ranking_snapshots' not in st.session_state:
+        st.session_state.futures_strategy_ranking_snapshots = dict(
+            persisted_futures_state.get('strategy_ranking_snapshots', {})
+        )
     if 'futures_strategy_editor_revision' not in st.session_state:
         st.session_state.futures_strategy_editor_revision = 0
     if 'futures_enhanced_layer_enabled' not in st.session_state:
@@ -18735,6 +18830,9 @@ def render_futures_strategy_room():
                 ).strftime('%Y/%m/%d %H:%M:%S')
                 universe = live_universe
                 st.session_state.futures_strategy_editor_revision += 1
+                refresh_strategy_ranking_snapshots(
+                    live_universe, 'futures', analysis=True,
+                )
                 persist_futures_room_state(live_universe)
                 st.toast(f"已用即時串流更新 {live_count} 個契約並重新排序", icon="📊")
             else:
@@ -18745,6 +18843,8 @@ def render_futures_strategy_room():
         refresh_official or settlement_removed_keys or not saved_universe_records
         or universe_meta.get('updated') != (saved_metadata.get('updated') if isinstance(saved_metadata, dict) else None)
     ):
+        if refresh_official:
+            refresh_strategy_ranking_snapshots(universe, 'futures', analysis=True)
         persist_futures_room_state(universe)
 
     official_date = str(universe_meta.get('updated') or '')
@@ -18879,6 +18979,9 @@ def render_futures_strategy_room():
                     str(row['契約鍵']): _safe_number(row.get('收盤價'))
                     for _, row in updated_rows.iterrows()
                 })
+                refresh_strategy_ranking_snapshots(
+                    updated_rows, 'futures', analysis=True,
+                )
                 persist_futures_room_state()
                 save_data_cache(
                     st.session_state.stock_data, st.session_state.ignored_stocks,
@@ -21955,14 +22058,14 @@ with tab_fibo:
             futures_item[2] if futures_item else pd.DataFrame(), futures_item[4] if futures_item else None,
         )
         if plan is None:
-            st.warning("目前缺少足夠的加權或期貨日 K，暫時無法建立操作計畫。")
-            if st.button(
-                "🔄 重新載入指數日 K", key="retry_index_trade_plan_history",
-                width='stretch',
-            ):
+            st.info("⏳ 正在載入加權與期貨日 K；取得足夠資料後會直接顯示操作計畫。")
+            if not st.session_state.get('_index_trade_plan_auto_retry', False):
+                st.session_state['_index_trade_plan_auto_retry'] = True
                 clear_index_market_data_cache()
                 st.rerun()
+            st.caption("資料來源仍在回應中，可先停留在此頁等待下一次更新。")
         else:
+            st.session_state.pop('_index_trade_plan_auto_retry', None)
             display_direction, direction_color = {
                 '偏多': ('偏多', '#ff4b4b'),
                 '偏空': ('偏空', '#00c853'),
