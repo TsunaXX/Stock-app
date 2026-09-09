@@ -1831,7 +1831,8 @@ def test_opening_yahoo_batch_does_not_request_nonexistent_twf_symbol():
 
 def test_goodinfo_http_path_has_no_browser_dependency():
     requirements = (APP_PATH.parent / "requirements.txt").read_text(encoding="utf-8")
-    packages = (APP_PATH.parent / "packages.txt").read_text(encoding="utf-8")
+    packages_path = APP_PATH.parent / "packages.txt"
+    packages = packages_path.read_text(encoding="utf-8") if packages_path.exists() else ""
     assert "selenium" not in requirements.lower()
     assert "crawl4ai" not in requirements.lower()
     assert "scrapling" not in requirements.lower()
@@ -2567,6 +2568,13 @@ def test_cache_merge_preserves_remote_device_sections():
     assert merged["fibo_tags"] == remote["fibo_tags"]
     assert {row["dedupe_key"] for row in merged["strategy_signal_log"]} == {"remote-1", "local-1"}
     assert merged["company_event_snapshot"]["updated_at"] == "2026/08/11 10:00"
+    remote['stock_swing_snapshot'] = {'updated_at': '2026-09-09T08:29:00+08:00', 'entries': [{'score': 80}]}
+    local['stock_swing_snapshot'] = {'updated_at': '2026-09-09T08:00:00+08:00', 'entries': [{'score': 20}]}
+    merged = symbols['_merge_data_cache_payload'](remote, local)
+    assert merged['stock_swing_snapshot'] == remote['stock_swing_snapshot']
+    local['stock_swing_snapshot'] = {}
+    assert symbols['_merge_data_cache_payload'](remote, local)['stock_swing_snapshot'] == remote['stock_swing_snapshot']
+
 
 
 def test_cache_merge_can_replace_cloud_stock_snapshot_without_resurrecting_old_rows():
@@ -2908,3 +2916,57 @@ def test_daytrade_breakout_at_daily_limit_is_rejected_instead_of_moved_backwards
     )
     assert long_plan["valid"] is False and long_plan["blocking_reason"] == "已到漲停"
     assert short_plan["valid"] is False and short_plan["blocking_reason"] == "已到跌停"
+
+
+def test_stock_swing_freeze_boundaries():
+    ns = load_app_symbols('stock_swing_refresh_allowed')
+    ns['is_market_closed_func'] = lambda day: day.weekday() >= 5
+    allowed = ns['stock_swing_refresh_allowed']
+    assert allowed('2026-09-09 08:29:59')
+    assert not allowed('2026-09-09 08:30:00', True)
+    assert not allowed('2026-09-09 13:29:59', True)
+    assert not allowed('2026-09-09 14:00:00')
+    assert allowed('2026-09-09 13:30:00', True)
+    assert not allowed('2026-09-09T00:30:00Z', True)
+    assert allowed('2026-09-12 12:00:00', True)
+
+
+def test_calendar_only_explicitly_selected_companies():
+    ns = load_app_symbols('company_calendar_key', 'selected_company_calendar_snapshot')
+    snapshot = {'calendar_companies': ['2330'], 'earnings': {'events': [
+        {'ticker': '2330.TW'}, {'ticker': 'META'}]},
+        'us_revenue': {'events': [{'revenue': {'ticker': 'META'}}]}}
+    filtered = ns['selected_company_calendar_snapshot'](snapshot)
+    assert filtered['earnings']['events'] == [{'ticker': '2330.TW'}]
+    assert filtered['us_revenue']['events'] == []
+    assert len(snapshot['earnings']['events']) == 2
+    snapshot['calendar_companies'] = []
+    assert ns['selected_company_calendar_snapshot'](snapshot)['earnings']['events'] == []
+
+
+def test_swing_snapshot_keeps_scores_during_intraday_analysis():
+    from types import SimpleNamespace
+    ns = load_app_symbols('stock_swing_refresh_allowed', 'refresh_stock_swing_snapshot')
+    ns['is_market_closed_func'] = lambda day: False
+    current = [pd.Timestamp('2026-09-09 08:29:00', tz='Asia/Taipei')]
+    def timestamp(value):
+        return pd.Timestamp(value)
+    timestamp.now = lambda **kwargs: current[0]
+    ns['pd'] = SimpleNamespace(Timestamp=timestamp)
+    state = {'stock_data': pd.DataFrame([{'代號': '2330', '收盤價': 100}])}
+    ns['st'] = SimpleNamespace(session_state=state)
+    ns['_post_close_target_date'] = lambda now: (now, date(2026, 9, 8))
+    ns['resolve_post_close_ranking_context'] = lambda *args, **kwargs: {}
+    ns['build_strategy_ranking_entries'] = lambda rows, *args, **kwargs: [
+        {'code': '2330', 'score': int(rows.iloc[0]['收盤價'])}]
+    refresh = ns['refresh_stock_swing_snapshot']
+    assert refresh(analysis=True)
+    original = dict(state['stock_swing_snapshot'])
+    state['stock_data'].loc[0, '收盤價'] = 999
+    current[0] = pd.Timestamp('2026-09-09 09:00', tz='Asia/Taipei')
+    assert not refresh(analysis=True)
+    assert state['stock_swing_snapshot'] == original
+    current[0] = pd.Timestamp('2026-09-09 13:30', tz='Asia/Taipei')
+    assert refresh(analysis=True)
+    assert state['stock_swing_snapshot']['entries'][0]['score'] == 999
+    assert state['stock_swing_snapshot']['target_date'] == '2026-09-09'
