@@ -2984,6 +2984,7 @@ def normalize_company_event_snapshot(saved):
         return normalized
     normalized['updated_at'] = str(saved.get('updated_at', '') or '')
     normalized['tickers'] = str(saved.get('tickers', '') or '')
+    normalized['calendar_companies'] = [str(v) for v in saved.get('calendar_companies', [])] if isinstance(saved.get('calendar_companies'), list) else []
     saved_overrides = saved.get('revenue_date_overrides', {})
     if isinstance(saved_overrides, dict):
         normalized['revenue_date_overrides'] = {
@@ -3093,6 +3094,21 @@ def apply_revenue_announcement_date_overrides(snapshot, overrides=None):
         + list(normalized.get('us_revenue', {}).get('events', []))
     )
     return normalize_company_event_snapshot(normalized)
+
+
+def company_calendar_key(event):
+    revenue = event.get('revenue') if isinstance(event.get('revenue'), dict) else {}
+    return str(event.get('ticker') or revenue.get('ticker') or event.get('title', '')).upper().removesuffix('.TW').removesuffix('.TWO')
+
+
+def selected_company_calendar_snapshot(snapshot):
+    selected = set(snapshot.get('calendar_companies', []))
+    return {**snapshot, **{
+        section: {**snapshot.get(section, {}), 'events': [
+            event for event in snapshot.get(section, {}).get('events', [])
+            if company_calendar_key(event) in selected
+        ]} for section in ('earnings', 'taiwan_revenue', 'us_revenue')
+    }}
 
 
 def parse_calendar_event_date(value):
@@ -7909,7 +7925,7 @@ def plot_fibonacci_chart(
             return
 
     diff = high_60 - low_60
-    ratios = [-2.618, -2.0, -1.618, -1.0, 0.0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0, 1.618, 2.0, 2.618]
+    ratios = [-2.618, -2.0, -1.618, -1.0, -0.618, 0.0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0, 1.618, 2.0, 2.618]
     asset_type = (
         'futures' if ticker_code in ('TWF=F', 'TMF=F')
         else ('index' if str(ticker_code).startswith('^') else 'stock')
@@ -8018,6 +8034,9 @@ def plot_fibonacci_chart(
 
     # 額外留白讓最高／最低標記不會壓到圖表標題，手機上也能看清 K 棒。
     y_min_view, y_max_view = fibonacci_initial_y_range(low_60, high_60, padding_ratio=0.10)
+    extended_view = st.toggle("顯示費波延伸區間（-2.618～2.618）", value=False, key="fibo_extended_view")
+    if extended_view:
+        y_min_view, y_max_view = low_60 - 2.718 * diff, low_60 + 2.718 * diff
     if pd.isna(y_min_view) or pd.isna(y_max_view): y_min_view, y_max_view = None, None
 
     interval_display_map = {"1m": "1分K", "5m": "5分K", "15m": "15分K", "60m": "60分K", "1d": "日K", "1wk": "週K", "1mo": "月K"}
@@ -11819,6 +11838,7 @@ def mark_stock_data_updated():
     """Mark only real stock-data refreshes as a newer snapshot than the cloud copy."""
     timestamp = datetime.now(pytz.timezone('Asia/Taipei')).isoformat()
     st.session_state['_stock_data_updated_at'] = timestamp
+    refresh_stock_swing_snapshot(analysis=True)
     return timestamp
 
 
@@ -11940,6 +11960,9 @@ def _merge_data_cache_payload(
         newest_stock_payload.get('stock_data_updated_at')
         or newest_stock_payload.get('updated_at')
         or datetime.now(pytz.timezone('Asia/Taipei')).isoformat()
+    )
+    merged['stock_swing_snapshot'] = _newer_timestamped_state(
+        remote.get('stock_swing_snapshot'), local.get('stock_swing_snapshot'),
     )
     merged['version'] = 3
     merged['updated_at'] = datetime.now(pytz.timezone('Asia/Taipei')).isoformat()
@@ -12125,6 +12148,7 @@ def save_data_cache(
             ),
             # Keep display settings with the stock scope so a Streamlit reboot
             # or another device does not reset the selected row count.
+            'stock_swing_snapshot': st.session_state.get('stock_swing_snapshot', {}),
             'display_settings': get_stock_display_settings(),
         })
 
@@ -12408,6 +12432,7 @@ def load_data_cache():
         {},
     )
 
+    st.session_state['stock_swing_snapshot'] = data.get('stock_swing_snapshot', {})
     st.session_state['_cached_stock_display_settings'] = (
         normalize_stock_display_settings(data.get('display_settings', {}))
         if isinstance(data.get('display_settings', {}), dict)
@@ -16128,9 +16153,10 @@ def fetch_post_close_stock_ranking_context(target_date_text, asset_type='combine
     }
 
 
-def resolve_post_close_ranking_context(now_value=None, asset_type='combined'):
+def resolve_post_close_ranking_context(now_value=None, asset_type='combined', target_date=None):
     """Use current official data, falling back to this session's last usable snapshot."""
     current, target = _post_close_target_date(now_value)
+    target = target_date or target
     fallback_key = f'_post_close_ranking_last_success_{asset_type}'
     try:
         context = fetch_post_close_stock_ranking_context(
@@ -16731,18 +16757,61 @@ def format_ranking_entry_identity(rank, name, code, direction):
     )
 
 
+def stock_swing_refresh_allowed(now_value, analysis=False):
+    current = pd.Timestamp(now_value)
+    if current.tzinfo is not None:
+        current = current.tz_convert('Asia/Taipei').tz_localize(None)
+    return (current.time() < dt_time(8, 30)
+            or (analysis and (is_market_closed_func(current.date()) or current.time() >= dt_time(13, 30))))
+
+
+def refresh_stock_swing_snapshot(analysis=False):
+    current = pd.Timestamp.now(tz='Asia/Taipei')
+    if not stock_swing_refresh_allowed(current, analysis):
+        return False
+    previous = st.session_state.get('stock_swing_snapshot', {})
+    if not analysis and previous.get('updated_at') and (current - pd.Timestamp(previous['updated_at'])).total_seconds() < 60:
+        return False
+    rows = st.session_state.get('stock_data')
+    if rows is None or rows.empty:
+        return False
+    _, target = _post_close_target_date(current)
+    if analysis and current.time() >= dt_time(13, 30) and not is_market_closed_func(current.date()):
+        target = current.date()
+    context = resolve_post_close_ranking_context(current, asset_type='stock', target_date=target)
+    entries = build_strategy_ranking_entries(rows, '波段', market_context=context, asset_type='stock')
+    if not entries:
+        return False
+    st.session_state['stock_swing_snapshot'] = {
+        'updated_at': current.isoformat(), 'target_date': target.isoformat(), 'entries': entries,
+    }
+    return True
+
+
 def render_strategy_ranking(rows, strategy_mode, room_label):
     """Render the independent post-close ranking immediately below its table."""
     current, target_date = _post_close_target_date()
     if rows is None or rows.empty:
         return
     asset_type = 'futures' if room_label == '期貨' else 'stock'
-    market_context = resolve_post_close_ranking_context(
-        current, asset_type=asset_type,
-    )
-    entries = build_strategy_ranking_entries(
-        rows, strategy_mode, now_value=current, market_context=market_context,
-    )
+    if room_label == '股票' and strategy_mode != '當沖':
+        if refresh_stock_swing_snapshot():
+            save_data_cache(st.session_state.stock_data, st.session_state.ignored_stocks,
+                            st.session_state.all_candidates, st.session_state.saved_notes)
+        snapshot = st.session_state.get('stock_swing_snapshot', {})
+        if snapshot.get('target_date'):
+            target_date = date.fromisoformat(snapshot['target_date'])
+        codes = set(rows['代號'].astype(str))
+        entries = [e for e in snapshot.get('entries', []) if e['code'] in codes]
+        if not entries:
+            st.info('尚無盤前波段排名快照；請於 8:30 前或收盤後執行分析。')
+            return
+        st.caption(f"波段排名快照：{snapshot.get('updated_at', '')}｜8:30 起固定，收盤後執行分析才更新")
+    else:
+        market_context = resolve_post_close_ranking_context(current, asset_type=asset_type)
+        entries = build_strategy_ranking_entries(
+            rows, strategy_mode, now_value=current, market_context=market_context,
+        )
     if not entries:
         return
     ranking_title = '當沖排名' if strategy_mode == '當沖' else '波段排名'
@@ -23461,6 +23530,7 @@ with tab3:
 
     company_snapshot = normalize_company_event_snapshot(st.session_state.company_event_snapshot)
     st.session_state.company_event_snapshot = company_snapshot
+    company_snapshot = selected_company_calendar_snapshot(company_snapshot)
     earnings_events = list(company_snapshot.get("earnings", {}).get("events", []))
     legacy_market_by_name = {}
     for resolved_text in company_snapshot.get("earnings", {}).get("resolved", []):
@@ -23919,6 +23989,7 @@ with tab_company:
             new_snapshot = {
                 "updated_at": datetime.now(pytz.timezone("Asia/Taipei")).strftime("%Y/%m/%d %H:%M"),
                 "tickers": company_ticker_input,
+                "calendar_companies": previous_snapshot.get("calendar_companies", []),
                 "events": combined_events,
                 "earnings": earnings_result,
                 "taiwan_revenue": taiwan_revenue_result,
@@ -23965,6 +24036,21 @@ with tab_company:
     </style>
     """, unsafe_allow_html=True)
     snapshot = st.session_state.company_event_snapshot
+    company_options = sorted({company_calendar_key(e) for e in snapshot.get('events', [])})
+    chosen_companies = st.multiselect(
+        '加入行事曆的公司（查詢後勾選）', company_options,
+        default=[v for v in snapshot.get('calendar_companies', []) if v in company_options],
+        key='company_calendar_selection',
+    )
+    if st.button('儲存行事曆公司', key='save_calendar_companies'):
+        snapshot = {**snapshot, 'calendar_companies': chosen_companies,
+                    'updated_at': datetime.now(pytz.timezone('Asia/Taipei')).strftime('%Y/%m/%d %H:%M:%S')}
+        st.session_state.company_event_snapshot = snapshot
+        saved = save_company_event_snapshot(snapshot)
+        if get_app_secret('gsheet_api_url') and not saved:
+            st.warning('已套用；雲端同步失敗，請重試儲存。')
+        else:
+            st.success('已儲存行事曆公司。')
     revenue_events = list(snapshot.get('taiwan_revenue', {}).get('events', []))
     if revenue_events:
         with st.expander("🗓️ 月營收公告日校正（可直接修改日期）", expanded=False):
