@@ -17843,7 +17843,7 @@ def generate_note_from_points(points, manual_note, show_3d):
         points = []
 
     display_candidates = []
-    target_tags = ['前高', '前低', '昨高', '昨低', '今高', '今低']
+    target_tags = ['前高', '前低', '昨高', '昨低']
     for point in points:
         tag = point.get('tag', '')
         if tag in target_tags and not show_3d:
@@ -17894,8 +17894,78 @@ def filter_strategy_note_points(points, base_price):
         return []
     return [
         point for point in points
-        if limit_down <= round(float(point['val']), 2) <= limit_up
+        if point.get('force')
+        or limit_down <= round(float(point['val']), 2) <= limit_up
     ]
+
+
+def build_stock_strategy_points(history):
+    """Apply the stock strategy-note rules to completed daily candles only."""
+    if not isinstance(history, pd.DataFrame) or history.empty:
+        return [], None
+
+    close = float(history.iloc[-1]['Close'])
+    latest = history.iloc[-1]
+    touch = (
+        detect_stock_candle_limit_touch(
+            history.iloc[-2]['Close'], latest['High'], latest['Low'],
+        )
+        if len(history) >= 2 else {'touched_up': False, 'touched_down': False}
+    )
+    prior = history.iloc[:-1].tail(90)
+    prior_high = float(prior['High'].max()) if not prior.empty else None
+    prior_lows = prior['Low'][prior['Low'] > 0]
+    prior_low = float(prior_lows.min()) if not prior_lows.empty else None
+    today_high = float(latest['High'])
+    today_low = float(latest['Low'])
+    is_new_high = prior_high is not None and today_high > prior_high
+    is_new_low = prior_low is not None and today_low < prior_low
+
+    points = []
+    for offset, prefix in ((2, '昨'), (3, '前')):
+        if len(history) >= offset:
+            candle = history.iloc[-offset]
+            points.extend((
+                {'val': apply_tick_rules(candle['High']), 'tag': f'{prefix}高'},
+                {'val': apply_tick_rules(candle['Low']), 'tag': f'{prefix}低'},
+            ))
+
+    ma5 = None
+    if len(history) >= 5:
+        average = sum(Decimal(str(value)) for value in history['Close'].tail(5)) / Decimal('5')
+        ma5_raw = float(average.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
+        ma5 = apply_sr_rules(ma5_raw, close)
+        ma5_tag = '多' if ma5_raw < close else ('空' if ma5_raw > close else '平')
+        points.append({'val': ma5, 'tag': ma5_tag, 'force': True})
+
+    high_tag = (
+        '漲停高' if touch['touched_up'] and is_new_high
+        else '漲停' if touch['touched_up']
+        else '高' if is_new_high else ''
+    )
+    low_tag = (
+        '跌停低' if touch['touched_down'] and is_new_low
+        else '跌停' if touch['touched_down']
+        else '低' if is_new_low else ''
+    )
+    points.extend((
+        {'val': apply_tick_rules(latest['Open']), 'tag': '', 'force': True},
+        {'val': apply_tick_rules(today_high), 'tag': high_tag, 'force': True},
+        {'val': apply_tick_rules(today_low), 'tag': low_tag, 'force': True},
+    ))
+
+    if (touch['touched_up'] or is_new_high) and close >= today_high * 0.97:
+        points.append({
+            'val': apply_sr_rules(today_high * 1.03, today_high),
+            'tag': '', 'force': True,
+        })
+    if (touch['touched_down'] or is_new_low) and close <= today_low * 1.03:
+        points.append({
+            'val': apply_sr_rules(today_low * 0.97, today_low),
+            'tag': '', 'force': True,
+        })
+
+    return filter_strategy_note_points(points, close), ma5
 
 def fetch_stock_data_raw(
     code, name_hint="", extra_data=None, futures_set=None,
@@ -17910,7 +17980,7 @@ def fetch_stock_data_raw(
     
     # 優先使用永豐 API 擷取昨日/歷史日 K 線資料
     if sj_logged_in and sj_api is not None:
-        sj_df = fetch_shioaji_data(sj_api, code, interval='1d', lookback_days=40)
+        sj_df = fetch_shioaji_data(sj_api, code, interval='1d', lookback_days=180)
         if not sj_df.empty:
             hist = sj_df
             source_used = "shioaji"
@@ -17932,7 +18002,8 @@ def fetch_stock_data_raw(
     if hist.empty:
         try:
             stock = twstock.Stock(code)
-            tw_data = stock.fetch_31()
+            history_start = datetime.now() - timedelta(days=180)
+            tw_data = stock.fetch_from(history_start.year, history_start.month)
             if tw_data and len(tw_data) > 0:
                 df_tw = pd.DataFrame(tw_data)
                 df_tw['Date'] = pd.to_datetime(df_tw['date'])
@@ -17965,10 +18036,10 @@ def fetch_stock_data_raw(
     if hist.empty:
         try:
             ticker_obj = yf.Ticker(f"{code}.TW")
-            hist_yf = ticker_obj.history(period="3mo", auto_adjust=False)
+            hist_yf = ticker_obj.history(period="6mo", auto_adjust=False)
             if hist_yf.empty:
                 ticker_obj = yf.Ticker(f"{code}.TWO")
-                hist_yf = ticker_obj.history(period="3mo", auto_adjust=False)
+                hist_yf = ticker_obj.history(period="6mo", auto_adjust=False)
             if not hist_yf.empty:
                 hist = hist_yf
                 source_used = "yfinance"
@@ -18104,12 +18175,8 @@ def fetch_stock_data_raw(
         if len(ma20_series.dropna()) >= 6:
             risk_ma20_slope = float(ma20_series.iloc[-1] - ma20_series.iloc[-6])
 
-    # 戰略備註與表格收盤價使用同一價格基準；歷史 K 棒仍保留原值供高低點與均線計算。
-    strategy_base_price = (
-        live_quote_price
-        if live_quote_price is not None and live_quote_price > 0
-        else live_base_price
-    )
+    # 戰略備註只使用資料內最後一根完整日 K 收盤；即時價僅供行情欄位顯示。
+    strategy_base_price = float(hist_strat.iloc[-1]['Close'])
     if len(hist_strat) >= 2: prev_of_base = hist_strat.iloc[-2]['Close']
     else: prev_of_base = strategy_base_price 
 
@@ -18128,99 +18195,7 @@ def fetch_stock_data_raw(
     limit_down_show = limit_context['display_down']
     limit_up_today = limit_context['today_up']
     limit_down_today = limit_context['today_down']
-    latest_limit_touch = (
-        detect_stock_candle_limit_touch(
-            hist_strat.iloc[-2]['Close'],
-            hist_strat.iloc[-1]['High'],
-            hist_strat.iloc[-1]['Low'],
-        )
-        if len(hist_strat) >= 2
-        else {
-            'limit_up': limit_up_today, 'limit_down': limit_down_today,
-            'touched_up': False, 'touched_down': False,
-        }
-    )
-    limit_up_T = latest_limit_touch['limit_up']
-    limit_down_T = latest_limit_touch['limit_down']
-    note_ceiling, note_floor = calculate_limits(strategy_base_price)
-
-    target_price = apply_sr_rules(strategy_base_price * 1.03, strategy_base_price)
-    stop_price = apply_sr_rules(strategy_base_price * 0.97, strategy_base_price)
-    
-    points = []
-    recent_records = hist_strat.tail(3).to_dict('records')
-    recent_records.reverse()
-    days_map = {0: "今", 1: "昨", 2: "前"}
-    
-    for idx, row in enumerate(recent_records):
-        if idx in days_map:
-            prefix = days_map[idx]
-            h_val = apply_tick_rules(row['High'])
-            l_val = apply_tick_rules(row['Low'])
-            if h_val > 0 and note_floor <= h_val <= note_ceiling: points.append({"val": h_val, "tag": f"{prefix}高"})
-            if l_val > 0 and note_floor <= l_val <= note_ceiling: points.append({"val": l_val, "tag": f"{prefix}低"})
-
-    if len(hist_strat) >= 5:
-        last_5_closes = hist_strat['Close'].tail(5).values
-        avg_val = sum(Decimal(str(x)) for x in last_5_closes) / Decimal("5")
-        ma5_raw = float(avg_val.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
-        ma5 = apply_sr_rules(ma5_raw, strategy_base_price)
-        ma5_tag = "多" if ma5_raw < strategy_base_price else ("空" if ma5_raw > strategy_base_price else "平")
-        points.append({"val": ma5, "tag": ma5_tag, "force": True})
-
-    if len(hist_strat) >= 2:
-        last_candle = hist_strat.iloc[-1]
-        p_open = apply_tick_rules(last_candle['Open'])
-        if note_floor <= p_open <= note_ceiling: points.append({"val": p_open, "tag": ""})
-
-        p_high = apply_tick_rules(last_candle['High'])
-        p_low = apply_tick_rules(last_candle['Low'])
-        if note_floor <= p_high <= note_ceiling:
-             tag_high = "漲停" if latest_limit_touch['touched_up'] else ""
-             points.append({"val": p_high, "tag": tag_high})
-        if note_floor <= p_low <= note_ceiling:
-             tag_low = "跌停" if latest_limit_touch['touched_down'] else ""
-             points.append({"val": p_low, "tag": tag_low})
-
-    if len(hist_strat) >= 3:
-        pre_prev_candle = hist_strat.iloc[-2]
-        pp_high = apply_tick_rules(pre_prev_candle['High'])
-        pp_low = apply_tick_rules(pre_prev_candle['Low'])
-        if note_floor <= pp_high <= note_ceiling: points.append({"val": pp_high, "tag": ""})
-        if note_floor <= pp_low <= note_ceiling: points.append({"val": pp_low, "tag": ""})
-
-    show_plus_3 = False
-    show_minus_3 = False
-    
-    if not hist_strat.empty:
-        high_90_raw = hist_strat['High'].max()
-        low_vals = hist_strat['Low'][hist_strat['Low'] > 0]
-        low_90_raw = low_vals.min() if not low_vals.empty else hist_strat['Low'].min()
-            
-        high_90 = apply_tick_rules(high_90_raw)
-        low_90 = apply_tick_rules(low_90_raw)
-        points.append({"val": high_90, "tag": "高"})
-        points.append({"val": low_90, "tag": "低"})
-        
-        if len(hist_strat) >= 2:
-             if latest_limit_touch['touched_up']:
-                 tag_label = "漲停高" if (abs(limit_up_T - high_90_raw) < 0.05) else "漲停"
-                 if note_floor <= limit_up_T <= note_ceiling: points.append({"val": limit_up_T, "tag": tag_label})
-             if latest_limit_touch['touched_down']:
-                 tag_label = "跌停低" if (abs(limit_down_T - low_90_raw) < 0.05) else "跌停"
-                 if note_floor <= limit_down_T <= note_ceiling: points.append({"val": limit_down_T, "tag": tag_label})
-
-        if len(hist_strat) >= 2:
-            high_T = hist_strat.iloc[-1]['High']
-            low_T = hist_strat.iloc[-1]['Low']
-            close_T = hist_strat.iloc[-1]['Close']
-            if latest_limit_touch['touched_up'] and close_T >= limit_up_T * 0.97: show_plus_3 = True
-            if latest_limit_touch['touched_down'] and close_T <= limit_down_T * 1.03: show_minus_3 = True
-
-    if show_plus_3: points.append({"val": target_price, "tag": ""})
-    if show_minus_3: points.append({"val": stop_price, "tag": ""})
-        
-    full_calc_points = filter_strategy_note_points(points, strategy_base_price)
+    full_calc_points, ma5 = build_stock_strategy_points(hist_strat)
     
     manual_note = saved_notes_dict.get(code, "") if saved_notes_dict else ""
     strategy_note, auto_note = generate_note_from_points(full_calc_points, manual_note, show_3d=False)
@@ -18233,7 +18208,11 @@ def fetch_stock_data_raw(
     # 兼容字典與舊版集合的判定
     has_futures = futures_set.get(code, "") if isinstance(futures_set, dict) else ("✅" if futures_set and code in futures_set else "")
     
-    display_price = strategy_base_price
+    display_price = (
+        live_quote_price
+        if live_quote_price is not None and live_quote_price > 0
+        else live_base_price
+    )
     display_change_rate = live_quote_rate if live_quote_rate is not None else live_pct_change
     return {
         "代號": code, "名稱": final_name_display, "收盤價": round(display_price, 2), "漲跌幅": display_change_rate, "期貨": has_futures,
@@ -18241,7 +18220,8 @@ def fetch_stock_data_raw(
         "當日漲停價": limit_up_show, "當日跌停價": limit_down_show,
         "_交易日漲停價": limit_up_today, "_交易日跌停價": limit_down_today,
         "_漲跌停基準": "隔日開盤" if limit_context['display_is_next_session'] else "當日",
-        "戰略備註": strategy_note, "_points": full_calc_points, "狀態": "", "_auto_note": auto_note, "_ma5": ma5 if 'ma5' in locals() else None,
+        "戰略備註": strategy_note, "_points": full_calc_points, "狀態": "", "_auto_note": auto_note,
+        "_strategy_close": strategy_base_price, "_ma5": ma5,
         "_risk_atr14": risk_atr14, "_risk_ma20": risk_ma20, "_risk_ma20_slope": risk_ma20_slope,
         "_risk_close_position": risk_close_position, "_risk_prev_high": risk_prev_high, "_risk_prev_low": risk_prev_low,
         "_plan_prev_high": plan_prev_high, "_plan_prev_low": plan_prev_low,
@@ -19658,7 +19638,7 @@ if tab1.open and stock_strategy_tab.open:
             for i, row in df_display.iterrows():
                 code = row['代號']
                 points = filter_strategy_note_points(
-                    row.get('_points', []), row.get('收盤價'),
+                    row.get('_points', []), row.get('_strategy_close', row.get('收盤價')),
                 )
                 manual = st.session_state.saved_notes.get(code, "")
 
@@ -20447,7 +20427,7 @@ if tab1.open and stock_strategy_tab.open:
                 if not st.session_state.stock_data.empty:
                      for idx, row in st.session_state.stock_data.iterrows():
                          points = filter_strategy_note_points(
-                             row.get('_points', []), row.get('收盤價'),
+                             row.get('_points', []), row.get('_strategy_close', row.get('收盤價')),
                          )
                          clean_note, _ = generate_note_from_points(points, "", show_3d_hilo)
                          st.session_state.stock_data.at[idx, '戰略備註'] = clean_note
@@ -20631,8 +20611,10 @@ if tab1.open and stock_strategy_tab.open:
                     # 重新套用戰略備註與價差邏輯
                     for i, row in df_indep.iterrows():
                         pts = row.get('_points', [])
+                        pts = filter_strategy_note_points(
+                            pts, row.get('_strategy_close', row.get('收盤價')),
+                        )
                         manual = st.session_state.saved_notes.get(row['代號'], "")
-                        pts = filter_strategy_note_points(pts, row.get('收盤價'))
                         n_full, n_auto = generate_note_from_points(pts, manual, show_3d_hilo)
                         df_indep.at[i, "戰略備註"] = n_full
                         df_indep.at[i, "名稱"] = row['名稱'].replace('🔴 ', '').replace('🟢 ', '').replace('⚪ ', '')
