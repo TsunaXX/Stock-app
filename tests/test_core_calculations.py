@@ -408,7 +408,7 @@ def test_option_flow_series_is_continuous_intraday_accumulation():
     assert list(result["net_force"]) == [0, 8, 22]
 
 
-def test_option_flow_chart_keeps_txf_as_a_step_line_with_readable_scale():
+def test_option_flow_chart_uses_curves_with_readable_txf_scale():
     symbols = load_app_symbols(
         "calculate_txo_cumulative_flow_series", "build_txo_flow_history_chart",
     )
@@ -420,7 +420,8 @@ def test_option_flow_chart_keeps_txf_as_a_step_line_with_readable_scale():
     figure = symbols["build_txo_flow_history_chart"](history)
     txf_trace = next(trace for trace in figure.data if trace.name == "台指期")
     assert txf_trace.yaxis == "y2"
-    assert txf_trace.line.shape == "hv"
+    assert all(trace.line.shape == "spline" for trace in figure.data)
+    assert all(trace.line.smoothing == 0.6 for trace in figure.data)
     assert list(figure.layout.yaxis2.range) == [21950, 22052]
 
 
@@ -1297,6 +1298,36 @@ def test_stock_quote_refresh_uses_one_snapshot_batch_for_all_rows():
     assert count == 2
     assert len(calls) == 1
     assert refreshed["收盤價"].tolist() == [101, 202]
+
+
+def test_stock_price_only_refresh_preserves_every_strategy_field():
+    symbols = load_app_symbols(
+        "_safe_number", "snapshot_change_rate", "price_change_amount",
+        "merge_realtime_stock_snapshots",
+    )
+    snapshot = type("Snapshot", (), {"close": 105, "change_rate": 5})()
+    source = pd.DataFrame([{
+        "代號": "2330", "收盤價": 100, "漲跌幅": 2,
+        "戰略備註": "95-100平-105", "_points": [{"val": 100, "tag": "平"}],
+        "_strategy_close": 100, "_ma5": 100, "狀態": "命中",
+        "當日漲停價": 110, "當日跌停價": 90, "成交價價差": 2,
+    }])
+    strategy_columns = [column for column in source.columns if column != "收盤價"]
+    refreshed, count = symbols["merge_realtime_stock_snapshots"](
+        source, {"2330": snapshot}, price_only=True,
+    )
+    assert count == 1 and refreshed.at[0, "收盤價"] == 105
+    pd.testing.assert_frame_equal(
+        refreshed[strategy_columns], source[strategy_columns], check_dtype=False,
+    )
+
+    app_source = APP_PATH.read_text(encoding="utf-8")
+    button_start = app_source.index('"⏱️ 即時更新最新成交價"')
+    button_end = app_source.index("if btn_clear_notes:", button_start)
+    button_source = app_source[button_start:button_end]
+    assert "price_only=True" in button_source
+    assert "refresh_persisted_stock_rows" not in button_source
+    assert "update_strategy_signal_outcomes" not in button_source
 
 
 def test_stock_main_and_independent_tables_share_column_order_and_compact_mode():
