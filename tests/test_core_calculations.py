@@ -19,7 +19,9 @@ from urllib.parse import urljoin
 import numpy as np
 import pandas as pd
 import pytz
+import plotly.graph_objects as go
 from bs4 import BeautifulSoup
+from plotly.subplots import make_subplots
 
 
 APP_PATH = Path(__file__).parents[1] / "app.py"
@@ -56,6 +58,8 @@ def load_app_symbols(*names):
         "pd": pd,
         "parsedate_to_datetime": parsedate_to_datetime,
         "pytz": pytz,
+        "go": go,
+        "make_subplots": make_subplots,
         "re": re,
         "threading": threading,
         "time": time,
@@ -92,6 +96,15 @@ def test_stock_limit_prices_are_decimal_tick_exact():
     assert calculate_limits(1.90) == (2.09, 1.71)
     assert calculate_limits(4.10) == (4.51, 3.69)
     assert calculate_limits(10.50) == (11.55, 9.45)
+
+
+def test_stock_strategy_note_only_shows_next_open_range():
+    symbols = load_app_symbols(
+        "get_tick_size", "calculate_limits", "fmt_price",
+        "generate_stock_strategy_note",
+    )
+    note, auto_note = symbols["generate_stock_strategy_note"](100, "")
+    assert note == auto_note == "隔日開盤範圍 90～110"
 
 
 def test_downward_tick_uses_the_lower_price_band():
@@ -336,6 +349,22 @@ def test_option_flow_series_is_continuous_intraday_accumulation():
     assert list(result["bearish_curve"]) == [0, -10, -20]
     assert list(result["seller_curve"]) == [0, 14, 28]
     assert list(result["net_force"]) == [0, 8, 22]
+
+
+def test_option_flow_chart_keeps_txf_as_a_step_line_with_readable_scale():
+    symbols = load_app_symbols(
+        "calculate_txo_cumulative_flow_series", "build_txo_flow_history_chart",
+    )
+    start = datetime(2026, 9, 1, 9, 0, 0)
+    history = [
+        {"time": start, "spot": 22000, "BC": 0, "BP": 0, "SC": 0, "SP": 0},
+        {"time": start + timedelta(seconds=5), "spot": 22002, "BC": 5, "BP": 2, "SC": 3, "SP": 4},
+    ]
+    figure = symbols["build_txo_flow_history_chart"](history)
+    txf_trace = next(trace for trace in figure.data if trace.name == "台指期")
+    assert txf_trace.yaxis == "y2"
+    assert txf_trace.line.shape == "hv"
+    assert list(figure.layout.yaxis2.range) == [21950, 22052]
 
 
 def test_strategy_market_environment_distinguishes_sideways_and_unconfirmed():
