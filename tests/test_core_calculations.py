@@ -4,6 +4,7 @@ import ast
 import calendar
 import html
 import io
+import itertools
 import json
 import math
 import re
@@ -43,6 +44,7 @@ def load_app_symbols(*names):
         "calendar": calendar,
         "html": html,
         "io": io,
+        "itertools": itertools,
         "date": date,
         "datetime": datetime,
         "dt_time": dt_time,
@@ -98,13 +100,20 @@ def test_stock_limit_prices_are_decimal_tick_exact():
     assert calculate_limits(10.50) == (11.55, 9.45)
 
 
-def test_stock_strategy_note_only_shows_next_open_range():
+def test_stock_strategy_note_analysis_stays_inside_next_open_range():
     symbols = load_app_symbols(
         "get_tick_size", "calculate_limits", "fmt_price",
-        "generate_stock_strategy_note",
+        "generate_note_from_points", "filter_strategy_note_points",
     )
-    note, auto_note = symbols["generate_stock_strategy_note"](100, "")
-    assert note == auto_note == "隔日開盤範圍 90～110"
+    points = [
+        {"val": 89, "tag": "低"}, {"val": 90, "tag": ""},
+        {"val": 100, "tag": "多"}, {"val": 110, "tag": ""},
+        {"val": 111, "tag": "高"},
+    ]
+    filtered = symbols["filter_strategy_note_points"](points, 100)
+    note, auto_note = symbols["generate_note_from_points"](filtered, "", False)
+    assert [point["val"] for point in filtered] == [90, 100, 110]
+    assert note == auto_note == "90-🔴100多-110"
 
 
 def test_downward_tick_uses_the_lower_price_band():
