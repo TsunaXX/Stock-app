@@ -12,7 +12,6 @@ import math
 import time
 import threading
 import os
-import itertools
 import json
 import re
 import html
@@ -6724,23 +6723,29 @@ def build_txo_flow_history_chart(history):
         ), secondary_y=False)
     fig.add_trace(go.Scatter(
         x=frame['time'], y=frame['spot'], mode='lines', name='台指期',
-        line=dict(color='#f5f5f5', width=2.1), opacity=0.9,
+        line=dict(color='#f5f5f5', width=2.1, shape='hv'), opacity=0.9,
         hovertemplate='%{y:,.0f} 點<extra></extra>',
     ), secondary_y=True)
     fig.add_hline(y=0, line_dash='dot', line_color='#7f8c8d')
     fig.update_layout(
         template='plotly_dark', height=430, margin=dict(l=48, r=58, t=36, b=42),
         hovermode='x unified', legend=dict(orientation='h', y=1.16, x=0),
-        xaxis=dict(title='臺北時間'), uirevision='txo-flow-force-v3',
+        xaxis=dict(title='臺北時間'),
     )
     fig.update_yaxes(
         title_text='盤中累積力量（口）', autorange=True,
         zeroline=True, secondary_y=False,
     )
-    fig.update_yaxes(
-        title_text='台指期（點）', autorange=True, showgrid=False,
-        secondary_y=True,
-    )
+    spot_values = frame['spot'].dropna()
+    if spot_values.empty:
+        fig.update_yaxes(title_text='台指期（點）', showgrid=False, secondary_y=True)
+    else:
+        spot_padding = max(50.0, float(spot_values.max() - spot_values.min()) * 0.1)
+        fig.update_yaxes(
+            title_text='台指期（點）',
+            range=[float(spot_values.min()) - spot_padding, float(spot_values.max()) + spot_padding],
+            showgrid=False, secondary_y=True,
+        )
     return fig
 
 
@@ -13257,10 +13262,7 @@ def render_stock_strategy_controls():
         st.checkbox(
             "查詢權證（含圖表快速標籤）", key="allow_warrant_search"
         )
-        show_3d_hilo = st.checkbox(
-            "近 3 日高低點（戰略備註）", key='stock_show_3d_hilo',
-            help="在戰略備註加入前天、昨天、今天的高低點。"
-        )
+        show_3d_hilo = False
         current_limit_rows = st.number_input(
             "顯示筆數（檔案／雲端）", min_value=1, step=1,
             value=st.session_state.limit_rows, key='limit_rows_input'
@@ -17832,65 +17834,12 @@ def recalculate_row(row, points_map):
         return status
     except Exception: return status
 
-def generate_note_from_points(points, manual_note, show_3d):
-    # 修正：加入安全判斷，防止重整或合併時產生 NaN 導致的 TypeError
-    if not isinstance(points, list):
-        points = []
-        
-    display_candidates = []
-    target_tags = ['前高', '前低', '昨高', '昨低', '今高', '今低']
-    for p in points:
-        t = p.get('tag', '')
-        if t in target_tags and not show_3d: continue
-        if p['val'] <= 0: continue
-        display_candidates.append(p)
-        
-    display_candidates.sort(key=lambda x: x['val'])
-    note_parts = []
-    seen_vals = set() 
-    
-    for val, group in itertools.groupby(display_candidates, key=lambda x: round(x['val'], 2)):
-        if val in seen_vals: continue
-        seen_vals.add(val)
-        g_list = list(group)
-        tags = [x['tag'] for x in g_list if x['tag']]
-        
-        final_tag = ""
-        if "漲停高" in tags: final_tag = "漲停高"
-        elif "跌停低" in tags: final_tag = "跌停低" 
-        elif "漲停" in tags: final_tag = "漲停"
-        elif "跌停" in tags: final_tag = "跌停"
-        elif "多" in tags: final_tag = "多"
-        elif "空" in tags: final_tag = "空"
-        elif "平" in tags: final_tag = "平"
-        elif "高" in tags: final_tag = "高"
-        elif "低" in tags: final_tag = "低"
-        elif "今高" in tags: final_tag = "今高"
-        elif "今低" in tags: final_tag = "今低"
-        elif "昨高" in tags: final_tag = "昨高"
-        elif "昨低" in tags: final_tag = "昨低"
-        elif "前高" in tags: final_tag = "前高"
-        elif "前低" in tags: final_tag = "前低"
-        
-        v_str = fmt_price(val)
-        suffix_tags = ["多", "空", "平"]
-        prefix_tags = ["漲停", "漲停高", "跌停", "跌停低", "高", "低"]
-        numeric_only_tags = ["前高", "前低", "昨高", "昨低", "今高", "今低"]
-        
-        if final_tag in suffix_tags: 
-            if final_tag == "多":
-                item = f"🔴{v_str}{final_tag}"
-            elif final_tag == "空":
-                item = f"🟢{v_str}{final_tag}"
-            else:
-                item = f"{v_str}{final_tag}"
-        elif final_tag in prefix_tags: item = f"{final_tag}{v_str}"
-        elif final_tag in numeric_only_tags: item = v_str 
-        elif final_tag: item = f"{v_str}{final_tag}" 
-        else: item = v_str
-        note_parts.append(item)
-        
-    auto_note = "-".join(note_parts)
+def generate_stock_strategy_note(base_price, manual_note):
+    limit_up, limit_down = calculate_limits(base_price)
+    auto_note = (
+        f"隔日開盤範圍 {fmt_price(limit_down)}～{fmt_price(limit_up)}"
+        if limit_up and limit_down else ""
+    )
     if manual_note:
         if manual_note.startswith("[M]"): return manual_note[3:], auto_note
         if auto_note and manual_note.strip().startswith(auto_note.strip()): return manual_note, auto_note
@@ -18232,7 +18181,7 @@ def fetch_stock_data_raw(
         if p.get('force', False) or p.get('tag') in threed_tags or (note_floor <= v <= note_ceiling): full_calc_points.append(p)
     
     manual_note = saved_notes_dict.get(code, "") if saved_notes_dict else ""
-    strategy_note, auto_note = generate_note_from_points(full_calc_points, manual_note, show_3d=False)
+    strategy_note, auto_note = generate_stock_strategy_note(strategy_base_price, manual_note)
     
     if name_hint: final_name = name_hint
     elif name_map_dict and code in name_map_dict: final_name = name_map_dict[code]
@@ -19391,7 +19340,7 @@ if tab1.open and stock_strategy_tab.open:
                 "⚙️ 股票戰略室設定、資料管理與選股資料來源",
                 expanded=st.session_state.stock_data.empty,
             ):
-                hide_non_stock, show_3d_hilo = render_stock_strategy_controls()
+                hide_non_stock, _show_3d_hilo = render_stock_strategy_controls()
                 st.divider()
                 uploaded_file, selected_sheet, search_selection = (
                     render_stock_data_source_controls()
@@ -19666,26 +19615,11 @@ if tab1.open and stock_strategy_tab.open:
 
             for i, row in df_display.iterrows():
                 code = row['代號']
-                points = row.get('_points', [])
                 manual = st.session_state.saved_notes.get(code, "")
 
-                if not points:
-                    # 優先保留目前表格中的完整文字，避免 cached_notes 蓋掉使用者在自動備註任意位置插入的手動修改。
-                    cached = st.session_state.get('cached_notes', {}).get(code, {})
-                    current_note_value = row.get('戰略備註', '')
-                    current_auto_value = row.get('_auto_note', '')
-                    current_note = '' if pd.isna(current_note_value) else str(current_note_value).strip()
-                    current_auto = '' if pd.isna(current_auto_value) else str(current_auto_value).strip()
-                    if current_note:
-                        new_full_note = current_note
-                        new_auto_note = current_auto or cached.get('auto', '')
-                    elif cached and cached.get('note'):
-                        new_full_note = cached['note']
-                        new_auto_note = cached.get('auto', '')
-                    else:
-                        new_full_note, new_auto_note = generate_note_from_points(points, manual, show_3d_hilo)
-                else:
-                    new_full_note, new_auto_note = generate_note_from_points(points, manual, show_3d_hilo)
+                new_full_note, new_auto_note = generate_stock_strategy_note(
+                    row.get('收盤價'), manual,
+                )
 
                 df_display.at[i, "戰略備註"] = new_full_note
                 df_display.at[i, "_auto_note"] = new_auto_note
@@ -20467,7 +20401,7 @@ if tab1.open and stock_strategy_tab.open:
                 st.toast("手動備註已清除", icon="🧹")
                 if not st.session_state.stock_data.empty:
                      for idx, row in st.session_state.stock_data.iterrows():
-                         clean_note, _ = generate_note_from_points(row.get('_points', []), "", show_3d_hilo)
+                         clean_note, _ = generate_stock_strategy_note(row.get('收盤價'), "")
                          st.session_state.stock_data.at[idx, '戰略備註'] = clean_note
                          if '_auto_note' in st.session_state.stock_data.columns: st.session_state.stock_data.at[idx, '_auto_note'] = clean_note
                 save_data_cache(st.session_state.stock_data, st.session_state.ignored_stocks, st.session_state.all_candidates, st.session_state.saved_notes)
@@ -20650,7 +20584,7 @@ if tab1.open and stock_strategy_tab.open:
                     for i, row in df_indep.iterrows():
                         pts = row.get('_points', [])
                         manual = st.session_state.saved_notes.get(row['代號'], "")
-                        n_full, n_auto = generate_note_from_points(pts, manual, show_3d_hilo)
+                        n_full, n_auto = generate_stock_strategy_note(row.get('收盤價'), manual)
                         df_indep.at[i, "戰略備註"] = n_full
                         df_indep.at[i, "名稱"] = row['名稱'].replace('🔴 ', '').replace('🟢 ', '').replace('⚪ ', '')
                         price_difference = price_change_amount(row.get('收盤價'), row.get('漲跌幅'))
