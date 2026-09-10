@@ -3104,6 +3104,14 @@ def test_calendar_only_explicitly_selected_companies():
     assert ns['selected_company_calendar_snapshot'](snapshot)['earnings']['events'] == []
 
 
+def test_taiwan_revenue_calendar_text_keeps_only_company_month_and_growth():
+    text = load_app_symbols('taiwan_revenue_calendar_text')['taiwan_revenue_calendar_text']
+    assert text({
+        'company': '台積電', 'revenue_month': '11508',
+        'mom': '+10.1%', 'yoy': '+53.32%', 'announcement_time': '13:42',
+    }) == '台積電 8月 MoM+10.1%／YoY+53.32%'
+
+
 def test_all_ranking_snapshots_keep_scores_during_intraday_analysis():
     from types import SimpleNamespace
     ns = load_app_symbols(

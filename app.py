@@ -2921,6 +2921,15 @@ def company_calendar_key(event):
     return str(event.get('ticker') or revenue.get('ticker') or event.get('title', '')).upper().removesuffix('.TW').removesuffix('.TWO')
 
 
+def taiwan_revenue_calendar_text(revenue):
+    """月營收在行事曆只保留公司、月份與 MoM／YoY。"""
+    values = revenue if isinstance(revenue, dict) else {}
+    company = str(values.get("company", "月營收事件")).strip() or "月營收事件"
+    revenue_month = str(values.get("revenue_month", ""))
+    month_label = f"{int(revenue_month[-2:])}月" if re.fullmatch(r"\d{5}", revenue_month) else "月營收"
+    return f"{company} {month_label} MoM{values.get('mom', '--')}／YoY{values.get('yoy', '--')}"
+
+
 def selected_company_calendar_snapshot(snapshot):
     selected = set(snapshot.get('calendar_companies', []))
     return {**snapshot, **{
@@ -23740,17 +23749,9 @@ with tab3:
                     color = "#FFD700"
                 if event.get("market") == "台股" and isinstance(event.get("revenue"), dict):
                     revenue = event.get("revenue", {})
-                    mom, yoy = str(revenue.get("mom", "--")), str(revenue.get("yoy", "--"))
-                    revenue_month = str(revenue.get("revenue_month", ""))
-                    month_label = f"{int(revenue_month[-2:])}月" if re.fullmatch(r"\d{5}", revenue_month) else "月營收"
-                    time_label = str(revenue.get("announcement_time", "")).strip()
-                    company_label = html.escape(str(revenue.get("company", "月營收事件")))
-                    event_label = f"{html.escape(time_label)}｜{company_label} {month_label}" if time_label else f"{company_label} {month_label}"
                     content_html.append(
                         "<div style='font-size:.8em;margin-top:2px;font-weight:bold'>"
-                        f"<span style='color:#00E676'>{event_label}</span> "
-                        f"<span style='color:{_percent_color(mom)}'>MoM{html.escape(mom)}</span>／"
-                        f"<span style='color:{_percent_color(yoy)}'>YoY{html.escape(yoy)}</span></div>"
+                        f"<span style='color:#00E676'>{html.escape(taiwan_revenue_calendar_text(revenue))}</span></div>"
                     )
                 elif event.get("source") == "Yahoo Finance（季度／年度營收）":
                     revenue = event.get("revenue", {})
@@ -23831,18 +23832,21 @@ with tab_company:
     st.markdown("""
     <style>
     .company-room-title {
-        margin: 0.1rem 0 0.25rem;
+        margin: 0.1rem 0 0.18rem;
         color: #f5f7fa;
-        font-size: 1.35rem;
+        font-size: 1.55rem;
         line-height: 1.35;
-        font-weight: 700;
+        font-weight: 760;
     }
+    .company-room-description { color: #b7c2d0; line-height: 1.7; margin-bottom: 1rem; }
+    .company-step { display: flex; align-items: center; gap: .48rem; margin: 1.15rem 0 .45rem; color: #f5f7fa; font-size: 1.02rem; font-weight: 700; }
+    .company-step-number { display: inline-flex; align-items: center; justify-content: center; width: 1.5rem; height: 1.5rem; border-radius: 50%; background: #1769aa; color: #fff; font-size: .78rem; }
     </style>
     <div class='company-room-title'>🏢 公司營收與財報</div>
     """, unsafe_allow_html=True)
-    st.caption("手動同步公司財報與營收資料；同步結果會顯示於本頁。需要顯示在股市行事曆的公司，請於下方另外勾選並儲存。")
+    st.markdown("<div class='company-room-description'>手動同步公司財報與營收資料；同步結果會顯示於本頁。需要顯示在股市行事曆的公司，請於下方另外勾選並儲存。</div>", unsafe_allow_html=True)
 
-    st.markdown("#### 1. 查詢並同步公司")
+    st.markdown("<div class='company-step'><span class='company-step-number'>1</span>查詢並同步公司</div>", unsafe_allow_html=True)
 
     company_ticker_input = st.text_input(
         "追蹤公司或代碼（用逗號分隔，例如 2408, 台積電, META, Google, Tesla）",
@@ -23857,9 +23861,9 @@ with tab_company:
             f"{item['input']} → {item['display_name']}（{item['candidates'][0]}）" for item in resolved_preview
         ))
 
-    sync_col, status_col = st.columns([1, 2.2])
+    sync_col, status_col = st.columns([0.9, 2.1], vertical_alignment="center")
     with sync_col:
-        sync_company_data = st.button("🔄 同步公司資料", key="sync_company_financial_data", width="stretch")
+        sync_company_data = st.button("🔄 同步公司資料", key="sync_company_financial_data", width="content")
     with status_col:
         current_snapshot = st.session_state.company_event_snapshot
         if current_snapshot.get("updated_at"):
@@ -23958,16 +23962,20 @@ with tab_company:
     </style>
     """, unsafe_allow_html=True)
     snapshot = st.session_state.company_event_snapshot
-    st.markdown("#### 2. 選擇加入股市行事曆的公司")
+    st.markdown("<div class='company-step'><span class='company-step-number'>2</span>選擇加入股市行事曆的公司</div>", unsafe_allow_html=True)
     st.caption("只會加入勾選並儲存的公司；未勾選公司的查詢結果仍保留在本頁。")
     company_options = sorted({company_calendar_key(e) for e in snapshot.get('events', [])})
-    chosen_companies = st.multiselect(
-        '加入行事曆的公司（查詢後勾選）', company_options,
-        default=[v for v in snapshot.get('calendar_companies', []) if v in company_options],
-        key='company_calendar_selection',
-    )
+    select_col, save_col = st.columns([3, 1], vertical_alignment="bottom")
+    with select_col:
+        chosen_companies = st.multiselect(
+            '加入行事曆的公司（查詢後勾選）', company_options,
+            default=[v for v in snapshot.get('calendar_companies', []) if v in company_options],
+            key='company_calendar_selection',
+        )
+    with save_col:
+        save_calendar_companies = st.button('🏢 儲存行事曆公司', key='save_calendar_companies', width='content')
     st.caption(f"目前選擇 {len(chosen_companies)} 家，共有 {len(company_options)} 家可選。")
-    if st.button('儲存行事曆公司', key='save_calendar_companies', width='stretch'):
+    if save_calendar_companies:
         snapshot = {**snapshot, 'calendar_companies': chosen_companies,
                     'updated_at': datetime.now(pytz.timezone('Asia/Taipei')).strftime('%Y/%m/%d %H:%M:%S')}
         st.session_state.company_event_snapshot = snapshot
@@ -24038,5 +24046,5 @@ with tab_company:
     summary_cols[0].metric("財報事件", len(snapshot.get("earnings", {}).get("events", [])))
     summary_cols[1].metric("台股月營收", len(snapshot.get("taiwan_revenue", {}).get("events", [])))
     summary_cols[2].metric("美股營收", len(snapshot.get("us_revenue", {}).get("events", [])))
-    st.markdown("#### 3. 查看同步結果")
+    st.markdown("<div class='company-step'><span class='company-step-number'>3</span>查看同步結果</div>", unsafe_allow_html=True)
     render_company_event_snapshot(snapshot)
