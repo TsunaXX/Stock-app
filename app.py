@@ -12,6 +12,7 @@ import math
 import time
 import threading
 import os
+import itertools
 import json
 import re
 import html
@@ -13262,7 +13263,10 @@ def render_stock_strategy_controls():
         st.checkbox(
             "查詢權證（含圖表快速標籤）", key="allow_warrant_search"
         )
-        show_3d_hilo = False
+        show_3d_hilo = st.checkbox(
+            "近 3 日高低點（戰略備註）", key='stock_show_3d_hilo',
+            help="在戰略備註加入前天、昨天、今天的高低點。"
+        )
         current_limit_rows = st.number_input(
             "顯示筆數（檔案／雲端）", min_value=1, step=1,
             value=st.session_state.limit_rows, key='limit_rows_input'
@@ -17834,17 +17838,64 @@ def recalculate_row(row, points_map):
         return status
     except Exception: return status
 
-def generate_stock_strategy_note(base_price, manual_note):
-    limit_up, limit_down = calculate_limits(base_price)
-    auto_note = (
-        f"隔日開盤範圍 {fmt_price(limit_down)}～{fmt_price(limit_up)}"
-        if limit_up and limit_down else ""
-    )
+def generate_note_from_points(points, manual_note, show_3d):
+    if not isinstance(points, list):
+        points = []
+
+    display_candidates = []
+    target_tags = ['前高', '前低', '昨高', '昨低', '今高', '今低']
+    for point in points:
+        tag = point.get('tag', '')
+        if tag in target_tags and not show_3d:
+            continue
+        if point['val'] > 0:
+            display_candidates.append(point)
+
+    display_candidates.sort(key=lambda item: item['val'])
+    note_parts = []
+    seen_vals = set()
+    for value, group in itertools.groupby(display_candidates, key=lambda item: round(item['val'], 2)):
+        if value in seen_vals:
+            continue
+        seen_vals.add(value)
+        tags = [item['tag'] for item in group if item['tag']]
+        final_tag = next((tag for tag in (
+            '漲停高', '跌停低', '漲停', '跌停', '多', '空', '平', '高', '低',
+            '今高', '今低', '昨高', '昨低', '前高', '前低',
+        ) if tag in tags), '')
+        value_text = fmt_price(value)
+        if final_tag == '多':
+            item = f"🔴{value_text}多"
+        elif final_tag == '空':
+            item = f"🟢{value_text}空"
+        elif final_tag in ('平',):
+            item = f"{value_text}{final_tag}"
+        elif final_tag in ('漲停', '漲停高', '跌停', '跌停低', '高', '低'):
+            item = f"{final_tag}{value_text}"
+        elif final_tag in target_tags:
+            item = value_text
+        elif final_tag:
+            item = f"{value_text}{final_tag}"
+        else:
+            item = value_text
+        note_parts.append(item)
+
+    auto_note = "-".join(note_parts)
     if manual_note:
         if manual_note.startswith("[M]"): return manual_note[3:], auto_note
         if auto_note and manual_note.strip().startswith(auto_note.strip()): return manual_note, auto_note
         return f"{auto_note}{manual_note}", auto_note
     return auto_note, auto_note
+
+
+def filter_strategy_note_points(points, base_price):
+    limit_up, limit_down = calculate_limits(base_price)
+    if not limit_up or not limit_down:
+        return []
+    return [
+        point for point in points
+        if limit_down <= round(float(point['val']), 2) <= limit_up
+    ]
 
 def fetch_stock_data_raw(
     code, name_hint="", extra_data=None, futures_set=None,
@@ -18091,12 +18142,7 @@ def fetch_stock_data_raw(
     )
     limit_up_T = latest_limit_touch['limit_up']
     limit_down_T = latest_limit_touch['limit_down']
-    note_floor = min(
-        value for value in (limit_down_show, limit_down_T) if value and value > 0
-    )
-    note_ceiling = max(
-        value for value in (limit_up_show, limit_up_T) if value and value > 0
-    )
+    note_ceiling, note_floor = calculate_limits(strategy_base_price)
 
     target_price = apply_sr_rules(strategy_base_price * 1.03, strategy_base_price)
     stop_price = apply_sr_rules(strategy_base_price * 0.97, strategy_base_price)
@@ -18174,14 +18220,10 @@ def fetch_stock_data_raw(
     if show_plus_3: points.append({"val": target_price, "tag": ""})
     if show_minus_3: points.append({"val": stop_price, "tag": ""})
         
-    full_calc_points = []
-    threed_tags = ['前高', '前低', '昨高', '昨低', '今高', '今低']
-    for p in points:
-        v = float(f"{p['val']:.2f}")
-        if p.get('force', False) or p.get('tag') in threed_tags or (note_floor <= v <= note_ceiling): full_calc_points.append(p)
+    full_calc_points = filter_strategy_note_points(points, strategy_base_price)
     
     manual_note = saved_notes_dict.get(code, "") if saved_notes_dict else ""
-    strategy_note, auto_note = generate_stock_strategy_note(strategy_base_price, manual_note)
+    strategy_note, auto_note = generate_note_from_points(full_calc_points, manual_note, show_3d=False)
     
     if name_hint: final_name = name_hint
     elif name_map_dict and code in name_map_dict: final_name = name_map_dict[code]
@@ -19340,7 +19382,7 @@ if tab1.open and stock_strategy_tab.open:
                 "⚙️ 股票戰略室設定、資料管理與選股資料來源",
                 expanded=st.session_state.stock_data.empty,
             ):
-                hide_non_stock, _show_3d_hilo = render_stock_strategy_controls()
+                hide_non_stock, show_3d_hilo = render_stock_strategy_controls()
                 st.divider()
                 uploaded_file, selected_sheet, search_selection = (
                     render_stock_data_source_controls()
@@ -19615,10 +19657,13 @@ if tab1.open and stock_strategy_tab.open:
 
             for i, row in df_display.iterrows():
                 code = row['代號']
+                points = filter_strategy_note_points(
+                    row.get('_points', []), row.get('收盤價'),
+                )
                 manual = st.session_state.saved_notes.get(code, "")
 
-                new_full_note, new_auto_note = generate_stock_strategy_note(
-                    row.get('收盤價'), manual,
+                new_full_note, new_auto_note = generate_note_from_points(
+                    points, manual, show_3d_hilo,
                 )
 
                 df_display.at[i, "戰略備註"] = new_full_note
@@ -20401,7 +20446,10 @@ if tab1.open and stock_strategy_tab.open:
                 st.toast("手動備註已清除", icon="🧹")
                 if not st.session_state.stock_data.empty:
                      for idx, row in st.session_state.stock_data.iterrows():
-                         clean_note, _ = generate_stock_strategy_note(row.get('收盤價'), "")
+                         points = filter_strategy_note_points(
+                             row.get('_points', []), row.get('收盤價'),
+                         )
+                         clean_note, _ = generate_note_from_points(points, "", show_3d_hilo)
                          st.session_state.stock_data.at[idx, '戰略備註'] = clean_note
                          if '_auto_note' in st.session_state.stock_data.columns: st.session_state.stock_data.at[idx, '_auto_note'] = clean_note
                 save_data_cache(st.session_state.stock_data, st.session_state.ignored_stocks, st.session_state.all_candidates, st.session_state.saved_notes)
@@ -20584,7 +20632,8 @@ if tab1.open and stock_strategy_tab.open:
                     for i, row in df_indep.iterrows():
                         pts = row.get('_points', [])
                         manual = st.session_state.saved_notes.get(row['代號'], "")
-                        n_full, n_auto = generate_stock_strategy_note(row.get('收盤價'), manual)
+                        pts = filter_strategy_note_points(pts, row.get('收盤價'))
+                        n_full, n_auto = generate_note_from_points(pts, manual, show_3d_hilo)
                         df_indep.at[i, "戰略備註"] = n_full
                         df_indep.at[i, "名稱"] = row['名稱'].replace('🔴 ', '').replace('🟢 ', '').replace('⚪ ', '')
                         price_difference = price_change_amount(row.get('收盤價'), row.get('漲跌幅'))
