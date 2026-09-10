@@ -13,8 +13,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, time as dt_time, timedelta
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP
-from email.utils import parsedate_to_datetime
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import urljoin
 
 import numpy as np
@@ -58,7 +58,6 @@ def load_app_symbols(*names):
         "math": math,
         "np": np,
         "pd": pd,
-        "parsedate_to_datetime": parsedate_to_datetime,
         "pytz": pytz,
         "go": go,
         "make_subplots": make_subplots,
@@ -68,6 +67,7 @@ def load_app_symbols(*names):
         "ThreadPoolExecutor": ThreadPoolExecutor,
         "as_completed": as_completed,
         "urljoin": urljoin,
+        "st": SimpleNamespace(cache_data=lambda **kwargs: lambda function: function),
     }
     module = ast.fix_missing_locations(ast.Module(body=selected, type_ignores=[]))
     exec(compile(module, APP_PATH, "exec"), namespace)
@@ -639,6 +639,75 @@ def test_mops_monthly_revenue_parser_rejects_security_page_and_keeps_source():
     row = parse(page, "2408", 115, 8, "MOPS+")
     assert row["資料年月"] == "11508"
     assert row["_source"] == "MOPS+ 單一公司月營收"
+    assert "_report_date" not in row
+
+
+def test_mops_ezsearch_parser_matches_exact_company_period_and_time():
+    parse = load_app_symbols("_parse_mops_ezsearch_monthly_revenue")[
+        "_parse_mops_ezsearch_monthly_revenue"
+    ]
+    rows = [
+        {
+            "COMPANY_ID": "2330", "AN_CODE": "F22", "CDATE": "115/09/09",
+            "CTIME": "08:01:02", "HYPERLINK": "?year=115&month=07&co_id=2330",
+        },
+        {
+            "COMPANY_ID": "2317", "AN_CODE": "F22", "CDATE": "115/09/10",
+            "CTIME": "09:00:00", "HYPERLINK": "?year=115&month=08&co_id=2317",
+        },
+        {
+            "COMPANY_ID": "2330", "AN_CODE": "F22", "CDATE": "115/09/10",
+            "CTIME": "13:42:00", "HYPERLINK": "?year=115&month=08&co_id=2330",
+        },
+    ]
+    assert parse(rows, "2330", 115, 8) == "2026-09-10T13:42:00"
+
+
+def test_taiwan_revenue_uses_mops_before_twse_and_keeps_actual_time():
+    fetch = load_app_symbols("fetch_taiwan_monthly_revenue_events")[
+        "fetch_taiwan_monthly_revenue_events"
+    ]
+    calls = []
+    row = {
+        "公司代號": "2330", "公司名稱": "台積電", "資料年月": "11508",
+        "營業收入-當月營收": "100", "營業收入-上月營收": "90",
+        "營業收入-上月比較增減(%)": "11.1", "營業收入-去年同月增減(%)": "20",
+        "_mops_direct": True, "_source": "MOPS+ 單一公司月營收",
+    }
+    fetch.__globals__.update({
+        "resolve_earnings_ticker": lambda value: {
+            "candidates": ["2330.TW"], "display_name": "台積電"
+        },
+        "_mops_monthly_revenue_probe_months": lambda: [(115, 8)],
+        "_roc_month_text": lambda year, month: f"{year:03d}{month:02d}",
+        "fetch_mops_company_monthly_revenue": lambda *args: dict(row),
+        "fetch_twse_monthly_revenue_rows": lambda: calls.append("twse") or [],
+        "select_latest_monthly_revenue_rows": lambda rows: {},
+        "fetch_finmind_monthly_revenue_rows": lambda *args: [],
+        "build_finmind_monthly_revenue_row": lambda *args: None,
+        "fetch_mops_monthly_revenue_announcement": lambda *args: "2026-09-10T13:42:00",
+        "_signed_percent": lambda value: f"{value}%",
+        "_thousand_currency": str,
+        "_to_number": float,
+    })
+    result = fetch(["2330"])
+    event = result["events"][0]
+    assert calls == []
+    assert event["date"] == "2026-09-10T13:42:00"
+    assert event["title"].startswith("2026/09/10 13:42｜台積電 8月營收")
+
+    twse_row = {**row, "_mops_direct": False, "_source": "", "出表日期": "1150910"}
+    fetch.__globals__.update({
+        "fetch_mops_company_monthly_revenue": lambda *args: None,
+        "fetch_twse_monthly_revenue_rows": lambda: calls.append("twse") or [twse_row],
+        "select_latest_monthly_revenue_rows": lambda rows: {"2330": rows[0]},
+        "fetch_mops_monthly_revenue_announcement": lambda *args: None,
+        "_roc_compact_date": lambda value: date(2026, 9, 10),
+    })
+    fallback = fetch(["2330"])["events"][0]
+    assert calls == ["twse"]
+    assert fallback["date"] == "2026-09-10"
+    assert fallback["revenue"]["date_source"] == "TWSE OpenAPI 出表日期（公告時間未取得）"
 
 
 def test_finmind_monthly_revenue_fallback_converts_july_data():
@@ -2396,60 +2465,10 @@ def test_revenue_announcement_date_override_persists_in_snapshot():
     assert event["revenue"]["report_date"] == "2026-08-04"
     assert corrected["revenue_date_overrides"] == {"2408:11507": "2026-08-04"}
 
-
-def test_public_revenue_report_date_prefers_earliest_matching_release():
-    symbols = load_app_symbols("_to_number", "select_cnyes_revenue_announcement_date")
-    select_date = symbols["select_cnyes_revenue_announcement_date"]
-    assert select_date([
-        {"title": "營收速報 - 南亞科(2408)7月營收", "publishAt": 1785802800},  # 2026-08-04 18:20 Taipei
-        {"title": "南亞科(2408) 7月營收續強", "publishAt": 1785859200},
-        {"title": "南亞科(2408)6月營收", "publishAt": 1785802800},
-        {"title": "其他公司(1234)7月營收", "publishAt": 1785802800},
-    ], "2408", 2026, 7) == "2026-08-04"
-
-
-def test_cnyes_current_items_data_envelope_is_parsed():
-    extract = load_app_symbols("extract_cnyes_search_items")["extract_cnyes_search_items"]
-    rows = [{
-        "title": "DRAM漲不停！南亞科7月營收再創高",
-        "content": "南亞科 (2408-TW) 今 (4) 日公告 7 月營收",
-        "publishAt": 1785800804,
-    }]
-    assert extract({"items": {"data": rows, "total": 1}}) == rows
-    assert extract({"data": {"items": rows}}) == rows
-
-
-def test_google_news_revenue_date_uses_earliest_matching_company_report():
-    symbols = load_app_symbols("select_google_news_revenue_announcement_date")
-    rss = """<?xml version='1.0' encoding='UTF-8'?><rss><channel>
-      <item><title>南亞科(2408)市場新聞</title>
-        <pubDate>Mon, 03 Aug 2026 07:00:00 GMT</pubDate></item>
-      <item><title>南亞科(2408)7月營收公告</title>
-        <pubDate>Tue, 04 Aug 2026 07:40:03 GMT</pubDate></item>
-      <item><title>南亞科(2408)7月營收後續</title>
-        <pubDate>Wed, 05 Aug 2026 08:20:00 GMT</pubDate></item>
-    </channel></rss>""".encode()
-    assert symbols["select_google_news_revenue_announcement_date"](
-        rss, "2408", "南亞科", 2026, 7
-    ) == "2026-08-04"
-
-
-def test_finmind_revenue_date_is_primary_and_news_sources_are_fallbacks():
-    choose = load_app_symbols(
-        "choose_revenue_announcement_date"
-    )["choose_revenue_announcement_date"]
-    assert choose("2026-08-10", "2026-08-03", "2026-08-03", 2026, 7) == (
-        "2026-08-10", "FinMind 收錄日",
-    )
-    assert choose(None, "2026-08-04", "2026-08-03", 2026, 7) == (
-        "2026-08-04", "鉅亨網直接營收報導",
-    )
-    assert choose(None, None, "2026-08-04", 2026, 7) == (
-        "2026-08-04", "Google News 營收報導",
-    )
-    assert choose("2026-08-20", "2026-08-10", None, 2026, 7) == (
-        "2026-08-10", "鉅亨網直接營收報導",
-    )
+    event["date"] = "2026-08-05T13:42:00"
+    event["revenue"]["announcement_datetime"] = "2026-08-05T13:42:00"
+    official = symbols["apply_revenue_announcement_date_overrides"](corrected)
+    assert official["taiwan_revenue"]["events"][0]["date"] == "2026-08-05T13:42:00"
 
 
 def test_saved_manual_revenue_date_remains_authoritative_after_sync():
