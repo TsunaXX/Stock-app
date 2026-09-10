@@ -63,7 +63,7 @@ jobs:
                   f\"官方資料回應格式異常（已自動重試 {attempts} 次）：{last_error}\"
               ) from last_error
 
-'''
+          '''
 
           old_block = text[block_start:tpex_call]
           if 'return response.json()' not in old_block:
