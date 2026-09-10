@@ -8638,18 +8638,36 @@ def fetch_official_turnover_ranking(refresh_bucket=None, now_value=None):
         "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
     }
 
-    def get_json(url, params=None):
-        if str(url).startswith(_TPEX_ORIGIN):
-            with _tpex_verified_session() as session:
-                response = session.get(
+    def get_json(url, params=None, attempts=3):
+        """Retry transient official API failures before surfacing an error."""
+        last_error = None
+        for attempt in range(attempts):
+            try:
+                if str(url).startswith(_TPEX_ORIGIN):
+                    with _tpex_verified_session() as session:
+                        response = session.get(
+                            url, params=params, headers=headers, timeout=(3, 8),
+                        )
+                        response.raise_for_status()
+                        return response.json()
+
+                response = requests.get(
                     url, params=params, headers=headers, timeout=(3, 8),
                 )
-        else:
-            response = requests.get(
-                url, params=params, headers=headers, timeout=(3, 8),
-            )
-        response.raise_for_status()
-        return response.json()
+                response.raise_for_status()
+                return response.json()
+            except (requests.RequestException, ValueError) as exc:
+                last_error = exc
+                if attempt + 1 < attempts:
+                    time.sleep(0.5 * (attempt + 1))
+
+        if isinstance(last_error, requests.RequestException):
+            raise requests.ConnectionError(
+                f"官方資料連線失敗（已自動重試 {attempts} 次）：{last_error}"
+            ) from last_error
+        raise ValueError(
+            f"官方資料回應格式異常（已自動重試 {attempts} 次）：{last_error}"
+        ) from last_error
 
     tpex_rows = get_json(_TPEX_DAILY_QUOTES_URL)
     available_dates = [
