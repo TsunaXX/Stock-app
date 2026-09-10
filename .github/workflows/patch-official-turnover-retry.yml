@@ -28,19 +28,9 @@ jobs:
           path = Path('app.py')
           text = path.read_text(encoding='utf-8')
 
-          old = '''    def get_json(url, params=None):
-              if str(url).startswith(_TPEX_ORIGIN):
-                  with _tpex_verified_session() as session:
-                      response = session.get(
-                          url, params=params, headers=headers, timeout=(3, 8),
-                      )
-              else:
-                  response = requests.get(
-                      url, params=params, headers=headers, timeout=(3, 8),
-                  )
-              response.raise_for_status()
-              return response.json()
-          '''
+          func_start = text.index('def fetch_official_turnover_ranking(')
+          tpex_call = text.index('    tpex_rows = get_json(_TPEX_DAILY_QUOTES_URL)', func_start)
+          block_start = text.index('    def get_json(', func_start, tpex_call)
 
           new = '''    def get_json(url, params=None, attempts=3):
               \"\"\"Retry transient official API failures before surfacing an error.\"\"\"
@@ -72,12 +62,14 @@ jobs:
               raise ValueError(
                   f\"官方資料回應格式異常（已自動重試 {attempts} 次）：{last_error}\"
               ) from last_error
-          '''
 
-          if text.count(old) != 1:
-              raise SystemExit(f'Expected exactly one official turnover get_json block, found {text.count(old)}')
+'''
 
-          path.write_text(text.replace(old, new, 1), encoding='utf-8')
+          old_block = text[block_start:tpex_call]
+          if 'return response.json()' not in old_block:
+              raise SystemExit('Official turnover get_json block was not recognized')
+
+          path.write_text(text[:block_start] + new + text[tpex_call:], encoding='utf-8')
           PY
 
       - name: Verify Python syntax
