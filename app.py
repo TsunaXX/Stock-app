@@ -6719,12 +6719,12 @@ def build_txo_flow_history_chart(history):
     ):
         fig.add_trace(go.Scatter(
             x=frame['time'], y=frame[field], mode='lines', name=name,
-            line=dict(color=color, width=width, dash=dash),
+            line=dict(color=color, width=width, dash=dash, shape='spline', smoothing=0.6),
             hovertemplate='%{y:,.0f} 口<extra></extra>',
         ), secondary_y=False)
     fig.add_trace(go.Scatter(
         x=frame['time'], y=frame['spot'], mode='lines', name='台指期',
-        line=dict(color='#f5f5f5', width=2.1, shape='hv'), opacity=0.9,
+        line=dict(color='#f5f5f5', width=2.1, shape='spline', smoothing=0.6), opacity=0.9,
         hovertemplate='%{y:,.0f} 點<extra></extra>',
     ), secondary_y=True)
     fig.add_hline(y=0, line_dash='dot', line_color='#7f8c8d')
@@ -10809,7 +10809,7 @@ def render_strategy_validation_room():
     with st.expander("📖 策略驗證怎麼記錄與判讀", expanded=False):
         st.markdown("""
         1. **先記錄**：在股票或期貨戰略室按「記錄目前表格的已觸發訊號」。它會一次保存表內符合門檻的標的，不是只保存目前查看的那一檔；同一交易日、商品、策略、方向與進場價只會保存一筆。
-        2. **再更新**：回到原戰略室按即時更新報價／分析時，該次取得的最新價會更新已記錄訊號的追蹤結果；策略驗證頁本身**不會額外抓行情**。
+        2. **再更新**：期貨戰略室的即時更新報價／分析會用最新價更新已記錄訊號；股票戰略室的「即時更新最新成交價」只更新主表價格，不改策略驗證紀錄。策略驗證頁本身**不會額外抓行情**。
         3. **怎麼看表格**：建立時間、策略、方向、進場／停損／目標是建立訊號當下的計畫；可在「實際進場價」填入真實成交點位，後續 R、快照 MFE／MAE 與結果會優先以它計算，留白則沿用計畫進場價。15／30／60 分與收盤欄只在更新時間貼近該節點時記錄，不會用較晚價格回填。
         4. **R、MFE、MAE**：1R 是進場到失效點的距離，不是金額；例如多方進場 100、停損 95，1R = 5。MFE 是建立訊號後最有利曾走到多少 R，MAE 是最不利曾回撤多少 R，可用來檢查進場是否太晚、停損是否太近，不等於實際損益。
         5. **刪除與匯出**：可在下方明細勾選多筆「刪除」，再按刪除按鈕移除勾選紀錄；匯出按鈕會下載目前篩選後的 CSV。
@@ -13462,6 +13462,7 @@ def render_stock_strategy_explanation():
 - **③ 依序判讀**：先看`方向`與`訊號狀態`，再看`進出場預判`、`支撐壓力`及`進場信心`。`進／停／目`分別是觀察進場、失效離場與第一目標。
 - **④ 控制風險**：信心分是條件一致度，**不是勝率**；`注意累計 N 次`表示近期連續／累計達注意標準的次數。若已公告下個交易日開始處置，會優先顯示`下個開盤日處置`；`未查核`代表官方名單尚未完整取得。
 - **⑤ 更新資料**：重抓日 K、更新盤中條件或更新注意／處置名單時，會一併更新可取得的即時報價。原排行與表格順序不會因此改變。
+- **即時成交價**：「即時更新最新成交價」只更新`收盤價`欄，不重算戰略備註、策略、指標或策略驗證紀錄。
         """)
 
 def render_futures_strategy_explanation():
@@ -18386,7 +18387,9 @@ def fetch_stock_snapshot_map(api, codes):
         return {}
 
 
-def merge_realtime_stock_snapshots(stock_data, snapshot_map, points_map=None, quote_time=None):
+def merge_realtime_stock_snapshots(
+    stock_data, snapshot_map, points_map=None, quote_time=None, price_only=False,
+):
     """Apply one batched Shioaji snapshot response to the stock table."""
     if not isinstance(stock_data, pd.DataFrame) or stock_data.empty:
         return stock_data, 0
@@ -18409,8 +18412,11 @@ def merge_realtime_stock_snapshots(stock_data, snapshot_map, points_map=None, qu
         price = _safe_number(getattr(snapshot, 'close', None))
         if price is None or price <= 0:
             continue
-        change_rate = snapshot_change_rate(snapshot, price)
         refreshed.at[row_index, '收盤價'] = price
+        updated_count += 1
+        if price_only:
+            continue
+        change_rate = snapshot_change_rate(snapshot, price)
         if change_rate is not None:
             refreshed.at[row_index, '漲跌幅'] = change_rate
         refreshed.at[row_index, '成交價價差'] = price_change_amount(price, change_rate)
@@ -18433,12 +18439,12 @@ def merge_realtime_stock_snapshots(stock_data, snapshot_map, points_map=None, qu
             refreshed.at[row_index, '狀態'] = recalculate_row(
                 refreshed.loc[row_index], points_map,
             )
-        updated_count += 1
     return refreshed, updated_count
 
 
 def refresh_stock_quotes_for_codes(
     stock_data, sj_logged_in=False, sj_api=None, points_map=None, snapshot_map=None,
+    price_only=False,
 ):
     """Update all visible stock quotes with one Shioaji snapshot batch."""
     if (
@@ -18451,7 +18457,7 @@ def refresh_stock_quotes_for_codes(
             sj_api, stock_data['代號'].astype(str).tolist(),
         )
     return merge_realtime_stock_snapshots(
-        stock_data, snapshot_map, points_map=points_map,
+        stock_data, snapshot_map, points_map=points_map, price_only=price_only,
     )
 
 
@@ -20367,10 +20373,10 @@ if tab1.open and stock_strategy_tab.open:
             col_rt_update, col_btn, col_clear = st.columns([2, 2.5, 2])
             with col_rt_update:
                 btn_rt_update = st.button(
-                    "⏱️ 即時更新報價＋戰略",
+                    "⏱️ 即時更新最新成交價",
                     width='stretch',
                     type="primary",
-                    help="同步重抓目前清單的日 K 與即時報價，並重算戰略備註與排行指標。",
+                    help="批次更新目前清單的最新成交價；不變更戰略備註、策略或指標。",
                 )
             with col_btn: btn_update = st.button("⚡ 執行更新&儲存手動備註", width='stretch')
             with col_clear: btn_clear_notes = st.button("🧹 清除手動備註", width='stretch', help="清除所有記憶的戰略備註內容")
@@ -20378,25 +20384,19 @@ if tab1.open and stock_strategy_tab.open:
             if btn_rt_update:
                 if st.session_state.get('sj_logged_in', False) and st.session_state.get('sj_api'):
                     sj_api = st.session_state.sj_api
-                    code_map_dict, _ = load_local_stock_names()
                     total_count = len(st.session_state.stock_data)
-                    with st.spinner("正在同步更新報價、戰略備註與排行指標..."):
-                        refreshed_rows, updated_count = refresh_persisted_stock_rows(
+                    with st.spinner("正在更新最新成交價..."):
+                        refreshed_rows, updated_count = refresh_stock_quotes_for_codes(
                             st.session_state.stock_data,
-                            st.session_state.futures_list,
-                            st.session_state.saved_notes,
-                            code_map_dict,
                             True,
                             sj_api,
+                            price_only=True,
                         )
                     if updated_count:
                         st.session_state.stock_data = refreshed_rows
                         tz_tw = pytz.timezone('Asia/Taipei')
                         st.session_state.last_rt_update_time = datetime.now(tz_tw).strftime("%Y/%m/%d %H:%M:%S")
-                        update_strategy_signal_outcomes({
-                            str(row['代號']): _safe_number(row.get('收盤價'))
-                            for _, row in st.session_state.stock_data.iterrows()
-                        })
+                        st.session_state['_stock_data_updated_at'] = datetime.now(tz_tw).isoformat()
                         save_data_cache(
                             st.session_state.stock_data,
                             st.session_state.ignored_stocks,
@@ -20406,20 +20406,20 @@ if tab1.open and stock_strategy_tab.open:
                         st.session_state.stock_strategy_editor_revision += 1
                         if updated_count < total_count:
                             st.session_state.stock_strategy_refresh_warning = (
-                                f"本次 {total_count} 檔中有 {total_count - updated_count} 檔未取得完整新資料；"
-                                "已標示為資料過期，不沿用舊戰略價位。"
+                                f"本次 {total_count} 檔中有 {total_count - updated_count} 檔未取得最新成交價；"
+                                "原資料維持不變。"
                             )
                         else:
                             st.session_state.pop('stock_strategy_refresh_warning', None)
                         st.toast(
-                            f"已同步更新 {updated_count} 檔報價、戰略備註與排行指標。",
+                            f"已更新 {updated_count} 檔最新成交價。",
                             icon="⏱️",
                         )
                         st.rerun()
                     else:
-                        st.warning("目前未取得任何完整最新資料，未沿用舊戰略價位。")
+                        st.warning("目前未取得任何最新成交價，原資料維持不變。")
                 else:
-                    st.warning("⚠️ 請先登入永豐 API 才能使用即時更新報價與戰略功能。")
+                    st.warning("⚠️ 請先登入永豐 API 才能更新最新成交價。")
 
             if btn_clear_notes:
                 st.session_state.saved_notes = {}
@@ -20441,7 +20441,7 @@ if tab1.open and stock_strategy_tab.open:
                 st.warning(refresh_warning)
 
             if 'last_rt_update_time' in st.session_state:
-                st.markdown(f"<div style='text-align: left; color: #888; font-size: 14px; margin-top: 5px; margin-bottom: 10px;'>透過永豐API同步更新報價與戰略(更新時間:{st.session_state.last_rt_update_time})</div>", unsafe_allow_html=True)
+                st.markdown(f"<div style='text-align: left; color: #888; font-size: 14px; margin-top: 5px; margin-bottom: 10px;'>透過永豐 API 更新最新成交價（更新時間：{st.session_state.last_rt_update_time}）</div>", unsafe_allow_html=True)
 
             if btn_update:
                  update_map = edited_df.set_index('代號')[['戰略備註']].to_dict('index')
