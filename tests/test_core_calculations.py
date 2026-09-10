@@ -116,6 +116,54 @@ def test_stock_strategy_note_analysis_stays_inside_next_open_range():
     assert note == auto_note == "90-🔴100多-110"
 
 
+def test_stock_strategy_note_matches_limit_and_new_high_low_rules():
+    symbols = load_app_symbols(
+        "_safe_number", "get_tick_size", "apply_tick_rules", "apply_sr_rules",
+        "calculate_limits", "detect_stock_candle_limit_touch", "fmt_price",
+        "generate_note_from_points", "filter_strategy_note_points",
+        "build_stock_strategy_points",
+    )
+
+    def note(rows):
+        points, _ = symbols["build_stock_strategy_points"](pd.DataFrame(rows))
+        return symbols["generate_note_from_points"](points, "", False)[0]
+
+    assert note([
+        {"Open": 158, "High": 229.5, "Low": 150, "Close": 158},
+        {"Open": 160, "High": 190, "Low": 155, "Close": 160},
+        {"Open": 161.5, "High": 185, "Low": 157, "Close": 161.5},
+        {"Open": 175, "High": 190, "Low": 170, "Close": 180},
+        {"Open": 183, "High": 198, "Low": 178.5, "Close": 198},
+    ]) == "🔴171.5多-178.5-183-漲停198-203.5"
+
+    assert note([
+        {"Open": 96, "High": 101, "Low": 94, "Close": 96},
+        {"Open": 97, "High": 102, "Low": 95, "Close": 97},
+        {"Open": 99.5, "High": 102.5, "Low": 96, "Close": 99.5},
+        {"Open": 96, "High": 102, "Low": 95, "Close": 95.5},
+        {"Open": 100, "High": 103, "Low": 99, "Close": 102},
+    ]) == "🔴98多-99-100-高103-106"
+
+    assert note([
+        {"Open": 111, "High": 120, "Low": 108.5, "Close": 111},
+        {"Open": 112, "High": 119, "Low": 109, "Close": 112},
+        {"Open": 112.5, "High": 118, "Low": 109, "Close": 112.5},
+        {"Open": 116, "High": 120, "Low": 110, "Close": 116.5},
+        {"Open": 110, "High": 111, "Low": 107, "Close": 108},
+    ]) == "104-低107-110-111-🟢112空"
+
+    high_points, _ = symbols["build_stock_strategy_points"](pd.DataFrame([
+        {"Open": 175, "High": 190, "Low": 170, "Close": 180},
+        {"Open": 190, "High": 198, "Low": 185, "Close": 198},
+    ]))
+    low_points, _ = symbols["build_stock_strategy_points"](pd.DataFrame([
+        {"Open": 98, "High": 105, "Low": 95, "Close": 100},
+        {"Open": 95, "High": 98, "Low": 90, "Close": 90},
+    ]))
+    assert "漲停高" in {point["tag"] for point in high_points}
+    assert "跌停低" in {point["tag"] for point in low_points}
+
+
 def test_downward_tick_uses_the_lower_price_band():
     symbols = load_app_symbols("get_tick_size", "move_tick")
     assert symbols["move_tick"](10.0, -1) == 9.99
