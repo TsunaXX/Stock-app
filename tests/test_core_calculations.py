@@ -1467,7 +1467,8 @@ def test_risk_fetch_recovers_failed_source_without_refetching_successes(monkeypa
     import requests
     from types import SimpleNamespace
     symbols = load_app_symbols('fetch_market_risk_lists', 'validate_market_risk_payload',
-                               'parse_twse_disposition_page_payload', 'parse_tpex_disposition_page_payload')
+                               'parse_twse_disposition_page_payload', 'parse_tpex_disposition_page_payload',
+                               '_TPEX_SECURITY_LIST_URL')
     counts = {}
     sessions = []
     class Session:
@@ -1483,12 +1484,12 @@ def test_risk_fetch_recovers_failed_source_without_refetching_successes(monkeypa
             pass
     monkeypatch.setattr(requests, 'Session', Session)
     symbols.update(requests=requests, _TPEX_ORIGIN='https://www.tpex.org.tw/',
-                   _TPEX_DAILY_QUOTES_URL='https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes',
                    _tpex_verified_session=Session, adjust_to_next_market_day=lambda d: d)
     monkeypatch.setattr(time, 'sleep', lambda _: None)
     result = symbols['fetch_market_risk_lists']()
     assert result == ({}, [], [], {}, [])
     assert sorted(counts.values()) == [1] * 9 + [3]
+    assert symbols['_TPEX_SECURITY_LIST_URL'] in counts
     assert len(sessions) == 11
 
 

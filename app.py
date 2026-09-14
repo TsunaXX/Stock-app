@@ -8314,6 +8314,7 @@ _TWSE_LISTED_COMPANIES_URL = "https://openapi.twse.com.tw/v1/opendata/t187ap03_L
 _TWSE_LISTED_FUNDS_URL = "https://openapi.twse.com.tw/v1/opendata/t187ap47_L"
 _TPEX_ORIGIN = "https://www.tpex.org.tw/"
 _TPEX_DAILY_QUOTES_URL = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"
+_TPEX_SECURITY_LIST_URL = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes"
 
 
 class _TpexRelaxedStrictSSLAdapter(HTTPAdapter):
@@ -15409,7 +15410,7 @@ def fetch_market_risk_lists():
         ),
         (
             '上櫃證券清單',
-            _TPEX_DAILY_QUOTES_URL,
+            _TPEX_SECURITY_LIST_URL,
             list,
             None,
         ),
