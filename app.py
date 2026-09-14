@@ -8315,6 +8315,9 @@ _TWSE_LISTED_FUNDS_URL = "https://openapi.twse.com.tw/v1/opendata/t187ap47_L"
 _TPEX_ORIGIN = "https://www.tpex.org.tw/"
 _TPEX_DAILY_QUOTES_URL = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"
 _TPEX_SECURITY_LIST_URL = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes"
+_TPEX_INTERMEDIATE_CERT = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "certs", "twca_cyber_ssl_2023.pem",
+)
 
 
 class _TpexRelaxedStrictSSLAdapter(HTTPAdapter):
@@ -8330,6 +8333,7 @@ class _TpexRelaxedStrictSSLAdapter(HTTPAdapter):
     def _verified_context():
         context = create_urllib3_context()
         context.load_verify_locations(certifi.where())
+        context.load_verify_locations(_TPEX_INTERMEDIATE_CERT)
         strict_flag = getattr(ssl, "VERIFY_X509_STRICT", 0)
         if strict_flag:
             context.verify_flags &= ~strict_flag

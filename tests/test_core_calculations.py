@@ -967,6 +967,8 @@ def test_official_turnover_ranking_rejects_missing_same_date_rows():
 
 
 def test_tpex_ssl_compatibility_keeps_verification_and_is_host_scoped():
+    import ssl
+
     source = APP_PATH.read_text(encoding="utf-8")
     tree = ast.parse(source)
     definitions = {
@@ -979,12 +981,16 @@ def test_tpex_ssl_compatibility_keeps_verification_and_is_host_scoped():
     fetch_source = definitions["fetch_official_turnover_ranking"]
     ranking_fetch_source = definitions["fetch_post_close_stock_ranking_context"]
     assert 'context.load_verify_locations(certifi.where())' in adapter_source
+    assert 'context.load_verify_locations(_TPEX_INTERMEDIATE_CERT)' in adapter_source
     assert 'context.verify_flags &= ~strict_flag' in adapter_source
     assert 'context.check_hostname = False' not in adapter_source
     assert 'verify=False' not in adapter_source
     assert 'session.mount(_TPEX_ORIGIN, _TpexRelaxedStrictSSLAdapter())' in session_source
     assert 'with _tpex_verified_session() as session' in fetch_source
     assert 'with _tpex_verified_session() as session' in ranking_fetch_source
+    ssl.create_default_context().load_verify_locations(
+        APP_PATH.parent / "certs" / "twca_cyber_ssl_2023.pem"
+    )
 
 
 def test_official_turnover_auto_analysis_cannot_fall_back_to_stale_url():
