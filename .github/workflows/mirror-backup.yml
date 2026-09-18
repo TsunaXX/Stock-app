@@ -1,0 +1,60 @@
+name: Mirror Stock-app to XTsunaX
+
+on:
+  push:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: stock-app-backup-mirror
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  mirror:
+    if: github.repository == 'TsunaXX/Stock-app'
+    runs-on: ubuntu-latest
+    env:
+      BACKUP_REPO_TOKEN: ${{ secrets.BACKUP_REPO_TOKEN }}
+      SOURCE_REPO: TsunaXX/Stock-app
+      BACKUP_REPO: XTsunaX/Stock-app
+
+    steps:
+      - name: Check backup token
+        id: token
+        shell: bash
+        run: |
+          if [ -z "$BACKUP_REPO_TOKEN" ]; then
+            echo "::warning::BACKUP_REPO_TOKEN is not configured. Mirror sync skipped."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Mirror repository
+        if: steps.token.outputs.ready == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          git clone --mirror             "https://x-access-token:${GH_TOKEN}@github.com/${SOURCE_REPO}.git"             source.git
+
+          cd source.git
+
+          git push --mirror             "https://x-access-token:${BACKUP_REPO_TOKEN}@github.com/${BACKUP_REPO}.git"
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          if [ "${{ steps.token.outputs.ready }}" = "true" ]; then
+            echo "Backup mirror target: ${BACKUP_REPO}" >> "$GITHUB_STEP_SUMMARY"
+            echo "Source: ${SOURCE_REPO}" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Mirror skipped because BACKUP_REPO_TOKEN is not configured." >> "$GITHUB_STEP_SUMMARY"
+          fi
