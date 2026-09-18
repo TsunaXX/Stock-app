@@ -1,4 +1,3 @@
-# Verification trigger: backup mirror configured
 name: Mirror Stock-app to XTsunaX
 
 on:
