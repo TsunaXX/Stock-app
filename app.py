@@ -11093,6 +11093,7 @@ def _is_valid_data_cache_payload(value):
         'company_event_snapshot': dict,
         'futures_strategy_state': dict,
         'display_settings': dict,
+        'quick_search_state': dict,
     }
     present = [key for key in expected_types if key in value]
     return bool(present) and all(
@@ -11122,6 +11123,39 @@ def get_stock_display_settings():
         'hide_non_stock': st.session_state.get('stock_hide_non_stock', True),
         'allow_warrant_search': st.session_state.get('allow_warrant_search', False),
         'show_3d_hilo': st.session_state.get('stock_show_3d_hilo', False),
+    })
+
+
+def normalize_stock_quick_search_state(value):
+    """Keep portable stock selector values and their cross-device timestamp."""
+    source = value if isinstance(value, dict) else {}
+
+    def clean(items):
+        result = []
+        for item in items if isinstance(items, list) else []:
+            text = str(item or '').strip()
+            if text and text not in result:
+                result.append(text)
+        return result
+
+    state = {
+        'main': clean(source.get('main', [])),
+        'independent': clean(source.get('independent', [])),
+        'updated_at': str(source.get('updated_at', '')).strip(),
+    }
+    return state if state['main'] or state['independent'] or state['updated_at'] else {}
+
+
+def get_stock_quick_search_state():
+    current = normalize_stock_quick_search_state(
+        st.session_state.get('_stock_quick_search_state', {})
+    )
+    return normalize_stock_quick_search_state({
+        'main': st.session_state.get('search_multiselect', current.get('main', [])),
+        'independent': st.session_state.get(
+            'indep_search_multiselect', current.get('independent', []),
+        ),
+        'updated_at': current.get('updated_at', ''),
     })
 
 
@@ -11861,6 +11895,9 @@ def _merge_data_cache_payload(
         )
         for key in ranking_keys
     }
+    merged['quick_search_state'] = _newer_timestamped_state(
+        remote.get('quick_search_state'), local.get('quick_search_state'),
+    )
     merged['version'] = 3
     merged['updated_at'] = datetime.now(pytz.timezone('Asia/Taipei')).isoformat()
     return _json_safe(merged)
@@ -12049,6 +12086,7 @@ def save_data_cache(
                 'stock_strategy_ranking_snapshots', {}
             ),
             'display_settings': get_stock_display_settings(),
+            'quick_search_state': get_stock_quick_search_state(),
         })
 
         # 股票獨立本機快取。
@@ -12090,6 +12128,11 @@ def save_data_cache(
                 if sync_ok:
                     st.session_state['stock_strategy_ranking_snapshots'] = dict(
                         cloud_payload.get('strategy_ranking_snapshots', {})
+                    )
+                    st.session_state['_stock_quick_search_state'] = (
+                        normalize_stock_quick_search_state(
+                            cloud_payload.get('quick_search_state')
+                        )
                     )
                     _write_json_atomic(
                         STOCK_STRATEGY_CACHE_FILE, cloud_payload, indent=2,
@@ -12366,6 +12409,14 @@ def load_data_cache():
         if isinstance(data.get('display_settings', {}), dict)
         else {}
     )
+    quick_search_state = normalize_stock_quick_search_state(
+        data.get('quick_search_state')
+    )
+    if not quick_search_state:
+        legacy_search = load_search_cache()
+        if legacy_search:
+            quick_search_state = {'main': legacy_search, 'independent': [], 'updated_at': ''}
+    st.session_state['_stock_quick_search_state'] = quick_search_state
 
     st.session_state[
         '_stock_data_updated_at'
@@ -12655,6 +12706,27 @@ def save_search_cache(selected_items):
     except (OSError, TypeError, ValueError):
         pass
 
+
+def persist_stock_quick_search_state():
+    """Save both stock selectors locally and in the Google Sheet stock scope."""
+    previous = get_stock_quick_search_state()
+    state = normalize_stock_quick_search_state({
+        'main': st.session_state.get('search_multiselect', previous.get('main', [])),
+        'independent': st.session_state.get(
+            'indep_search_multiselect', previous.get('independent', []),
+        ),
+        'updated_at': datetime.now(pytz.timezone('Asia/Taipei')).isoformat(),
+    })
+    st.session_state['_stock_quick_search_state'] = state
+    save_search_cache(state.get('main', []))
+    return save_data_cache(
+        st.session_state.stock_data,
+        st.session_state.ignored_stocks,
+        st.session_state.all_candidates,
+        st.session_state.saved_notes,
+        replace_stock_data=False,
+    )
+
 if 'stock_data' not in st.session_state:
     (
         cached_df,
@@ -12702,7 +12774,17 @@ if 'calc_base_price' not in st.session_state: st.session_state.calc_base_price =
 if 'calc_view_price' not in st.session_state: st.session_state.calc_view_price = 100.0
 if 'url_history' not in st.session_state: st.session_state.url_history = load_url_history()
 if 'cloud_url_input' not in st.session_state: st.session_state.cloud_url_input = st.session_state.url_history[0] if st.session_state.url_history else ""
-if 'search_multiselect' not in st.session_state: st.session_state.search_multiselect = load_search_cache()
+cached_stock_quick_search = normalize_stock_quick_search_state(
+    st.session_state.get('_stock_quick_search_state', {})
+)
+if 'search_multiselect' not in st.session_state:
+    st.session_state.search_multiselect = (
+        cached_stock_quick_search.get('main') or load_search_cache()
+    )
+if 'indep_search_multiselect' not in st.session_state:
+    st.session_state.indep_search_multiselect = cached_stock_quick_search.get(
+        'independent', []
+    )
 if 'saved_notes' not in st.session_state: st.session_state.saved_notes = {}
 if 'futures_list' not in st.session_state: st.session_state.futures_list = {}
 if 'ignored_data_cache' not in st.session_state: st.session_state.ignored_data_cache = {} # 新增這行：忽略資料快取
@@ -12862,8 +12944,9 @@ if 'limit_rows' not in st.session_state:
         cached_stock_display_settings or saved_config
     )['limit_rows']
 if 'stock_hide_non_stock' not in st.session_state:
-    # 每個新工作階段預設先排除 ETF／權證／債券；使用者仍可手動取消。
-    st.session_state.stock_hide_non_stock = True
+    st.session_state.stock_hide_non_stock = normalize_stock_display_settings(
+        cached_stock_display_settings
+    )['hide_non_stock']
 if 'allow_warrant_search' not in st.session_state:
     st.session_state.allow_warrant_search = normalize_stock_display_settings(
         cached_stock_display_settings
@@ -13198,9 +13281,14 @@ def render_stock_strategy_controls():
                 st.session_state.ignored_stocks = set()
                 st.session_state.all_candidates = []
                 st.session_state.search_multiselect = []
+                st.session_state.indep_search_multiselect = []
                 st.session_state.saved_notes = {}
                 st.session_state.cached_notes = {}
                 st.session_state.pop('stock_independent_raw_results', None)
+                st.session_state['_stock_quick_search_state'] = {
+                    'main': [], 'independent': [],
+                    'updated_at': datetime.now(pytz.timezone('Asia/Taipei')).isoformat(),
+                }
                 save_search_cache([])
                 save_data_cache(
                     pd.DataFrame(), set(), [], {},
@@ -13273,12 +13361,9 @@ def render_stock_data_source_controls():
                     st.rerun()
         st.text_input("輸入連結 (CSV/Excel/Google Sheet)", key="cloud_url_input", placeholder="https://...")
 
-    def update_search_cache():
-        save_search_cache(st.session_state.get("search_multiselect", []))
-
     search_selection = st.multiselect(
         "🔍 快速查詢 (中文/代號)", options=stock_options,
-        key="search_multiselect", on_change=update_search_cache,
+        key="search_multiselect", on_change=persist_stock_quick_search_state,
         placeholder="輸入 2330 或 台積電...",
     )
     render_stock_external_resources()
@@ -20383,6 +20468,7 @@ if tab1.open and stock_strategy_tab.open:
                     "🔍 快速查詢 (中文/代號)",
                     options=build_stock_search_options(),
                     key="indep_search_multiselect",
+                    on_change=persist_stock_quick_search_state,
                     placeholder="輸入 2330 或 台積電..."
                 )
             with col_q2:

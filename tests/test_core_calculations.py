@@ -1035,6 +1035,47 @@ def test_stock_display_settings_are_normalized_for_reboot_restore():
     assert normalize({"limit_rows": "invalid"})["limit_rows"] == 5
 
 
+def test_stock_quick_search_uses_newest_cross_device_selection():
+    symbols = load_app_symbols(
+        "_state_updated_at", "_newer_timestamped_state",
+        "normalize_stock_quick_search_state", "get_stock_quick_search_state",
+        "persist_stock_quick_search_state",
+    )
+    normalize = symbols["normalize_stock_quick_search_state"]
+    older = normalize({
+        "main": ["2330 台積電", "2330 台積電"],
+        "updated_at": "2026-09-18T09:00:00+08:00",
+    })
+    newer = normalize({
+        "main": ["2408 南亞科"], "independent": ["2317 鴻海"],
+        "updated_at": "2026-09-18T09:05:00+08:00",
+    })
+    assert older["main"] == ["2330 台積電"]
+    assert symbols["_newer_timestamped_state"](older, newer) == newer
+
+    class State(dict):
+        __getattr__ = dict.__getitem__
+
+    class FakeStreamlit:
+        session_state = State({
+            "search_multiselect": ["2408 南亞科"],
+            "indep_search_multiselect": ["2317 鴻海"],
+            "stock_data": pd.DataFrame(), "ignored_stocks": set(),
+            "all_candidates": [], "saved_notes": {},
+        })
+
+    local_saves, cloud_saves = [], []
+    symbols.update({
+        "st": FakeStreamlit(),
+        "save_search_cache": lambda items: local_saves.append(list(items)),
+        "save_data_cache": lambda *args, **kwargs: cloud_saves.append((args, kwargs)) or True,
+    })
+    assert symbols["persist_stock_quick_search_state"]()
+    assert local_saves == [["2408 南亞科"]]
+    assert symbols["st"].session_state["_stock_quick_search_state"]["independent"] == ["2317 鴻海"]
+    assert cloud_saves[0][1]["replace_stock_data"] is False
+
+
 def test_post_21_strategy_ranking_uses_visible_rows_and_selected_mode():
     symbols = load_app_symbols(
         "get_holidays", "is_market_closed_func", "_as_float", "_ranking_number",
@@ -1886,7 +1927,7 @@ def test_stock_strategy_settings_are_manual_and_strategy_validation_tab_is_remov
     assert "_reopen_stock_strategy_settings = True" not in source
     assert '["📈 股票戰略室", "🧭 期貨戰略室"]' in source
     assert "validation_strategy_tab" not in source
-    assert "st.session_state.stock_hide_non_stock = True" in source
+    assert ")['hide_non_stock']" in source
 
 
 def test_independent_tables_use_the_same_post_21_ranking():
@@ -2062,12 +2103,14 @@ def test_shioaji_credentials_are_never_mixed_across_sources():
 def test_render_uses_persistent_shioaji_env_and_cached_startup_snapshots():
     source = APP_PATH.read_text(encoding="utf-8")
     render_yaml = (APP_PATH.parent / "render.yaml").read_text(encoding="utf-8")
+    requirements = (APP_PATH.parent / "requirements.txt").read_text(encoding="utf-8")
     assert "SHIOAJI_API_KEY" in render_yaml
     assert "SHIOAJI_SECRET_KEY" in render_yaml
     assert "st.session_state._stock_cache_refresh_pending = False" in source
     assert "def _fetch_remote_scope_cached" in source
     assert "save_fibo_config(sync_cloud=False)" in source
     assert "def fetch_fibonacci_yahoo_history" in source
+    assert "shioaji==1.7.5" in requirements
 
 
 def test_shioaji_futures_resolver_uses_v17_lazy_root_api():
@@ -2705,6 +2748,10 @@ def test_cache_merge_preserves_remote_device_sections():
         "fibo_tags": ["A", "B", "C", "D", "E"],
         "strategy_signal_log": [{"dedupe_key": "remote-1"}],
         "company_event_snapshot": {"updated_at": "2026/08/10 10:00", "events": [{"date": "2026-08-10"}]},
+        "quick_search_state": {
+            "main": ["2330 台積電"], "independent": [],
+            "updated_at": "2026-08-10T10:00:00+08:00",
+        },
     }
     local = {
         "stock_data": [{"代號": "2317", "收盤價": 200}],
@@ -2715,12 +2762,17 @@ def test_cache_merge_preserves_remote_device_sections():
         "fibo_tags": ["1", "2", "3", "4", "5"],
         "strategy_signal_log": [{"dedupe_key": "local-1"}],
         "company_event_snapshot": {"updated_at": "2026/08/11 10:00", "events": [{"date": "2026-08-11"}]},
+        "quick_search_state": {
+            "main": ["2408 南亞科"], "independent": ["2317 鴻海"],
+            "updated_at": "2026-08-11T10:00:00+08:00",
+        },
     }
     merged = symbols["_merge_data_cache_payload"](remote, local)
     assert {row["代號"] for row in merged["stock_data"]} == {"2330", "2317"}
     assert merged["fibo_tags"] == remote["fibo_tags"]
     assert {row["dedupe_key"] for row in merged["strategy_signal_log"]} == {"remote-1", "local-1"}
     assert merged["company_event_snapshot"]["updated_at"] == "2026/08/11 10:00"
+    assert merged["quick_search_state"] == local["quick_search_state"]
     remote['strategy_ranking_snapshots'] = {
         'daytrade': {'updated_at': '2026-09-09T08:29:00+08:00', 'entries': [{'score': 80}]},
         'swing': {'updated_at': '2026-09-09T08:00:00+08:00', 'entries': [{'score': 60}]},
