@@ -52,13 +52,13 @@ jobs:
 
           if cmp -s "$source_refs" "$backup_refs"; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "Source and backup refs are already identical."
+            echo "Source and backup heads/tags are already identical."
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"
-            echo "Repository refs differ; mirror sync is required."
+            echo "Source and backup heads/tags differ; sync is required."
           fi
 
-      - name: Mirror repository
+      - name: Sync branches and tags
         if: steps.token.outputs.ready == 'true' && steps.compare.outputs.changed == 'true'
         shell: bash
         env:
@@ -70,7 +70,7 @@ jobs:
 
           cd source.git
 
-          git push --mirror             "https://x-access-token:${BACKUP_REPO_TOKEN}@github.com/${BACKUP_REPO}.git"
+          git push --prune             "https://x-access-token:${BACKUP_REPO_TOKEN}@github.com/${BACKUP_REPO}.git"             "+refs/heads/*:refs/heads/*"             "+refs/tags/*:refs/tags/*"
 
       - name: Summary
         if: always()
@@ -79,9 +79,9 @@ jobs:
           if [ "${{ steps.token.outputs.ready }}" != "true" ]; then
             echo "Mirror skipped: BACKUP_REPO_TOKEN is not configured." >> "$GITHUB_STEP_SUMMARY"
           elif [ "${{ steps.compare.outputs.changed }}" = "true" ]; then
-            echo "Mirror sync completed or was attempted." >> "$GITHUB_STEP_SUMMARY"
+            echo "Branches/tags sync completed or was attempted." >> "$GITHUB_STEP_SUMMARY"
             echo "Source: ${SOURCE_REPO}" >> "$GITHUB_STEP_SUMMARY"
             echo "Backup: ${BACKUP_REPO}" >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "No repository ref changes detected; no sync was needed." >> "$GITHUB_STEP_SUMMARY"
+            echo "No heads/tags changes detected; no sync was needed." >> "$GITHUB_STEP_SUMMARY"
           fi
