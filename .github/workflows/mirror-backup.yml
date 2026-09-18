@@ -34,8 +34,32 @@ jobs:
             echo "ready=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Mirror repository
+      - name: Compare source and backup refs
+        id: compare
         if: steps.token.outputs.ready == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          source_refs="$(mktemp)"
+          backup_refs="$(mktemp)"
+
+          git ls-remote --heads --tags             "https://x-access-token:${GH_TOKEN}@github.com/${SOURCE_REPO}.git"             | sort > "$source_refs"
+
+          git ls-remote --heads --tags             "https://x-access-token:${BACKUP_REPO_TOKEN}@github.com/${BACKUP_REPO}.git"             | sort > "$backup_refs"
+
+          if cmp -s "$source_refs" "$backup_refs"; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Source and backup refs are already identical."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "Repository refs differ; mirror sync is required."
+          fi
+
+      - name: Mirror repository
+        if: steps.token.outputs.ready == 'true' && steps.compare.outputs.changed == 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -52,9 +76,12 @@ jobs:
         if: always()
         shell: bash
         run: |
-          if [ "${{ steps.token.outputs.ready }}" = "true" ]; then
-            echo "Backup mirror target: ${BACKUP_REPO}" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ steps.token.outputs.ready }}" != "true" ]; then
+            echo "Mirror skipped: BACKUP_REPO_TOKEN is not configured." >> "$GITHUB_STEP_SUMMARY"
+          elif [ "${{ steps.compare.outputs.changed }}" = "true" ]; then
+            echo "Mirror sync completed or was attempted." >> "$GITHUB_STEP_SUMMARY"
             echo "Source: ${SOURCE_REPO}" >> "$GITHUB_STEP_SUMMARY"
+            echo "Backup: ${BACKUP_REPO}" >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "Mirror skipped because BACKUP_REPO_TOKEN is not configured." >> "$GITHUB_STEP_SUMMARY"
+            echo "No repository ref changes detected; no sync was needed." >> "$GITHUB_STEP_SUMMARY"
           fi
