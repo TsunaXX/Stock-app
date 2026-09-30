@@ -3384,7 +3384,7 @@ st.session_state.stock_data = pd.DataFrame([{
 st.session_state.all_candidates = []
 st.session_state.sj_logged_in = True
 st.session_state.sj_api = SimpleNamespace(Contracts=SimpleNamespace(Stocks={'2330':SimpleNamespace(code='2330')}))
-st.session_state.stock_strategy_settings_open = True
+st.session_state.setdefault('stock_strategy_settings_open', True)
 get_strategy_intraday_history = lambda *args, **kwargs: pd.DataFrame()
 refresh_daytrade_metrics_for_codes = lambda rows, *args, **kwargs: (rows.assign(**{'收盤價':101.}), 1, 1)
 """
@@ -3406,6 +3406,13 @@ refresh_daytrade_metrics_for_codes = lambda rows, *args, **kwargs: (rows.assign(
         app.toggle(key='stock_auto_enabled').set_value(True).run()
         assert not app.exception
         assert app.session_state['stock_auto_config']['enabled'] is True
+        app.toggle(key='stock_strategy_settings_open').set_value(False).run()
+        assert not app.exception
+        assert app.toggle(key='stock_strategy_settings_open').value is False
+        app.run()
+        app.toggle(key='stock_strategy_settings_open').set_value(True).run()
+        assert not app.exception
+        assert app.toggle(key='stock_auto_enabled').value is True
         app.toggle(key='stock_auto_enabled').set_value(False).run()
         assert not app.exception
         assert app.session_state['stock_auto_config']['enabled'] is False
@@ -3522,3 +3529,12 @@ save_futures_strategy_state = lambda *a, **kw: None
         assert not app.exception
         app.toggle(key='futures_auto_enabled').set_value(False).run()
         assert not app.exception
+
+
+def test_auto_status_marks_switch_and_hides_waiting_when_disabled():
+    ns = load_app_symbols('intraday_auto_status_text')
+    waiting = '等待新串流或背景分 K 資料；保留上次資料與來源時間。'
+    ns['st'] = SimpleNamespace(session_state={'stock_auto_status':waiting})
+    text = ns['intraday_auto_status_text']
+    assert text('stock', True) == '自動更新：開啟｜' + waiting
+    assert text('stock', False) == '自動更新：關閉'
