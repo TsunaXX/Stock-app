@@ -18512,6 +18512,13 @@ def intraday_auto_window_open(now_tw, start=None, end=None, stock=False):
     return start <= clock <= end if start <= end else clock >= start or clock <= end
 
 
+def intraday_auto_status_text(room, enabled):
+    if not enabled:
+        return '自動更新：關閉'
+    status = st.session_state.get(f'{room}_auto_status', '等待更新時段與 Shioaji 連線。')
+    return '自動更新：開啟｜' + status
+
+
 def intraday_auto_settings(room):
     config = st.session_state.get(f'{room}_auto_config', {})
     restricted = room == 'stock' or config.get('restricted', False)
@@ -18533,7 +18540,7 @@ def render_intraday_auto_controls(room):
         if room == 'stock':
             st.session_state['_stock_auto_settings_changed'] = True
 
-    st.caption('⏱️ 主表自動更新')
+    st.markdown('<span style="color:#fff;font-weight:600">⏱︎ 主表自動更新</span>', unsafe_allow_html=True)
     st.toggle('啟用自動更新', value=config.get('enabled', False),
               key=f'{room}_auto_enabled', on_change=save_settings)
     st.number_input('更新間隔（秒）', min_value=1, max_value=300, value=config.get('seconds', 5),
@@ -19193,8 +19200,7 @@ def render_futures_strategy_room():
                 display_rows = updated
             finally:
                 finish_intraday_auto_update('futures', started, count)
-        if futures_auto_enabled:
-            st.caption(st.session_state.get('futures_auto_status', '等待 Shioaji 連線。'))
+        st.caption(f'市場環境：{market_bias}｜' + intraday_auto_status_text('futures', futures_auto_enabled))
         if st.session_state.get('futures_auto_updated_at'):
             st.caption('自動更新時間：' + st.session_state['futures_auto_updated_at'])
         cache = st.session_state.futures_strategy_live_cache
@@ -19902,6 +19908,18 @@ if tab1.open and stock_strategy_tab.open:
         # 即使資料在本輪重整時被篩成空表，原表欄位設定仍有可用的安全欄寬。
         note_width_px = 160
         if not st.session_state.stock_data.empty:
+            risk_preview_enabled = st.checkbox(
+                "🛡️ 啟用附加分析層（可隨時關閉回到原表）",
+                value=True,
+                key="risk_filter_preview_enabled",
+                help="加入支撐壓力、進出場點位、訊號、信心、資料品質與成效紀錄；不改動週轉率排序或原始戰略備註。"
+            )
+            strategy_settings_open = st.toggle(
+                "🧭 選股條件與進場信心設定",
+                key='stock_strategy_settings_open', persist_state='session',
+                help='手動開啟或收合；更新資料與頁面重新執行後會維持目前狀態。',
+            )
+
             stock_auto_enabled, stock_auto_seconds, stock_auto_start, stock_auto_end = intraday_auto_settings('stock')
 
             @st.fragment(run_every=1 if stock_auto_enabled else None)
@@ -19923,8 +19941,8 @@ if tab1.open and stock_strategy_tab.open:
                         st.session_state.stock_data = refreshed
                     finally:
                         finish_intraday_auto_update('stock', started, count)
-                if stock_auto_enabled:
-                    st.caption(st.session_state.get('stock_auto_status', '等待更新時段與 Shioaji 連線。'))
+                if not risk_preview_enabled:
+                    st.caption(intraday_auto_status_text('stock', stock_auto_enabled))
                 if st.session_state.get('stock_auto_updated_at'):
                     st.caption('自動更新時間：' + st.session_state['stock_auto_updated_at'])
                 if st.session_state.get('stock_manual_refresh_status'):
@@ -20007,12 +20025,6 @@ if tab1.open and stock_strategy_tab.open:
                             except Exception: pass
 
                 # 附加層只讀取原選股結果；關閉後維持既有表格、排序與戰略備註。
-                risk_preview_enabled = st.checkbox(
-                    "🛡️ 啟用附加分析層（可隨時關閉回到原表）",
-                    value=True,
-                    key="risk_filter_preview_enabled",
-                    help="加入支撐壓力、進出場點位、訊號、信心、資料品質與成效紀錄；不改動週轉率排序或原始戰略備註。"
-                )
                 risk_show_only_eligible = False
                 stock_compact_table = False
                 stock_notify = False
@@ -20045,11 +20057,6 @@ if tab1.open and stock_strategy_tab.open:
                     stock_compact_table = bool(st.session_state.get('stock_strategy_compact_table', True))
                     stock_notify = bool(st.session_state.get('stock_strategy_notify', True))
                     st.session_state.pop('_reopen_stock_strategy_settings', None)
-                    strategy_settings_open = st.toggle(
-                        "🧭 選股條件與進場信心設定",
-                        key='stock_strategy_settings_open',
-                        help='手動開啟或收合；更新資料與頁面重新執行後會維持目前狀態。',
-                    )
                     if strategy_settings_open:
                         if st.session_state.get('risk_filter_direction') in ('多頭', '空頭'):
                             st.session_state['risk_filter_direction'] = '多' if st.session_state['risk_filter_direction'] == '多頭' else '空'
@@ -20271,7 +20278,7 @@ if tab1.open and stock_strategy_tab.open:
                     market_source = str(market_environment.get('source', '臺指期資料不足'))
                     market_change = _safe_number(market_environment.get('change'))
                     market_change_text = f" {_signed_percent_arrow(market_change)}" if market_change is not None else ''
-                    st.caption(f"市場環境：{market_bias}｜依據 {market_source}{market_change_text}；只提供順逆勢標示，不改動原選股順位。")
+                    st.caption(f"市場環境：{market_bias}｜依據 {market_source}{market_change_text}；只提供順逆勢標示，不改動原選股順位。" + "｜" + intraday_auto_status_text('stock', stock_auto_enabled))
 
                     for i, row in df_display.iterrows():
                         market_lists_updated = market_risk_checked_for_row(
