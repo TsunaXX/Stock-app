@@ -539,6 +539,36 @@ def test_stock_limit_color_requires_actual_equality_not_stale_status():
     assert state("90", 100.5, 90) == "down"
 
 
+def test_stock_strategy_rejects_old_daily_candle_after_close():
+    symbols = load_app_symbols(
+        "latest_completed_stock_trading_date", "completed_stock_strategy_history",
+    )
+    symbols["is_market_closed_func"] = lambda value: value.weekday() >= 5
+    history = pd.DataFrame(
+        {"Close": [100, 101, 102]},
+        index=pd.to_datetime(["2026-09-28", "2026-09-29", "2026-09-30"]),
+    )
+    before_close = pytz.timezone("Asia/Taipei").localize(datetime(2026, 9, 30, 10, 0))
+    after_close = before_close.replace(hour=15)
+
+    completed, expected = symbols["completed_stock_strategy_history"](history, before_close)
+    assert expected == date(2026, 9, 29)
+    assert completed.index[-1].date() == expected
+
+    stale, expected = symbols["completed_stock_strategy_history"](history.iloc[:2], after_close)
+    assert expected == date(2026, 9, 30)
+    assert stale.empty
+
+    source = APP_PATH.read_text(encoding="utf-8")
+    plot_start = source.index("def plot_fibonacci_chart")
+    plot_end = source.index("def ", plot_start + 10)
+    plot_source = source[plot_start:plot_end]
+    no_login_guard = plot_source.index('ticker in ("TWF=F", "TMF=F")')
+    yahoo_fallback = plot_source.index("df = fetch_fibonacci_yahoo_history", no_login_guard)
+    assert no_login_guard < yahoo_fallback
+    assert "永豐詳細錯誤" not in plot_source[no_login_guard:yahoo_fallback]
+
+
 def test_restored_stock_rows_use_fresh_values_and_mark_failed_rows_stale():
     symbols = load_app_symbols("_stale_stock_identity_row", "_merge_refreshed_stock_rows")
     merge = symbols["_merge_refreshed_stock_rows"]

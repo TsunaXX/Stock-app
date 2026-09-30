@@ -7463,6 +7463,19 @@ def plot_fibonacci_chart(
             )
             return
 
+        if (
+            not sj_kbars_used and not twse_taiex_used
+            and ticker in ("TWF=F", "TMF=F")
+        ):
+            if st.session_state.get('sj_logged_in', False):
+                st.warning(
+                    f"⚠️ 無法獲取 {display_name} 的永豐資料；"
+                    f"詳細錯誤：{st.session_state.get('sj_last_error', '無')}。"
+                )
+            else:
+                st.info("台指期貨資料需要登入永豐 Shioaji；目前不會向 Yahoo 查詢不存在的替代代號。")
+            return
+
         # 若永豐未登入或其他商品的永豐資料不足，才退回使用 yfinance。
         if not sj_kbars_used and not twse_taiex_used:
             df = fetch_fibonacci_yahoo_history(
@@ -7478,12 +7491,6 @@ def plot_fibonacci_chart(
                 if not df.empty:
                     ticker = ticker_two
 
-           # 期貨異常保護 (移除自動替換加權指數邏輯)
-            if (df.empty or 'High' not in df.columns) and (ticker == "TWF=F" or ticker == "TMF=F"):
-                sj_status = "已登入" if st.session_state.get('sj_logged_in', False) else "未登入"
-                st.warning(f"⚠️ 無法獲取 {display_name} 的資料。診斷：永豐API={sj_status}（{'有取得資料' if sj_kbars_used else '沒取得資料'}）；永豐詳細錯誤：{st.session_state.get('sj_last_error', '無')}。請確保網路連線正常或稍後再試。")
-                return
-                
             # 將 YF 的個股成交量 (股) 統一轉換為 (張)
             if not df.empty and not is_index and 'Volume' in df.columns:
                 df['Volume'] = df['Volume'] / 1000
@@ -17915,6 +17922,39 @@ def build_stock_strategy_points(history):
 
     return filter_strategy_note_points(points, close), ma5
 
+
+def latest_completed_stock_trading_date(now_value=None):
+    """Return the newest trading day whose closing candle should be complete."""
+    current = now_value or datetime.now(pytz.timezone('Asia/Taipei'))
+    if current.tzinfo is None:
+        current = pytz.timezone('Asia/Taipei').localize(current)
+    else:
+        current = current.astimezone(pytz.timezone('Asia/Taipei'))
+    target = current.date()
+    if current.time() < dt_time(14, 30) or is_market_closed_func(target):
+        target -= timedelta(days=1)
+    while is_market_closed_func(target):
+        target -= timedelta(days=1)
+    return target
+
+
+def completed_stock_strategy_history(history, now_value=None):
+    """Keep strategy candles through the expected close and reject stale history."""
+    if not isinstance(history, pd.DataFrame) or history.empty:
+        return pd.DataFrame(), latest_completed_stock_trading_date(now_value)
+    expected = latest_completed_stock_trading_date(now_value)
+    completed = history.copy()
+    index = pd.DatetimeIndex(pd.to_datetime(completed.index, errors='coerce'))
+    if index.tz is not None:
+        index = index.tz_convert('Asia/Taipei').tz_localize(None)
+    completed.index = index
+    completed = completed[completed.index.notna()]
+    completed = completed[completed.index.date <= expected].sort_index()
+    if completed.empty or completed.index[-1].date() != expected:
+        return pd.DataFrame(), expected
+    return completed, expected
+
+
 def fetch_stock_data_raw(
     code, name_hint="", extra_data=None, futures_set=None,
     saved_notes_dict=None, name_map_dict=None, sj_logged_in=False,
@@ -18011,20 +18051,24 @@ def fetch_stock_data_raw(
                 
                 rt_time_str = rt_data['info']['time']
                 rt_dt = datetime.strptime(rt_time_str, "%Y-%m-%d %H:%M:%S")
+                expected_date = latest_completed_stock_trading_date()
+                if not expected_date <= rt_dt.date() <= datetime.now(tz_tw).date():
+                    live_quote_price = live_quote_rate = None
+                    raise ValueError("twstock 即時報價日期落後")
                 live_quote_time = rt_time_str
-                today_date = pd.Timestamp(datetime.now(tz_tw).date())
+                quote_date = pd.Timestamp(rt_dt.date())
 
                 if hist.empty:
-                    hist = pd.DataFrame([{'Open': rt_open, 'High': rt_high, 'Low': rt_low, 'Close': rt_price, 'Volume': rt_vol}], index=[today_date])
+                    hist = pd.DataFrame([{'Open': rt_open, 'High': rt_high, 'Low': rt_low, 'Close': rt_price, 'Volume': rt_vol}], index=[quote_date])
                 else:
                     if hist.index.tzinfo is not None: hist.index = hist.index.tz_localize(None)
                     last_hist_date = hist.index[-1]
-                    if last_hist_date < today_date:
-                        if datetime.now(tz_tw).weekday() < 5:
-                            new_row = pd.DataFrame([{'Open': rt_open, 'High': rt_high, 'Low': rt_low, 'Close': rt_price, 'Volume': rt_vol}], index=[today_date])
+                    if last_hist_date < quote_date:
+                        if rt_dt.weekday() < 5:
+                            new_row = pd.DataFrame([{'Open': rt_open, 'High': rt_high, 'Low': rt_low, 'Close': rt_price, 'Volume': rt_vol}], index=[quote_date])
                             hist = pd.concat([hist, new_row])
                             hist.sort_index(inplace=True)
-                    elif last_hist_date == today_date:
+                    elif last_hist_date == quote_date:
                         hist.at[last_hist_date, 'Close'] = rt_price
                         hist.at[last_hist_date, 'High'] = max(hist.at[last_hist_date, 'High'], rt_high)
                         hist.at[last_hist_date, 'Low'] = min(hist.at[last_hist_date, 'Low'], rt_low)
@@ -18043,7 +18087,6 @@ def fetch_stock_data_raw(
     # as a wrong limit immediately after a 14:30 refresh.
     tz_tw_calc = pytz.timezone('Asia/Taipei')
     now_tw_calc = datetime.now(tz_tw_calc)
-    switch_time = dt_time(14, 30)
     current_session_prev_close = None
     current_session_close = None
     if not hist.empty:
@@ -18056,12 +18099,9 @@ def fetch_stock_data_raw(
             # available): the latest completed close is today's reference.
             current_session_prev_close = current_session_close
 
-    if now_tw_calc.time() < switch_time:
-        if not hist.empty and hist.index[-1].date() == now_tw_calc.date():
-            if len(hist) > 1:
-                hist = hist.iloc[:-1]
-
-    if hist.empty: return None
+    hist, strategy_data_date = completed_stock_strategy_history(hist, now_tw_calc)
+    if hist.empty:
+        return None
 
     # 修正夜盤基準：若是期貨，透過快照直接擷取官方基準價 (日盤 13:45 收盤價)
     if include_live_quote and sj_logged_in and sj_api is not None and code in ["TWF=F", "TMF=F"]:
@@ -18175,6 +18215,7 @@ def fetch_stock_data_raw(
         "_plan_prev_high": plan_prev_high, "_plan_prev_low": plan_prev_low,
         "_quote_bid": live_quote_bid, "_quote_ask": live_quote_ask, "_quote_time": live_quote_time,
         "_data_as_of": live_quote_time or pd.Timestamp(hist.index[-1]).strftime('%Y/%m/%d'),
+        "_strategy_data_as_of": strategy_data_date.strftime('%Y/%m/%d'),
         "_data_stale": False,
     }
 
@@ -19508,6 +19549,12 @@ if tab1.open and stock_strategy_tab.open:
                 str(task[0]) for task in tasks_to_run
                 if str(task[0]) not in existing_data
             }
+            if failed_codes:
+                expected_date = latest_completed_stock_trading_date()
+                st.warning(
+                    f"{len(failed_codes)} 檔未取得截至 {expected_date:%Y/%m/%d} 的完整日 K；"
+                    "未使用較舊的開高低收或五日線產生戰略備註。"
+                )
             if failed_codes and not previous_stock_data.empty and '代號' in previous_stock_data.columns:
                 previous_failed = previous_stock_data[
                     previous_stock_data['代號'].astype(str).isin(failed_codes)
@@ -19517,8 +19564,8 @@ if tab1.open and stock_strategy_tab.open:
                     if previous_code:
                         existing_data[previous_code] = _stale_stock_identity_row(previous_row)
                 if not previous_failed.empty:
-                    st.warning(
-                        f"{len(previous_failed)} 檔本次更新失敗；已保留代號，舊行情與舊策略不再顯示。"
+                    st.caption(
+                        f"已保留 {len(previous_failed)} 檔代號；舊行情與舊策略不再顯示。"
                     )
 
             if existing_data:
@@ -20475,7 +20522,17 @@ if tab1.open and stock_strategy_tab.open:
                 st.markdown("<div style='margin-top: 28px;'></div>", unsafe_allow_html=True)
                 btn_indep_run = st.button("🚀 執行分析", key="btn_indep_run", width='stretch')
 
-            cached_indep_data = st.session_state.get('stock_independent_raw_results', [])
+            expected_indep_date = latest_completed_stock_trading_date().strftime('%Y/%m/%d')
+            cached_indep_data = [
+                row for row in st.session_state.get('stock_independent_raw_results', [])
+                if str(row.get('_strategy_data_as_of', '')) == expected_indep_date
+            ]
+            if (
+                st.session_state.get('stock_independent_raw_results')
+                and not cached_indep_data
+            ):
+                st.session_state.pop('stock_independent_raw_results', None)
+                st.info("上一份獨立分析不是最新完整交易日，已停止顯示舊戰略備註。")
             if btn_indep_run and not indep_selection:
                 st.warning("請先選擇至少一檔股票再執行獨立分析。")
             if (btn_indep_run and indep_selection) or cached_indep_data:
@@ -20539,8 +20596,11 @@ if tab1.open and stock_strategy_tab.open:
                     if indep_data:
                         st.session_state.stock_independent_raw_results = indep_data
                     else:
-                        st.warning("本次未取得有效資料，已保留上一份獨立分析結果。")
-                        indep_data = list(cached_indep_data)
+                        st.warning(
+                            f"本次未取得截至 {expected_indep_date} 的完整日 K；"
+                            "未顯示舊的獨立分析結果。"
+                        )
+                        indep_data = []
 
                 if indep_data:
                     df_indep = pd.DataFrame(indep_data)
