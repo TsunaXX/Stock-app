@@ -14462,6 +14462,7 @@ def update_futures_live_rows(rows, api, strategy_mode, direction_choice, include
     if rows.empty or api is None:
         return rows, 0
     updated, _ = filter_active_futures_rows(rows)
+    updated = updated.astype(object)
     if updated.empty:
         updated.attrs['resolved_contract_count'] = 0
         return updated, 0
@@ -14536,7 +14537,7 @@ def update_futures_live_rows(rows, api, strategy_mode, direction_choice, include
         if live_vwap is not None and live_vwap > 0 and strategy_mode == '當沖':
             analysis['VWAP'] = live_vwap
         for column, value in analysis.items():
-            updated.at[index, column] = value
+            set_futures_row_values(updated, index, {column: value})
         updated.at[index, '實際契約'] = str(getattr(contract, 'code', updated.at[index, '期貨代碼']))
     return updated, update_count
 
@@ -14545,6 +14546,7 @@ def update_futures_universe_live(rows, api):
     if rows.empty or api is None:
         return rows, 0
     updated, _ = filter_active_futures_rows(rows)
+    updated = updated.astype(object)
     if updated.empty:
         return updated, 0
     roots = sorted(set(updated['期貨代碼'].astype(str).str.upper()), key=len, reverse=True)
@@ -16895,7 +16897,7 @@ def render_strategy_ranking(rows, strategy_mode, room_label, allow_refresh=True)
         st.info(f'尚無盤前{room_label}{"當沖" if snapshot_key == "daytrade" else "波段"}排名快照；正在等待資料。')
         return
     st.caption(
-        f"排名快照：{snapshot.get('updated_at', '')}｜8:30 起固定，收盤後執行分析才更新｜"
+        f"排名快照：{(parse_strategy_data_time(snapshot.get('updated_at')).strftime('%Y/%m/%d %H:%M:%S') if parse_strategy_data_time(snapshot.get('updated_at')) is not None else '—')}｜8:30 起固定，收盤後執行分析才更新｜"
         "已同步 Google Sheet，可跨裝置讀取"
     )
     ranking_title = '當沖排名' if strategy_mode == '當沖' else '波段排名'
@@ -18510,24 +18512,57 @@ def intraday_auto_window_open(now_tw, start=None, end=None, stock=False):
     return start <= clock <= end if start <= end else clock >= start or clock <= end
 
 
+def intraday_auto_settings(room):
+    config = st.session_state.get(f'{room}_auto_config', {})
+    restricted = room == 'stock' or config.get('restricted', False)
+    return (config.get('enabled', False), config.get('seconds', 5),
+            config.get('start', dt_time(9, 0)) if restricted else None,
+            config.get('end', dt_time(13, 30)) if restricted else None)
+
+
 def render_intraday_auto_controls(room):
-    stock = room == 'stock'
-    with st.expander('⏱️ 主表自動更新', expanded=False):
-        enabled = st.toggle('啟用自動更新', value=False, key=f'{room}_auto_enabled')
-        seconds = st.number_input('更新間隔（秒）', min_value=1, max_value=300, value=5,
-                                  key=f'{room}_auto_seconds')
-        restricted = stock or st.checkbox('限定更新時段', value=False, key=f'{room}_auto_restricted')
-        start = end = None
-        if restricted:
-            left, right = st.columns(2)
-            start = left.time_input('開始時間', value=dt_time(9, 0), key=f'{room}_auto_start')
-            end = right.time_input('結束時間', value=dt_time(13, 30), key=f'{room}_auto_end')
-        st.caption('僅更新主表顯示標的；需登入 Shioaji 並保持此頁開啟。更新完成後才計算下一次間隔。')
-    if not enabled and st.session_state.get('sj_api') is not None:
-        state = _stream_state(st.session_state.sj_api)
-        if state.get('strategy_owned_subscriptions', {}).get(room):
+    config = st.session_state.setdefault(f'{room}_auto_config', {})
+
+    def save_settings():
+        for field in ('enabled', 'seconds', 'restricted', 'start', 'end'):
+            key = f'{room}_auto_{field}'
+            if key in st.session_state:
+                config[field] = st.session_state[key]
+        if not config.get('enabled', False) and st.session_state.get('sj_api') is not None:
             sync_strategy_stream_scope(st.session_state.sj_api, [], room)
-    return enabled, int(seconds), start, end
+        if room == 'stock':
+            st.session_state['_stock_auto_settings_changed'] = True
+
+    st.caption('⏱️ 主表自動更新')
+    st.toggle('啟用自動更新', value=config.get('enabled', False),
+              key=f'{room}_auto_enabled', on_change=save_settings)
+    st.number_input('更新間隔（秒）', min_value=1, max_value=300, value=config.get('seconds', 5),
+                    key=f'{room}_auto_seconds', on_change=save_settings)
+    restricted = room == 'stock' or st.checkbox(
+        '限定更新時段', value=config.get('restricted', False),
+        key=f'{room}_auto_restricted', on_change=save_settings)
+    if restricted:
+        left, right = st.columns(2)
+        left.time_input('開始時間', value=config.get('start', dt_time(9, 0)),
+                        key=f'{room}_auto_start', on_change=save_settings)
+        right.time_input('結束時間', value=config.get('end', dt_time(13, 30)),
+                         key=f'{room}_auto_end', on_change=save_settings)
+    st.caption('僅更新主表顯示標的；需登入 Shioaji 並保持此頁開啟。更新完成後才計算下一次間隔。')
+    return intraday_auto_settings(room)
+
+
+def futures_auto_night_scope(enabled, now_tw):
+    return enabled and (now_tw.time() >= dt_time(15, 0) or now_tw.time() < dt_time(5, 0))
+
+
+def set_futures_row_values(rows, index, values):
+    # Official integer columns also receive decimal quotes and missing cache values.
+    for column, value in values.items():
+        if column not in rows.columns:
+            rows[column] = pd.Series(None, index=rows.index, dtype=object)
+        elif rows[column].dtype != object:
+            rows[column] = rows[column].astype(object)
+        rows.at[index, column] = value
 
 
 def sync_strategy_stream_scope(api, contracts, room):
@@ -18566,9 +18601,11 @@ def begin_intraday_auto_update(room, enabled, seconds, start=None, end=None):
 
 def finish_intraday_auto_update(room, started, count):
     st.session_state[f'{room}_auto_completed'] = time.monotonic()
+    if count:
+        st.session_state[f'{room}_auto_updated_at'] = datetime.now(pytz.timezone('Asia/Taipei')).strftime('%Y/%m/%d %H:%M:%S')
     st.session_state[f'{room}_auto_status'] = (
         f'本輪 {count} 檔｜耗時 {time.monotonic() - started:.2f} 秒｜'
-        + datetime.now(pytz.timezone('Asia/Taipei')).strftime('%H:%M:%S')
+        + datetime.now(pytz.timezone('Asia/Taipei')).strftime('%Y/%m/%d %H:%M:%S')
         if count else '等待新串流或背景分 K 資料；保留上次資料與來源時間。'
     )
     st.session_state[f'{room}_auto_lock'].release()
@@ -18834,6 +18871,7 @@ def render_futures_strategy_room():
                     key="futures_direction_choice",
                     help="自動：依成交價相對開盤價（當沖則優先參考 VWAP）判定；偏多：固定以突破壓力的做多計畫計算；偏空：固定以跌破支撐的做空計畫計算。"
                 )
+                futures_auto_enabled, futures_auto_seconds, futures_auto_start, futures_auto_end = render_intraday_auto_controls('futures')
             with control2:
                 limit_rows = st.number_input("顯示筆數", min_value=1, max_value=50, value=5, step=1, key="futures_strategy_limit")
                 minimum_volume = st.number_input("最低成交口數", min_value=1, value=1, step=1, key="futures_minimum_volume")
@@ -19053,6 +19091,8 @@ def render_futures_strategy_room():
     )
     if universe_meta.get('errors'):
         st.warning("部分官方資料未完整取得：" + "｜".join(universe_meta['errors']))
+    auto_night = futures_auto_night_scope(futures_auto_enabled, datetime.now(pytz.timezone('Asia/Taipei')))
+    only_night = only_night or auto_night
     if only_night:
         st.caption(
             "🌙 夜盤篩選：僅顯示可交易夜盤的契約；夜盤即時排行已更新時依夜盤累計成交口數排序，"
@@ -19125,12 +19165,13 @@ def render_futures_strategy_room():
             manual_rows['_manual_order'] = manual_rows['契約鍵'].map(order_map)
             manual_rows = manual_rows.sort_values('_manual_order').drop(columns=['_manual_order'])
         display_rows = pd.concat([base_rows, manual_rows, linked_rows], ignore_index=True)
-    futures_auto_enabled, futures_auto_seconds, futures_auto_start, futures_auto_end = render_intraday_auto_controls('futures')
     if refresh_live:
         st.session_state['_futures_manual_refresh'] = True
 
     @st.fragment(run_every=1 if futures_auto_enabled else None)
     def render_futures_main_table(display_rows):
+        if futures_auto_night_scope(futures_auto_enabled, datetime.now(pytz.timezone('Asia/Taipei'))) != auto_night:
+            st.rerun()
         display_rows = display_rows.copy()
         if begin_intraday_auto_update('futures', futures_auto_enabled, futures_auto_seconds, futures_auto_start, futures_auto_end):
             started = time.monotonic()
@@ -19141,7 +19182,7 @@ def render_futures_strategy_room():
                     cached = st.session_state.futures_strategy_live_cache.get(str(row['契約鍵']), {})
                     for column, value in cached.items():
                         if column in display_rows.columns and column != '交易時段':
-                            display_rows.at[index, column] = value
+                            set_futures_row_values(display_rows, index, {column: value})
                 updated, count = update_futures_live_rows(
                     display_rows, st.session_state.sj_api, strategy_mode, direction_choice, stream_only=True,
                 )
@@ -19154,6 +19195,8 @@ def render_futures_strategy_room():
                 finish_intraday_auto_update('futures', started, count)
         if futures_auto_enabled:
             st.caption(st.session_state.get('futures_auto_status', '等待 Shioaji 連線。'))
+        if st.session_state.get('futures_auto_updated_at'):
+            st.caption('自動更新時間：' + st.session_state['futures_auto_updated_at'])
         cache = st.session_state.futures_strategy_live_cache
 
         for index, row in display_rows.iterrows():
@@ -19164,11 +19207,11 @@ def render_futures_strategy_room():
                     if column == '交易時段':
                         continue
                     if column in display_rows.columns or column in ('支撐壓力', '進出場點位', '方向', '觸發條件', '實際契約', 'VWAP', 'ATR', '買價', '賣價', '報價時間', '_intraday_history_pending'):
-                        display_rows.at[index, column] = value
+                        set_futures_row_values(display_rows, index, {column: value})
             if not cached or cached.get('_策略週期') != strategy_mode or cached.get('_分析方向') != direction_choice:
                 analysis = calculate_futures_strategy_levels(display_rows.loc[index], strategy_mode, direction_choice)
                 for column, value in analysis.items():
-                    display_rows.at[index, column] = value
+                    set_futures_row_values(display_rows, index, {column: value})
 
         def refresh_futures_live_data():
             if not st.session_state.get('sj_logged_in', False) or st.session_state.get('sj_api') is None:
@@ -19859,10 +19902,12 @@ if tab1.open and stock_strategy_tab.open:
         # 即使資料在本輪重整時被篩成空表，原表欄位設定仍有可用的安全欄寬。
         note_width_px = 160
         if not st.session_state.stock_data.empty:
-            stock_auto_enabled, stock_auto_seconds, stock_auto_start, stock_auto_end = render_intraday_auto_controls('stock')
+            stock_auto_enabled, stock_auto_seconds, stock_auto_start, stock_auto_end = intraday_auto_settings('stock')
 
             @st.fragment(run_every=1 if stock_auto_enabled else None)
             def render_stock_main_table():
+                if st.session_state.pop('_stock_auto_settings_changed', False):
+                    st.rerun()
                 if begin_intraday_auto_update('stock', stock_auto_enabled, stock_auto_seconds, stock_auto_start, stock_auto_end):
                     started = time.monotonic()
                     count = 0
@@ -19880,6 +19925,8 @@ if tab1.open and stock_strategy_tab.open:
                         finish_intraday_auto_update('stock', started, count)
                 if stock_auto_enabled:
                     st.caption(st.session_state.get('stock_auto_status', '等待更新時段與 Shioaji 連線。'))
+                if st.session_state.get('stock_auto_updated_at'):
+                    st.caption('自動更新時間：' + st.session_state['stock_auto_updated_at'])
                 if st.session_state.get('stock_manual_refresh_status'):
                     st.caption(st.session_state.stock_manual_refresh_status)
                 market_bias = '盤整'
@@ -20021,6 +20068,7 @@ if tab1.open and stock_strategy_tab.open:
                                 key="risk_filter_direction",
                                 help="系統自動會逐檔判斷：當沖以分 K、VWAP、開盤區間及量能為主；隔日／波段以日 K 均線、前高前低與支撐壓力為主。選多或空可強制整表使用指定方向。"
                             )
+                            render_intraday_auto_controls('stock')
                         with risk_col2:
                             risk_min_score = st.slider("最低進場信心", min_value=60, max_value=90, value=75, key="risk_filter_min_score")
                             risk_max_extension = st.slider("最大乖離（ATR）", min_value=1.0, max_value=3.0, value=2.0, step=0.1, key="risk_filter_max_extension")

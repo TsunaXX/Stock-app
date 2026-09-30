@@ -3343,16 +3343,16 @@ def test_intraday_history_seed_is_background_and_reused():
 
 def test_futures_auto_reads_stream_only_and_waits_for_history():
     ns = load_app_symbols('update_futures_live_rows', '_safe_number', '_stream_datetime',
-                          'snapshot_change_rate', 'fresh_strategy_stream_quote')
+                          'snapshot_change_rate', 'fresh_strategy_stream_quote', 'set_futures_row_values')
     rows = pd.DataFrame([{'期貨代碼':'CDF', '契約月份':'202610', '契約鍵':'CDF:202610',
-                          '收盤價':100., '開盤價':99., '當日高':101., '當日低':98.,
+                          '收盤價':100, '開盤價':99, '當日高':101, '當日低':98,
                           '當日成交口數':10, '原始保證金率':13., '維持保證金率':10., '乘數':2000.,
                           '商品類型':'股票'}])
     ns['filter_active_futures_rows'] = lambda r: (r.copy(), [])
     ns['resolve_shioaji_futures_contract'] = lambda *args: SimpleNamespace(code='CDFJ6')
     ns['sync_strategy_stream_scope'] = lambda *args: None
     calls = []
-    quote = SimpleNamespace(code='CDFJ6', source='stream', close=102., open=100., high=103., low=99.,
+    quote = SimpleNamespace(code='CDFJ6', source='stream', close=102.5, open=100., high=103., low=99.,
                             total_volume=12, change_price=2, avg_price=101.,
                             updated_at=datetime.now(pytz.timezone('Asia/Taipei')).replace(tzinfo=None))
     ns['get_stream_quotes'] = lambda api, contracts, snapshot_fallback: (
@@ -3364,7 +3364,7 @@ def test_futures_auto_reads_stream_only_and_waits_for_history():
     ns['calculate_futures_strategy_levels'] = lambda row, *args: {'方向':'偏多', 'VWAP':100.}
     updated, count = ns['update_futures_live_rows'](rows, object(), '當沖', '自動', stream_only=True)
     assert calls == [False, ('history_wait', False)]
-    assert count == 1 and updated.iloc[0]['收盤價'] == 102
+    assert count == 1 and updated.iloc[0]['收盤價'] == 102.5
     assert updated.iloc[0]['開盤價'] == 100
     assert updated.iloc[0]['VWAP'] == 101
     assert updated.iloc[0]['_intraday_history_pending'] == True
@@ -3403,6 +3403,12 @@ refresh_daytrade_metrics_for_codes = lambda rows, *args, **kwargs: (rows.assign(
         assert not app.exception
         tables = [d.value for d in app.dataframe if '代號' in d.value.columns and '收盤價' in d.value.columns]
         assert float(tables[0]['收盤價'].iloc[0]) == 101
+        app.toggle(key='stock_auto_enabled').set_value(True).run()
+        assert not app.exception
+        assert app.session_state['stock_auto_config']['enabled'] is True
+        app.toggle(key='stock_auto_enabled').set_value(False).run()
+        assert not app.exception
+        assert app.session_state['stock_auto_config']['enabled'] is False
 
 
 def test_auto_scope_cancels_removed_jobs_without_unsubscribing_existing_consumers():
@@ -3463,3 +3469,56 @@ def test_futures_trading_dates_are_batched_and_preserve_holiday_night_grouping()
     aware = bars.copy()
     aware.index = aware.index.tz_localize('Asia/Taipei').tz_convert('UTC')
     assert calculate(row, '當沖', '偏多', aware) == intraday
+
+
+def test_futures_cache_types_and_night_auto_restore():
+    ns = load_app_symbols('set_futures_row_values', 'futures_auto_night_scope',
+                          'filter_futures_strategy_display_rows', 'parse_strategy_data_time')
+    rows = pd.DataFrame({'契約鍵':['day','night'], '交易時段':['日盤','日盤+夜盤'],
+                         '收盤價':[100,200], '當日成交口數':[200,100], '月份順位':[0,0]})
+    original = rows.copy()
+    ns['set_futures_row_values'](rows, 0, {'收盤價':100.5, 'VWAP':101.2, 'ATR':None})
+    ns['set_futures_row_values'](rows, 1, {'收盤價':'', 'VWAP':'—', 'ATR':0.5})
+    assert rows.loc[0,'收盤價'] == 100.5 and rows.loc[1,'VWAP'] == '—'
+    for hour, enabled, expected in [(15,True,['night']), (0,True,['night']),
+                                    (5,True,['day','night']), (16,False,['day','night'])]:
+        only_night = ns['futures_auto_night_scope'](enabled, datetime(2026,9,30,hour))
+        selected = ns['filter_futures_strategy_display_rows'](original, only_night=only_night)
+        assert selected['契約鍵'].tolist() == expected
+    assert original['收盤價'].tolist() == [100,200]
+    stamp = ns['parse_strategy_data_time']('2026-09-30T14:39:37.649478+08:00')
+    assert stamp.strftime('%Y/%m/%d %H:%M:%S') == '2026/09/30 14:39:37'
+
+
+def test_futures_fragment_cached_decimal_and_settings_ui():
+    from unittest.mock import patch
+    import requests
+    from streamlit.testing.v1 import AppTest
+    source = APP_PATH.read_text(encoding='utf-8')
+    setup = """
+st.session_state.strategy_room_active_tab = '🧭 期貨戰略室'
+fixture_rows = pd.DataFrame([{'契約鍵':'CDF:202610','期貨代碼':'CDF','契約月份':'202610',
+    '名稱':'台積電期貨','標的代號':'2330','商品類型':'股票','當日成交口數':1000,
+    '未平倉口數':500,'收盤價':100,'開盤價':99,'當日高':101,'當日低':98,
+    '漲跌幅':1,'當日漲停價':110,'當日跌停價':90,'所需保證金':26000,
+    '維持保證金':20000,'原始保證金率':13,'維持保證金率':10,'乘數':2000,
+    '指數期貨':False,'ETF期貨':False,'小型期貨':False,'次月期貨':False,
+    '月份順位':0,'交易時段':'日盤+夜盤','資料日期':'2026/09/30'}])
+fetch_futures_strategy_universe = lambda *a, **kw: (fixture_rows.copy(), {'updated':'2026/09/30','errors':[]})
+load_futures_strategy_state = lambda: {'live_cache':{'CDF:202610':{'收盤價':100.5,'VWAP':'—','報價時間':'2026/09/30 16:00:00'}}}
+save_futures_strategy_state = lambda *a, **kw: None
+"""
+    source = source.replace('tab1, tab_fibo, tab2, tab_db, tab_company, tab3 = st.tabs([',
+                            setup + '\n' + 'tab1, tab_fibo, tab2, tab_db, tab_company, tab3 = st.tabs([')
+    with patch('requests.get', side_effect=requests.ConnectionError('offline')), \
+         patch('requests.post', side_effect=requests.ConnectionError('offline')), \
+         patch('yfinance.download', return_value=pd.DataFrame()), \
+         patch('yfinance.Ticker', return_value=SimpleNamespace(history=lambda *a, **kw: pd.DataFrame(), fast_info={}, info={})):
+        app = AppTest.from_string(source, default_timeout=120).run()
+        assert not app.exception
+        assert app.toggle(key='futures_auto_enabled').value is False
+        assert app.checkbox(key='futures_auto_restricted').value is False
+        app.toggle(key='futures_auto_enabled').set_value(True).run()
+        assert not app.exception
+        app.toggle(key='futures_auto_enabled').set_value(False).run()
+        assert not app.exception
