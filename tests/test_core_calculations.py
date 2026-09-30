@@ -3425,3 +3425,41 @@ def test_auto_scope_cancels_removed_jobs_without_unsubscribing_existing_consumer
     assert pending.cancelled() and not state['strategy_histories']
     assert set(state['strategy_owned_subscriptions']['stock']) == {'new'}
     assert 'manual' in state['subscriptions']
+
+
+def test_futures_trading_dates_are_batched_and_preserve_holiday_night_grouping():
+    ns = load_app_symbols('calculate_futures_strategy_levels', '_safe_number',
+                          'get_futures_trading_date', 'is_market_closed_func', 'get_holidays')
+    ns['get_futures_tick_size'] = lambda *a: 0.5
+    ns['round_futures_price'] = lambda price, *a: price
+    ns['fmt_price'] = str
+    ns['clamp_futures_intraday_levels'] = lambda a, b, c, *args: (a, b, c)
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            value = datetime(2026, 9, 30, 1)
+            return tz.localize(value) if tz else value
+    ns['datetime'] = Clock
+    index = pd.DatetimeIndex(['2026-09-24 13:00','2026-09-24 13:30',
+                             '2026-09-24 15:00','2026-09-24 15:30','2026-09-24 16:00',
+                             '2026-09-29 09:00','2026-09-29 09:30',
+                             '2026-09-29 15:00','2026-09-29 15:30','2026-09-29 16:00'])
+    bars = pd.DataFrame({'Open':100.,'High':range(103,113),'Low':range(96,106),
+                         'Close':101.,'Volume':10.}, index=index)
+    row = {'期貨代碼':'CDF','收盤價':101.,'開盤價':100.,'當日高':112.,'當日低':96.}
+    date_fn = ns['get_futures_trading_date']
+    oracle = [date_fn(ts.to_pydatetime()).date() for ts in index]
+    assert oracle[2] == date(2026, 9, 29)  # 9/25 and 9/28 closures plus weekend.
+    calls = []
+    ns['get_futures_trading_date'] = lambda ts: calls.append(ts) or date_fn(ts)
+    calculate = ns['calculate_futures_strategy_levels']
+    intraday = calculate(row, '當沖', '偏多', bars)
+    assert intraday['支撐壓力'] == '支 103.0｜壓 112.0'
+    assert len(calls) == 4  # Distinct adjusted dates, not ten minute bars.
+    daily = bars.assign(trade_date=oracle).groupby('trade_date').agg(
+        {'Open':'first','High':'max','Low':'min','Close':'last','Volume':'sum'})
+    daily.index = pd.to_datetime(daily.index) + pd.Timedelta(hours=12)
+    assert calculate(row, '波段', '偏多', bars) == calculate(row, '波段', '偏多', daily)
+    aware = bars.copy()
+    aware.index = aware.index.tz_localize('Asia/Taipei').tz_convert('UTC')
+    assert calculate(row, '當沖', '偏多', aware) == intraday

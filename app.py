@@ -14228,6 +14228,17 @@ def calculate_futures_strategy_levels(row, strategy_mode='當沖', direction_cho
         data = kbars.copy().sort_index().dropna(subset=['High', 'Low', 'Close'])
         if not data.empty:
             close = float(data['Close'].iloc[-1])
+            # Convert each distinct calendar date once, rather than every minute bar.
+            local_index = data.index
+            if local_index.tz is not None:
+                local_index = local_index.tz_convert('Asia/Taipei').tz_localize(None)
+                data.index = local_index
+            date_keys = local_index.normalize() + pd.to_timedelta((local_index.hour >= 15).astype(int), unit='D')
+            dates_by_key = {
+                key: get_futures_trading_date(key.to_pydatetime()).date()
+                for key in date_keys.unique()
+            }
+            trading_dates = date_keys.map(dates_by_key)
             previous_close = data['Close'].shift(1)
             true_range = pd.concat([
                 data['High'] - data['Low'],
@@ -14240,18 +14251,9 @@ def calculate_futures_strategy_levels(row, strategy_mode='當沖', direction_cho
                     or datetime.now(pytz.timezone('Asia/Taipei')).time() < dt_time(5, 0)
                 ) else 'day'
                 session_labels = pd.Series(
-                    [
-                        (
-                            get_futures_trading_date(
-                                ts.to_pydatetime().replace(
-                                    tzinfo=pytz.timezone('Asia/Taipei')
-                                ) if ts.tzinfo is None else ts.to_pydatetime()
-                            ).date(),
-                            'night' if ts.time() >= dt_time(15, 0) or ts.time() < dt_time(5, 0) else 'day',
-                        )
-                        for ts in data.index
-                    ],
-                    index=data.index,
+                    list(zip(trading_dates, np.where(
+                        (local_index.hour >= 15) | (local_index.hour < 5), 'night', 'day',
+                    ))), index=data.index,
                 )
                 matching_sessions = session_labels[session_labels.map(lambda value: value[1] == session_kind)]
                 selected_session = matching_sessions.iloc[-1] if not matching_sessions.empty else session_labels.iloc[-1]
@@ -14266,17 +14268,7 @@ def calculate_futures_strategy_levels(row, strategy_mode='當沖', direction_cho
                     typical = (recent['High'] + recent['Low'] + recent['Close']) / 3
                     vwap = float((typical * recent['Volume']).sum() / recent['Volume'].sum())
             else:
-                trade_date = pd.Series(
-                    [
-                        get_futures_trading_date(
-                            ts.to_pydatetime().replace(
-                                tzinfo=pytz.timezone('Asia/Taipei')
-                            ) if ts.tzinfo is None else ts.to_pydatetime()
-                        ).date()
-                        for ts in data.index
-                    ],
-                    index=data.index,
-                )
+                trade_date = pd.Series(trading_dates, index=data.index)
                 daily = data.assign(_trade_date=trade_date.values).groupby('_trade_date').agg({
                     'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last',
                     **({'Volume': 'sum'} if 'Volume' in data.columns else {})
