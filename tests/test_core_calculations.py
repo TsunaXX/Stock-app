@@ -3370,7 +3370,7 @@ def test_futures_auto_reads_stream_only_and_waits_for_history():
     assert updated.iloc[0]['_intraday_history_pending'] == True
 
 
-def test_manual_intraday_button_updates_table_without_full_page_rerun():
+def test_manual_intraday_button_updates_table_without_full_page_rerun(tmp_path):
     from unittest.mock import patch
     import requests
     from streamlit.testing.v1 import AppTest
@@ -3389,6 +3389,7 @@ get_strategy_intraday_history = lambda *args, **kwargs: pd.DataFrame()
 refresh_daytrade_metrics_for_codes = lambda rows, *args, **kwargs: (rows.assign(**{'收盤價':101.}), 1, 1)
 """
     anchor = 'tab1, tab_fibo, tab2, tab_db, tab_company, tab3 = st.tabs(['
+    setup = 'CONFIG_FILE = ' + repr(str(tmp_path / 'auto-config.json')) + '\n' + setup
     source = source.replace(anchor, setup + '\n' + anchor)
     with patch('requests.get', side_effect=requests.ConnectionError('offline UI check')), \
          patch('requests.post', side_effect=requests.ConnectionError('offline UI check')), \
@@ -3416,6 +3417,14 @@ refresh_daytrade_metrics_for_codes = lambda rows, *args, **kwargs: (rows.assign(
         app.toggle(key='stock_auto_enabled').set_value(False).run()
         assert not app.exception
         assert app.session_state['stock_auto_config']['enabled'] is False
+        app.number_input(key='stock_auto_seconds').set_value(12).run()
+        assert not app.exception
+        saved = json.loads((tmp_path / 'auto-config.json').read_text(encoding='utf-8'))
+        assert saved['stock_auto_seconds'] == 12
+        restarted = AppTest.from_string(source, default_timeout=120).run()
+        assert not restarted.exception
+        assert restarted.number_input(key='stock_auto_seconds').value == 12
+        assert restarted.toggle(key='stock_auto_enabled').value is False
 
 
 def test_auto_scope_cancels_removed_jobs_without_unsubscribing_existing_consumers():
@@ -3538,3 +3547,17 @@ def test_auto_status_marks_switch_and_hides_waiting_when_disabled():
     text = ns['intraday_auto_status_text']
     assert text('stock', True) == '自動更新：開啟｜' + waiting
     assert text('stock', False) == '自動更新：關閉'
+
+
+def test_auto_intervals_restore_separately_without_enabling_refresh():
+    ns = load_app_symbols('intraday_auto_settings')
+    saved = {'stock_auto_seconds':12, 'futures_auto_seconds':30}
+    ns['load_config'] = lambda: saved
+    ns['st'] = SimpleNamespace(session_state={})
+    settings = ns['intraday_auto_settings']
+    assert settings('stock') == (False,12,dt_time(9),dt_time(13,30))
+    assert settings('futures') == (False,30,None,None)
+    for invalid, expected in [('bad',5),(0,1),(999,300),(None,5)]:
+        saved['stock_auto_seconds'] = invalid
+        ns['st'].session_state.clear()
+        assert settings('stock')[1] == expected

@@ -18520,7 +18520,14 @@ def intraday_auto_status_text(room, enabled):
 
 
 def intraday_auto_settings(room):
-    config = st.session_state.get(f'{room}_auto_config', {})
+    if f'{room}_auto_config' not in st.session_state:
+        saved = load_config().get(f'{room}_auto_seconds', 5)
+        try:
+            seconds = max(1, min(300, int(saved)))
+        except (TypeError, ValueError, OverflowError):
+            seconds = 5
+        st.session_state[f'{room}_auto_config'] = {'seconds': seconds}
+    config = st.session_state[f'{room}_auto_config']
     restricted = room == 'stock' or config.get('restricted', False)
     return (config.get('enabled', False), config.get('seconds', 5),
             config.get('start', dt_time(9, 0)) if restricted else None,
@@ -18528,19 +18535,29 @@ def intraday_auto_settings(room):
 
 
 def render_intraday_auto_controls(room):
-    config = st.session_state.setdefault(f'{room}_auto_config', {})
+    intraday_auto_settings(room)
+    config = st.session_state[f'{room}_auto_config']
 
     def save_settings():
+        previous_seconds = config.get('seconds', 5)
         for field in ('enabled', 'seconds', 'restricted', 'start', 'end'):
             key = f'{room}_auto_{field}'
             if key in st.session_state:
                 config[field] = st.session_state[key]
+        if config.get('seconds', 5) != previous_seconds:
+            try:
+                with _RUNTIME_FILE_LOCK:
+                    saved = load_config()
+                    saved[f'{room}_auto_seconds'] = int(config['seconds'])
+                    _write_json_atomic(CONFIG_FILE, saved)
+            except (OSError, TypeError, ValueError):
+                st.warning('更新間隔已套用，但暫時無法寫入設定檔。')
         if not config.get('enabled', False) and st.session_state.get('sj_api') is not None:
             sync_strategy_stream_scope(st.session_state.sj_api, [], room)
         if room == 'stock':
             st.session_state['_stock_auto_settings_changed'] = True
 
-    st.markdown('<span style="color:#fff;font-weight:600">⏱︎ 主表自動更新</span>', unsafe_allow_html=True)
+    st.markdown('⏰ 主表自動更新')
     st.toggle('啟用自動更新', value=config.get('enabled', False),
               key=f'{room}_auto_enabled', on_change=save_settings)
     st.number_input('更新間隔（秒）', min_value=1, max_value=300, value=config.get('seconds', 5),
