@@ -18585,7 +18585,7 @@ def get_strategy_intraday_history(api, contract, asset='stock', wait=False):
 
     def fetch_history():
         # ponytail: one bounded two-worker pool per login; no per-symbol threads.
-        time.sleep(API_REQUEST_GAP_SECONDS)
+        time.sleep(max(API_REQUEST_GAP_SECONDS, 0.5))
         lookback = 5 if asset == 'stock' else 60
         frames = []
         first = now_tw.date() - timedelta(days=lookback)
@@ -18600,7 +18600,7 @@ def get_strategy_intraday_history(api, contract, asset='stock', wait=False):
                 frames.append(data.set_index('ts'))
             first = last + timedelta(days=1)
             if first <= now_tw.date():
-                time.sleep(API_REQUEST_GAP_SECONDS)
+                time.sleep(max(API_REQUEST_GAP_SECONDS, 0.5))
         result = pd.concat(frames).sort_index() if frames else pd.DataFrame()
         return result.loc[~result.index.duplicated(keep='last')]
 
