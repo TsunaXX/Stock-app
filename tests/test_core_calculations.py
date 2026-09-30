@@ -1431,7 +1431,7 @@ def test_stock_quote_refresh_uses_one_snapshot_batch_for_all_rows():
     api.Contracts = Contracts()
 
     calls = []
-    symbols["get_stream_quotes"] = lambda _api, contracts: (
+    symbols["get_stream_quotes"] = lambda _api, contracts, **kwargs: (
         calls.append(list(contracts)) or [Snapshot("2330", 101), Snapshot("2317", 202)]
     )
     source = pd.DataFrame([
@@ -1965,10 +1965,10 @@ def test_independent_tables_use_the_same_post_21_ranking():
     assert "independent_rows, strategy_mode, '期貨獨立計算'" in source
     assert "df_indep, indep_strategy_mode, '股票獨立計算'" in source
     main_futures_table = source.index("edited = st.data_editor(", source.index("def futures_column_config"))
-    main_futures_rank = source.index("render_strategy_ranking(display_rows, strategy_mode, '期貨')")
+    main_futures_rank = source.index("render_strategy_ranking(display_rows, strategy_mode, '期貨',")
     assert main_futures_table < main_futures_rank
     main_stock_table = source.index("edited_df = st.data_editor(", source.index("stock_editor_key ="))
-    main_stock_rank = source.index("render_strategy_ranking(df_display, strategy_mode, '股票')")
+    main_stock_rank = source.index("render_strategy_ranking(df_display, strategy_mode, '股票',")
     assert main_stock_table < main_stock_rank
     assert "查看策略信心明細" not in source
     assert "查看期貨策略信心明細" not in source
@@ -3235,3 +3235,231 @@ def test_all_ranking_snapshots_keep_scores_during_intraday_analysis():
     futures = pd.DataFrame([{'期貨代碼': 'TX', '收盤價': 200}])
     assert ns['refresh_strategy_ranking_snapshots'](futures, 'futures', analysis=True)
     assert set(state['futures_strategy_ranking_snapshots']) == {'daytrade', 'swing'}
+
+
+def test_intraday_auto_window_and_completion_gate():
+    ns = load_app_symbols('intraday_auto_window_open', 'begin_intraday_auto_update', 'finish_intraday_auto_update')
+    ns['is_market_closed_func'] = lambda d: d.weekday() >= 5
+    tz = pytz.timezone('Asia/Taipei')
+    window = ns['intraday_auto_window_open']
+    assert window(tz.localize(datetime(2026, 9, 30, 9)), dt_time(9), dt_time(13, 30), stock=True)
+    assert not window(tz.localize(datetime(2026, 9, 30, 13, 31)), dt_time(9), dt_time(13, 30), stock=True)
+    assert not window(tz.localize(datetime(2026, 10, 3, 10)), dt_time(9), dt_time(13, 30), stock=True)
+    assert window(tz.localize(datetime(2026, 10, 3, 1)), dt_time(15), dt_time(5))
+    assert window(tz.localize(datetime(2026, 9, 30, 23)))  # Futures have no default window.
+    state = {'sj_logged_in': True, 'sj_api': object()}
+    ns['st'] = SimpleNamespace(session_state=state)
+    assert not ns['begin_intraday_auto_update']('futures', False, 2)
+    assert ns['begin_intraday_auto_update']('futures', True, 2)
+    assert not ns['begin_intraday_auto_update']('futures', True, 2)
+    ns['finish_intraday_auto_update']('futures', time.monotonic(), 1)
+    assert not ns['begin_intraday_auto_update']('futures', True, 2)
+
+
+def test_stream_refresh_only_visible_stocks_preserves_daily_strategy_and_quote_age():
+    ns = load_app_symbols(
+        'refresh_daytrade_metrics_for_codes', 'refresh_stock_quotes_for_codes',
+        'merge_realtime_stock_snapshots', 'fresh_strategy_stream_quote', '_stream_datetime',
+        '_safe_number', '_stream_number', 'snapshot_change_rate', 'price_change_amount',
+    )
+    now = datetime.now(pytz.timezone('Asia/Taipei'))
+    rows = pd.DataFrame([{'代號': c, '收盤價': 100, '_ma5': 98, '_strategy_close': 100,
+                          '戰略備註': '固定備註', '_points': [{'val': 99}], '漲跌幅': 0}
+                         for c in ('2330', '2317', '0050', '9999')])
+    quotes = {c: SimpleNamespace(code=c, close=101, source='stream', updated_at=now.replace(tzinfo=None),
+                                change_rate=1, buy_price=100.5, sell_price=101) for c in ('2330', '2317')}
+    calls = []
+    ns['fetch_stock_snapshot_map'] = lambda api, codes, snapshot_fallback: (
+        calls.append((codes, snapshot_fallback)) or {c: quotes[c] for c in codes})
+    ns['ANALYSIS_MAX_WORKERS'] = 2
+    ns['sync_strategy_stream_scope'] = lambda *args: None
+    ns['_is_opening_micro_window'] = lambda now: False
+    ns['get_strategy_intraday_history'] = lambda api, contract, wait: pd.DataFrame()
+    ns['calculate_daytrade_metrics'] = lambda *args, **kwargs: {'_daytrade_close': 101}
+    ns['stock_snapshot_limit_context'] = lambda *a, **kw: None
+    api = SimpleNamespace(Contracts=SimpleNamespace(Stocks={c: SimpleNamespace(code=c) for c in quotes}))
+    # Restrict to one actual displayed row; hidden rows must remain byte-for-byte unchanged.
+    result, metrics, count = ns['refresh_daytrade_metrics_for_codes'](
+        rows, True, api, visible_codes=['2330'], stream_only=True,
+    )
+    assert calls == [(['2330'], False)]
+    assert (metrics, count) == (1, 1)
+    assert result.loc[0, '收盤價'] == 101
+    for col in ('_ma5', '_strategy_close', '戰略備註', '_points'):
+        assert result[col].tolist() == rows[col].tolist()
+    pd.testing.assert_frame_equal(result.loc[1:, rows.columns].reset_index(drop=True),
+                                  rows.loc[1:].reset_index(drop=True), check_dtype=False)
+    quotes['2330'].updated_at -= timedelta(minutes=5)
+    result, metrics, count = ns['refresh_daytrade_metrics_for_codes'](
+        rows, True, api, visible_codes=['2330'], stream_only=True,
+    )
+    assert (metrics, count) == (0, 0)
+    assert result['收盤價'].tolist() == [100] * 4
+
+
+def test_stream_cumulative_volume_is_not_counted_twice():
+    ns = load_app_symbols('merge_stream_quote_into_intraday', '_stream_number', '_stream_datetime')
+    now = datetime.now(pytz.timezone('Asia/Taipei')).replace(tzinfo=None)
+    frame = pd.DataFrame([{'Open': 100., 'High': 100., 'Low': 100., 'Close': 100., 'Volume': 10.}],
+                         index=[pd.Timestamp(now).floor('min')])
+    quote = SimpleNamespace(close=101, total_volume=12, updated_at=now)
+    first = ns['merge_stream_quote_into_intraday'](frame, quote, '1m')
+    second = ns['merge_stream_quote_into_intraday'](first, quote, '1m')
+    assert first['Volume'].sum() == second['Volume'].sum() == 12
+    quote.total_volume = 15
+    third = ns['merge_stream_quote_into_intraday'](second, quote, '1m')
+    assert third['Volume'].sum() == 15
+
+
+def test_intraday_history_seed_is_background_and_reused():
+    ns = load_app_symbols('get_strategy_intraday_history')
+    state = {'lock': threading.RLock()}
+    ns['_stream_state'] = lambda api: state
+    ns['API_REQUEST_GAP_SECONDS'] = 0
+    ns['_stream_quote_for_contract'] = lambda *args: None
+    ns['merge_stream_quote_into_intraday'] = lambda data, *args: data
+    ns['_remember_stream_error'] = lambda *args: None
+    ns['ANALYSIS_MAX_WORKERS'] = 2
+    calls = []
+    class Raw(dict):
+        __getattr__ = dict.__getitem__
+    class API:
+        def kbars(self, **kwargs):
+            calls.append(kwargs['contract'].code)
+            time.sleep(0.2)
+            return Raw(ts=[pd.Timestamp.now().value], Open=[100], High=[101], Low=[99], Close=[100], Volume=[1])
+    api = API()
+    contract = SimpleNamespace(code='2330')
+    get_history = ns['get_strategy_intraday_history']
+    started = time.monotonic()
+    assert get_history(api, contract).empty
+    assert time.monotonic() - started < 0.15
+    next(iter(state['strategy_histories'].values()))['future'].result(timeout=3)
+    assert not get_history(api, contract).empty
+    assert not get_history(api, contract).empty
+    assert calls == ['2330']
+    state['strategy_history_pool'].shutdown()
+
+
+def test_futures_auto_reads_stream_only_and_waits_for_history():
+    ns = load_app_symbols('update_futures_live_rows', '_safe_number', '_stream_datetime',
+                          'snapshot_change_rate', 'fresh_strategy_stream_quote')
+    rows = pd.DataFrame([{'期貨代碼':'CDF', '契約月份':'202610', '契約鍵':'CDF:202610',
+                          '收盤價':100., '開盤價':99., '當日高':101., '當日低':98.,
+                          '當日成交口數':10, '原始保證金率':13., '維持保證金率':10., '乘數':2000.,
+                          '商品類型':'股票'}])
+    ns['filter_active_futures_rows'] = lambda r: (r.copy(), [])
+    ns['resolve_shioaji_futures_contract'] = lambda *args: SimpleNamespace(code='CDFJ6')
+    ns['sync_strategy_stream_scope'] = lambda *args: None
+    calls = []
+    quote = SimpleNamespace(code='CDFJ6', source='stream', close=102., open=100., high=103., low=99.,
+                            total_volume=12, change_price=2, avg_price=101.,
+                            updated_at=datetime.now(pytz.timezone('Asia/Taipei')).replace(tzinfo=None))
+    ns['get_stream_quotes'] = lambda api, contracts, snapshot_fallback: (
+        calls.append(snapshot_fallback) or [quote])
+    ns['get_strategy_intraday_history'] = lambda api, contract, asset, wait: (
+        calls.append(('history_wait', wait)) or pd.DataFrame())
+    ns['get_futures_tick_size'] = lambda *args: 0.5
+    ns['round_futures_price'] = lambda price, *args: price
+    ns['calculate_futures_strategy_levels'] = lambda row, *args: {'方向':'偏多', 'VWAP':100.}
+    updated, count = ns['update_futures_live_rows'](rows, object(), '當沖', '自動', stream_only=True)
+    assert calls == [False, ('history_wait', False)]
+    assert count == 1 and updated.iloc[0]['收盤價'] == 102
+    assert updated.iloc[0]['開盤價'] == 100
+    assert updated.iloc[0]['VWAP'] == 101
+    assert updated.iloc[0]['_intraday_history_pending'] == True
+
+
+def test_manual_intraday_button_updates_table_without_full_page_rerun():
+    from unittest.mock import patch
+    import requests
+    from streamlit.testing.v1 import AppTest
+    source = APP_PATH.read_text(encoding='utf-8')
+    # Inject only market inputs; exercise the real fragment, button and editor.
+    setup = """
+st.session_state.stock_data = pd.DataFrame([{
+    '代號':'2330','名稱':'台積電','收盤價':100.,'漲跌幅':0.,'戰略備註':'固定',
+    '_points':[],'_ma5':98.,'_strategy_close':100.,'_source':'upload',
+    '_source_rank':1,'_order':0,'期貨':'有','狀態':''}])
+st.session_state.all_candidates = []
+st.session_state.sj_logged_in = True
+st.session_state.sj_api = SimpleNamespace(Contracts=SimpleNamespace(Stocks={'2330':SimpleNamespace(code='2330')}))
+st.session_state.stock_strategy_settings_open = True
+get_strategy_intraday_history = lambda *args, **kwargs: pd.DataFrame()
+refresh_daytrade_metrics_for_codes = lambda rows, *args, **kwargs: (rows.assign(**{'收盤價':101.}), 1, 1)
+"""
+    anchor = 'tab1, tab_fibo, tab2, tab_db, tab_company, tab3 = st.tabs(['
+    source = source.replace(anchor, setup + '\n' + anchor)
+    with patch('requests.get', side_effect=requests.ConnectionError('offline UI check')), \
+         patch('requests.post', side_effect=requests.ConnectionError('offline UI check')), \
+         patch('yfinance.download', return_value=pd.DataFrame()), \
+         patch('yfinance.Ticker', return_value=SimpleNamespace(history=lambda *a, **kw: pd.DataFrame(), fast_info={}, info={})):
+        app = AppTest.from_string(source, default_timeout=120).run()
+        assert not app.exception
+        assert app.toggle(key='stock_auto_enabled').value is False
+        assert app.time_input(key='stock_auto_start').value == dt_time(9)
+        assert app.time_input(key='stock_auto_end').value == dt_time(13, 30)
+        app.button(key='refresh_daytrade_filter_metrics').click().run()
+        assert not app.exception
+        tables = [d.value for d in app.dataframe if '代號' in d.value.columns and '收盤價' in d.value.columns]
+        assert float(tables[0]['收盤價'].iloc[0]) == 101
+
+
+def test_auto_scope_cancels_removed_jobs_without_unsubscribing_existing_consumers():
+    from concurrent.futures import Future
+    ns = load_app_symbols('sync_strategy_stream_scope')
+    pending = Future()
+    state = {'lock': threading.RLock(),
+             'subscriptions': {'manual': {'status':'active'}, 'old': {'status':'active'}},
+             'strategy_owned_subscriptions': {'stock': {'old': {'contract':SimpleNamespace(code='old')}}},
+             'strategy_histories': {('old','stock',date.today(),'formed'): {'future':pending}}}
+    ns['_stream_state'] = lambda api: state
+    removed = []
+    ns['_unsubscribe_market_stream'] = lambda api, state, code, metadata: removed.append(code)
+    def subscribe(api, contract):
+        state['subscriptions'].setdefault(contract.code, {'status':'active', 'contract':contract})
+        return True
+    ns['ensure_market_stream_subscription'] = subscribe
+    ns['sync_strategy_stream_scope'](object(), [SimpleNamespace(code='manual'),SimpleNamespace(code='new')], 'stock')
+    assert removed == ['old']
+    assert pending.cancelled() and not state['strategy_histories']
+    assert set(state['strategy_owned_subscriptions']['stock']) == {'new'}
+    assert 'manual' in state['subscriptions']
+
+
+def test_futures_trading_dates_are_batched_and_preserve_holiday_night_grouping():
+    ns = load_app_symbols('calculate_futures_strategy_levels', '_safe_number',
+                          'get_futures_trading_date', 'is_market_closed_func', 'get_holidays')
+    ns['get_futures_tick_size'] = lambda *a: 0.5
+    ns['round_futures_price'] = lambda price, *a: price
+    ns['fmt_price'] = str
+    ns['clamp_futures_intraday_levels'] = lambda a, b, c, *args: (a, b, c)
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            value = datetime(2026, 9, 30, 1)
+            return tz.localize(value) if tz else value
+    ns['datetime'] = Clock
+    index = pd.DatetimeIndex(['2026-09-24 13:00','2026-09-24 13:30',
+                             '2026-09-24 15:00','2026-09-24 15:30','2026-09-24 16:00',
+                             '2026-09-29 09:00','2026-09-29 09:30',
+                             '2026-09-29 15:00','2026-09-29 15:30','2026-09-29 16:00'])
+    bars = pd.DataFrame({'Open':100.,'High':range(103,113),'Low':range(96,106),
+                         'Close':101.,'Volume':10.}, index=index)
+    row = {'期貨代碼':'CDF','收盤價':101.,'開盤價':100.,'當日高':112.,'當日低':96.}
+    date_fn = ns['get_futures_trading_date']
+    oracle = [date_fn(ts.to_pydatetime()).date() for ts in index]
+    assert oracle[2] == date(2026, 9, 29)  # 9/25 and 9/28 closures plus weekend.
+    calls = []
+    ns['get_futures_trading_date'] = lambda ts: calls.append(ts) or date_fn(ts)
+    calculate = ns['calculate_futures_strategy_levels']
+    intraday = calculate(row, '當沖', '偏多', bars)
+    assert intraday['支撐壓力'] == '支 103.0｜壓 112.0'
+    assert len(calls) == 4  # Distinct adjusted dates, not ten minute bars.
+    daily = bars.assign(trade_date=oracle).groupby('trade_date').agg(
+        {'Open':'first','High':'max','Low':'min','Close':'last','Volume':'sum'})
+    daily.index = pd.to_datetime(daily.index) + pd.Timedelta(hours=12)
+    assert calculate(row, '波段', '偏多', bars) == calculate(row, '波段', '偏多', daily)
+    aware = bars.copy()
+    aware.index = aware.index.tz_localize('Asia/Taipei').tz_convert('UTC')
+    assert calculate(row, '當沖', '偏多', aware) == intraday
