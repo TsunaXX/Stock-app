@@ -18453,12 +18453,12 @@ def merge_realtime_stock_snapshots(
             continue
         refreshed.at[row_index, '收盤價'] = price
         updated_count += 1
-        if price_only:
-            continue
         change_rate = snapshot_change_rate(snapshot, price)
-        if change_rate is not None:
+        if change_rate is not None or price_only:
             refreshed.at[row_index, '漲跌幅'] = change_rate
         refreshed.at[row_index, '成交價價差'] = price_change_amount(price, change_rate)
+        if price_only:
+            continue
         refreshed.at[row_index, '_quote_bid'] = _safe_number(
             getattr(snapshot, 'buy_price', None)
         )
