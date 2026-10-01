@@ -1458,11 +1458,14 @@ def test_stock_price_only_refresh_preserves_every_strategy_field():
         "_strategy_close": 100, "_ma5": 100, "狀態": "命中",
         "當日漲停價": 110, "當日跌停價": 90, "成交價價差": 2,
     }])
-    strategy_columns = [column for column in source.columns if column != "收盤價"]
+    strategy_columns = [column for column in source.columns
+                        if column not in ("收盤價", "漲跌幅", "成交價價差")]
     refreshed, count = symbols["merge_realtime_stock_snapshots"](
         source, {"2330": snapshot}, price_only=True,
     )
     assert count == 1 and refreshed.at[0, "收盤價"] == 105
+    assert refreshed.at[0, "漲跌幅"] == 5
+    assert refreshed.at[0, "成交價價差"] == 5
     pd.testing.assert_frame_equal(
         refreshed[strategy_columns], source[strategy_columns], check_dtype=False,
     )
@@ -3561,3 +3564,20 @@ def test_auto_intervals_restore_separately_without_enabling_refresh():
         saved['stock_auto_seconds'] = invalid
         ns['st'].session_state.clear()
         assert settings('stock')[1] == expected
+
+
+def test_quote_only_refresh_keeps_reported_rates_with_the_same_prices():
+    ns = load_app_symbols('merge_realtime_stock_snapshots', '_safe_number',
+                          'snapshot_change_rate', 'price_change_amount')
+    source = pd.DataFrame({'代號':['4956','1727','1815'],
+                           '收盤價':[47.25,112,116], '漲跌幅':[1.29,2.29,-0.43],
+                           '戰略備註':['fixed']*3})
+    quotes = {code:SimpleNamespace(close=price,change_rate=rate)
+              for code,price,rate in [('4956',47.4,1.61),('1727',112.5,2.75),('1815',116.5,0)]}
+    updated, count = ns['merge_realtime_stock_snapshots'](source, quotes, price_only=True)
+    assert count == 3
+    assert updated['漲跌幅'].tolist() == [1.61,2.75,0]
+    assert updated['戰略備註'].tolist() == ['fixed']*3
+    missing, _ = ns['merge_realtime_stock_snapshots'](
+        source, {'4956':SimpleNamespace(close=47.4)}, price_only=True)
+    assert pd.isna(missing.loc[0,'漲跌幅'])
