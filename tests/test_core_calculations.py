@@ -1009,7 +1009,7 @@ def test_tpex_ssl_compatibility_keeps_verification_and_is_host_scoped():
     adapter_source = definitions["_TpexRelaxedStrictSSLAdapter"]
     session_source = definitions["_tpex_verified_session"]
     fetch_source = definitions["fetch_official_turnover_ranking"]
-    ranking_fetch_source = definitions["fetch_post_close_stock_ranking_context"]
+    ranking_fetch_source = definitions["fetch_ranking_source"]
     assert 'context.load_verify_locations(certifi.where())' in adapter_source
     assert 'context.load_verify_locations(_TPEX_INTERMEDIATE_CERT)' in adapter_source
     assert 'context.verify_flags &= ~strict_flag' in adapter_source
@@ -3221,6 +3221,7 @@ def test_all_ranking_snapshots_keep_scores_during_intraday_analysis():
     ns['st'] = SimpleNamespace(session_state=state)
     ns['_post_close_target_date'] = lambda now: (now, date(2026, 9, 8))
     ns['resolve_post_close_ranking_context'] = lambda *args, **kwargs: {}
+    ns['ranking_context_issues'] = lambda *args: []
     ns['build_strategy_ranking_entries'] = lambda rows, *args, **kwargs: [
         {'code': '2330', 'score': int(rows.iloc[0]['收盤價'])}]
     refresh = ns['refresh_stock_swing_snapshot']
@@ -3393,7 +3394,7 @@ refresh_daytrade_metrics_for_codes = lambda rows, *args, **kwargs: (rows.assign(
 """
     anchor = 'tab1, tab_fibo, tab2, tab_db, tab_company, tab3 = st.tabs(['
     setup = 'CONFIG_FILE = ' + repr(str(tmp_path / 'auto-config.json')) + '\n' + setup
-    source = source.replace(anchor, setup + '\n' + anchor)
+    source = source.replace(anchor, setup + '\nrender_postclose_maintenance = lambda: None\n' + anchor)
     with patch('requests.get', side_effect=requests.ConnectionError('offline UI check')), \
          patch('requests.post', side_effect=requests.ConnectionError('offline UI check')), \
          patch('yfinance.download', return_value=pd.DataFrame()), \
