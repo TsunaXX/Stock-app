@@ -8505,7 +8505,7 @@ def _build_official_turnover_ranking(
 
 
 @st.cache_data(ttl=300, max_entries=2, show_spinner=False)
-def fetch_official_turnover_ranking(refresh_bucket=None, now_value=None):
+def fetch_official_turnover_ranking(refresh_bucket=None, now_value=None, expected_date=None):
     """Fetch a same-date TWSE+TPEx turnover ranking from official sources."""
     del refresh_bucket
     headers = {
@@ -8555,6 +8555,8 @@ def fetch_official_turnover_ranking(refresh_bucket=None, now_value=None):
     if not available_dates:
         raise ValueError("TPEx 尚未提供有效行情日期")
     source_date = max(available_dates)
+    if expected_date and source_date != pd.Timestamp(expected_date).date():
+        raise ValueError('上櫃行情日期尚未就緒；保留上次完整排行')
     twse_params = {
         "date": source_date.strftime("%Y%m%d"),
         "type": "ALLBUT0999", "response": "json",
@@ -9368,7 +9370,7 @@ def _json_safe(value):
         return str(value)
 
 
-def load_futures_strategy_state():
+def load_futures_strategy_state(sync_cloud=True):
     """讀取期貨戰略室上次成功取得的表格與使用者清單。"""
     cloud_state = st.session_state.get('_cached_futures_strategy_state', {})
     local_state = {}
@@ -9394,7 +9396,7 @@ def load_futures_strategy_state():
             except (OSError, TypeError, ValueError):
                 pass
 
-    if not st.session_state.get('_futures_cloud_loaded', False):
+    if sync_cloud and not st.session_state.get('_futures_cloud_loaded', False):
         gsheet_api_url = get_app_secret('gsheet_api_url')
         if gsheet_api_url:
             remote_state, remote_error = _fetch_remote_scope_cached(
@@ -9458,10 +9460,11 @@ def _newer_timestamped_state(first, second):
 def save_futures_strategy_state(
     universe=None, metadata=None, rank_cache=None, live_cache=None,
     manual=None, ignored=None, rank_time=None, live_time=None,
+    sync_cloud=True,
 ):
     """持久化期貨表格快照，重整後仍能還原最後成功資料。"""
     try:
-        existing_state = load_futures_strategy_state()
+        existing_state = load_futures_strategy_state(sync_cloud=sync_cloud)
         with _RUNTIME_FILE_LOCK:
             config = load_config()
             config.pop('futures_strategy_custom_prices', None)
@@ -9504,6 +9507,7 @@ def save_futures_strategy_state(
                     now_iso if selection_changed else existing.get('selection_updated_at', existing.get('updated_at'))
                 ),
                 'strategy_ranking_snapshots': ranking_snapshots,
+                'postclose_sync_pending': not sync_cloud,
                 'updated_at': now_iso,
             })
             saved_state, _ = prune_futures_settlement_state(saved_state)
@@ -9514,7 +9518,7 @@ def save_futures_strategy_state(
                 _write_json_atomic(CONFIG_FILE, config)
         sync_ok = True
         gsheet_api_url = get_app_secret('gsheet_api_url')
-        if gsheet_api_url:
+        if gsheet_api_url and sync_cloud:
             with get_data_cache_sync_lock():
                 remote_state, _ = _fetch_remote_scope(
                     gsheet_api_url, GOOGLE_SCOPE_FUTURES, timeout=8,
@@ -9532,8 +9536,11 @@ def save_futures_strategy_state(
                     saved_state = cloud_state
                     _write_json_atomic(FUTURES_STATE_CACHE_FILE, saved_state, indent=2)
         st.session_state['_cached_futures_strategy_state'] = saved_state
-        st.session_state['_futures_cloud_loaded'] = True
+        if sync_cloud:
+            st.session_state['_futures_cloud_loaded'] = True
         st.session_state['_futures_cloud_save_status'] = 'ok' if sync_ok else 'local_only'
+        if gsheet_api_url and not sync_cloud:
+            st.session_state['_futures_cloud_save_status'] = 'pending'
         return True
     except (OSError, TypeError, ValueError):
         return False
@@ -11974,6 +11981,7 @@ def save_data_cache(
     replace_ignored=False,
     replace_stock_data=True,
     verify_stock_data=False,
+    sync_cloud=True,
 ):
     """
     股票戰略室專用儲存。
@@ -12119,6 +12127,7 @@ def save_data_cache(
             ),
             'display_settings': get_stock_display_settings(),
             'quick_search_state': get_stock_quick_search_state(),
+            'postclose_sync_pending': not sync_cloud,
         })
 
         # 股票獨立本機快取。
@@ -12136,7 +12145,7 @@ def save_data_cache(
 
         sync_ok = True
 
-        if gsheet_api_url:
+        if gsheet_api_url and sync_cloud:
             with get_data_cache_sync_lock():
                 remote_payload, _ = _fetch_remote_scope(
                     gsheet_api_url, GOOGLE_SCOPE_STOCK, timeout=8,
@@ -12190,6 +12199,8 @@ def save_data_cache(
                 '但 Google Sheet 回讀未確認成功。'
             )
 
+        if gsheet_api_url and not sync_cloud:
+            st.session_state['_data_cache_sync_status'] = 'pending'
         return sync_ok
 
     except (
@@ -15947,17 +15958,93 @@ def _post_close_target_date(now_value=None):
     return current, target
 
 
-@st.cache_data(ttl=3600, max_entries=6, show_spinner=False)
+@st.cache_data(ttl=86400, max_entries=64, show_spinner=False)
+def fetch_ranking_source(name, url, params, target_date_text):
+    """Cache successful source versions separately; failures remain retryable."""
+    headers = {'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json'}
+    if url.startswith(_TPEX_ORIGIN):
+        with _tpex_verified_session() as session:
+            response = session.get(url, params=params, headers=headers, timeout=(4, 10))
+    else:
+        response = requests.get(url, params=params, headers=headers, timeout=(4, 10))
+    response.raise_for_status()
+    payload = response.json()
+    daily = name.endswith(('institutional', 'margin', 'valuation'))
+    if isinstance(payload, dict):
+        tables = payload.get('tables', [])
+        records = payload.get('data') or next((
+            table.get('data') for table in tables if len(table.get('fields', [])) >= 14
+        ), [])
+        raw_date = payload.get('date')
+    elif isinstance(payload, list) and all(isinstance(item, dict) for item in payload):
+        records = payload
+        raw_date = payload[0].get('Date') if payload else None
+    else:
+        raise ValueError('官方來源回傳格式錯誤')
+    if not records:
+        raise ValueError('官方來源尚無完整資料列')
+    if daily and _ranking_market_date(raw_date) != target_date_text:
+        raise ValueError(f'官方資料日 {_ranking_market_date(raw_date) or "不明"} 尚未就緒')
+    if isinstance(payload, list) and daily and any(
+        _ranking_market_date(item.get('Date')) != target_date_text for item in payload
+    ):
+        raise ValueError('官方資料含不同交易日')
+    if name == 'twse_institutional':
+        fields = payload.get('fields', [])
+        required = ['投信買賣超股數', '自營商買賣超股數', '三大法人買賣超股數']
+        if not all(field in fields for field in required) or not any(
+            field in fields for field in ('外陸資買賣超股數(不含外資自營商)', '外資及陸資買賣超股數(不含外資自營商)')
+        ):
+            raise ValueError('上市法人欄位不完整')
+        foreign_field = next(field for field in fields if field in (
+            '外陸資買賣超股數(不含外資自營商)', '外資及陸資買賣超股數(不含外資自營商)',
+        ))
+        indexes = [fields.index(field) for field in required + [foreign_field]]
+        if any(len(row) <= max(indexes) or any(_ranking_number(row[index]) is None for index in indexes)
+               for row in records if row and re.fullmatch(r'\d{4}', str(row[0]).strip())):
+            raise ValueError('上市法人資料列缺項')
+    if name == 'tpex_institutional' and not all(
+        key in records[0] for key in (
+            'Foreign Investors include Mainland Area Investors (Foreign Dealers excluded)-Difference',
+            'SecuritiesInvestmentTrustCompanies-Difference', 'Dealers-Difference', 'TotalDifference',
+        )
+    ):
+        raise ValueError('上櫃法人欄位不完整')
+    numeric_keys = {
+        'tpex_institutional': (
+            'Foreign Investors include Mainland Area Investors (Foreign Dealers excluded)-Difference',
+            'SecuritiesInvestmentTrustCompanies-Difference', 'Dealers-Difference', 'TotalDifference',
+        ),
+        'tpex_margin': ('MarginPurchaseBalance', 'MarginPurchaseBalancePreviousDay',
+                        'ShortSaleBalance', 'ShortSaleBalancePreviousDay'),
+    }.get(name, ())
+    if numeric_keys and any(
+        any(_ranking_number(row.get(key)) is None for key in numeric_keys)
+        for row in records if re.fullmatch(r'\d{4}', str(row.get('SecuritiesCompanyCode', '')).strip())
+    ):
+        raise ValueError('上櫃籌碼資料列缺項')
+    if name == 'twse_margin' and any(
+        len(row) < 13 or any(_ranking_number(row[index]) is None for index in (5, 6, 11, 12))
+        for row in records if row and re.fullmatch(r'\d{4}', str(row[0]).strip())
+    ):
+        raise ValueError('上市融資券資料列缺項')
+    if isinstance(payload, list):
+        code_key = ('公司代號' if name.endswith(('revenue', 'eps')) else
+                    'Code' if name == 'twse_valuation' else
+                    'ContractCode' if name == 'taifex_institutional' else 'SecuritiesCompanyCode')
+        if not any(str(item.get(code_key) or (
+            item.get('SecuritiesCompanyCode') if name == 'tpex_eps' else ''
+        ) or '').strip() for item in records):
+            raise ValueError('官方來源缺少證券／契約代號')
+    return payload
+
+
+@st.cache_data(ttl=60, max_entries=6, show_spinner=False)
 def fetch_post_close_stock_ranking_context(target_date_text, asset_type='combined'):
-    """Fetch only applicable post-close sources and reuse them for one hour."""
+    """Assemble independently cached, date-validated official sources."""
     target_date_text = _ranking_market_date(target_date_text)
     if not target_date_text:
         raise ValueError('盤後排名資料日格式錯誤')
-    headers = {
-        'Accept': 'application/json, text/plain, */*',
-        'Accept-Language': 'zh-TW,zh;q=0.9,en;q=0.7',
-        'User-Agent': 'Mozilla/5.0 (compatible; StockApp/1.0)',
-    }
     jobs = {
         'twse_institutional': (
             'https://www.twse.com.tw/rwd/zh/fund/T86',
@@ -15992,18 +16079,7 @@ def fetch_post_close_stock_ranking_context(target_date_text, asset_type='combine
 
     def fetch_one(item):
         name, (url, params) = item
-        if url.startswith(_TPEX_ORIGIN):
-            with _tpex_verified_session() as session:
-                response = session.get(
-                    url, params=params, headers=headers, timeout=(4, 10),
-                )
-        else:
-            response = requests.get(url, params=params, headers=headers, timeout=(4, 10))
-        response.raise_for_status()
-        payload = response.json()
-        if not isinstance(payload, (dict, list)):
-            raise ValueError('回傳格式錯誤')
-        return name, payload
+        return name, fetch_ranking_source(name, url, params, target_date_text)
 
     payloads = {}
     errors = []
@@ -16066,10 +16142,9 @@ def fetch_post_close_stock_ranking_context(target_date_text, asset_type='combine
         for values in detail.get('data', []):
             record = stock_record(values[0] if values else '')
             if record is not None and len(values) >= 13:
-                margin_previous = _ranking_number(values[5], 0) or 0
-                short_previous = _ranking_number(values[11], 0) or 0
-                record['margin_delta'] = (_ranking_number(values[6], 0) or 0) - margin_previous
-                record['short_delta'] = (_ranking_number(values[12], 0) or 0) - short_previous
+                for field, before, after in (('margin_delta', 5, 6), ('short_delta', 11, 12)):
+                    previous_value, current_value = _ranking_number(values[before]), _ranking_number(values[after])
+                    record[field] = current_value - previous_value if None not in (previous_value, current_value) else None
 
     for source_key, source_label in (
         ('tpex_institutional', '上櫃法人'),
@@ -16087,8 +16162,7 @@ def fetch_post_close_stock_ranking_context(target_date_text, asset_type='combine
         if record is not None:
             record['institutional_net'] = _ranking_number(item.get('TotalDifference'))
             record['foreign_net'] = _ranking_number(
-                item.get('ForeignInvestorsInclude MainlandAreaInvestors-Difference')
-                or item.get('Foreign Investors include Mainland Area Investors (Foreign Dealers excluded)-Difference')
+                item.get('Foreign Investors include Mainland Area Investors (Foreign Dealers excluded)-Difference')
             )
             record['trust_net'] = _ranking_number(
                 item.get('SecuritiesInvestmentTrustCompanies-Difference')
@@ -16098,14 +16172,10 @@ def fetch_post_close_stock_ranking_context(target_date_text, asset_type='combine
     for item in payloads.get('tpex_margin', []):
         record = stock_record(item.get('SecuritiesCompanyCode'))
         if record is not None:
-            record['margin_delta'] = (
-                (_ranking_number(item.get('MarginPurchaseBalance'), 0) or 0)
-                - (_ranking_number(item.get('MarginPurchaseBalancePreviousDay'), 0) or 0)
-            )
-            record['short_delta'] = (
-                (_ranking_number(item.get('ShortSaleBalance'), 0) or 0)
-                - (_ranking_number(item.get('ShortSaleBalancePreviousDay'), 0) or 0)
-            )
+            for field, prefix in (('margin_delta', 'MarginPurchaseBalance'), ('short_delta', 'ShortSaleBalance')):
+                before = _ranking_number(item.get(prefix + 'PreviousDay'))
+                after = _ranking_number(item.get(prefix))
+                record[field] = after - before if None not in (before, after) else None
 
     def add_valuation(code, pe, pb, dividend_yield):
         record = stock_record(code)
@@ -16221,14 +16291,41 @@ def resolve_post_close_ranking_context(now_value=None, asset_type='combined', ta
     except Exception as exc:
         logger.warning('Post-close ranking context failed: %s', type(exc).__name__)
         context = {}
-    if context.get('stocks') or context.get('futures_products'):
+    if (context.get('stocks') or context.get('futures_products')) and not context.get('errors'):
         context['using_last_success'] = False
         st.session_state[fallback_key] = context
+        return context
+    if context:
         return context
     fallback = dict(st.session_state.get(fallback_key, {}))
     if fallback:
         fallback['using_last_success'] = True
     return fallback
+
+
+def ranking_context_issues(context, rows, asset_type, target):
+    """Do not turn a failed chip feed into a technically-only new ranking."""
+    issues = list(context.get('errors', []))
+    if context.get('date') != _ranking_market_date(target) or context.get('using_last_success'):
+        issues.append('排名來源日期尚未就緒')
+    required = ['上市法人', '上市融資券', '上櫃法人', '上櫃融資券', '上市估值', '上櫃估值']
+    if asset_type == 'futures':
+        required.append('期貨法人')
+    for source in required:
+        if context.get('source_dates', {}).get(source) != _ranking_market_date(target):
+            issues.append(f'{source}尚未就緒')
+    code_column = '標的代號' if asset_type == 'futures' else '代號'
+    for code in rows.get(code_column, pd.Series(dtype=str)).astype(str).unique():
+        if not re.fullmatch(r'\d{4}', code):
+            continue
+        item = context.get('stocks', {}).get(code, {})
+        if any(_ranking_number(item.get(field)) is None for field in ('foreign_net', 'trust_net', 'dealer_net')):
+            issues.append(f'{code} 法人籌碼缺項')
+        # A security absent from the published margin list may be ineligible;
+        # a present but unparseable balance must not silently become zero.
+        if any(field in item and item[field] is None for field in ('margin_delta', 'short_delta')):
+            issues.append(f'{code} 融資券缺項')
+    return list(dict.fromkeys(issues))
 
 
 def _ranking_component_from_items(items, bonus=0, label_limit=3):
@@ -16843,6 +16940,10 @@ def refresh_strategy_ranking_snapshots(rows, asset_type, analysis=False):
     if analysis and current.time() >= dt_time(13, 30) and not is_market_closed_func(current.date()):
         target = current.date()
     context = resolve_post_close_ranking_context(current, asset_type=asset_type, target_date=target)
+    issues = ranking_context_issues(context, rows, asset_type, target)
+    st.session_state[f'_{asset_type}_ranking_waiting'] = issues
+    if issues:
+        return False
     refreshed = {}
     for mode, key in (('當沖', 'daytrade'), ('波段', 'swing')):
         entries = build_strategy_ranking_entries(
@@ -16856,6 +16957,7 @@ def refresh_strategy_ranking_snapshots(rows, asset_type, analysis=False):
                 'source_dates': dict(context.get('source_dates', {})),
                 'errors': list(context.get('errors', [])),
                 'using_last_success': bool(context.get('using_last_success')),
+                'complete': True,
                 'entries': entries[:50],
             }
     if not refreshed:
@@ -16880,13 +16982,12 @@ def render_strategy_ranking(rows, strategy_mode, room_label, allow_refresh=True)
     asset_type = 'futures' if room_label.startswith('期貨') else 'stock'
     snapshot_key = 'daytrade' if strategy_mode == '當沖' else 'swing'
     state_key = f'{asset_type}_strategy_ranking_snapshots'
-    refreshed = refresh_strategy_ranking_snapshots(rows, asset_type) if allow_refresh else False
-    if refreshed:
-        if asset_type == 'stock':
-            save_data_cache(st.session_state.stock_data, st.session_state.ignored_stocks,
-                            st.session_state.all_candidates, st.session_state.saved_notes)
-        else:
-            save_futures_strategy_state()
+    # Rendering never waits for official APIs. The maintenance fragment owns
+    # background refresh, independently of the intraday quote toggle.
+    st.session_state[f'_postclose_visible_{asset_type}'] = rows.copy(deep=True)
+    waiting = st.session_state.get(f'_{asset_type}_ranking_waiting', [])
+    if waiting:
+        st.caption('盤後資料待補齊，保留原排名：' + '、'.join(waiting[:4]))
     snapshot = st.session_state.get(state_key, {}).get(snapshot_key, {})
     if snapshot.get('target_date'):
         target_date = date.fromisoformat(snapshot['target_date'])
@@ -16897,8 +16998,8 @@ def render_strategy_ranking(rows, strategy_mode, room_label, allow_refresh=True)
         st.info(f'尚無盤前{room_label}{"當沖" if snapshot_key == "daytrade" else "波段"}排名快照；正在等待資料。')
         return
     st.caption(
-        f"排名快照：{(parse_strategy_data_time(snapshot.get('updated_at')).strftime('%Y/%m/%d %H:%M:%S') if parse_strategy_data_time(snapshot.get('updated_at')) is not None else '—')}｜8:30 起固定，收盤後執行分析才更新｜"
-        "已同步 Google Sheet，可跨裝置讀取"
+        f"排名快照：{(parse_strategy_data_time(snapshot.get('updated_at')).strftime('%Y/%m/%d %H:%M:%S') if parse_strategy_data_time(snapshot.get('updated_at')) is not None else '—')}｜8:30 起固定；21:00 後資料完整時自動建立隔日排名｜"
+        "快照支援 Google Sheet 跨裝置同步"
     )
     ranking_title = '當沖排名' if strategy_mode == '當沖' else '波段排名'
     period_label = '今日盤後' if target_date == current.date() else '前一交易日盤後'
@@ -18261,6 +18362,7 @@ def fetch_stock_data_raw(
         "_漲跌停基準": "隔日開盤" if limit_context['display_is_next_session'] else "當日",
         "戰略備註": strategy_note, "_points": full_calc_points, "狀態": "", "_auto_note": auto_note,
         "_strategy_close": strategy_base_price, "_ma5": ma5,
+        "_strategy_change_rate": (strategy_base_price / prev_of_base - 1) * 100 if prev_of_base > 0 else None,
         "_risk_atr14": risk_atr14, "_risk_ma20": risk_ma20, "_risk_ma20_slope": risk_ma20_slope,
         "_risk_close_position": risk_close_position, "_risk_prev_high": risk_prev_high, "_risk_prev_low": risk_prev_low,
         "_plan_prev_high": plan_prev_high, "_plan_prev_low": plan_prev_low,
@@ -19609,6 +19711,410 @@ def render_futures_strategy_room():
         render_strategy_ranking(
             independent_rows, strategy_mode, '期貨獨立計算',
         )
+
+def postclose_maintenance_window(now_value):
+    current, target = _post_close_target_date(now_value)
+    closed = is_market_closed_func(current.date())
+    ranking_open = closed or current.time() < dt_time(8, 30) or current.time() >= dt_time(21)
+    sources_open = ranking_open or current.time() >= dt_time(14, 30)
+    if not closed and current.time() >= dt_time(14, 30):
+        target = current.date()
+    return current, target, sources_open, ranking_open
+
+
+def postclose_scope(rows, asset):
+    column = '期貨代碼' if asset == 'futures' else '代號'
+    return sorted({
+        str(row.get(column, '')) + (':' + str(row.get('契約月份', '')) if asset == 'futures' else '')
+        for _, row in rows.iterrows()
+    })
+
+
+def postclose_risk_version(risk):
+    from hashlib import sha256
+    content = {key: risk.get(key) for key in ('attention', 'disposition', 'disposition_tomorrow')}
+    return sha256(json.dumps(content, sort_keys=True, ensure_ascii=False).encode('utf-8')).hexdigest()
+
+
+def postclose_snapshot_ready(snapshots, rows, asset, target, risk=None):
+    scope = postclose_scope(rows, asset)
+    return all(
+        snapshots.get(mode, {}).get('complete')
+        and snapshots[mode].get('target_date') == target.isoformat()
+        and snapshots[mode].get('scope') == scope
+        and (asset != 'stock' or risk is None
+             or snapshots[mode].get('risk_version') == postclose_risk_version(risk))
+        for mode in ('daytrade', 'swing')
+    )
+
+
+@st.cache_data(ttl=900, max_entries=4, show_spinner=False)
+def load_postclose_futures_seed(cloud_url):
+    """Read the existing saved scope in the worker, including on a new device."""
+    local = {}
+    if os.path.exists(FUTURES_STATE_CACHE_FILE):
+        with _RUNTIME_FILE_LOCK:
+            with open(FUTURES_STATE_CACHE_FILE, encoding='utf-8') as file:
+                local = json.load(file)
+    remote = {}
+    if cloud_url:
+        remote, error = _fetch_remote_scope_cached(cloud_url, GOOGLE_SCOPE_FUTURES, timeout=6)
+        if error and not local:
+            raise ValueError('期貨已保存清單暫時無法讀取')
+    return _merge_futures_strategy_state(remote or {}, local)
+
+
+def postclose_futures_seed_rows(saved):
+    rows = pd.DataFrame(saved.get('universe', []))
+    if rows.empty or '契約鍵' not in rows:
+        return pd.DataFrame()
+    snapshots = saved.get('strategy_ranking_snapshots', {})
+    scope = set(snapshots.get('daytrade', {}).get('scope', []))
+    codes = {entry['code'] for entry in snapshots.get('daytrade', {}).get('entries', [])}
+    if scope:
+        rows = rows[rows['契約鍵'].astype(str).isin(scope)]
+    elif codes:
+        rows = rows[rows['期貨代碼'].astype(str).isin(codes)]
+    else:
+        keys = set(saved.get('manual', []))
+        keys.update(rows['契約鍵'].astype(str).head(5))
+        rows = rows[rows['契約鍵'].astype(str).isin(keys)]
+    return rows[~rows['契約鍵'].astype(str).isin(saved.get('ignored', []))].copy()
+
+
+@st.cache_data(ttl=86400, max_entries=256, show_spinner=False)
+def fetch_postclose_stock_row(code, name, target_text):
+    # No login, snapshots or intraday subscription is needed for daily analysis.
+    row = fetch_stock_data_raw(code, name, include_live_quote=False)
+    if not row or _ranking_market_date(row.get('_strategy_data_as_of')) != target_text:
+        raise ValueError(f'{code} 日 K 尚未就緒')
+    return row
+
+
+@st.cache_data(ttl=86400, max_entries=4, show_spinner=False)
+def fetch_postclose_futures_rows(target_text):
+    rows, meta = fetch_futures_strategy_universe(futures_rollover_cache_key())
+    if rows.empty or meta.get('errors') or any(
+        _ranking_market_date(value) != target_text for value in rows['資料日期']
+    ):
+        raise ValueError('期貨日盤行情／保證金尚未完整')
+    return rows, meta
+
+
+def build_postclose_job(row_sets, target, need_turnover, need_risk, previous_risk):
+    """Worker returns immutable results; never reads or writes session state."""
+    result = {'rankings': {}, 'errors': {}}
+    target_text = target.strftime('%Y%m%d')
+    if need_turnover:
+        try:
+            result['turnover'] = fetch_official_turnover_ranking(expected_date=target.isoformat())
+        except Exception as exc:
+            result['errors']['週轉率'] = str(exc)
+    risk = previous_risk
+    if need_risk:
+        try:
+            attention, disposition, tomorrow, markets, errors = fetch_market_risk_lists()
+            risk = merge_market_risk_refresh(previous_risk, attention, disposition, tomorrow,
+                                             errors, market_by_code=markets)
+            result['risk'] = risk
+            if errors:
+                result['errors']['注意／處置'] = '、'.join(errors)
+        except Exception as exc:
+            result['errors']['注意／處置'] = str(exc)
+    if not row_sets:
+        return result
+    for asset, visible in row_sets.items():
+        try:
+            context = fetch_post_close_stock_ranking_context(target_text, asset_type=asset)
+        except Exception as exc:
+            result['errors'][asset] = f'排名來源：{type(exc).__name__}'
+            continue
+        issues = ranking_context_issues(context, visible, asset, target)
+        if asset == 'stock' and (not risk.get('updated') or risk.get('errors')):
+            issues.append('注意／處置名單尚未完整')
+        if issues:
+            result['errors'][asset] = '、'.join(issues)
+            continue
+        try:
+            if asset == 'stock':
+                records = []
+                for _, original in visible.iterrows():
+                    row = original.to_dict()
+                    if (_ranking_market_date(row.get('_strategy_data_as_of')) != target_text
+                            or _ranking_number(row.get('_strategy_change_rate')) is None):
+                        row = fetch_postclose_stock_row(str(row['代號']), str(row.get('名稱', '')), target_text)
+                    row = dict(row)
+                    row['收盤價'] = row['_strategy_close']
+                    row['漲跌幅'] = row['_strategy_change_rate']
+                    if any(_ranking_number(row.get(key)) is None for key in ('收盤價', '漲跌幅', '_ma5')):
+                        raise ValueError(f'{row["代號"]} 收盤價／五日線缺項')
+                    # Current-session VWAP must not leak into a prior-day snapshot.
+                    for key in list(row):
+                        if key.startswith('_daytrade_') or key == 'VWAP 狀態':
+                            row.pop(key)
+                    code = str(row['代號'])
+                    row['風險'] = ('處置' if code in set(risk.get('disposition', [])) | set(risk.get('disposition_tomorrow', []))
+                                   else '注意' if risk.get('attention', {}).get(code, 0) else '')
+                    records.append(row)
+                rows = pd.DataFrame(records)
+            else:
+                official, metadata = fetch_postclose_futures_rows(target_text)
+                previous_dates = {_ranking_market_date(value) for value in visible.get('資料日期', [])}
+                previous_date = next(iter(previous_dates)) if len(previous_dates) == 1 else ''
+                official = enrich_futures_ranking_fields(
+                    official, visible, metadata, {'updated': previous_date},
+                )
+                keys = set(visible['契約鍵'].astype(str))
+                rows = official[official['契約鍵'].astype(str).isin(keys)].copy()
+                if set(rows['契約鍵'].astype(str)) != keys:
+                    raise ValueError('部分期貨契約尚無同日行情')
+            snapshots = {}
+            for mode, key in (('當沖', 'daytrade'), ('波段', 'swing')):
+                entries = build_strategy_ranking_entries(rows, mode, market_context=context, asset_type=asset)
+                if not entries:
+                    raise ValueError('尚無完整策略排名')
+                snapshots[key] = {
+                    'updated_at': pd.Timestamp.now(tz='Asia/Taipei').isoformat(),
+                    'target_date': target.isoformat(), 'source_date': target_text,
+                    'source_dates': context['source_dates'], 'errors': [],
+                    'complete': True, 'scope': postclose_scope(visible, asset),
+                    'risk_version': postclose_risk_version(risk) if asset == 'stock' else '',
+                    'entries': entries[:50], 'using_last_success': False,
+                }
+            result['rankings'][asset] = snapshots
+        except Exception as exc:
+            result['errors'][asset] = str(exc)
+    return result
+
+
+@st.cache_resource
+def get_postclose_worker():
+    # At most one maintenance job per process; no unbounded queue across tabs/devices.
+    return {'executor': ThreadPoolExecutor(max_workers=1), 'slot': threading.BoundedSemaphore(1)}
+
+
+def run_postclose_job(worker, function, *args):
+    try:
+        return function(*args)
+    finally:
+        worker['slot'].release()
+
+
+def merge_postclose_scope(remote, local, asset):
+    """Only automated rankings/risk may change; cloud selections stay intact."""
+    remote = remote if isinstance(remote, dict) else {}
+    merged = dict(remote or local)
+    first, second = remote.get('strategy_ranking_snapshots', {}), local.get('strategy_ranking_snapshots', {})
+    merged['strategy_ranking_snapshots'] = {
+        key: _newer_timestamped_state(first.get(key), second.get(key)) for key in set(first) | set(second)
+    }
+    if asset == 'stock':
+        old, new = remote.get('market_risk_data', {}), local.get('market_risk_data', {})
+        selected = _newer_timestamped_state(
+            {**old, 'updated_at': old.get('last_attempt') or old.get('updated')},
+            {**new, 'updated_at': new.get('last_attempt') or new.get('updated')},
+        )
+        if new.get('errors') and selected.get('updated_at') == (new.get('last_attempt') or new.get('updated')):
+            selected = merge_market_risk_refresh(
+                old, new.get('attention'), new.get('disposition'), new.get('disposition_tomorrow'),
+                new['errors'], market_by_code=new.get('market_by_code'), attempted_at=new.get('last_attempt'),
+            )
+        merged['market_risk_data'] = selected
+    merged.pop('postclose_sync_pending', None)
+    merged['updated_at'] = pd.Timestamp.now(tz='Asia/Taipei').isoformat()
+    return merged
+
+
+def sync_postclose_scopes(cloud_url, assets):
+    """Persist outside the UI, merging the latest file and remote scope first."""
+    completed = []
+    for asset in assets:
+        path, scope = ((STOCK_STRATEGY_CACHE_FILE, GOOGLE_SCOPE_STOCK) if asset == 'stock'
+                       else (FUTURES_STATE_CACHE_FILE, GOOGLE_SCOPE_FUTURES))
+        with get_data_cache_sync_lock():
+            with _RUNTIME_FILE_LOCK:
+                with open(path, encoding='utf-8') as file:
+                    local = json.load(file)
+            remote, error = _fetch_remote_scope(cloud_url, scope, timeout=8)
+            if error:
+                continue
+            merged = merge_postclose_scope(remote, local, asset)
+            ok, _ = _save_remote_scope(cloud_url, scope, merged,
+                                      updated_at=merged.get('updated_at'), timeout=8, verify=True)
+            if ok:
+                completed.append(asset)
+                with _RUNTIME_FILE_LOCK:
+                    with open(path, encoding='utf-8') as file:
+                        latest = json.load(file)
+                    if latest == local:
+                        latest.pop('postclose_sync_pending', None)
+                        _write_json_atomic(path, latest, indent=2)
+    return completed
+
+
+@st.fragment(run_every=60)
+def render_postclose_maintenance():
+    current, target, sources_open, ranking_open = postclose_maintenance_window(pd.Timestamp.now(tz='Asia/Taipei'))
+    state = st.session_state.setdefault('_postclose_maintenance', {})
+    if not state.get('sync_restored'):
+        state['sync_restored'] = True
+        if get_app_secret('gsheet_api_url'):
+            for asset, path in (('stock', STOCK_STRATEGY_CACHE_FILE), ('futures', FUTURES_STATE_CACHE_FILE)):
+                try:
+                    with _RUNTIME_FILE_LOCK:
+                        with open(path, encoding='utf-8') as file:
+                            pending = json.load(file).get('postclose_sync_pending')
+                    if pending:
+                        state.setdefault('pending_sync', {})[asset] = time.monotonic()
+                except (OSError, ValueError, TypeError):
+                    pass
+    sync_task = state.get('sync_task')
+    if sync_task is not None and sync_task.done():
+        state.pop('sync_task')
+        state['sync_retry_at'] = time.monotonic() + 900
+        try:
+            completed = sync_task.result()
+        except Exception:
+            completed = []
+        for asset in completed:
+            if state.get('sync_versions', {}).get(asset) == state.get('pending_sync', {}).get(asset):
+                state['pending_sync'].pop(asset, None)
+                key = '_data_cache_sync_status' if asset == 'stock' else '_futures_cloud_save_status'
+                st.session_state[key] = 'ok'
+    if state.get('pending_sync') and not state.get('sync_task') and time.monotonic() >= state.get('sync_retry_at', 0):
+        worker = get_postclose_worker()
+        if worker['slot'].acquire(blocking=False):
+            state['sync_versions'] = dict(state['pending_sync'])
+            state['sync_task'] = worker['executor'].submit(
+                run_postclose_job, worker, sync_postclose_scopes, get_app_secret('gsheet_api_url'),
+                list(state['pending_sync']),
+            )
+    if state.get('pending_sync'):
+        st.caption('排名已保留本機，Google Sheet 背景同步中；失敗會自動重試。')
+    seed_task = state.get('seed_task')
+    if seed_task is not None and seed_task.done():
+        state.pop('seed_task')
+        try:
+            saved = seed_task.result()
+            rows = postclose_futures_seed_rows(saved)
+            if not rows.empty and '_postclose_visible_futures' not in st.session_state:
+                st.session_state['_postclose_visible_futures'] = rows
+                st.session_state.setdefault('futures_strategy_ranking_snapshots', saved.get('strategy_ranking_snapshots', {}))
+                st.session_state.setdefault('_cached_futures_strategy_state', saved)
+        except Exception:
+            state['seed_retry_at'] = time.monotonic() + 900
+        else:
+            state['seed_loaded'] = True
+    period = 'preopen' if current.time() < dt_time(8, 30) else 'postclose' if ranking_open else 'afternoon'
+    phase = f'{target}:{current.date()}:{period}'
+    future = state.get('future')
+    if future is not None and future.done():
+        state.pop('future', None)
+        state['retry_at'] = time.monotonic() + 900
+        try:
+            result = future.result()
+        except Exception as exc:
+            result = {'rankings': {}, 'errors': {'資料檢查': type(exc).__name__}}
+        state['status'] = '；'.join(f'{key}：{value}' for key, value in result['errors'].items()) or '盤後資料檢查完成'
+        stock_dirty = futures_dirty = False
+        if state.get('target') == target.isoformat() and sources_open:
+            if 'turnover' in result:
+                ranking, source_date = result['turnover']
+                existing_date = _ranking_market_date(st.session_state.get('turnover_ranking_date'))
+                if source_date == target and (not existing_date or existing_date <= target.strftime('%Y%m%d')):
+                    st.session_state.update(turnover_ranking_df=ranking, goodinfo_df=ranking,
+                                            turnover_ranking_source='official', turnover_ranking_date=source_date.isoformat())
+                    _save_official_turnover_cache(ranking, source_date)
+            risk = result.get('risk')
+            if risk and st.session_state.get('risk_filter_market_data', {}).get('updated') == state.get('risk_version'):
+                previous = st.session_state.get('risk_filter_market_data', {})
+                content_keys = ('attention', 'disposition', 'disposition_tomorrow', 'market_by_code', 'errors')
+                # Only changed content/date is saved; checking an unchanged version is cheap.
+                if any(previous.get(key) != risk.get(key) for key in content_keys) or str(previous.get('updated', ''))[:10] != str(risk.get('updated', ''))[:10]:
+                    st.session_state['risk_filter_market_data'] = risk
+                    stock_dirty = True
+                    state['retry_at'] = 0
+                if not risk.get('errors'):
+                    state['risk_done'] = phase
+            if ranking_open:
+                for asset, snapshots in result['rankings'].items():
+                    key = f'{asset}_strategy_ranking_snapshots'
+                    previous = st.session_state.get(key, {})
+                    versions = {mode: item.get('updated_at') for mode, item in previous.items()}
+                    visible = st.session_state.get(f'_postclose_visible_{asset}')
+                    if versions != state.get('versions', {}).get(asset, {}):
+                        continue  # A manual analysis or cloud restore finished meanwhile.
+                    if visible is not None and postclose_scope(visible, asset) != snapshots['daytrade']['scope']:
+                        continue
+                    st.session_state[key] = snapshots
+                    st.session_state[f'_{asset}_ranking_waiting'] = []
+                    stock_dirty |= asset == 'stock'
+                    futures_dirty |= asset == 'futures'
+        for asset in ('stock', 'futures'):
+            if asset in result['errors']:
+                st.session_state[f'_{asset}_ranking_waiting'] = [result['errors'][asset]]
+        if stock_dirty:
+            save_data_cache(st.session_state.stock_data, st.session_state.ignored_stocks,
+                            st.session_state.all_candidates, st.session_state.saved_notes, sync_cloud=False)
+        if futures_dirty:
+            save_futures_strategy_state(sync_cloud=False)
+        if stock_dirty or futures_dirty:
+            if get_app_secret('gsheet_api_url'):
+                for asset, dirty in (('stock', stock_dirty), ('futures', futures_dirty)):
+                    if dirty:
+                        state.setdefault('pending_sync', {})[asset] = time.monotonic()
+                state['sync_retry_at'] = 0
+            st.rerun()
+    if not sources_open:
+        st.caption('盤後自動檢查：排名凍結中；21:00 後檢查完整資料。')
+        return
+    if ranking_open and not state.get('seed_loaded') and not state.get('seed_task') and time.monotonic() >= state.get('seed_retry_at', 0):
+        # This read shares the single worker but never waits on the browser thread.
+        worker = get_postclose_worker()
+        if worker['slot'].acquire(blocking=False):
+            state['seed_task'] = worker['executor'].submit(
+                run_postclose_job, worker, load_postclose_futures_seed, get_app_secret('gsheet_api_url'),
+            )
+    if state.get('future') is not None:
+        st.caption('盤後自動檢查：背景補齊缺項中，主表保留原資料。')
+        return
+    st.caption('盤後自動檢查：' + str(state.get('status', '等待檢查；資料未齊每 15 分鐘重試。')))
+    scopes = {
+        asset: postclose_scope(st.session_state[f'_postclose_visible_{asset}'], asset)
+        for asset in ('stock', 'futures') if f'_postclose_visible_{asset}' in st.session_state
+    }
+    if (state.get('target') == target.isoformat() and state.get('phase') == phase
+            and state.get('scopes') == scopes and time.monotonic() < state.get('retry_at', 0)):
+        return
+    row_sets = {}
+    if ranking_open:
+        for asset in ('stock', 'futures'):
+            rows = st.session_state.get(f'_postclose_visible_{asset}')
+            if rows is None or rows.empty:
+                continue
+            snapshots = st.session_state.get(f'{asset}_strategy_ranking_snapshots', {})
+            if not postclose_snapshot_ready(snapshots, rows, asset, target,
+                                            st.session_state.get('risk_filter_market_data', {})):
+                row_sets[asset] = rows.copy(deep=True)
+    need_turnover = _ranking_market_date(st.session_state.get('turnover_ranking_date')) != target.strftime('%Y%m%d')
+    need_risk = state.get('risk_done') != phase
+    if not row_sets and not need_turnover and not need_risk:
+        return
+    worker = get_postclose_worker()
+    if not worker['slot'].acquire(blocking=False):
+        return
+    state['target'] = target.isoformat()
+    state['phase'] = phase
+    state['scopes'] = scopes
+    state['versions'] = {
+        asset: {mode: item.get('updated_at') for mode, item in st.session_state.get(f'{asset}_strategy_ranking_snapshots', {}).items()}
+        for asset in row_sets
+    }
+    risk = dict(st.session_state.get('risk_filter_market_data', {}))
+    state['risk_version'] = risk.get('updated')
+    state['future'] = worker['executor'].submit(run_postclose_job, worker, build_postclose_job, row_sets, target,
+                                               need_turnover, need_risk, risk)
+
 
 # ==========================================
 # 主介面 (Tabs)
@@ -24573,3 +25079,8 @@ with tab_company:
     summary_cols[2].metric("美股營收", len(snapshot.get("us_revenue", {}).get("events", [])))
     st.markdown("<div class='company-step'><span class='company-step-number'>3</span>查看同步結果</div>", unsafe_allow_html=True)
     render_company_event_snapshot(snapshot)
+
+
+if tab1.open:
+    with tab1:
+        render_postclose_maintenance()
