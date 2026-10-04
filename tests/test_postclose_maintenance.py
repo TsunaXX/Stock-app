@@ -10,7 +10,7 @@ from test_core_calculations import load_app_symbols
 
 def helpers(*extra):
     return load_app_symbols('_as_float', '_ranking_number', '_ranking_market_date',
-                            '_ranking_clamp', 'postclose_risk_version', *extra)
+                            '_ranking_clamp', 'postclose_risk_version', 'enrich_futures_ranking_fields', '_safe_number', *extra)
 
 
 def context():

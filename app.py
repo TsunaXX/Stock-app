@@ -19824,7 +19824,11 @@ def build_postclose_job(row_sets, target, need_turnover, need_risk, previous_ris
     if not row_sets:
         return result
     for asset, visible in row_sets.items():
-        context = fetch_post_close_stock_ranking_context(target_text, asset_type=asset)
+        try:
+            context = fetch_post_close_stock_ranking_context(target_text, asset_type=asset)
+        except Exception as exc:
+            result['errors'][asset] = f'排名來源：{type(exc).__name__}'
+            continue
         issues = ranking_context_issues(context, visible, asset, target)
         if asset == 'stock' and (not risk.get('updated') or risk.get('errors')):
             issues.append('注意／處置名單尚未完整')
@@ -19854,7 +19858,12 @@ def build_postclose_job(row_sets, target, need_turnover, need_risk, previous_ris
                     records.append(row)
                 rows = pd.DataFrame(records)
             else:
-                official, _ = fetch_postclose_futures_rows(target_text)
+                official, metadata = fetch_postclose_futures_rows(target_text)
+                previous_dates = {_ranking_market_date(value) for value in visible.get('資料日期', [])}
+                previous_date = next(iter(previous_dates)) if len(previous_dates) == 1 else ''
+                official = enrich_futures_ranking_fields(
+                    official, visible, metadata, {'updated': previous_date},
+                )
                 keys = set(visible['契約鍵'].astype(str))
                 rows = official[official['契約鍵'].astype(str).isin(keys)].copy()
                 if set(rows['契約鍵'].astype(str)) != keys:
