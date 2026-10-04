@@ -23,6 +23,7 @@ import pytz
 import plotly.graph_objects as go
 from bs4 import BeautifulSoup
 from plotly.subplots import make_subplots
+from market_automation import attach_macro_results, data_version, index_scenario, macro_results, merge_company_sections, merge_macro_results, vwap_guard
 
 
 APP_PATH = Path(__file__).parents[1] / "app.py"
@@ -68,6 +69,10 @@ def load_app_symbols(*names):
         "as_completed": as_completed,
         "urljoin": urljoin,
         "st": SimpleNamespace(cache_data=lambda **kwargs: lambda function: function),
+        "vwap_guard": vwap_guard, "merge_company_sections": merge_company_sections,
+        "data_version": data_version, "macro_results": macro_results,
+        "attach_macro_results": attach_macro_results, "index_scenario": index_scenario,
+        "merge_macro_results": merge_macro_results,
     }
     module = ast.fix_missing_locations(ast.Module(body=selected, type_ignores=[]))
     exec(compile(module, APP_PATH, "exec"), namespace)
@@ -1713,7 +1718,7 @@ def test_stock_ranking_and_option_plan_skip_redundant_fetches():
     assert "'tpex_daily'" not in ranking_source
     assert "if asset_type in ('futures', 'combined')" in ranking_source
 
-    option_start = source.index("if refresh_option_plan or not option_cache")
+    option_start = source.index("if tab_fibo.open and tab_option_plan.open and (")
     option_end = source.index("directional_quote = option_cache.get", option_start)
     option_source = source[option_start:option_end]
     assert option_source.count("select_txo_expiry(") == 1
@@ -2409,7 +2414,7 @@ def test_requested_futures_controls_and_company_tab_order_are_present():
     assert "🚨 官方上市處置公告" in source
     assert "🚨 官方上櫃處置公告" in source
     assert "st.columns(\n            3, gap='small', vertical_alignment='center'\n        )" in source
-    assert "taiwan_tab, us_tab, earnings_tab = st.tabs" in source
+    assert "taiwan_tab, us_tab, earnings_tab, event_tab = st.tabs" in source
     assert "只顯示夜盤期貨" in source
     assert source.index("只顯示夜盤期貨") > source.index("只顯示小型股票期貨")
     assert source.index("只顯示夜盤期貨") < source.index("隱藏小型期貨")
@@ -3264,7 +3269,7 @@ def test_stream_refresh_only_visible_stocks_preserves_daily_strategy_and_quote_a
     ns = load_app_symbols(
         'refresh_daytrade_metrics_for_codes', 'refresh_stock_quotes_for_codes',
         'merge_realtime_stock_snapshots', 'fresh_strategy_stream_quote', '_stream_datetime',
-        '_safe_number', '_stream_number', 'snapshot_change_rate', 'price_change_amount',
+        '_safe_number', '_stream_number', 'snapshot_change_rate', 'price_change_amount', 'get_tick_size',
     )
     now = datetime.now(pytz.timezone('Asia/Taipei'))
     rows = pd.DataFrame([{'代號': c, '收盤價': 100, '_ma5': 98, '_strategy_close': 100,
@@ -3279,7 +3284,7 @@ def test_stream_refresh_only_visible_stocks_preserves_daily_strategy_and_quote_a
     ns['sync_strategy_stream_scope'] = lambda *args: None
     ns['_is_opening_micro_window'] = lambda now: False
     ns['get_strategy_intraday_history'] = lambda api, contract, wait: pd.DataFrame()
-    ns['calculate_daytrade_metrics'] = lambda *args, **kwargs: {'_daytrade_close': 101}
+    ns['calculate_daytrade_metrics'] = lambda *args, **kwargs: {'_daytrade_close': 101, '_daytrade_vwap': 100}
     ns['stock_snapshot_limit_context'] = lambda *a, **kw: None
     api = SimpleNamespace(Contracts=SimpleNamespace(Stocks={c: SimpleNamespace(code=c) for c in quotes}))
     # Restrict to one actual displayed row; hidden rows must remain byte-for-byte unchanged.
@@ -3347,7 +3352,7 @@ def test_intraday_history_seed_is_background_and_reused():
 
 def test_futures_auto_reads_stream_only_and_waits_for_history():
     ns = load_app_symbols('update_futures_live_rows', '_safe_number', '_stream_datetime',
-                          'snapshot_change_rate', 'fresh_strategy_stream_quote', 'set_futures_row_values')
+                          'snapshot_change_rate', 'fresh_strategy_stream_quote', 'set_futures_row_values', 'parse_trade_plan_numbers')
     rows = pd.DataFrame([{'期貨代碼':'CDF', '契約月份':'202610', '契約鍵':'CDF:202610',
                           '收盤價':100, '開盤價':99, '當日高':101, '當日低':98,
                           '當日成交口數':10, '原始保證金率':13., '維持保證金率':10., '乘數':2000.,
@@ -3525,8 +3530,16 @@ fixture_rows = pd.DataFrame([{'契約鍵':'CDF:202610','期貨代碼':'CDF','契
     '指數期貨':False,'ETF期貨':False,'小型期貨':False,'次月期貨':False,
     '月份順位':0,'交易時段':'日盤+夜盤','資料日期':'2026/09/30'}])
 fetch_futures_strategy_universe = lambda *a, **kw: (fixture_rows.copy(), {'updated':'2026/09/30','errors':[]})
-load_futures_strategy_state = lambda: {'live_cache':{'CDF:202610':{'收盤價':100.5,'VWAP':'—','報價時間':'2026/09/30 16:00:00'}}}
+load_futures_strategy_state = lambda: {'live_cache':{'CDF:202610':{'收盤價':100.5,'VWAP':'—','報價時間':'2026/09/30 16:00:00',
+    '_daytrade_guard_side':'long','_last_intraday_stop':99.5,'_last_intraday_session':'night'}}}
+original_futures_levels = calculate_futures_strategy_levels
+def verify_futures_live_cache(row, *args, **kwargs):
+    st.session_state['_test_futures_cache_seen'] = (
+        row.get('_daytrade_guard_side') == 'long' and row.get('_last_intraday_stop') == 99.5)
+    return original_futures_levels(row, *args, **kwargs)
+calculate_futures_strategy_levels = verify_futures_live_cache
 save_futures_strategy_state = lambda *a, **kw: None
+render_postclose_maintenance = lambda: None
 """
     source = source.replace('tab1, tab_fibo, tab2, tab_db, tab_company, tab3 = st.tabs([',
                             setup + '\n' + 'tab1, tab_fibo, tab2, tab_db, tab_company, tab3 = st.tabs([')
@@ -3538,6 +3551,7 @@ save_futures_strategy_state = lambda *a, **kw: None
         assert not app.exception
         assert app.toggle(key='futures_auto_enabled').value is False
         assert app.checkbox(key='futures_auto_restricted').value is False
+        assert app.session_state['_test_futures_cache_seen'] is True
         app.toggle(key='futures_auto_enabled').set_value(True).run()
         assert not app.exception
         app.toggle(key='futures_auto_enabled').set_value(False).run()
