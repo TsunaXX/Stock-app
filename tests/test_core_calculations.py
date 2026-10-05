@@ -3247,7 +3247,7 @@ def test_all_ranking_snapshots_keep_scores_during_intraday_analysis():
 
 
 def test_intraday_auto_window_and_completion_gate():
-    ns = load_app_symbols('intraday_auto_window_open', 'begin_intraday_auto_update', 'finish_intraday_auto_update')
+    ns = load_app_symbols('intraday_auto_window_open', 'intraday_auto_interval', 'begin_intraday_auto_update', 'finish_intraday_auto_update')
     ns['is_market_closed_func'] = lambda d: d.weekday() >= 5
     tz = pytz.timezone('Asia/Taipei')
     window = ns['intraday_auto_window_open']
@@ -3383,6 +3383,13 @@ def test_manual_intraday_button_updates_table_without_full_page_rerun(tmp_path):
     from unittest.mock import patch
     import requests
     from streamlit.testing.v1 import AppTest
+    from streamlit.runtime.scriptrunner_utils.script_run_context import ScriptRunContext
+    native_intervals = []
+    original_enqueue = ScriptRunContext.enqueue
+    def record_timer(ctx, message):
+        if message.HasField('auto_rerun'):
+            native_intervals.append(message.auto_rerun.interval)
+        return original_enqueue(ctx, message)
     source = APP_PATH.read_text(encoding='utf-8')
     # Inject only market inputs; exercise the real fragment, button and editor.
     setup = """
@@ -3408,13 +3415,17 @@ def refresh_daytrade_metrics_for_codes(rows, *args, **kwargs):
     anchor = 'tab1, tab_fibo, tab2, tab_db, tab_company, tab3 = st.tabs(['
     setup = 'CONFIG_FILE = ' + repr(str(tmp_path / 'auto-config.json')) + '\n' + setup
     source = source.replace(anchor, setup + '\nrender_postclose_maintenance = lambda: None\n' + anchor)
-    with patch('requests.get', side_effect=requests.ConnectionError('offline UI check')), \
+    with patch.object(ScriptRunContext, 'enqueue', record_timer), \
+         patch('requests.get', side_effect=requests.ConnectionError('offline UI check')), \
          patch('requests.post', side_effect=requests.ConnectionError('offline UI check')), \
          patch('yfinance.download', return_value=pd.DataFrame()), \
          patch('yfinance.Ticker', return_value=SimpleNamespace(history=lambda *a, **kw: pd.DataFrame(), fast_info={}, info={})):
         app = AppTest.from_string(source, default_timeout=120).run()
         assert not app.exception
         assert app.toggle(key='stock_auto_enabled').value is False
+        assert app.session_state['stock_auto_timer_seconds'] is None
+        assert app.session_state['stock_independent_auto_timer_seconds'] is None
+        assert 1 not in native_intervals
         assert app.time_input(key='stock_auto_start').value == dt_time(9)
         assert app.time_input(key='stock_auto_end').value == dt_time(13, 30)
         app.button(key='refresh_daytrade_filter_metrics').click().run()
@@ -3424,6 +3435,7 @@ def refresh_daytrade_metrics_for_codes(rows, *args, **kwargs):
         app.toggle(key='stock_auto_enabled').set_value(True).run()
         assert not app.exception
         assert app.session_state['stock_auto_config']['enabled'] is True
+        assert app.session_state['stock_auto_timer_seconds'] == 5
         app.toggle(key='stock_strategy_settings_open').set_value(False).run()
         assert not app.exception
         assert app.toggle(key='stock_strategy_settings_open').value is False
@@ -3446,12 +3458,16 @@ def refresh_daytrade_metrics_for_codes(rows, *args, **kwargs):
         app.toggle(key='stock_independent_auto_enabled').set_value(True).run()
         assert not app.exception
         assert '下一輪重試' in app.session_state['stock_independent_auto_status']
+        assert app.session_state['stock_independent_auto_timer_seconds'] == 5
         assert app.session_state['stock_independent_raw_results'][0]['收盤價'] == 100
         app.run()
         assert not app.exception
         assert app.session_state['stock_independent_raw_results'][0]['收盤價'] == 101
         assert app.session_state['stock_independent_raw_results'][0]['戰略備註'] == '固定'
+        native_intervals.clear()
         app.number_input(key='stock_independent_auto_seconds').set_value(7).run()
+        assert 7 in native_intervals and 1 not in native_intervals
+        assert app.session_state['stock_independent_auto_timer_seconds'] == 7
         saved = json.loads((tmp_path / 'auto-config.json').read_text(encoding='utf-8'))
         assert saved['stock_independent_auto_seconds'] == 7 and saved['stock_auto_seconds'] == 12
 
@@ -3579,18 +3595,22 @@ def update_futures_live_rows(rows, *args, **kwargs):
         app = AppTest.from_string(source, default_timeout=120).run()
         assert not app.exception
         assert app.toggle(key='futures_auto_enabled').value is False
+        assert app.session_state['futures_auto_timer_seconds'] is None
+        assert app.session_state['futures_independent_auto_timer_seconds'] is None
         assert app.checkbox(key='futures_auto_restricted').value is False
         assert app.session_state['_test_futures_cache_seen'] is True
         assert app.toggle(key='futures_independent_auto_enabled').value is False
         assert app.checkbox(key='futures_independent_auto_restricted').value is False
         app.toggle(key='futures_independent_auto_enabled').set_value(True).run()
         assert not app.exception
+        assert app.session_state['futures_independent_auto_timer_seconds'] == 5
         cached = app.session_state['futures_independent_result']['rows']
         assert len(cached) == 2
         assert cached[0]['期貨代碼'] == 'NONE' and cached[0]['收盤價'] == 100
         assert cached[1]['期貨代碼'] == 'CDF' and cached[1]['收盤價'] == 101.5
         app.toggle(key='futures_independent_auto_enabled').set_value(False).run()
         assert not app.exception
+        assert app.session_state['futures_independent_auto_timer_seconds'] is None
         independent = [table.value for table in app.dataframe if '期貨代碼' in table.value.columns and len(table.value) == 2]
         assert independent
         app.toggle(key='futures_auto_enabled').set_value(True).run()
