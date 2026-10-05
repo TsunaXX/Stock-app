@@ -19194,15 +19194,34 @@ def sync_strategy_stream_scope(api, contracts, room):
                 owned[code] = dict(state['subscriptions'][code])
 
 
-def begin_intraday_auto_update(room, enabled, seconds, start=None, end=None):
-    """A completion-based gate; fragment reruns never overlap a manual update."""
+def intraday_auto_interval(room, enabled, seconds, start=None, end=None):
+    """Disable the table timer itself when quotes cannot be refreshed."""
     now_tw = datetime.now(pytz.timezone('Asia/Taipei'))
     if not enabled or not st.session_state.get('sj_logged_in', False) or st.session_state.get('sj_api') is None:
         if enabled:
             st.session_state[f'{room}_auto_status'] = '等待 Shioaji 登入與行情連線。'
-        return False
+        return None
     if not intraday_auto_window_open(now_tw, start, end, stock=room.startswith('stock')):
         st.session_state[f'{room}_auto_status'] = '目前不在更新時段；保留上次資料與來源時間。'
+        return None
+    return seconds
+
+
+def configure_intraday_auto_timer(room):
+    interval = intraday_auto_interval(room, *intraday_auto_settings(room))
+    st.session_state[f'{room}_auto_timer_seconds'] = interval
+    return interval
+
+
+def check_intraday_auto_timer(room):
+    key = f'{room}_auto_timer_seconds'
+    if key in st.session_state and st.session_state[key] != intraday_auto_interval(room, *intraday_auto_settings(room)):
+        st.rerun()
+
+
+def begin_intraday_auto_update(room, enabled, seconds, start=None, end=None):
+    """A completion-based gate; fragment reruns never overlap a manual update."""
+    if intraday_auto_interval(room, enabled, seconds, start, end) is None:
         return False
     if time.monotonic() - st.session_state.get(f'{room}_auto_completed', 0) < seconds:
         return False
@@ -19794,8 +19813,9 @@ def render_futures_strategy_room():
     if refresh_live:
         st.session_state['_futures_manual_refresh'] = True
 
-    @st.fragment(run_every=1 if futures_auto_enabled else None)
+    @st.fragment(run_every=configure_intraday_auto_timer('futures'))
     def render_futures_main_table(display_rows):
+        check_intraday_auto_timer('futures')
         if futures_auto_night_scope(futures_auto_enabled, datetime.now(pytz.timezone('Asia/Taipei'))) != auto_night:
             st.rerun()
         display_rows = display_rows.copy()
@@ -20176,8 +20196,9 @@ def render_futures_strategy_room():
             'rows': _json_safe(independent_rows.to_dict(orient='records')),
         }
 
-    @st.fragment(run_every=1 if independent_auto[0] else None)
+    @st.fragment(run_every=configure_intraday_auto_timer('futures_independent'))
     def render_futures_independent_table():
+        check_intraday_auto_timer('futures_independent')
         cached_independent = st.session_state.get('futures_independent_result', {})
         independent_rows = pd.DataFrame(cached_independent.get('rows', [])).astype(object)
         if not independent_rows.empty and cached_independent.get('strategy_mode') != strategy_mode:
@@ -20492,6 +20513,9 @@ def sync_postclose_scopes(cloud_url, assets):
 
 @st.fragment(run_every=60)
 def render_postclose_maintenance():
+    # Reuse this minute tick to resume paused tables; no extra polling fragment.
+    for room in ('stock', 'stock_independent', 'futures', 'futures_independent'):
+        check_intraday_auto_timer(room)
     current, target, sources_open, ranking_open = postclose_maintenance_window(pd.Timestamp.now(tz='Asia/Taipei'))
     state = st.session_state.setdefault('_postclose_maintenance', {})
     if not state.get('sync_restored'):
@@ -20667,6 +20691,9 @@ tab1, tab_fibo, tab2, tab_db, tab_company, tab3 = st.tabs([
 ], key="main_workspace_active_tab", on_change="rerun")
 
 with tab1:
+    # Only timers registered during this full app run belong to visible tables.
+    for room in ('stock', 'stock_independent', 'futures', 'futures_independent'):
+        st.session_state.pop(f'{room}_auto_timer_seconds', None)
     if tab1.open:
         render_opening_direction_prompt()
     if st.session_state.get('strategy_room_active_tab') == "📊 策略驗證":
@@ -20985,10 +21012,11 @@ if tab1.open and stock_strategy_tab.open:
 
             stock_auto_enabled, stock_auto_seconds, stock_auto_start, stock_auto_end = intraday_auto_settings('stock')
 
-            @st.fragment(run_every=1 if stock_auto_enabled else None)
+            @st.fragment(run_every=configure_intraday_auto_timer('stock'))
             def render_stock_main_table():
                 if st.session_state.pop('_stock_auto_settings_changed', False):
                     st.rerun()
+                check_intraday_auto_timer('stock')
                 if begin_intraday_auto_update('stock', stock_auto_enabled, stock_auto_seconds, stock_auto_start, stock_auto_end):
                     started = time.monotonic()
                     count, error = 0, None
@@ -22029,8 +22057,9 @@ if tab1.open and stock_strategy_tab.open:
                         )
                         indep_data = []
 
-                @st.fragment(run_every=1 if independent_auto[0] else None)
+                @st.fragment(run_every=configure_intraday_auto_timer('stock_independent'))
                 def render_stock_independent_table():
+                    check_intraday_auto_timer('stock_independent')
                     indep_data = st.session_state.get('stock_independent_raw_results', [])
                     indep_data = [row for row in indep_data if str(row.get('_strategy_data_as_of', '')) == latest_completed_stock_trading_date().strftime('%Y/%m/%d')]
                     if begin_intraday_auto_update('stock_independent', *independent_auto):

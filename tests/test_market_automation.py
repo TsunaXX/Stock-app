@@ -492,7 +492,7 @@ def test_shared_main_and_independent_subscription_lives_until_last_scope_closes(
 
 
 def test_refresh_failure_releases_gate_without_claiming_new_data_time():
-    ns = load_app_symbols('begin_intraday_auto_update', 'finish_intraday_auto_update',
+    ns = load_app_symbols('intraday_auto_interval', 'begin_intraday_auto_update', 'finish_intraday_auto_update',
                           'intraday_auto_window_open', 'intraday_auto_settings')
     state = {'sj_logged_in': True, 'sj_api': object(), 'stock_independent_auto_updated_at': 'original'}
     ns['st'] = SimpleNamespace(session_state=state)
@@ -505,3 +505,56 @@ def test_refresh_failure_releases_gate_without_claiming_new_data_time():
     assert not state['stock_independent_auto_lock'].locked()
     assert state['stock_independent_auto_updated_at'] == 'original'
     assert '下一輪重試' in state['stock_independent_auto_status']
+
+
+def test_table_timers_use_user_interval_and_stop_or_resume_at_session_boundaries():
+    from datetime import datetime
+    import pytz
+    ns = load_app_symbols('intraday_auto_window_open', 'intraday_auto_interval',
+                          'intraday_auto_settings', 'configure_intraday_auto_timer', 'check_intraday_auto_timer')
+    current = [datetime(2026,10,5,9,30,tzinfo=pytz.timezone('Asia/Taipei'))]
+    ns['datetime'] = SimpleNamespace(now=lambda _: current[0])
+    closed = [False]
+    ns['is_market_closed_func'] = lambda _: closed[0]
+    ns['load_config'] = lambda: {}
+    state = {'sj_logged_in': True, 'sj_api': object()}
+    def rerun():
+        raise RuntimeError('timer reconfiguration')
+    ns['st'] = SimpleNamespace(session_state=state, rerun=rerun)
+    configure, check = ns['configure_intraday_auto_timer'], ns['check_intraday_auto_timer']
+    for room in ('stock','stock_independent','futures','futures_independent'):
+        assert configure(room) is None
+        state[f'{room}_auto_config'].update(enabled=True, seconds=12)
+        assert configure(room) == 12
+        state['sj_logged_in'] = False
+        assert configure(room) is None
+        state['sj_logged_in'] = True
+        state['sj_api'], saved_api = None, state['sj_api']
+        assert configure(room) is None
+        state['sj_api'] = saved_api
+        assert configure(room) == 12
+    current[0] = current[0].replace(hour=13, minute=31)
+    for room in ('stock','stock_independent'):
+        with pytest.raises(RuntimeError, match='timer reconfiguration'):
+            check(room)
+        assert configure(room) is None
+        for _ in range(120):
+            check(room)  # Paused minute checks never rebuild tables.
+    assert configure('futures') == 12
+    current[0] = current[0].replace(day=6, hour=9, minute=0)
+    with pytest.raises(RuntimeError, match='timer reconfiguration'):
+        check('stock')
+    assert configure('stock') == 12
+    closed[0] = True
+    assert configure('stock_independent') is None
+    for room in ('futures','futures_independent'):
+        state[f'{room}_auto_config'].update(restricted=True, start=ns['dt_time'](15), end=ns['dt_time'](5))
+        assert configure(room) is None
+        current[0] = current[0].replace(hour=23)
+        with pytest.raises(RuntimeError, match='timer reconfiguration'):
+            check(room)
+        assert configure(room) == 12
+        current[0] = current[0].replace(hour=4)
+        assert configure(room) == 12
+        current[0] = current[0].replace(hour=9)
+    check('unrendered_room')  # Hidden or absent tables cannot restart old timers.

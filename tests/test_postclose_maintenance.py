@@ -135,7 +135,7 @@ def test_background_completion_respects_freeze_and_newer_manual_snapshot():
     import ast
     import time
     from test_core_calculations import APP_PATH
-    ns = helpers('_post_close_target_date', 'postclose_maintenance_window', 'postclose_scope')
+    ns = helpers('_post_close_target_date', 'postclose_maintenance_window', 'postclose_scope', 'check_intraday_auto_timer')
     tree = ast.parse(APP_PATH.read_text(encoding='utf-8'))
     node = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
                 and node.name == 'render_postclose_maintenance')
@@ -195,6 +195,7 @@ import pandas as pd
 import time
 from datetime import date, time as dt_time
 from types import SimpleNamespace
+check_intraday_auto_timer = lambda room: None
 postclose_maintenance_window = lambda now: (pd.Timestamp('2026-10-02 21:00'), date(2026, 10, 2), True, True)
 st.session_state.setdefault('_postclose_maintenance', {'sync_restored': True, 'seed_loaded': True, 'future': SimpleNamespace(done=lambda: False)})
 ''' + function_source + '''
