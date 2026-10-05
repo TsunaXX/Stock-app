@@ -402,3 +402,106 @@ def test_background_sheet_merge_preserves_remote_selection_dates_and_own_timesta
     ns['_fetch_remote_scope'] = lambda *a, **kw: (None, 'read failed')
     assert not ns['sync_company_background_snapshot']('https://test.invalid', local)
     assert len(writes) == 1
+
+
+def test_stream_disconnect_restores_subscriptions_without_polling():
+    ns = load_app_symbols('_install_stream_callbacks', 'ensure_market_stream_subscription',
+                          '_stream_contract_codes', '_shioaji_quote_type')
+    state = {'lock': threading.RLock(), 'callbacks_installed': False, 'subscriptions': {},
+             'aliases': {}, 'quotes': {'2330': {'source': 'stream', 'updated_at': 'original'}}}
+    ns['_stream_state'] = lambda api: state
+    ns['_remember_stream_error'] = lambda *args: None
+    ns['sj'] = None
+    calls, events = [], []
+    api = SimpleNamespace(set_on_quote_stk_v1_callback=lambda cb: None,
+                          quote=SimpleNamespace(set_event_callback=events.append),
+                          subscribe=lambda contract, **kw: calls.append(contract.code))
+    contract = SimpleNamespace(code='2330')
+    ensure = ns['ensure_market_stream_subscription']
+    assert ensure(api, contract) and ensure(api, contract)
+    assert calls == ['2330']
+    events[0](0, 12, '', '')
+    assert not ensure(api, contract)
+    assert state['quotes']['2330']['source'] == 'stream_stale'
+    assert state['quotes']['2330']['updated_at'] == 'original'
+    events[0](0, 13, '', '')
+    assert ensure(api, contract) and ensure(api, contract)
+    assert calls == ['2330', '2330']
+    from concurrent.futures import Future
+    completed, pending = Future(), Future()
+    completed.set_result(None)
+    state['strategy_histories'] = {'complete': {'future': completed}, 'pending': {'future': pending}}
+    events[0](0, 13, '', '')
+    assert state['strategy_histories']['complete']['failed'] is True
+    assert 'failed' not in state['strategy_histories']['pending']
+
+
+def test_failed_background_seed_retries_after_backoff_and_then_reuses_success():
+    from concurrent.futures import Future
+    ns = load_app_symbols('get_strategy_intraday_history')
+    state = {'lock': threading.RLock()}
+    clock, attempts = [0.], []
+    ns['time'] = SimpleNamespace(monotonic=lambda: clock[0], sleep=lambda _: None)
+    ns['_stream_state'] = lambda api: state
+    ns['_stream_quote_for_contract'] = lambda *a: None
+    ns['merge_stream_quote_into_intraday'] = lambda data, *a: data
+    ns['_remember_stream_error'] = lambda *a: None
+    ns['API_REQUEST_GAP_SECONDS'], ns['ANALYSIS_MAX_WORKERS'] = 0, 2
+    class Pool:
+        def submit(self, function):
+            attempts.append(1)
+            future = Future()
+            if len(attempts) == 1:
+                future.set_exception(ConnectionError('temporary'))
+            else:
+                future.set_result(bars([100, 101]))
+            return future
+    state['strategy_history_pool'] = Pool()
+    get = ns['get_strategy_intraday_history']
+    api, contract = object(), SimpleNamespace(code='2330')
+    assert get(api, contract).empty
+    clock[0] = 59
+    assert get(api, contract).empty and len(attempts) == 1
+    clock[0] = 60
+    assert not get(api, contract).empty
+    clock[0] = 3600
+    assert not get(api, contract).empty and len(attempts) == 2
+
+
+def test_shared_main_and_independent_subscription_lives_until_last_scope_closes():
+    from concurrent.futures import Future
+    from datetime import date
+    ns = load_app_symbols('sync_strategy_stream_scope')
+    pending = Future()
+    state = {'lock': threading.RLock(), 'subscriptions': {},
+             'strategy_histories': {('2330','stock',date.today(),'formed'): {'future': pending}}}
+    ns['_stream_state'] = lambda api: state
+    removed = []
+    ns['_unsubscribe_market_stream'] = lambda api, state, code, metadata: removed.append(code)
+    def subscribe(api, contract):
+        state['subscriptions'].setdefault(contract.code, {'contract': contract, 'status': 'active'})
+        return True
+    ns['ensure_market_stream_subscription'] = subscribe
+    sync, api, contract = ns['sync_strategy_stream_scope'], object(), SimpleNamespace(code='2330')
+    sync(api, [contract], 'stock')
+    sync(api, [contract], 'stock_independent')
+    sync(api, [], 'stock')
+    assert not removed and not pending.cancelled()
+    sync(api, [], 'stock_independent')
+    assert removed == ['2330'] and pending.cancelled()
+
+
+def test_refresh_failure_releases_gate_without_claiming_new_data_time():
+    ns = load_app_symbols('begin_intraday_auto_update', 'finish_intraday_auto_update',
+                          'intraday_auto_window_open', 'intraday_auto_settings')
+    state = {'sj_logged_in': True, 'sj_api': object(), 'stock_independent_auto_updated_at': 'original'}
+    ns['st'] = SimpleNamespace(session_state=state)
+    ns['is_market_closed_func'] = lambda _: False
+    ns['load_config'] = lambda: {'stock_independent_auto_seconds': 7, 'futures_independent_auto_seconds': 12}
+    assert ns['intraday_auto_settings']('stock_independent')[1:] == (7, ns['dt_time'](9), ns['dt_time'](13,30))
+    assert ns['intraday_auto_settings']('futures_independent')[1:] == (12, None, None)
+    assert ns['begin_intraday_auto_update']('stock_independent', True, 1)
+    ns['finish_intraday_auto_update']('stock_independent', ns['time'].monotonic(), 1, ValueError())
+    assert not state['stock_independent_auto_lock'].locked()
+    assert state['stock_independent_auto_updated_at'] == 'original'
+    assert '下一輪重試' in state['stock_independent_auto_status']

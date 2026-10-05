@@ -1499,7 +1499,7 @@ def test_stock_main_and_independent_tables_share_column_order_and_compact_mode()
     assert "盤中觸發" in full
     source = APP_PATH.read_text(encoding="utf-8")
     assert 'key="indep_stock_compact_table"' in source
-    assert "stock_strategy_display_columns(\n                            True, indep_is_daytrade" in source
+    assert re.search(r'stock_strategy_display_columns\(\s+True, indep_is_daytrade', source)
 
 
 def test_stock_refresh_actions_also_refresh_available_quotes_and_explanation_matches():
@@ -3395,7 +3395,15 @@ st.session_state.sj_logged_in = True
 st.session_state.sj_api = SimpleNamespace(Contracts=SimpleNamespace(Stocks={'2330':SimpleNamespace(code='2330')}))
 st.session_state.setdefault('stock_strategy_settings_open', True)
 get_strategy_intraday_history = lambda *args, **kwargs: pd.DataFrame()
-refresh_daytrade_metrics_for_codes = lambda rows, *args, **kwargs: (rows.assign(**{'收盤價':101.}), 1, 1)
+st.session_state.setdefault('stock_independent_raw_results', [{**st.session_state.stock_data.iloc[0].to_dict(), '_strategy_data_as_of':latest_completed_stock_trading_date().strftime('%Y/%m/%d')}])
+intraday_auto_window_open = lambda *a, **kw: True
+st.session_state['stock_independent_auto_completed'] = 0
+
+def refresh_daytrade_metrics_for_codes(rows, *args, **kwargs):
+    if kwargs.get('stream_room') == 'stock_independent' and st.session_state.get('_test_fail_once', True):
+        st.session_state['_test_fail_once'] = False
+        raise ConnectionError('temporary independent update failure')
+    return rows.assign(**{'收盤價':101.}), 1, 1
 """
     anchor = 'tab1, tab_fibo, tab2, tab_db, tab_company, tab3 = st.tabs(['
     setup = 'CONFIG_FILE = ' + repr(str(tmp_path / 'auto-config.json')) + '\n' + setup
@@ -3434,6 +3442,18 @@ refresh_daytrade_metrics_for_codes = lambda rows, *args, **kwargs: (rows.assign(
         assert not restarted.exception
         assert restarted.number_input(key='stock_auto_seconds').value == 12
         assert restarted.toggle(key='stock_auto_enabled').value is False
+        assert app.toggle(key='stock_independent_auto_enabled').value is False
+        app.toggle(key='stock_independent_auto_enabled').set_value(True).run()
+        assert not app.exception
+        assert '下一輪重試' in app.session_state['stock_independent_auto_status']
+        assert app.session_state['stock_independent_raw_results'][0]['收盤價'] == 100
+        app.run()
+        assert not app.exception
+        assert app.session_state['stock_independent_raw_results'][0]['收盤價'] == 101
+        assert app.session_state['stock_independent_raw_results'][0]['戰略備註'] == '固定'
+        app.number_input(key='stock_independent_auto_seconds').set_value(7).run()
+        saved = json.loads((tmp_path / 'auto-config.json').read_text(encoding='utf-8'))
+        assert saved['stock_independent_auto_seconds'] == 7 and saved['stock_auto_seconds'] == 12
 
 
 def test_auto_scope_cancels_removed_jobs_without_unsubscribing_existing_consumers():
@@ -3540,6 +3560,15 @@ def verify_futures_live_cache(row, *args, **kwargs):
 calculate_futures_strategy_levels = verify_futures_live_cache
 save_futures_strategy_state = lambda *a, **kw: None
 render_postclose_maintenance = lambda: None
+st.session_state.sj_logged_in = True
+st.session_state.sj_api = SimpleNamespace()
+st.session_state.setdefault('futures_independent_result', {'strategy_mode':'當沖','rows':[
+    {**fixture_rows.iloc[0].to_dict(), '契約鍵':'NONE:202610', '期貨代碼':'NONE', '交易時段':'日盤'},
+    fixture_rows.iloc[0].to_dict()]})
+futures_auto_night_scope = lambda enabled, now: enabled
+st.session_state['futures_independent_auto_completed'] = 0
+def update_futures_live_rows(rows, *args, **kwargs):
+    return rows.assign(**{'收盤價':101.5}).reset_index(drop=True), len(rows)
 """
     source = source.replace('tab1, tab_fibo, tab2, tab_db, tab_company, tab3 = st.tabs([',
                             setup + '\n' + 'tab1, tab_fibo, tab2, tab_db, tab_company, tab3 = st.tabs([')
@@ -3552,6 +3581,18 @@ render_postclose_maintenance = lambda: None
         assert app.toggle(key='futures_auto_enabled').value is False
         assert app.checkbox(key='futures_auto_restricted').value is False
         assert app.session_state['_test_futures_cache_seen'] is True
+        assert app.toggle(key='futures_independent_auto_enabled').value is False
+        assert app.checkbox(key='futures_independent_auto_restricted').value is False
+        app.toggle(key='futures_independent_auto_enabled').set_value(True).run()
+        assert not app.exception
+        cached = app.session_state['futures_independent_result']['rows']
+        assert len(cached) == 2
+        assert cached[0]['期貨代碼'] == 'NONE' and cached[0]['收盤價'] == 100
+        assert cached[1]['期貨代碼'] == 'CDF' and cached[1]['收盤價'] == 101.5
+        app.toggle(key='futures_independent_auto_enabled').set_value(False).run()
+        assert not app.exception
+        independent = [table.value for table in app.dataframe if '期貨代碼' in table.value.columns and len(table.value) == 2]
+        assert independent
         app.toggle(key='futures_auto_enabled').set_value(True).run()
         assert not app.exception
         app.toggle(key='futures_auto_enabled').set_value(False).run()
