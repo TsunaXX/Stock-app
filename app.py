@@ -301,6 +301,26 @@ def _install_stream_callbacks(api):
     # Index streaming is available in Shioaji 1.7+; older versions simply keep
     # using the one-time snapshot seed for IX0001.
     register('set_on_quote_idx_v1_callback', 'IND')
+    event_setter = getattr(getattr(api, 'quote', None), 'set_event_callback', None)
+    if callable(event_setter):
+        def connection_event(resp_code, event_code, info, event):
+            # SDK reconnects the transport; restore subscriptions on the next UI tick.
+            with state['lock']:
+                if event_code in (1, 2, 12):
+                    state['connection_down'] = True
+                    for quote in state['quotes'].values():
+                        quote['source'] = 'stream_stale'
+                elif event_code in (0, 13):
+                    state['connection_down'] = False
+                    for subscription in state['subscriptions'].values():
+                        subscription.update(status='reconnect', retry_after=0)
+                    for entry in state.get('strategy_histories', {}).values():
+                        if entry['future'].done():
+                            entry.update(failed=True, retry_after=0)
+        try:
+            event_setter(connection_event)
+        except Exception as exc:
+            _remember_stream_error(state, f'connection callback: {exc}')
     if installed == 0:
         _remember_stream_error(state, '無法註冊任何 Quote v1 callback')
         with state['lock']:
@@ -352,9 +372,13 @@ def ensure_market_stream_subscription(api, contract):
     subscription_key = requested
     now_mono = time.monotonic()
     with state['lock']:
+        if state.get('connection_down'):
+            return False
         state['aliases'][requested] = target_code
         existing = state['subscriptions'].get(subscription_key)
         if existing:
+            if existing.get('status') == 'pending':
+                return False
             if existing.get('status') == 'active':
                 existing['last_used'] = now_mono
                 return True
@@ -366,7 +390,7 @@ def ensure_market_stream_subscription(api, contract):
         }
         active = [
             (key, value) for key, value in state['subscriptions'].items()
-            if key != subscription_key and value.get('status') == 'active'
+            if key != subscription_key and value.get('status') in ('active', 'reconnect')
         ]
 
     # Shioaji allows at most 200 subscriptions. Keep headroom for broker/system
@@ -482,6 +506,8 @@ def get_stream_quotes(api, contracts, snapshot_fallback=True):
     results = [_stream_quote_for_contract(api, contract) for contract in contracts]
     fallback_indices = []
     state = _stream_state(api)
+    if not snapshot_fallback and state.get('connection_down'):
+        return [None] * len(contracts)
     now_mono = time.monotonic()
     now_tw = datetime.now(pytz.timezone('Asia/Taipei')).replace(tzinfo=None)
     if snapshot_fallback:
@@ -14844,14 +14870,18 @@ def fetch_futures_contract_kbars(api, contract, lookback_days=20):
     except Exception:
         return pd.DataFrame()
 
-def update_futures_live_rows(rows, api, strategy_mode, direction_choice, include_analysis=True, stream_only=False):
+def update_futures_live_rows(rows, api, strategy_mode, direction_choice, include_analysis=True, stream_only=False, stream_room='futures'):
     """批次更新顯示中的實際契約快照，並選擇性重算支撐壓力。"""
     if rows.empty or api is None:
+        if stream_only and api is not None:
+            sync_strategy_stream_scope(api, [], stream_room)
         return rows, 0
     updated, _ = filter_active_futures_rows(rows)
     updated = updated.astype(object)
     if updated.empty:
         updated.attrs['resolved_contract_count'] = 0
+        if stream_only:
+            sync_strategy_stream_scope(api, [], stream_room)
         return updated, 0
     resolved = []
     for index, row in updated.iterrows():
@@ -14859,10 +14889,10 @@ def update_futures_live_rows(rows, api, strategy_mode, direction_choice, include
         if contract is not None:
             resolved.append((index, contract))
     updated.attrs['resolved_contract_count'] = len(resolved)
+    if stream_only:
+        sync_strategy_stream_scope(api, [contract for _, contract in resolved], stream_room)
     if not resolved:
         return updated, 0
-    if stream_only:
-        sync_strategy_stream_scope(api, [contract for _, contract in resolved], 'futures')
 
     snapshots = {}
     try:
@@ -19070,7 +19100,7 @@ def intraday_auto_settings(room):
             seconds = 5
         st.session_state[f'{room}_auto_config'] = {'seconds': seconds}
     config = st.session_state[f'{room}_auto_config']
-    restricted = room == 'stock' or config.get('restricted', False)
+    restricted = room.startswith('stock') or config.get('restricted', False)
     return (config.get('enabled', False), config.get('seconds', 5),
             config.get('start', dt_time(9, 0)) if restricted else None,
             config.get('end', dt_time(13, 30)) if restricted else None)
@@ -19099,12 +19129,12 @@ def render_intraday_auto_controls(room):
         if room == 'stock':
             st.session_state['_stock_auto_settings_changed'] = True
 
-    st.markdown('⏰ 主表自動更新')
+    st.markdown('⏰ 獨立分析自動更新' if room.endswith('_independent') else '⏰ 主表自動更新')
     st.toggle('啟用自動更新', value=config.get('enabled', False),
               key=f'{room}_auto_enabled', on_change=save_settings)
     st.number_input('更新間隔（秒）', min_value=1, max_value=300, value=config.get('seconds', 5),
                     key=f'{room}_auto_seconds', on_change=save_settings)
-    restricted = room == 'stock' or st.checkbox(
+    restricted = room.startswith('stock') or st.checkbox(
         '限定更新時段', value=config.get('restricted', False),
         key=f'{room}_auto_restricted', on_change=save_settings)
     if restricted:
@@ -19113,7 +19143,7 @@ def render_intraday_auto_controls(room):
                         key=f'{room}_auto_start', on_change=save_settings)
         right.time_input('結束時間', value=config.get('end', dt_time(13, 30)),
                          key=f'{room}_auto_end', on_change=save_settings)
-    st.caption('僅更新主表顯示標的；需登入 Shioaji 並保持此頁開啟。更新完成後才計算下一次間隔。')
+    st.caption('僅更新此表顯示標的；需登入 Shioaji 並保持此頁開啟。更新完成後才計算下一次間隔。')
     return intraday_auto_settings(room)
 
 
@@ -19136,10 +19166,22 @@ def sync_strategy_stream_scope(api, contracts, room):
     state = _stream_state(api)
     selected = {str(contract.code) for contract in contracts}
     with state['lock']:
+        scopes = state.setdefault('strategy_stream_scopes', {})
+        scopes[room] = selected
         owned = state.setdefault('strategy_owned_subscriptions', {}).setdefault(room, {})
-        removed = [(code, owned.pop(code)) for code in list(owned) if code not in selected]
+        removed = []
+        for code in list(owned):
+            if code not in selected:
+                metadata = owned.pop(code)
+                other = next((scope for scope, codes in scopes.items() if scope != room and code in codes), None)
+                if other is None:
+                    removed.append((code, metadata))
+                else:
+                    state['strategy_owned_subscriptions'].setdefault(other, {})[code] = metadata
+        asset = room.split('_', 1)[0]
+        retained = set().union(*(codes for scope, codes in scopes.items() if scope.split('_', 1)[0] == asset))
         for key, entry in list(state.get('strategy_histories', {}).items()):
-            if key[1] == room and key[0] not in selected and entry['future'].cancel():
+            if key[1] == asset and key[0] not in retained and entry['future'].cancel():
                 state['strategy_histories'].pop(key, None)
     for code, metadata in removed:
         _unsubscribe_market_stream(api, state, code, metadata)
@@ -19156,8 +19198,11 @@ def begin_intraday_auto_update(room, enabled, seconds, start=None, end=None):
     """A completion-based gate; fragment reruns never overlap a manual update."""
     now_tw = datetime.now(pytz.timezone('Asia/Taipei'))
     if not enabled or not st.session_state.get('sj_logged_in', False) or st.session_state.get('sj_api') is None:
+        if enabled:
+            st.session_state[f'{room}_auto_status'] = '等待 Shioaji 登入與行情連線。'
         return False
-    if not intraday_auto_window_open(now_tw, start, end, stock=room == 'stock'):
+    if not intraday_auto_window_open(now_tw, start, end, stock=room.startswith('stock')):
+        st.session_state[f'{room}_auto_status'] = '目前不在更新時段；保留上次資料與來源時間。'
         return False
     if time.monotonic() - st.session_state.get(f'{room}_auto_completed', 0) < seconds:
         return False
@@ -19165,15 +19210,18 @@ def begin_intraday_auto_update(room, enabled, seconds, start=None, end=None):
     return lock.acquire(blocking=False)
 
 
-def finish_intraday_auto_update(room, started, count):
+def finish_intraday_auto_update(room, started, count, error=None):
     st.session_state[f'{room}_auto_completed'] = time.monotonic()
-    if count:
+    if count and not error:
         st.session_state[f'{room}_auto_updated_at'] = datetime.now(pytz.timezone('Asia/Taipei')).strftime('%Y/%m/%d %H:%M:%S')
     st.session_state[f'{room}_auto_status'] = (
         f'本輪 {count} 檔｜耗時 {time.monotonic() - started:.2f} 秒｜'
         + datetime.now(pytz.timezone('Asia/Taipei')).strftime('%Y/%m/%d %H:%M:%S')
-        if count else '等待新串流或背景分 K 資料；保留上次資料與來源時間。'
+        if count else '等待新串流或背景分 K 資料；保留上次資料與來源時間。｜檢查時間：'
+        + datetime.now(pytz.timezone('Asia/Taipei')).strftime('%Y/%m/%d %H:%M:%S')
     )
+    if error:
+        st.session_state[f'{room}_auto_status'] = '本輪更新失敗，下一輪重試；保留上次資料與來源時間。'
     st.session_state[f'{room}_auto_lock'].release()
 
 
@@ -19187,7 +19235,7 @@ def get_strategy_intraday_history(api, contract, asset='stock', wait=False):
     key = (str(contract.code), asset, now_tw.date(), phase)
 
     def fetch_history():
-        # ponytail: one bounded two-worker pool per login; no per-symbol threads.
+        # ponytail: one bounded pool per login; no per-symbol threads.
         time.sleep(max(API_REQUEST_GAP_SECONDS, 0.5))
         lookback = 5 if asset == 'stock' else 60
         frames = []
@@ -19210,7 +19258,7 @@ def get_strategy_intraday_history(api, contract, asset='stock', wait=False):
     with state['lock']:
         histories = state.setdefault('strategy_histories', {})
         entry = histories.get(key)
-        if wait and entry is not None and entry.get('failed'):
+        if entry is not None and entry.get('failed') and (wait or time.monotonic() >= entry.get('retry_after', 0)):
             histories.pop(key)
             entry = None
         if entry is None:
@@ -19234,10 +19282,12 @@ def get_strategy_intraday_history(api, contract, asset='stock', wait=False):
             _remember_stream_error(state, f'分 K {contract.code}: {exc}')
             entry['data'] = pd.DataFrame()
             entry['failed'] = True
+            entry['retry_after'] = time.monotonic() + 60
     if entry['data'] is None:
         return pd.DataFrame()
     if entry['data'].empty:
         entry['failed'] = True
+        entry.setdefault('retry_after', time.monotonic() + 60)
     quote = _stream_quote_for_contract(api, contract)
     data = merge_stream_quote_into_intraday(entry['data'], quote, '1m')
     entry['data'] = data
@@ -19258,9 +19308,11 @@ def fresh_strategy_stream_quote(quote, now_tw=None):
 
 
 def refresh_daytrade_metrics_for_codes(stock_data, sj_logged_in=False, sj_api=None,
-                                      visible_codes=None, stream_only=False):
+                                      visible_codes=None, stream_only=False, stream_room='stock'):
     """只更新指定主表標的；以串流與快取分 K 計算盤中條件。"""
     if stock_data.empty or '代號' not in stock_data.columns or not sj_logged_in or sj_api is None:
+        if stream_only and sj_api is not None:
+            sync_strategy_stream_scope(sj_api, [], stream_room)
         return stock_data, 0, 0
 
     codes = list(dict.fromkeys(stock_data['代號'].astype(str)))
@@ -19273,7 +19325,7 @@ def refresh_daytrade_metrics_for_codes(stock_data, sj_logged_in=False, sj_api=No
                 contracts.append(sj_api.Contracts.Stocks[code])
             except (KeyError, TypeError, AttributeError):
                 continue
-        sync_strategy_stream_scope(sj_api, contracts, 'stock')
+        sync_strategy_stream_scope(sj_api, contracts, stream_room)
     now_tw = datetime.now(pytz.timezone('Asia/Taipei'))
     interval_label = '快取 1 分 K'
     snapshot_map = fetch_stock_snapshot_map(sj_api, codes, snapshot_fallback=not stream_only)
@@ -19749,7 +19801,7 @@ def render_futures_strategy_room():
         display_rows = display_rows.copy()
         if begin_intraday_auto_update('futures', futures_auto_enabled, futures_auto_seconds, futures_auto_start, futures_auto_end):
             started = time.monotonic()
-            count = 0
+            count, error = 0, None
             try:
                 # Start with the last live rows, while the official selection stays fixed.
                 for index, row in display_rows.iterrows():
@@ -19765,8 +19817,11 @@ def render_futures_strategy_room():
                     values.update({'_策略週期': strategy_mode, '_分析方向': direction_choice})
                     st.session_state.futures_strategy_live_cache[str(row['契約鍵'])] = values
                 display_rows = updated
+            except Exception as exc:
+                error = exc
+                _remember_stream_error(_stream_state(st.session_state.sj_api), f'futures auto: {exc}')
             finally:
-                finish_intraday_auto_update('futures', started, count)
+                finish_intraday_auto_update('futures', started, count, error)
         st.caption(f'市場環境：{market_bias}｜' + intraday_auto_status_text('futures', futures_auto_enabled))
         if st.session_state.get('futures_auto_updated_at'):
             st.caption('自動更新時間：' + st.session_state['futures_auto_updated_at'])
@@ -20089,6 +20144,8 @@ def render_futures_strategy_room():
         disabled=not enhanced_layer,
         help='欄位順序與上方期貨主表一致；關閉可查看完整分析欄位。',
     )
+    with st.expander('獨立分析自動更新設定'):
+        independent_auto = render_intraday_auto_controls('futures_independent')
     run_futures_independent = st.button(
         "🚀 執行期貨獨立分析", key='run_futures_independent'
     )
@@ -20119,46 +20176,79 @@ def render_futures_strategy_room():
             'rows': _json_safe(independent_rows.to_dict(orient='records')),
         }
 
-    cached_independent = st.session_state.get('futures_independent_result', {})
-    independent_rows = pd.DataFrame(cached_independent.get('rows', []))
-    if not independent_rows.empty and cached_independent.get('strategy_mode') != strategy_mode:
-        for index, row in independent_rows.iterrows():
-            analysis = calculate_futures_strategy_levels(row, strategy_mode, direction_choice)
-            for column, value in analysis.items():
-                independent_rows.at[index, column] = value
-        if enhanced_layer:
-            independent_rows = enrich_futures_strategy_rows(
-                independent_rows, strategy_mode, market_bias,
-            )
-        st.session_state.futures_independent_result = {
-            'strategy_mode': strategy_mode,
-            'rows': _json_safe(independent_rows.to_dict(orient='records')),
-        }
+    @st.fragment(run_every=1 if independent_auto[0] else None)
+    def render_futures_independent_table():
+        cached_independent = st.session_state.get('futures_independent_result', {})
+        independent_rows = pd.DataFrame(cached_independent.get('rows', [])).astype(object)
+        if not independent_rows.empty and cached_independent.get('strategy_mode') != strategy_mode:
+            for index, row in independent_rows.iterrows():
+                analysis = calculate_futures_strategy_levels(row, strategy_mode, direction_choice)
+                for column, value in analysis.items():
+                    independent_rows.at[index, column] = value
+            if enhanced_layer:
+                independent_rows = enrich_futures_strategy_rows(
+                    independent_rows, strategy_mode, market_bias,
+                )
+            st.session_state.futures_independent_result = {
+                'strategy_mode': strategy_mode,
+                'rows': _json_safe(independent_rows.to_dict(orient='records')),
+            }
 
-    if not independent_rows.empty:
-        if enhanced_layer:
-            independent_source_columns = (
-                futures_compact_columns if independent_compact_futures else futures_full_columns
+        all_independent_rows = independent_rows.astype(object)
+        night_scope = futures_auto_night_scope(independent_auto[0], datetime.now(pytz.timezone('Asia/Taipei')))
+        independent_rows = filter_futures_strategy_display_rows(all_independent_rows, only_night=True) if night_scope else all_independent_rows.copy()
+        if begin_intraday_auto_update('futures_independent', *independent_auto):
+            started, count, error = time.monotonic(), 0, None
+            try:
+                updated, count = update_futures_live_rows(
+                    independent_rows, st.session_state.sj_api, strategy_mode, direction_choice,
+                    stream_only=True, stream_room='futures_independent',
+                )
+                for _, row in updated.iterrows():
+                    for index in all_independent_rows.index[all_independent_rows['契約鍵'].astype(str) == str(row['契約鍵'])]:
+                        set_futures_row_values(all_independent_rows, index, row.to_dict())
+                st.session_state.futures_independent_result = {
+                    'strategy_mode': strategy_mode,
+                    'rows': _json_safe(all_independent_rows.to_dict(orient='records')),
+                }
+                independent_rows = updated
+            except Exception as exc:
+                error = exc
+                _remember_stream_error(_stream_state(st.session_state.sj_api), f'futures independent: {exc}')
+            finally:
+                finish_intraday_auto_update('futures_independent', started, count, error)
+        st.caption(intraday_auto_status_text('futures_independent', independent_auto[0]))
+        if st.session_state.get('futures_independent_auto_updated_at'):
+            st.caption('自動更新時間：' + st.session_state['futures_independent_auto_updated_at'])
+        if night_scope:
+            st.caption('夜盤自動更新：僅顯示夜盤契約；關閉後還原原本分析標的。')
+        if not independent_rows.empty:
+            if enhanced_layer:
+                independent_source_columns = (
+                    futures_compact_columns if independent_compact_futures else futures_full_columns
+                )
+            else:
+                independent_source_columns = futures_basic_columns
+            independent_columns = [
+                column for column in independent_source_columns if column != '忽略'
+            ]
+            for column in independent_columns:
+                if column not in independent_rows.columns:
+                    independent_rows[column] = None
+            independent_display = independent_rows[independent_columns].copy()
+            independent_display['收盤價'] = independent_display['收盤價'].apply(fmt_price)
+            independent_display['漲跌幅'] = independent_display['漲跌幅'].apply(_signed_percent)
+            st.dataframe(
+                independent_display.style.apply(style_futures_row, axis=1),
+                column_config=futures_column_config(independent_display, include_ignore=False),
+                hide_index=True, width='stretch', row_height=30
             )
-        else:
-            independent_source_columns = futures_basic_columns
-        independent_columns = [
-            column for column in independent_source_columns if column != '忽略'
-        ]
-        for column in independent_columns:
-            if column not in independent_rows.columns:
-                independent_rows[column] = None
-        independent_display = independent_rows[independent_columns].copy()
-        independent_display['收盤價'] = independent_display['收盤價'].apply(fmt_price)
-        independent_display['漲跌幅'] = independent_display['漲跌幅'].apply(_signed_percent)
-        st.dataframe(
-            independent_display.style.apply(style_futures_row, axis=1),
-            column_config=futures_column_config(independent_display, include_ignore=False),
-            hide_index=True, width='stretch', row_height=30
-        )
-        render_strategy_ranking(
-            independent_rows, strategy_mode, '期貨獨立計算',
-        )
+            render_strategy_ranking(
+                independent_rows, strategy_mode, '期貨獨立計算',
+            )
+
+    render_futures_independent_table()
+
 
 def postclose_maintenance_window(now_value):
     current, target = _post_close_target_date(now_value)
@@ -20588,8 +20678,10 @@ with tab1:
     if st.session_state.get('sj_api') is not None:
         if not tab1.open or not stock_strategy_tab.open:
             sync_strategy_stream_scope(st.session_state.sj_api, [], 'stock')
+            sync_strategy_stream_scope(st.session_state.sj_api, [], 'stock_independent')
         if not tab1.open or not futures_strategy_tab.open:
             sync_strategy_stream_scope(st.session_state.sj_api, [], 'futures')
+            sync_strategy_stream_scope(st.session_state.sj_api, [], 'futures_independent')
     with stock_strategy_tab:
         stock_strategy_container = st.container()
     with futures_strategy_tab:
@@ -20899,7 +20991,7 @@ if tab1.open and stock_strategy_tab.open:
                     st.rerun()
                 if begin_intraday_auto_update('stock', stock_auto_enabled, stock_auto_seconds, stock_auto_start, stock_auto_end):
                     started = time.monotonic()
-                    count = 0
+                    count, error = 0, None
                     try:
                         codes = st.session_state.get('stock_main_visible_codes', [])
                         if hide_non_stock:
@@ -20910,8 +21002,11 @@ if tab1.open and stock_strategy_tab.open:
                             visible_codes=codes, stream_only=True,
                         )
                         st.session_state.stock_data = refreshed
+                    except Exception as exc:
+                        error = exc
+                        _remember_stream_error(_stream_state(st.session_state.sj_api), f'stock auto: {exc}')
                     finally:
-                        finish_intraday_auto_update('stock', started, count)
+                        finish_intraday_auto_update('stock', started, count, error)
                 if not risk_preview_enabled:
                     st.caption(intraday_auto_status_text('stock', stock_auto_enabled))
                 if st.session_state.get('stock_auto_updated_at'):
@@ -21850,6 +21945,9 @@ if tab1.open and stock_strategy_tab.open:
                 st.markdown("<div style='margin-top: 28px;'></div>", unsafe_allow_html=True)
                 btn_indep_run = st.button("🚀 執行分析", key="btn_indep_run", width='stretch')
 
+            with st.expander('獨立分析自動更新設定'):
+                independent_auto = render_intraday_auto_controls('stock_independent')
+
             expected_indep_date = latest_completed_stock_trading_date().strftime('%Y/%m/%d')
             cached_indep_data = [
                 row for row in st.session_state.get('stock_independent_raw_results', [])
@@ -21923,251 +22021,278 @@ if tab1.open and stock_strategy_tab.open:
                             indep_data = [res for res in results if res]
                     if indep_data:
                         st.session_state.stock_independent_raw_results = indep_data
+                        st.session_state.stock_independent_visible_codes = [row['代號'] for row in indep_data]
                     else:
                         st.warning(
                             f"本次未取得截至 {expected_indep_date} 的完整日 K；"
-                            "未顯示舊的獨立分析結果。"
+                            "保留上次有效的獨立分析結果。"
                         )
                         indep_data = []
 
-                if indep_data:
-                    df_indep = pd.DataFrame(indep_data)
-                    indep_is_daytrade = risk_preview_enabled and indep_strategy_mode == "當沖"
-                    if risk_preview_enabled:
-                        indep_market_risk_data = st.session_state.risk_filter_market_data
-                        indep_attention_counts = indep_market_risk_data.get('attention', {})
-                        indep_disposition_codes = indep_market_risk_data.get('disposition', [])
-                        indep_disposition_tomorrow_codes = indep_market_risk_data.get(
-                            'disposition_tomorrow', []
-                        )
-                        indep_market_lists_updated = bool(indep_market_risk_data.get('updated')) and not indep_market_risk_data.get('errors')
-                        if indep_is_daytrade and (not sj_logged or sj_api_obj is None):
-                            st.info("當沖需要登入永豐 Shioaji 才能取得即時串流與分 K；目前仍會顯示日 K 資料，但盤中條件會標示為資料不足。")
+                @st.fragment(run_every=1 if independent_auto[0] else None)
+                def render_stock_independent_table():
+                    indep_data = st.session_state.get('stock_independent_raw_results', [])
+                    indep_data = [row for row in indep_data if str(row.get('_strategy_data_as_of', '')) == latest_completed_stock_trading_date().strftime('%Y/%m/%d')]
+                    if begin_intraday_auto_update('stock_independent', *independent_auto):
+                        started, count, error = time.monotonic(), 0, None
+                        try:
+                            raw_rows = pd.DataFrame(indep_data)
+                            codes = st.session_state.get('stock_independent_visible_codes', raw_rows.get('代號', pd.Series(dtype=str)).tolist())
+                            refreshed, _, count = refresh_daytrade_metrics_for_codes(
+                                raw_rows, True, st.session_state.sj_api, visible_codes=codes,
+                                stream_only=True, stream_room='stock_independent',
+                            )
+                            indep_data = refreshed.to_dict(orient='records')
+                            st.session_state.stock_independent_raw_results = indep_data
+                        except Exception as exc:
+                            error = exc
+                            _remember_stream_error(_stream_state(st.session_state.sj_api), f'stock independent: {exc}')
+                        finally:
+                            finish_intraday_auto_update('stock_independent', started, count, error)
+                    st.caption(intraday_auto_status_text('stock_independent', independent_auto[0]))
+                    if st.session_state.get('stock_independent_auto_updated_at'):
+                        st.caption('自動更新時間：' + st.session_state['stock_independent_auto_updated_at'])
+                    if indep_data:
+                        df_indep = pd.DataFrame(indep_data).astype(object)
+                        indep_is_daytrade = risk_preview_enabled and indep_strategy_mode == "當沖"
+                        if risk_preview_enabled:
+                            indep_market_risk_data = st.session_state.risk_filter_market_data
+                            indep_attention_counts = indep_market_risk_data.get('attention', {})
+                            indep_disposition_codes = indep_market_risk_data.get('disposition', [])
+                            indep_disposition_tomorrow_codes = indep_market_risk_data.get(
+                                'disposition_tomorrow', []
+                            )
+                            indep_market_lists_updated = bool(indep_market_risk_data.get('updated')) and not indep_market_risk_data.get('errors')
+                            if indep_is_daytrade and (not sj_logged or sj_api_obj is None):
+                                st.info("當沖需要登入永豐 Shioaji 才能取得即時串流與分 K；目前仍會顯示日 K 資料，但盤中條件會標示為資料不足。")
 
-                    # 重新套用戰略備註與價差邏輯
-                    for i, row in df_indep.iterrows():
-                        pts = row.get('_points', [])
-                        pts = filter_strategy_note_points(
-                            pts, row.get('_strategy_close', row.get('收盤價')),
-                        )
-                        manual = st.session_state.saved_notes.get(row['代號'], "")
-                        n_full, n_auto = generate_note_from_points(pts, manual, show_3d_hilo)
-                        df_indep.at[i, "戰略備註"] = n_full
-                        df_indep.at[i, "名稱"] = row['名稱'].replace('🔴 ', '').replace('🟢 ', '').replace('⚪ ', '')
-                        price_difference = price_change_amount(row.get('收盤價'), row.get('漲跌幅'))
-                        df_indep.at[i, '成交價價差'] = (
-                            round(price_difference, 2) if price_difference is not None else None
-                        )
-
-                        ma5_val = row.get('_ma5')
-                        if pd.isna(ma5_val):
-                            for p in pts:
-                                if p.get('tag') in ['多', '空', '平']:
-                                    ma5_val = p.get('val')
-                                    break
-                        if pd.notna(ma5_val):
-                            close_p = row.get('收盤價')
-                            if pd.notna(close_p) and str(close_p).strip() != "":
-                                try: df_indep.at[i, '5日線價差'] = round(float(close_p) - float(ma5_val), 2)
-                                except Exception: pass
-
-                    if risk_preview_enabled:
+                        # 重新套用戰略備註與價差邏輯
                         for i, row in df_indep.iterrows():
-                            indep_market_lists_updated = market_risk_checked_for_row(
-                                row, indep_market_risk_data, st.session_state.get('sj_api'),
+                            pts = row.get('_points', [])
+                            pts = filter_strategy_note_points(
+                                pts, row.get('_strategy_close', row.get('收盤價')),
                             )
-                            direction_info = determine_stock_direction(row, indep_is_daytrade, indep_direction)
-                            row_direction = direction_info['direction']
-                            result = calculate_daytrade_filter_result(
-                                row, row_direction, indep_attention_counts, indep_disposition_codes,
-                                indep_market_lists_updated, indep_block_attention
-                            ) if indep_is_daytrade else calculate_risk_filter_result(
-                                row, row_direction, indep_max_extension, indep_attention_counts, indep_disposition_codes,
-                                indep_market_lists_updated, indep_block_attention,
-                                disposition_tomorrow_codes=indep_disposition_tomorrow_codes,
+                            manual = st.session_state.saved_notes.get(row['代號'], "")
+                            n_full, n_auto = generate_note_from_points(pts, manual, show_3d_hilo)
+                            df_indep.at[i, "戰略備註"] = n_full
+                            df_indep.at[i, "名稱"] = row['名稱'].replace('🔴 ', '').replace('🟢 ', '').replace('⚪ ', '')
+                            price_difference = price_change_amount(row.get('收盤價'), row.get('漲跌幅'))
+                            df_indep.at[i, '成交價價差'] = (
+                                round(price_difference, 2) if price_difference is not None else None
                             )
-                            code = str(row.get('代號', ''))
-                            if indep_is_daytrade:
-                                daily_risk = calculate_risk_filter_result(
+
+                            ma5_val = row.get('_ma5')
+                            if pd.isna(ma5_val):
+                                for p in pts:
+                                    if p.get('tag') in ['多', '空', '平']:
+                                        ma5_val = p.get('val')
+                                        break
+                            if pd.notna(ma5_val):
+                                close_p = row.get('收盤價')
+                                if pd.notna(close_p) and str(close_p).strip() != "":
+                                    try: df_indep.at[i, '5日線價差'] = round(float(close_p) - float(ma5_val), 2)
+                                    except Exception: pass
+
+                        if risk_preview_enabled:
+                            for i, row in df_indep.iterrows():
+                                indep_market_lists_updated = market_risk_checked_for_row(
+                                    row, indep_market_risk_data, st.session_state.get('sj_api'),
+                                )
+                                direction_info = determine_stock_direction(row, indep_is_daytrade, indep_direction)
+                                row_direction = direction_info['direction']
+                                result = calculate_daytrade_filter_result(
+                                    row, row_direction, indep_attention_counts, indep_disposition_codes,
+                                    indep_market_lists_updated, indep_block_attention
+                                ) if indep_is_daytrade else calculate_risk_filter_result(
                                     row, row_direction, indep_max_extension, indep_attention_counts, indep_disposition_codes,
                                     indep_market_lists_updated, indep_block_attention,
                                     disposition_tomorrow_codes=indep_disposition_tomorrow_codes,
                                 )
-                                if not daily_risk['eligible']:
-                                    result['eligible'] = False
-                                    if result['rule'].startswith('觸發：'):
-                                        result['rule'] = f"不交易：盤前門檻未通過（{daily_risk['rule']}）"
-                                df_indep.at[i, '風險'] = daily_risk['risk']
-                                df_indep.at[i, 'VWAP 狀態'] = result['vwap_status']
-                                df_indep.at[i, '開盤區間'] = result['opening_range']
-                                volume_ratio = _as_float(row.get('_daytrade_volume_ratio'))
-                                df_indep.at[i, '量能'] = f"{_format_compact_number(volume_ratio, 2)}x" if volume_ratio is not None else "資料不足"
-                                df_indep.at[i, '盤中觸發'] = result['rule']
-                            else:
-                                df_indep.at[i, '風險'] = result['risk']
-                                df_indep.at[i, '乖離'] = f"{_format_compact_number(result['extension'], 1, signed=True)} ATR" if result['extension'] is not None else "—"
-                                df_indep.at[i, '隔日規則'] = result['rule']
-                            trade_plan = build_guarded_stock_trade_plan(row, row_direction, indep_is_daytrade, result)
-                            if result.get('eligible') and not trade_plan.get('valid', False):
-                                result['eligible'] = False
-                                result['rule'] = f"觀察：{trade_plan.get('blocking_reason', '進場品質未達門檻')}"
+                                code = str(row.get('代號', ''))
                                 if indep_is_daytrade:
+                                    daily_risk = calculate_risk_filter_result(
+                                        row, row_direction, indep_max_extension, indep_attention_counts, indep_disposition_codes,
+                                        indep_market_lists_updated, indep_block_attention,
+                                        disposition_tomorrow_codes=indep_disposition_tomorrow_codes,
+                                    )
+                                    if not daily_risk['eligible']:
+                                        result['eligible'] = False
+                                        if result['rule'].startswith('觸發：'):
+                                            result['rule'] = f"不交易：盤前門檻未通過（{daily_risk['rule']}）"
+                                    df_indep.at[i, '風險'] = daily_risk['risk']
+                                    df_indep.at[i, 'VWAP 狀態'] = result['vwap_status']
+                                    df_indep.at[i, '開盤區間'] = result['opening_range']
+                                    volume_ratio = _as_float(row.get('_daytrade_volume_ratio'))
+                                    df_indep.at[i, '量能'] = f"{_format_compact_number(volume_ratio, 2)}x" if volume_ratio is not None else "資料不足"
                                     df_indep.at[i, '盤中觸發'] = result['rule']
                                 else:
+                                    df_indep.at[i, '風險'] = result['risk']
+                                    df_indep.at[i, '乖離'] = f"{_format_compact_number(result['extension'], 1, signed=True)} ATR" if result['extension'] is not None else "—"
                                     df_indep.at[i, '隔日規則'] = result['rule']
-                            result['trade_plan'] = trade_plan
-                            result['direction_info'] = direction_info
-                            signal_state = classify_signal_state(
-                                result['rule'], result['eligible'], result['score'], indep_min_score
+                                trade_plan = build_guarded_stock_trade_plan(row, row_direction, indep_is_daytrade, result)
+                                if result.get('eligible') and not trade_plan.get('valid', False):
+                                    result['eligible'] = False
+                                    result['rule'] = f"觀察：{trade_plan.get('blocking_reason', '進場品質未達門檻')}"
+                                    if indep_is_daytrade:
+                                        df_indep.at[i, '盤中觸發'] = result['rule']
+                                    else:
+                                        df_indep.at[i, '隔日規則'] = result['rule']
+                                result['trade_plan'] = trade_plan
+                                result['direction_info'] = direction_info
+                                signal_state = classify_signal_state(
+                                    result['rule'], result['eligible'], result['score'], indep_min_score
+                                )
+                                data_time = row.get('_daytrade_data_time') if indep_is_daytrade else None
+                                required_ready = bool(data_time) if indep_is_daytrade else result.get('extension') is not None
+                                quote_time = row.get('_quote_time') or data_time
+                                data_health = build_data_health(
+                                    quote_time, required_ready,
+                                    live_expected=bool(row.get('_quote_time')) or indep_is_daytrade
+                                )
+                                bid = _safe_number(row.get('_quote_bid'))
+                                ask = _safe_number(row.get('_quote_ask'))
+                                reference_price = _safe_number(row.get('收盤價'))
+                                tick = get_tick_size(reference_price) if reference_price is not None else 0.01
+                                spread_ticks = (
+                                    (ask - bid) / tick
+                                    if bid is not None and ask is not None and ask >= bid and tick > 0 else None
+                                )
+                                market_alignment = calculate_market_alignment(row_direction, market_bias)
+                                current_price = (
+                                    _safe_number(row.get('_daytrade_close')) if indep_is_daytrade else None
+                                ) or _safe_number(row.get('收盤價'))
+                                confidence = calculate_entry_confidence(
+                                    result['score'], signal_state, current_price, trade_plan['summary'], row_direction,
+                                    data_health, market_alignment, result.get('detail', '')
+                                )
+                                result['confidence'] = confidence
+                                df_indep.at[i, '建議方向'] = direction_info['label']
+                                df_indep.at[i, '方向依據'] = direction_info['basis']
+                                df_indep.at[i, '進出場預判'] = trade_plan['summary']
+                                df_indep.at[i, '支撐壓力'] = build_stock_support_resistance(row, indep_is_daytrade)
+                                df_indep.at[i, '訊號狀態'] = signal_state
+                                df_indep.at[i, '信心分'] = confidence['score']
+                                df_indep.at[i, '信心判讀'] = confidence['label']
+                                df_indep.at[i, '市場一致'] = market_alignment
+                                df_indep.at[i, '資料狀態'] = data_health
+                                df_indep.at[i, '買賣價差'] = f'{spread_ticks:.0f}跳' if spread_ticks is not None else '—'
+                                df_indep.at[i, '_indep_eligible'] = (
+                                    bool(trade_plan.get('valid')) and result['eligible']
+                                    and confidence['score'] >= indep_min_score
+                                )
+
+                            if indep_show_only_eligible:
+                                df_indep = df_indep[df_indep['_indep_eligible']].reset_index(drop=True)
+                                if df_indep.empty:
+                                    st.warning("目前沒有符合門檻的候選；可降低最低評分、放寬最大乖離，或改看完整結果。")
+
+                            input_cols = stock_strategy_display_columns(
+                                True, indep_is_daytrade, indep_compact_table,
+                                include_remove=False,
                             )
-                            data_time = row.get('_daytrade_data_time') if indep_is_daytrade else None
-                            required_ready = bool(data_time) if indep_is_daytrade else result.get('extension') is not None
-                            quote_time = row.get('_quote_time') or data_time
-                            data_health = build_data_health(
-                                quote_time, required_ready,
-                                live_expected=bool(row.get('_quote_time')) or indep_is_daytrade
-                            )
-                            bid = _safe_number(row.get('_quote_bid'))
-                            ask = _safe_number(row.get('_quote_ask'))
-                            reference_price = _safe_number(row.get('收盤價'))
-                            tick = get_tick_size(reference_price) if reference_price is not None else 0.01
-                            spread_ticks = (
-                                (ask - bid) / tick
-                                if bid is not None and ask is not None and ask >= bid and tick > 0 else None
-                            )
-                            market_alignment = calculate_market_alignment(row_direction, market_bias)
-                            current_price = (
-                                _safe_number(row.get('_daytrade_close')) if indep_is_daytrade else None
-                            ) or _safe_number(row.get('收盤價'))
-                            confidence = calculate_entry_confidence(
-                                result['score'], signal_state, current_price, trade_plan['summary'], row_direction,
-                                data_health, market_alignment, result.get('detail', '')
-                            )
-                            result['confidence'] = confidence
-                            df_indep.at[i, '建議方向'] = direction_info['label']
-                            df_indep.at[i, '方向依據'] = direction_info['basis']
-                            df_indep.at[i, '進出場預判'] = trade_plan['summary']
-                            df_indep.at[i, '支撐壓力'] = build_stock_support_resistance(row, indep_is_daytrade)
-                            df_indep.at[i, '訊號狀態'] = signal_state
-                            df_indep.at[i, '信心分'] = confidence['score']
-                            df_indep.at[i, '信心判讀'] = confidence['label']
-                            df_indep.at[i, '市場一致'] = market_alignment
-                            df_indep.at[i, '資料狀態'] = data_health
-                            df_indep.at[i, '買賣價差'] = f'{spread_ticks:.0f}跳' if spread_ticks is not None else '—'
-                            df_indep.at[i, '_indep_eligible'] = (
-                                bool(trade_plan.get('valid')) and result['eligible']
-                                and confidence['score'] >= indep_min_score
-                            )
-
-                        if indep_show_only_eligible:
-                            df_indep = df_indep[df_indep['_indep_eligible']].reset_index(drop=True)
-                            if df_indep.empty:
-                                st.warning("目前沒有符合門檻的候選；可降低最低評分、放寬最大乖離，或改看完整結果。")
-
-                        input_cols = stock_strategy_display_columns(
-                            True, indep_is_daytrade, indep_compact_table,
-                            include_remove=False,
-                        )
-                    else:
-                        input_cols = stock_strategy_display_columns(
-                            False, False, False, include_remove=False,
-                        )
-                    for col in input_cols:
-                        if col not in df_indep.columns: df_indep[col] = None
-
-                    cols_to_fmt = ["當日漲停價", "當日跌停價", "成交價價差", "5日線價差"]
-                    for c in cols_to_fmt:
-                        if c in df_indep.columns: df_indep[c] = df_indep[c].apply(fmt_price)
-
-                    # 強制轉換為 object 型別，以防寫入字串時發生 TypeError
-                    if "收盤價" in df_indep.columns: df_indep["收盤價"] = df_indep["收盤價"].astype(object)
-                    if "漲跌幅" in df_indep.columns: df_indep["漲跌幅"] = df_indep["漲跌幅"].astype(object)
-
-                    if "收盤價" in df_indep.columns and "漲跌幅" in df_indep.columns:
-                        for i in range(len(df_indep)):
-                            try:
-                                p = float(df_indep.at[i, "收盤價"])
-                                chg = float(df_indep.at[i, "漲跌幅"])
-                                df_indep.at[i, "收盤價"] = fmt_price(p)
-                                df_indep.at[i, "漲跌幅"] = _signed_percent(chg)
-                            except Exception:
-                                df_indep.at[i, "收盤價"] = fmt_price(df_indep.at[i, "收盤價"])
-                                try: df_indep.at[i, "漲跌幅"] = _signed_percent(float(df_indep.at[i, '漲跌幅']))
-                                except Exception: pass
-
-                    for col in input_cols:
-                        if col != "信心分":
-                            df_indep[col] = df_indep[col].map(_blank_display_text)
-
-                    # 套用與主表格完全一致的顏色邏輯
-                    styled_indep = df_indep[input_cols].style.apply(
-                        lambda row: style_tab1_df(row, df_indep), axis=1,
-                    )
-                    def indep_content_width(column, minimum, maximum=520, full_content=False):
-                        return _content_column_width(
-                            df_indep.get(column), minimum, maximum, full_content,
-                        )
-
-                    indep_column_config = {}
-                    if risk_preview_enabled:
-                        indep_column_config.update({
-                            "建議方向": st.column_config.TextColumn(width=indep_content_width('建議方向', 56, 90), disabled=True, help="紅色為建議多、綠色為建議空；手動指定時會顯示手動。"),
-                            "方向依據": st.column_config.TextColumn(width=indep_content_width('方向依據', 86), disabled=True, help="列出本檔採用的分 K／日 K、VWAP 與支撐壓力判斷。"),
-                            "風險": st.column_config.TextColumn("處置／注意", width=indep_content_width('風險', 64, 120), disabled=True, help="注意累計 N 次＝近期連續／累計達官方注意標準的次數；已公告下個交易日處置時，會優先顯示「下個開盤日處置」。"),
-                            "訊號狀態": st.column_config.TextColumn(width=indep_content_width('訊號狀態', 56, 140), disabled=True),
-                            "信心分": st.column_config.ProgressColumn("進場信心", min_value=0, max_value=100, format="%d", width=82, help="條件一致度，不是勝率。"),
-                            "信心判讀": st.column_config.TextColumn(width=indep_content_width('信心判讀', 48, 96), disabled=True),
-                            "支撐壓力": st.column_config.TextColumn(width=indep_content_width('支撐壓力', 76), disabled=True),
-                            "市場一致": st.column_config.TextColumn(width=indep_content_width('市場一致', 56, 120), disabled=True),
-                            "資料狀態": st.column_config.TextColumn(width=indep_content_width('資料狀態', 56, 150), disabled=True),
-                        })
-                        if indep_is_daytrade:
-                            indep_column_config.update({
-                                "VWAP 狀態": st.column_config.TextColumn(width=indep_content_width('VWAP 狀態', 72, 150), disabled=True, help="偏多：站上 VWAP；偏空：跌破 VWAP。"),
-                                "開盤區間": st.column_config.TextColumn(width=indep_content_width('開盤區間', 80, 150), disabled=True, help="09:00–09:15 顯示形成中的即時低點－高點；09:15 後固定為完整開盤區間。"),
-                                "量能": st.column_config.TextColumn(width=indep_content_width('量能', 52, 96), disabled=True, help="目前累積量相對最近交易日同時段平均量。"),
-                                "盤中觸發": st.column_config.TextColumn(width=indep_content_width('盤中觸發', 72), disabled=True, help="僅為盤中觀察提示，不是自動買賣指令。"),
-                                "進出場預判": st.column_config.TextColumn(width=indep_content_width('進出場預判', 86, 720, True), disabled=True, help="以開盤區間與 VWAP 推估進場、策略失效離場與第一目標。"),
-                            })
                         else:
+                            input_cols = stock_strategy_display_columns(
+                                False, False, False, include_remove=False,
+                            )
+                        for col in input_cols:
+                            if col not in df_indep.columns: df_indep[col] = None
+
+                        cols_to_fmt = ["當日漲停價", "當日跌停價", "成交價價差", "5日線價差"]
+                        for c in cols_to_fmt:
+                            if c in df_indep.columns: df_indep[c] = df_indep[c].apply(fmt_price)
+
+                        # 強制轉換為 object 型別，以防寫入字串時發生 TypeError
+                        if "收盤價" in df_indep.columns: df_indep["收盤價"] = df_indep["收盤價"].astype(object)
+                        if "漲跌幅" in df_indep.columns: df_indep["漲跌幅"] = df_indep["漲跌幅"].astype(object)
+
+                        if "收盤價" in df_indep.columns and "漲跌幅" in df_indep.columns:
+                            for i in range(len(df_indep)):
+                                try:
+                                    p = float(df_indep.at[i, "收盤價"])
+                                    chg = float(df_indep.at[i, "漲跌幅"])
+                                    df_indep.at[i, "收盤價"] = fmt_price(p)
+                                    df_indep.at[i, "漲跌幅"] = _signed_percent(chg)
+                                except Exception:
+                                    df_indep.at[i, "收盤價"] = fmt_price(df_indep.at[i, "收盤價"])
+                                    try: df_indep.at[i, "漲跌幅"] = _signed_percent(float(df_indep.at[i, '漲跌幅']))
+                                    except Exception: pass
+
+                        for col in input_cols:
+                            if col != "信心分":
+                                df_indep[col] = df_indep[col].map(_blank_display_text)
+
+                        # 套用與主表格完全一致的顏色邏輯
+                        styled_indep = df_indep[input_cols].style.apply(
+                            lambda row: style_tab1_df(row, df_indep), axis=1,
+                        )
+                        def indep_content_width(column, minimum, maximum=520, full_content=False):
+                            return _content_column_width(
+                                df_indep.get(column), minimum, maximum, full_content,
+                            )
+
+                        indep_column_config = {}
+                        if risk_preview_enabled:
                             indep_column_config.update({
-                                "乖離": st.column_config.TextColumn(width=indep_content_width('乖離', 52, 96), disabled=True),
-                                "隔日規則": st.column_config.TextColumn(width=indep_content_width('隔日規則', 72), disabled=True),
-                                "進出場預判": st.column_config.TextColumn(width=indep_content_width('進出場預判', 86, 720, True), disabled=True, help="以昨高／昨低與 ATR 推估進場、策略失效離場與第一目標。"),
+                                "建議方向": st.column_config.TextColumn(width=indep_content_width('建議方向', 56, 90), disabled=True, help="紅色為建議多、綠色為建議空；手動指定時會顯示手動。"),
+                                "方向依據": st.column_config.TextColumn(width=indep_content_width('方向依據', 86), disabled=True, help="列出本檔採用的分 K／日 K、VWAP 與支撐壓力判斷。"),
+                                "風險": st.column_config.TextColumn("處置／注意", width=indep_content_width('風險', 64, 120), disabled=True, help="注意累計 N 次＝近期連續／累計達官方注意標準的次數；已公告下個交易日處置時，會優先顯示「下個開盤日處置」。"),
+                                "訊號狀態": st.column_config.TextColumn(width=indep_content_width('訊號狀態', 56, 140), disabled=True),
+                                "信心分": st.column_config.ProgressColumn("進場信心", min_value=0, max_value=100, format="%d", width=82, help="條件一致度，不是勝率。"),
+                                "信心判讀": st.column_config.TextColumn(width=indep_content_width('信心判讀', 48, 96), disabled=True),
+                                "支撐壓力": st.column_config.TextColumn(width=indep_content_width('支撐壓力', 76), disabled=True),
+                                "市場一致": st.column_config.TextColumn(width=indep_content_width('市場一致', 56, 120), disabled=True),
+                                "資料狀態": st.column_config.TextColumn(width=indep_content_width('資料狀態', 56, 150), disabled=True),
                             })
+                            if indep_is_daytrade:
+                                indep_column_config.update({
+                                    "VWAP 狀態": st.column_config.TextColumn(width=indep_content_width('VWAP 狀態', 72, 150), disabled=True, help="偏多：站上 VWAP；偏空：跌破 VWAP。"),
+                                    "開盤區間": st.column_config.TextColumn(width=indep_content_width('開盤區間', 80, 150), disabled=True, help="09:00–09:15 顯示形成中的即時低點－高點；09:15 後固定為完整開盤區間。"),
+                                    "量能": st.column_config.TextColumn(width=indep_content_width('量能', 52, 96), disabled=True, help="目前累積量相對最近交易日同時段平均量。"),
+                                    "盤中觸發": st.column_config.TextColumn(width=indep_content_width('盤中觸發', 72), disabled=True, help="僅為盤中觀察提示，不是自動買賣指令。"),
+                                    "進出場預判": st.column_config.TextColumn(width=indep_content_width('進出場預判', 86, 720, True), disabled=True, help="以開盤區間與 VWAP 推估進場、策略失效離場與第一目標。"),
+                                })
+                            else:
+                                indep_column_config.update({
+                                    "乖離": st.column_config.TextColumn(width=indep_content_width('乖離', 52, 96), disabled=True),
+                                    "隔日規則": st.column_config.TextColumn(width=indep_content_width('隔日規則', 72), disabled=True),
+                                    "進出場預判": st.column_config.TextColumn(width=indep_content_width('進出場預判', 86, 720, True), disabled=True, help="以昨高／昨低與 ATR 推估進場、策略失效離場與第一目標。"),
+                                })
 
-                    st.dataframe(
-                        styled_indep,
-                        column_config={
-                            **indep_column_config,
-                            "代號": st.column_config.TextColumn(width=_content_column_width(df_indep.get("代號"), 44, 62)),
-                            "名稱": st.column_config.TextColumn(width=_content_column_width(df_indep.get("名稱"), 44, 130)),
-                            "收盤價": st.column_config.TextColumn("成交價", width=_content_column_width(df_indep.get("收盤價"), 52, 78)),
-                            "漲跌幅": st.column_config.TextColumn(width=_content_column_width(df_indep.get("漲跌幅"), 56, 78)),
-                            "期貨": st.column_config.TextColumn(width=_content_column_width(df_indep.get("期貨"), 44, 70)),
-                            "當日漲停價": st.column_config.TextColumn(width=_content_column_width(df_indep.get("當日漲停價"), 54, 78)),
-                            "當日跌停價": st.column_config.TextColumn(width=_content_column_width(df_indep.get("當日跌停價"), 54, 78)),
-                            "成交價價差": st.column_config.TextColumn(
-                                width=indep_content_width('成交價價差', 56, 96),
-                                help="目前成交價減去昨日收盤價；正值為上漲點數，負值為下跌點數。"
-                            ),
-                            "5日線價差": st.column_config.TextColumn(
-                                width=indep_content_width('5日線價差', 56, 96),
-                                help="目前成交價減去 5 日均線；正值在均線上方，負值在均線下方。"
-                            ),
-                            "買賣價差": st.column_config.TextColumn(
-                                width=indep_content_width('買賣價差', 56, 96),
-                                help="即時最佳賣價與最佳買價的距離，換算為跳動單位。"
-                            ),
-                            "狀態": None, # 設定為 None 隱藏獨立計算結果的狀態欄位
-                            "戰略備註": st.column_config.TextColumn("戰略備註", width=note_width_px)
-                        },
-                        hide_index=True, width='content', key="indep_table_output"
-                    )
+                        st.session_state.stock_independent_visible_codes = df_indep['代號'].astype(str).tolist()
+                        st.dataframe(
+                            styled_indep,
+                            column_config={
+                                **indep_column_config,
+                                "代號": st.column_config.TextColumn(width=_content_column_width(df_indep.get("代號"), 44, 62)),
+                                "名稱": st.column_config.TextColumn(width=_content_column_width(df_indep.get("名稱"), 44, 130)),
+                                "收盤價": st.column_config.TextColumn("成交價", width=_content_column_width(df_indep.get("收盤價"), 52, 78)),
+                                "漲跌幅": st.column_config.TextColumn(width=_content_column_width(df_indep.get("漲跌幅"), 56, 78)),
+                                "期貨": st.column_config.TextColumn(width=_content_column_width(df_indep.get("期貨"), 44, 70)),
+                                "當日漲停價": st.column_config.TextColumn(width=_content_column_width(df_indep.get("當日漲停價"), 54, 78)),
+                                "當日跌停價": st.column_config.TextColumn(width=_content_column_width(df_indep.get("當日跌停價"), 54, 78)),
+                                "成交價價差": st.column_config.TextColumn(
+                                    width=indep_content_width('成交價價差', 56, 96),
+                                    help="目前成交價減去昨日收盤價；正值為上漲點數，負值為下跌點數。"
+                                ),
+                                "5日線價差": st.column_config.TextColumn(
+                                    width=indep_content_width('5日線價差', 56, 96),
+                                    help="目前成交價減去 5 日均線；正值在均線上方，負值在均線下方。"
+                                ),
+                                "買賣價差": st.column_config.TextColumn(
+                                    width=indep_content_width('買賣價差', 56, 96),
+                                    help="即時最佳賣價與最佳買價的距離，換算為跳動單位。"
+                                ),
+                                "狀態": None, # 設定為 None 隱藏獨立計算結果的狀態欄位
+                                "戰略備註": st.column_config.TextColumn("戰略備註", width=note_width_px)
+                            },
+                            hide_index=True, width='content', key="indep_table_output"
+                        )
 
-                    render_strategy_ranking(
-                        df_indep, indep_strategy_mode, '股票獨立計算',
-                    )
+                        render_strategy_ranking(
+                            df_indep, indep_strategy_mode, '股票獨立計算',
+                        )
+
+                render_stock_independent_table()
 
 with tab2:
     tab2_1, tab2_2, tab2_3 = st.tabs(
