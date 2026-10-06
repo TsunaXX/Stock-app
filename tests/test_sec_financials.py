@@ -93,3 +93,61 @@ snapshot = {'us_revenue': {'events': [
     assert sum('財報期間截至 2026-09-03' in m.value for m in app.markdown) == 1
     assert any('2026-09-30' in c.value and 'Micron 官方' in c.value for c in app.caption)
     assert all('2026-05-31' not in m.value for m in app.markdown)
+
+
+def test_sec_latest_filing_parses_exhibit_and_flags_unparsed_new_release():
+    ns = load_app_symbols('fetch_sec_revenue')
+    ns['facts_revenue'] = facts_revenue
+    ns['release_revenue'] = release_revenue
+    ns['fetch_sec_tickers'] = lambda: {'0': {'ticker': 'MU', 'cik_str': 723125}}
+    ns['fetch_sec_submissions'] = lambda cik: {'filings': {'recent': {
+        'form':['8-K'], 'items':['2.02,9.01'], 'filingDate':['2026-09-30'],
+        'accessionNumber':['0000723125-26-000018'], 'primaryDocument':['cover.htm']}}}
+    ns['fetch_sec_facts'] = lambda cik, version: {'facts': {'us-gaap': {'Revenues': {'units': {'USD': [
+        {'start':'2026-02-27','end':'2026-05-28','val':41_456_000_000,
+         'form':'10-Q','filed':'2026-06-24','accn':'old'}]}}}}}
+    paths = []
+    def document(url):
+        paths.append(url)
+        return b'<a href="earnings99.htm">Exhibit 99.1</a>' if url.endswith('cover.htm') else FIXTURE.read_bytes()
+    ns['fetch_sec_document'] = document
+    result = ns['fetch_sec_revenue']('MU')
+    assert result['source'].startswith('SEC EDGAR') and result['quarter_revenue'] == 54_229_000_000
+    assert result['filed_date'] == '2026-09-30' and result['period_end'] == '2026-09-03'
+    assert len(paths) == 2 and paths[-1].endswith('/000072312526000018/earnings99.htm')
+    ns['fetch_sec_document'] = lambda url: (_ for _ in ()).throw(ValueError('unsupported/offline'))
+    result = ns['fetch_sec_revenue']('MU')
+    assert result['period_end'] == '2026-05-28' and result['warning']
+
+
+def test_manual_company_sync_clears_source_caches_and_keeps_prior_report_on_total_failure():
+    import ast
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    from test_core_calculations import APP_PATH
+    from test_stock_supplement import State
+    node = next(n for n in ast.walk(ast.parse(APP_PATH.read_text(encoding='utf-8')))
+                if isinstance(n, ast.If) and isinstance(n.test, ast.Name) and n.test.id == 'sync_company_data')
+    ns = load_app_symbols('empty_company_event_snapshot', 'normalize_company_event_snapshot',
+                          'apply_revenue_announcement_date_overrides')
+    event = {'ticker':'MU','market':'美股','title':'MU 季營收','date':'2026-09-30',
+             'revenue':{'ticker':'MU','period_end':'2026-09-03','quarter_revenue':54_229_000_000}}
+    state = State(company_event_snapshot={'tickers':'MU','calendar_companies':['MU'],
+                  'us_revenue':{'events':[event]}}, calendar_preferences={})
+    cleared, saved = [], []
+    ns['st'] = SimpleNamespace(session_state=state, spinner=lambda *a: nullcontext(),
+                              toast=lambda *a, **kw: None, rerun=lambda: None, warning=lambda *a: None)
+    for name in ('fetch_earnings_events','fetch_twse_monthly_revenue_rows','fetch_mops_company_monthly_revenue',
+                 'fetch_mops_monthly_revenue_announcement','fetch_finmind_monthly_revenue_rows',
+                 'fetch_taiwan_monthly_revenue_events','fetch_us_revenue_events','fetch_sec_revenue',
+                 'fetch_sec_submissions','fetch_sec_facts','fetch_micron_revenue','fetch_yahoo_revenue'):
+        ns[name] = SimpleNamespace(clear=lambda name=name: cleared.append(name))
+    ns.update(sync_company_data=True, preview_inputs=['MU'], company_ticker_input='MU',
+              COMPANY_SYNC_MAX_TICKERS=12, selected_event_types=[], CALENDAR_GROUP_OPTIONS=[], US_HIGH_IMPACT_EVENTS=[],
+              fetch_company_event_sections=lambda symbols: ({'us_revenue': {'events':[], 'missing':['offline']}}, [], symbols),
+              save_company_event_snapshot=lambda snapshot: saved.append(snapshot) or False,
+              save_calendar_preferences=lambda *a: None, get_app_secret=lambda *a: None)
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[node],type_ignores=[])), str(APP_PATH), 'exec'), ns)
+    assert saved[0]['us_revenue']['events'] == [event]
+    assert saved[0]['calendar_companies'] == ['MU']
+    assert {'fetch_sec_submissions','fetch_sec_facts','fetch_micron_revenue','fetch_yahoo_revenue'} <= set(cleared)
