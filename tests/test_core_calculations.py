@@ -1189,7 +1189,7 @@ def test_ranking_reason_uses_consistent_category_and_direction_colors():
 def test_strategy_ranking_weights_match_stock_and_futures_modes():
     weights = load_app_symbols("strategy_ranking_weights")["strategy_ranking_weights"]
     assert weights("stock", "當沖") == {
-        "technical": 0.55, "chips": 0.35, "fundamental": 0.10,
+        "technical": 0.60, "chips": 0.40, "fundamental": 0.00,
     }
     assert weights("stock", "隔日／波段") == {
         "technical": 0.40, "chips": 0.30, "fundamental": 0.30,
@@ -3214,7 +3214,7 @@ def test_all_ranking_snapshots_keep_scores_during_intraday_analysis():
     ns = load_app_symbols(
         '_state_updated_at',
         'ranking_snapshot_refresh_allowed', 'stock_swing_refresh_allowed',
-        'refresh_strategy_ranking_snapshots', 'refresh_stock_swing_snapshot',
+        'refresh_strategy_ranking_snapshots', 'refresh_stock_swing_snapshot', 'strategy_ranking_weights',
     )
     ns['is_market_closed_func'] = lambda day: False
     current = [pd.Timestamp('2026-09-09 08:29:00', tz='Asia/Taipei')]

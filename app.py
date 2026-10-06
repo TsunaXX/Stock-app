@@ -9940,6 +9940,7 @@ def _newer_timestamped_state(first, second):
     selected, other = (first, second) if first_time >= second_time else (second, first)
     merged = dict(selected)
     if (selected.get('supplemented') and selected.get('target_date') == other.get('target_date')
+            and selected.get('weights') == other.get('weights')
             and isinstance(selected.get('entries'), list) and isinstance(other.get('entries'), list)):
         entries = {entry['code']: entry for entry in [*other['entries'], *selected['entries']]
                    if isinstance(entry, dict) and entry.get('code')
@@ -16579,7 +16580,7 @@ def fetch_ranking_source(name, url, params, target_date_text):
 
 
 @st.cache_data(ttl=60, max_entries=6, show_spinner=False)
-def fetch_post_close_stock_ranking_context(target_date_text, asset_type='combined'):
+def fetch_post_close_stock_ranking_context(target_date_text, asset_type='combined', strategy_mode='波段'):
     """Assemble independently cached, date-validated official sources."""
     target_date_text = _ranking_market_date(target_date_text)
     if not target_date_text:
@@ -16610,6 +16611,8 @@ def fetch_post_close_stock_ranking_context(target_date_text, asset_type='combine
         'twse_eps': ('https://openapi.twse.com.tw/v1/opendata/t187ap14_L', None),
         'tpex_eps': ('https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap14_O', None),
     }
+    if asset_type == 'stock' and strategy_mode == '當沖':
+        jobs = {name: job for name, job in jobs.items() if name.endswith(('institutional', 'margin'))}
     if asset_type in ('futures', 'combined'):
         jobs['taifex_institutional'] = (
             'https://openapi.taifex.com.tw/v1/'
@@ -16818,14 +16821,14 @@ def fetch_post_close_stock_ranking_context(target_date_text, asset_type='combine
     }
 
 
-def resolve_post_close_ranking_context(now_value=None, asset_type='combined', target_date=None):
+def resolve_post_close_ranking_context(now_value=None, asset_type='combined', target_date=None, strategy_mode='波段'):
     """Use current official data, falling back to this session's last usable snapshot."""
     current, target = _post_close_target_date(now_value)
     target = target_date or target
-    fallback_key = f'_post_close_ranking_last_success_{asset_type}'
+    fallback_key = f'_post_close_ranking_last_success_{asset_type}_{strategy_mode}'
     try:
         context = fetch_post_close_stock_ranking_context(
-            target.strftime('%Y%m%d'), asset_type=asset_type,
+            target.strftime('%Y%m%d'), asset_type=asset_type, strategy_mode=strategy_mode,
         )
     except Exception as exc:
         logger.warning('Post-close ranking context failed: %s', type(exc).__name__)
@@ -16842,12 +16845,16 @@ def resolve_post_close_ranking_context(now_value=None, asset_type='combined', ta
     return fallback
 
 
-def ranking_context_issues(context, rows, asset_type, target):
+def ranking_context_issues(context, rows, asset_type, target, strategy_mode='波段'):
     """Do not turn a failed chip feed into a technically-only new ranking."""
-    issues = list(context.get('errors', []))
+    daytrade = asset_type == 'stock' and strategy_mode == '當沖'
+    issues = [error for error in context.get('errors', []) if not daytrade or
+              not any(name in error for name in ('valuation', 'revenue', 'eps', '估值', '營收', 'EPS'))]
     if context.get('date') != _ranking_market_date(target) or context.get('using_last_success'):
         issues.append('排名來源日期尚未就緒')
-    required = ['上市法人', '上市融資券', '上櫃法人', '上櫃融資券', '上市估值', '上櫃估值']
+    required = ['上市法人', '上市融資券', '上櫃法人', '上櫃融資券']
+    if not daytrade:
+        required.extend(['上市估值', '上櫃估值'])
     if asset_type == 'futures':
         required.append('期貨法人')
     for source in required:
@@ -17238,7 +17245,7 @@ def strategy_ranking_weights(asset_type, strategy_mode):
             {'technical': 0.35, 'chips': 0.50, 'fundamental': 0.15}
         )
     return (
-        {'technical': 0.55, 'chips': 0.35, 'fundamental': 0.10}
+        {'technical': 0.60, 'chips': 0.40, 'fundamental': 0.00}
         if is_daytrade else
         {'technical': 0.40, 'chips': 0.30, 'fundamental': 0.30}
     )
@@ -17253,7 +17260,7 @@ def _score_stock_post_close(row, strategy_mode, market_context):
         'chips': _ranking_chip_component(
             stock_context, market_context.get('scales', {}), is_daytrade,
         ),
-        'fundamental': _ranking_fundamental_component(stock_context, is_daytrade),
+        'fundamental': None if is_daytrade else _ranking_fundamental_component(stock_context),
     }
     weights = strategy_ranking_weights('stock', strategy_mode)
     risk_text = str(row.get('風險', ''))
@@ -17463,7 +17470,7 @@ def stock_swing_refresh_allowed(now_value, analysis=False):
 
 
 def refresh_strategy_ranking_snapshots(rows, asset_type, analysis=False):
-    """Refresh both modes together and retain their compact, cross-device result."""
+    """Validate each mode independently and retain its cross-device result."""
     current = pd.Timestamp.now(tz='Asia/Taipei')
     if not ranking_snapshot_refresh_allowed(current, analysis):
         return False
@@ -17478,17 +17485,20 @@ def refresh_strategy_ranking_snapshots(rows, asset_type, analysis=False):
     _, target = _post_close_target_date(current)
     if analysis and current.time() >= dt_time(13, 30) and not is_market_closed_func(current.date()):
         target = current.date()
-    context = resolve_post_close_ranking_context(current, asset_type=asset_type, target_date=target)
-    issues = ranking_context_issues(context, rows, asset_type, target)
-    st.session_state[f'_{asset_type}_ranking_waiting'] = issues
-    if issues:
-        return False
     refreshed = {}
+    waiting = []
     for mode, key in (('當沖', 'daytrade'), ('波段', 'swing')):
+        context = resolve_post_close_ranking_context(current, asset_type=asset_type, target_date=target,
+                                                     strategy_mode=mode)
+        issues = ranking_context_issues(context, rows, asset_type, target, mode)
+        st.session_state[f'_{asset_type}_{key}_ranking_waiting'] = issues
+        waiting.extend(issues)
+        if issues:
+            continue
         entries = build_strategy_ranking_entries(
             rows, mode, now_value=current, market_context=context, asset_type=asset_type,
         )
-        if entries:
+        if entries and len(entries) == len(rows):
             refreshed[key] = {
                 'updated_at': current.isoformat(),
                 'target_date': target.isoformat(),
@@ -17497,8 +17507,14 @@ def refresh_strategy_ranking_snapshots(rows, asset_type, analysis=False):
                 'errors': list(context.get('errors', [])),
                 'using_last_success': bool(context.get('using_last_success')),
                 'complete': True,
+                **({'weights': strategy_ranking_weights(asset_type, mode)}
+                   if asset_type == 'stock' and key == 'daytrade' else {}),
                 'entries': entries,
             }
+        else:
+            st.session_state[f'_{asset_type}_{key}_ranking_waiting'] = ['技術評分缺項']
+            waiting.append('技術評分缺項')
+    st.session_state[f'_{asset_type}_ranking_waiting'] = list(dict.fromkeys(waiting))
     if not refreshed:
         return False
     previous.update(refreshed)
@@ -17529,10 +17545,13 @@ def render_strategy_ranking(rows, strategy_mode, room_label, allow_refresh=True)
         tables[room_label] = visible
         visible = pd.concat(tables.values()).drop_duplicates('代號')
     st.session_state[f'_postclose_visible_{asset_type}'] = visible
-    waiting = st.session_state.get(f'_{asset_type}_ranking_waiting', [])
+    waiting = st.session_state.get(f'_{asset_type}_{snapshot_key}_ranking_waiting',
+                                   st.session_state.get(f'_{asset_type}_ranking_waiting', []))
     if waiting:
         st.caption('盤後資料待補齊，保留原排名：' + '、'.join(waiting[:4]))
     snapshot = st.session_state.get(state_key, {}).get(snapshot_key, {})
+    if asset_type == 'stock' and snapshot_key == 'daytrade' and snapshot.get('weights') != strategy_ranking_weights('stock', '當沖'):
+        snapshot = {}  # Never label a legacy 55/35/10 score as the new 60/40 ranking.
     if snapshot.get('target_date'):
         target_date = date.fromisoformat(snapshot['target_date'])
     code_column = '期貨代碼' if asset_type == 'futures' else '代號'
@@ -17561,7 +17580,8 @@ def render_strategy_ranking(rows, strategy_mode, room_label, allow_refresh=True)
         (
             "<span class='ranking-tech-text'>技術</span>：VWAP、均線、動能、ATR、價位結構　"
             "<span class='ranking-chip-text'>籌碼</span>：外資、投信、自營商、融資券　"
-            "<span class='ranking-basic-text'>基本</span>：月營收、EPS、營益率、估值"
+            + ("<span class='ranking-basic-text'>基本</span>：月營收、EPS、營益率、估值"
+               if strategy_mode != '當沖' else '')
         )
     )
     weight_badges = ''.join((
@@ -17570,6 +17590,7 @@ def render_strategy_ranking(rows, strategy_mode, room_label, allow_refresh=True)
         for key, label in (
             ('technical', '技術'), ('chips', '籌碼'), ('fundamental', '基本')
         )
+        if weights[key] > 0
     ))
     colored = []
     explanation_rows = []
@@ -17633,17 +17654,18 @@ def render_strategy_ranking(rows, strategy_mode, room_label, allow_refresh=True)
     )
     market_context = snapshot
     source_date = str(snapshot.get('source_date', ''))
+    source_label = '籌碼' if asset_type == 'stock' and strategy_mode == '當沖' else '籌碼／估值'
     source_text = (
-        f"盤後籌碼／估值資料日 {source_date[:4]}/{source_date[4:6]}/{source_date[6:]}。"
-        if len(source_date) == 8 else '盤後籌碼／估值來源暫未完整取得。'
+        f"盤後{source_label}資料日 {source_date[:4]}/{source_date[4:6]}/{source_date[6:]}。"
+        if len(source_date) == 8 else f'盤後{source_label}來源暫未完整取得。'
     )
     error_text = '；部分來源未取得，已依可用資料重分配權重。' if market_context.get('errors') else ''
     fallback_text = '；目前沿用本次工作階段最後成功快照。' if market_context.get('using_last_success') else ''
     st.caption(
         source_text + error_text + fallback_text
         + ' 有效資料率按適用分類計算；分類內缺項會把權重重配給已取得指標，整類未取得才扣覆蓋率。'
-        + ' 基本面採最新有效月／季資料。'
-        + ' 個股／ETF期貨不套用「股票期貨／ETF期貨」市場總部位，避免各檔顯示相同法人數字。'
+        + (' 基本面採最新有效月／季資料。' if weights['fundamental'] > 0 else '')
+        + (' 個股／ETF期貨不套用「股票期貨／ETF期貨」市場總部位，避免各檔顯示相同法人數字。' if asset_type == 'futures' else '')
         + ' 排名是獨立比較，不會更動表格順序；分數代表當沖／波段適配度，不是勝率。'
     )
 
@@ -20420,15 +20442,17 @@ def postclose_risk_version(risk):
     return sha256(json.dumps(content, sort_keys=True, ensure_ascii=False).encode('utf-8')).hexdigest()
 
 
-def postclose_snapshot_ready(snapshots, rows, asset, target, risk=None):
+def postclose_snapshot_ready(snapshots, rows, asset, target, risk=None, modes=('daytrade', 'swing')):
     scope = postclose_scope(rows, asset)
     return all(
         snapshots.get(mode, {}).get('complete')
         and snapshots[mode].get('target_date') == target.isoformat()
         and snapshots[mode].get('scope') == scope
+        and (asset != 'stock' or mode != 'daytrade'
+             or snapshots[mode].get('weights') == strategy_ranking_weights('stock', '當沖'))
         and (asset != 'stock' or risk is None
              or snapshots[mode].get('risk_version') == postclose_risk_version(risk))
-        for mode in ('daytrade', 'swing')
+        for mode in modes
     )
 
 
@@ -20485,7 +20509,8 @@ def fetch_postclose_futures_rows(target_text):
     return rows, meta
 
 
-def build_postclose_job(row_sets, target, need_turnover, need_risk, previous_risk, frozen_stock=None):
+def build_postclose_job(row_sets, target, need_turnover, need_risk, previous_risk, frozen_stock=None,
+                        stock_modes=('當沖', '波段')):
     """Worker returns immutable results; never reads or writes session state."""
     result = {'rankings': {}, 'errors': {}}
     target_text = target.strftime('%Y%m%d')
@@ -20508,16 +20533,8 @@ def build_postclose_job(row_sets, target, need_turnover, need_risk, previous_ris
     if not row_sets:
         return result
     for asset, visible in row_sets.items():
-        try:
-            context = fetch_post_close_stock_ranking_context(target_text, asset_type=asset)
-        except Exception as exc:
-            result['errors'][asset] = f'排名來源：{type(exc).__name__}'
-            continue
-        issues = ranking_context_issues(context, visible, asset, target)
         if asset == 'stock' and (not risk.get('updated') or risk.get('errors')):
-            issues.append('注意／處置名單尚未完整')
-        if issues:
-            result['errors'][asset] = '、'.join(issues)
+            result['errors'][asset] = '注意／處置名單尚未完整'
             continue
         try:
             if asset == 'stock':
@@ -20554,11 +20571,29 @@ def build_postclose_job(row_sets, target, need_turnover, need_risk, previous_ris
                     raise ValueError('部分期貨契約尚無同日行情')
             snapshots = {}
             for mode, key in (('當沖', 'daytrade'), ('波段', 'swing')):
-                entries = build_strategy_ranking_entries(rows, mode, market_context=context, asset_type=asset)
-                if not entries:
-                    raise ValueError('尚無完整策略排名')
+                if asset == 'stock' and mode not in stock_modes:
+                    continue
                 previous = (frozen_stock or {}).get(key, {}) if asset == 'stock' else {}
-                if previous.get('target_date') == target.isoformat():
+                weights = strategy_ranking_weights(asset, mode)
+                compatible = asset != 'stock' or key != 'daytrade' or previous.get('weights') == weights
+                mode_rows = rows
+                if compatible and previous.get('target_date') == target.isoformat():
+                    old_codes = {entry['code'] for entry in previous.get('entries', [])}
+                    mode_rows = rows[~rows['代號'].astype(str).isin(old_codes)] if asset == 'stock' else rows
+                    if mode_rows.empty:
+                        continue
+                try:
+                    context = fetch_post_close_stock_ranking_context(target_text, asset_type=asset, strategy_mode=mode)
+                    issues = ranking_context_issues(context, mode_rows, asset, target, mode)
+                    if issues:
+                        raise ValueError('、'.join(issues))
+                    entries = build_strategy_ranking_entries(mode_rows, mode, market_context=context, asset_type=asset)
+                    if len(entries) != len(mode_rows):
+                        raise ValueError('尚無完整策略排名')
+                except Exception as exc:
+                    result['errors'][f'{asset}:{key}'] = str(exc)
+                    continue
+                if compatible and previous.get('target_date') == target.isoformat():
                     old_entries = {entry['code']: entry for entry in previous.get('entries', [])}
                     entries = sorted([*old_entries.values(), *(entry for entry in entries if entry['code'] not in old_entries)],
                                      key=lambda entry: (-entry['score'], entry['code']))
@@ -20570,8 +20605,12 @@ def build_postclose_job(row_sets, target, need_turnover, need_risk, previous_ris
                     'complete': True, 'scope': postclose_scope(visible, asset),
                     'risk_version': postclose_risk_version(risk) if asset == 'stock' else '',
                     'entries': entries, 'using_last_success': False,
+                    **({'weights': weights} if asset == 'stock' and key == 'daytrade' else {}),
                 }
-            result['rankings'][asset] = snapshots
+            if snapshots:
+                result['rankings'][asset] = snapshots
+            else:
+                result['errors'][asset] = '；'.join(result['errors'].get(f'{asset}:{mode}', '') for mode in ('daytrade', 'swing'))
         except Exception as exc:
             result['errors'][asset] = str(exc)
     return result
@@ -20677,8 +20716,10 @@ def supplement_frozen_stock_rankings(current, state):
         for item in completed.values():
             item['scope'] = scope
             item['supplemented'] = True
-        st.session_state['stock_strategy_ranking_snapshots'] = completed
-        st.session_state['_stock_ranking_waiting'] = []
+        st.session_state['stock_strategy_ranking_snapshots'] = {**snapshots, **completed}
+        for mode in ('daytrade', 'swing'):
+            st.session_state[f'_stock_{mode}_ranking_waiting'] = [result['errors'][f'stock:{mode}']] if f'stock:{mode}' in result['errors'] else []
+        st.session_state['_stock_ranking_waiting'] = list(result['errors'].values())
         save_data_cache(st.session_state.stock_data, st.session_state.ignored_stocks,
                         st.session_state.all_candidates, st.session_state.saved_notes, sync_cloud=False)
         if get_app_secret('gsheet_api_url'):
@@ -20689,8 +20730,16 @@ def supplement_frozen_stock_rankings(current, state):
     if job:
         return
     missing = set()
+    stock_modes = ()
     for mode in ('daytrade', 'swing'):
-        missing.update(set(scope) - {entry['code'] for entry in snapshots.get(mode, {}).get('entries', [])})
+        snapshot = snapshots.get(mode, {})
+        codes = {entry['code'] for entry in snapshot.get('entries', [])}
+        if mode == 'daytrade' and snapshot.get('weights') != strategy_ranking_weights('stock', '當沖'):
+            codes = set()
+        if set(scope) - codes:
+            missing.update(set(scope) - codes)
+            stock_modes = ('當沖',) if mode == 'daytrade' else ('波段',)
+            break  # Publish daytrade first; its job never waits on swing fundamentals.
     if not missing:
         return
     retry_signature, retry_time = state.get('supplement_retry', (None, 0))
@@ -20703,7 +20752,7 @@ def supplement_frozen_stock_rankings(current, state):
     risk = dict(st.session_state.get('risk_filter_market_data', {}))
     state['supplement'] = {'signature': signature,
         'future': worker['executor'].submit(run_postclose_job, worker, build_postclose_job,
-                                            {'stock': pending}, target, False, False, risk, snapshots)}
+                                            {'stock': pending}, target, False, False, risk, snapshots, stock_modes)}
 
 
 @st.fragment(run_every=60)
@@ -20773,7 +20822,9 @@ def render_postclose_maintenance():
             result = future.result()
         except Exception as exc:
             result = {'rankings': {}, 'errors': {'資料檢查': type(exc).__name__}}
-        state['status'] = '；'.join(f'{key}：{value}' for key, value in result['errors'].items()) or '盤後資料檢查完成'
+        labels = {'stock': '股票', 'futures': '期貨', 'stock:daytrade': '股票當沖', 'stock:swing': '股票波段',
+                  'futures:daytrade': '期貨當沖', 'futures:swing': '期貨波段'}
+        state['status'] = '；'.join(f'{labels.get(key, key)}：{value}' for key, value in result['errors'].items()) or '盤後資料檢查完成'
         stock_dirty = futures_dirty = False
         if state.get('target') == target.isoformat() and sources_open:
             if 'turnover' in result:
@@ -20802,10 +20853,13 @@ def render_postclose_maintenance():
                     visible = st.session_state.get(f'_postclose_visible_{asset}')
                     if versions != state.get('versions', {}).get(asset, {}):
                         continue  # A manual analysis or cloud restore finished meanwhile.
-                    if visible is not None and postclose_scope(visible, asset) != snapshots['daytrade']['scope']:
+                    if visible is not None and postclose_scope(visible, asset) != next(iter(snapshots.values()))['scope']:
                         continue
-                    st.session_state[key] = snapshots
+                    st.session_state[key] = {**previous, **snapshots}
+                    state['retry_at'] = 0  # Check remaining modes/assets on the next maintenance tick.
                     st.session_state[f'_{asset}_ranking_waiting'] = []
+                    for mode in ('daytrade', 'swing'):
+                        st.session_state[f'_{asset}_{mode}_ranking_waiting'] = [result['errors'][f'{asset}:{mode}']] if f'{asset}:{mode}' in result['errors'] else []
                     stock_dirty |= asset == 'stock'
                     futures_dirty |= asset == 'futures'
         for asset in ('stock', 'futures'):
@@ -20856,11 +20910,16 @@ def render_postclose_maintenance():
                 row_sets[asset] = rows.copy(deep=True)
     need_turnover = _ranking_market_date(st.session_state.get('turnover_ranking_date')) != target.strftime('%Y%m%d')
     need_risk = state.get('risk_done') != phase
+    if len(row_sets) > 1:
+        asset = 'futures' if state.get('ranking_asset') == 'stock' else 'stock'
+        row_sets = {asset: row_sets[asset]}  # Separate jobs; a failed stock feed cannot starve futures.
     if not row_sets and not need_turnover and not need_risk:
         return
     worker = get_postclose_worker()
     if not worker['slot'].acquire(blocking=False):
         return
+    if row_sets:
+        state['ranking_asset'] = next(iter(row_sets))
     state['target'] = target.isoformat()
     state['phase'] = phase
     state['scopes'] = scopes
@@ -20870,8 +20929,15 @@ def render_postclose_maintenance():
     }
     risk = dict(st.session_state.get('risk_filter_market_data', {}))
     state['risk_version'] = risk.get('updated')
+    stock_rows = row_sets.get('stock')
+    stock_modes = ('當沖',)
+    if stock_rows is not None and postclose_snapshot_ready(
+        st.session_state.get('stock_strategy_ranking_snapshots', {}), stock_rows, 'stock', target, risk,
+        modes=('daytrade',),
+    ):
+        stock_modes = ('波段',)
     state['future'] = worker['executor'].submit(run_postclose_job, worker, build_postclose_job, row_sets, target,
-                                               need_turnover, need_risk, risk)
+                                               need_turnover, need_risk, risk, None, stock_modes)
 
 
 # ==========================================

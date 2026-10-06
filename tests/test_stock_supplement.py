@@ -15,11 +15,12 @@ class State(dict):
 
 def test_frozen_supplement_only_scores_missing_rows_saves_all_and_never_changes_existing_scores():
     ns = load_app_symbols('supplement_frozen_stock_rankings', 'postclose_scope', 'build_postclose_job',
-                          'run_postclose_job', '_ranking_market_date', '_ranking_number', '_as_float', 'postclose_risk_version')
+                          'run_postclose_job', '_ranking_market_date', '_ranking_number', '_as_float', 'postclose_risk_version', 'strategy_ranking_weights')
     now = pd.Timestamp('2026-10-06 10:00:00')
     original = [{'code': str(i), 'score': 80 - i, 'reason': 'frozen', 'coverage': 100} for i in range(5)]
     snapshots = {mode: {'target_date': '2026-10-05', 'updated_at': '2026-10-06T08:00:00+08:00',
-                        'complete': True, 'entries': original.copy()} for mode in ('daytrade', 'swing')}
+                        'complete': True, 'weights': ns['strategy_ranking_weights']('stock', '當沖' if mode == 'daytrade' else '波段'),
+                        'entries': original.copy()} for mode in ('daytrade', 'swing')}
     rows = pd.DataFrame([{'代號': str(i), '_strategy_close': 100, '_strategy_change_rate': 0,
                          '_strategy_data_as_of': '2026/10/05', '_ma5': 99, '收盤價': 999,
                          '_daytrade_vwap': 998} for i in range(56)])
@@ -50,11 +51,15 @@ def test_frozen_supplement_only_scores_missing_rows_saves_all_and_never_changes_
     supplement(now, maintenance)
     assert state['stock_strategy_ranking_snapshots'] is snapshots and not reruns
     supplement(now, maintenance)
+    assert state['stock_strategy_ranking_snapshots']['swing']['entries'] == original
+    assert len(state['stock_strategy_ranking_snapshots']['daytrade']['entries']) == 56
+    supplement(now, maintenance)
+    supplement(now, maintenance)
     for updated in state['stock_strategy_ranking_snapshots'].values():
         assert len(updated['entries']) == 56
         assert [e for e in updated['entries'] if e['code'] in {str(i) for i in range(5)}] == original
         assert updated['target_date'] == '2026-10-05' and updated['supplemented']
-    assert saved == [{'sync_cloud': False}] and maintenance['pending_sync']['stock']
+    assert saved == [{'sync_cloud': False}, {'sync_cloud': False}] and maintenance['pending_sync']['stock']
     supplement(now, maintenance)
     assert len(scored) == 2
 
@@ -108,4 +113,7 @@ def test_cloud_supplements_merge_same_day_additions_without_rolling_back_scores(
     assert merged['entries'] == [{'code':'2330','score':85}, {'code':'1815','score':70}, {'code':'1727','score':60}]
     assert len(old['entries']) == len(new['entries']) == 2
     new['target_date'] = '2026-10-06'
+    assert ns['_newer_timestamped_state'](old, new)['entries'] == new['entries']
+    new['target_date'] = old['target_date']
+    new['weights'] = {'technical': .6, 'chips': .4, 'fundamental': 0}
     assert ns['_newer_timestamped_state'](old, new)['entries'] == new['entries']
