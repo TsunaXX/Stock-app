@@ -20696,12 +20696,14 @@ def supplement_frozen_stock_rankings(current, state):
         return
     snapshots = st.session_state.get('stock_strategy_ranking_snapshots', {})
     _, target = _post_close_target_date(current)
-    saved_targets = {item.get('target_date') for item in snapshots.values() if item.get('target_date')}
+    daytrade = snapshots.get('daytrade', {})
+    migrating = daytrade.get('weights') != strategy_ranking_weights('stock', '當沖')
+    saved_targets = {daytrade['target_date']} if daytrade.get('target_date') else set()
     # An explicit after-close analysis may already have frozen today's complete data.
     if saved_targets == {current.date().isoformat()} and current.time() >= dt_time(13, 30):
         target = current.date()
-    if saved_targets and saved_targets != {target.isoformat()}:
-        return  # Never supplement a stale or mixed-day snapshot.
+    if saved_targets and saved_targets != {target.isoformat()} and not migrating:
+        return  # Only the formula migration may rebuild a stale daytrade date.
     scope = postclose_scope(rows, 'stock')
     signature = (target.isoformat(), tuple(scope), data_version(snapshots))
     job = state.get('supplement')
@@ -20739,6 +20741,8 @@ def supplement_frozen_stock_rankings(current, state):
     stock_modes = ()
     for mode in ('daytrade', 'swing'):
         snapshot = snapshots.get(mode, {})
+        if mode == 'swing' and snapshot.get('target_date') not in (None, target.isoformat()):
+            continue  # A retained swing snapshot has its own date/freeze rule.
         codes = {entry['code'] for entry in snapshot.get('entries', [])}
         if mode == 'daytrade' and snapshot.get('weights') != strategy_ranking_weights('stock', '當沖'):
             codes = set()
