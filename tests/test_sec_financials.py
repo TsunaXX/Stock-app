@@ -42,7 +42,9 @@ def test_sec_facts_use_actual_quarters_and_derive_q4_revenue_without_deriving_ep
 
 
 def test_us_source_failures_use_official_issuer_then_yahoo_without_empty_overwrite():
+    import logging
     ns = load_app_symbols('fetch_us_revenue_events', '_growth_percent', '_to_number', '_format_compact_number')
+    ns['logger'] = logging.getLogger(__name__)
     ns['resolve_earnings_ticker'] = lambda ticker: {'candidates': [ticker], 'display_name': ticker}
     calls = []
     def failed(ticker):

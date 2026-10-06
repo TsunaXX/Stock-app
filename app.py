@@ -2906,7 +2906,10 @@ def fetch_us_revenue_events(inputs):
                     data = candidate
                 if data and not data.get('warning'):
                     break
-            except Exception:
+            except Exception as exc:
+                logger.warning('US financial source failed: %s %s %s status=%s', ticker,
+                               getattr(loader, '__name__', 'issuer'), type(exc).__name__,
+                               getattr(getattr(exc, 'response', None), 'status_code', ''))
                 continue
         if data is None:
             missing.append(f"{item['display_name']}（官方／備援財報暫未取得）")
@@ -17526,7 +17529,7 @@ def render_strategy_ranking(rows, strategy_mode, room_label, allow_refresh=True)
     entries = [entry for entry in snapshot.get('entries', []) if entry['code'] in codes]
     missing_codes = codes - {entry['code'] for entry in entries}
     if missing_codes:
-        st.caption('盤前排名待補：' + '、'.join(sorted(missing_codes)) + '；背景補算同日盤後資料，既有評分保持不變。')
+        st.caption('盤前排名待補：' + '、'.join(sorted(missing_codes)) + '；等待補齊同日盤後資料，既有評分保持不變。')
     if not entries:
         st.info(f'尚無盤前{room_label}{"當沖" if snapshot_key == "daytrade" else "波段"}排名快照；正在等待資料。')
         return
