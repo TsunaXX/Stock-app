@@ -126,6 +126,9 @@ def merge_company_sections(snapshot, sections, prefer_existing=False):
         old_events = prior.get('events', [])
         # Public announcements/ex-dates are rolling feeds: retain historical events.
         def event_key(e):
+            if label == 'us_revenue':
+                revenue = e.get('revenue', {})
+                return str((e.get('ticker') or revenue.get('ticker'), revenue.get('period_end')))
             month = e.get('revenue', {}).get('revenue_month')
             return str(e.get('event_id') or (e.get('ticker'), month) if month else
                        e.get('event_id') or (e.get('ticker'), e.get('date'), e.get('title')))

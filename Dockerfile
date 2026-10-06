@@ -18,7 +18,7 @@ COPY requirements.txt ./
 RUN pip install --upgrade pip \
     && pip install -r requirements.txt
 
-COPY app.py stock_names.csv google_apps_script.gs ./
+COPY app.py market_automation.py sec_financials.py stock_names.csv google_apps_script.gs ./
 COPY .streamlit/config.toml ./.streamlit/config.toml
 
 EXPOSE 10000

@@ -34,6 +34,8 @@ import numpy as np
 import streamlit.components.v1 as components
 import pdfplumber
 import fitz  # PyMuPDF 用於將 PDF 轉為圖片
+from sec_financials import facts_revenue, release_revenue, sec_get
+
 from market_automation import (
     BackgroundJobs, attach_macro_results, data_version, index_scenario,
     macro_results, merge_company_sections, merge_macro_results, vwap_guard,
@@ -2768,79 +2770,163 @@ def _growth_percent(current, comparison):
     return (current_number - comparison_number) / abs(comparison_number) * 100
 
 
-@st.cache_data(ttl=60 * 60 * 6, max_entries=24, show_spinner=False)
+@st.cache_data(ttl=86400, max_entries=2, show_spinner=False)
+def fetch_sec_tickers():
+    return sec_get('https://www.sec.gov/files/company_tickers.json',
+                   get_app_secret('SEC_USER_AGENT', 'Stock-app github.com/TsunaXX/Stock-app')).json()
+
+
+@st.cache_data(ttl=600, max_entries=24, show_spinner=False)
+def fetch_sec_submissions(cik):
+    return sec_get(f'https://data.sec.gov/submissions/CIK{cik:010d}.json',
+                   get_app_secret('SEC_USER_AGENT', 'Stock-app github.com/TsunaXX/Stock-app')).json()
+
+
+@st.cache_data(ttl=21600, max_entries=24, show_spinner=False)
+def fetch_sec_facts(cik, filing_version):
+    # A new filing bypasses the old facts cache; unchanged filings reuse it.
+    return sec_get(f'https://data.sec.gov/api/xbrl/companyfacts/CIK{cik:010d}.json',
+                   get_app_secret('SEC_USER_AGENT', 'Stock-app github.com/TsunaXX/Stock-app')).json()
+
+
+@st.cache_data(ttl=86400, max_entries=64, show_spinner=False)
+def fetch_sec_document(url):
+    return sec_get(url, get_app_secret('SEC_USER_AGENT', 'Stock-app github.com/TsunaXX/Stock-app')).content
+
+
+@st.cache_data(ttl=600, max_entries=24, show_spinner=False)
+def fetch_sec_revenue(ticker):
+    companies = fetch_sec_tickers()
+    cik = next((int(row['cik_str']) for row in companies.values()
+                if str(row.get('ticker', '')).upper() == ticker.upper().replace('.', '-')), None)
+    if cik is None:
+        raise ValueError('SEC 公司代號未取得')
+    recent = fetch_sec_submissions(cik).get('filings', {}).get('recent', {})
+    filings = [{key: values[index] for key, values in recent.items() if isinstance(values, list) and len(values) > index}
+               for index, form in enumerate(recent.get('form', []))
+               if form in ('10-Q', '10-K', '20-F', '40-F', '6-K', '8-K')
+               and (form != '8-K' or '2.02' in recent.get('items', [''] * len(recent['form']))[index])]
+    if not filings:
+        raise ValueError('SEC 財報申報未取得')
+    latest = max(filings, key=lambda row: row.get('filingDate', ''))
+    data = None
+    try:
+        data = facts_revenue(fetch_sec_facts(cik, latest['accessionNumber']))
+        if data:
+            data.update(source='SEC EDGAR（XBRL／GAAP）',
+                        source_url=f"https://www.sec.gov/Archives/edgar/data/{cik}/{data['accession'].replace('-', '')}/")
+    except Exception:
+        pass
+    if latest['form'] in ('8-K', '6-K'):
+        base = f"https://www.sec.gov/Archives/edgar/data/{cik}/{latest['accessionNumber'].replace('-', '')}/"
+        try:
+            cover = BeautifulSoup(fetch_sec_document(base + latest['primaryDocument']), 'html.parser')
+            exhibit = next((a['href'] for a in cover.find_all('a', href=True)
+                            if re.search(r'99[. -]?1|press.release|earnings.release', a.get_text(' ', strip=True) + ' ' + a['href'], re.I)
+                            and a['href'].lower().endswith(('.htm', '.html'))), None)
+            url = urljoin(base, exhibit or latest['primaryDocument'])
+            if not url.startswith(base):
+                raise ValueError('SEC 財報附件路徑異常')
+            release = release_revenue(fetch_sec_document(url))
+            if release and (not data or release['period_end'] >= data['period_end']):
+                data = {**release, 'filed_date': latest['filingDate'], 'accession': latest['accessionNumber'],
+                        'source': 'SEC EDGAR（財報新聞稿／GAAP）', 'source_url': url}
+        except Exception:
+            pass
+    if not data:
+        raise ValueError('SEC 尚無可解析季度財報')
+    if latest['filingDate'] > data.get('filed_date', ''):
+        fetch_sec_facts.clear(cik, latest['accessionNumber'])
+        data['warning'] = 'SEC 有較新申報，季度數值尚待解析；保留已取得財報'
+    return data
+
+
+@st.cache_data(ttl=600, max_entries=2, show_spinner=False)
+def fetch_micron_revenue():
+    # Official issuer fallback also covers SEC IP restrictions; never hard-code a fiscal date/value.
+    response = requests.get('https://investors.micron.com/overview/default.aspx', timeout=(4, 10))
+    response.raise_for_status()
+    soup = BeautifulSoup(response.content, 'html.parser')
+    links = [urljoin('https://investors.micron.com/', a['href']).replace('http://', 'https://', 1)
+             for a in soup.find_all('a', href=True) if re.search(r'Reports.*Results', a['href'], re.I)]
+    links = [url for url in links if url.startswith('https://investors.micron.com/news/press-release/')]
+    if not links:
+        raise ValueError('Micron 最新財報連結未取得')
+    response = requests.get(links[0], timeout=(4, 10))
+    response.raise_for_status()
+    data = release_revenue(response.content)
+    if not data:
+        raise ValueError('Micron 財報格式尚未支援')
+    published = BeautifulSoup(response.content, 'html.parser').select_one('.evergreen-news-date-text')
+    data.update(source='Micron 官方財報（GAAP）', source_url=links[0],
+                filed_date=datetime.strptime(published.get_text(strip=True), '%B %d, %Y').date().isoformat() if published else '')
+    return data
+
+
+@st.cache_data(ttl=21600, max_entries=24, show_spinner=False)
+def fetch_yahoo_revenue(ticker):
+    ticker_obj = yf.Ticker(ticker)
+    if ticker_obj.get_info().get('financialCurrency') != 'USD':
+        raise ValueError('Yahoo 財報幣別不是美元或尚未確認')
+    quarterly = ticker_obj.quarterly_income_stmt
+    revenue = _income_statement_revenue(quarterly)
+    annual = _income_statement_revenue(ticker_obj.income_stmt)
+    quarters = sorted([(pd.Timestamp(c), _to_number(revenue[c])) for c in revenue.index
+                       if _to_number(revenue[c]) is not None], reverse=True) if revenue is not None else []
+    if not quarters:
+        raise ValueError('Yahoo 季度營收未取得')
+    end, value = quarters[0]
+    prior = next((v for d, v in quarters[1:] if 70 <= (end - d).days <= 110), None)
+    year_ago = next((v for d, v in quarters[1:] if 320 <= (end - d).days <= 410), None)
+    annuals = sorted([(pd.Timestamp(c), _to_number(annual[c])) for c in annual.index
+                      if _to_number(annual[c]) is not None], reverse=True) if annual is not None else []
+    eps = next((_to_number(quarterly.loc[index, end]) for index in quarterly.index
+                if str(index).replace(' ', '').lower() == 'dilutedeps'), None)
+    return {'period_end': end.date().isoformat(), 'quarter_revenue': value,
+            'previous_quarter': prior, 'year_ago_quarter': year_ago, 'eps': eps,
+            'annual_revenue': annuals[0][1] if annuals else None,
+            'annual_period_end': annuals[0][0].date().isoformat() if annuals else '',
+            'previous_annual': annuals[1][1] if len(annuals) > 1 else None,
+            'filed_date': '', 'source': 'Yahoo Finance（季度／年度營收備援）'}
+
+
+@st.cache_data(ttl=600, max_entries=24, show_spinner=False)
 def fetch_us_revenue_events(inputs):
-    """取得美股最新已公告季度與年度營收；美股沒有統一月營收，改以 QoQ／YoY 呈現。"""
     events, missing = [], []
     for user_input in inputs:
         item = resolve_earnings_ticker(user_input)
-        ticker = next((symbol for symbol in item["candidates"] if not re.fullmatch(r"\d{4,6}\.(?:TW|TWO)", symbol)), None)
+        ticker = next((symbol for symbol in item['candidates'] if not re.fullmatch(r'\d{4,6}\.(?:TW|TWO)', symbol)), None)
         if not ticker:
             continue
-        try:
-            ticker_obj = yf.Ticker(ticker)
-            quarterly_statement = ticker_obj.quarterly_income_stmt
-            quarterly_row = _income_statement_revenue(quarterly_statement)
-            annual_row = _income_statement_revenue(ticker_obj.income_stmt)
-            if quarterly_row is None:
-                missing.append(f"{item['display_name']}（尚無可用季度營收資料）")
+        data = None
+        for loader in (fetch_sec_revenue, *((lambda _: fetch_micron_revenue(),) if ticker == 'MU' else ()), fetch_yahoo_revenue):
+            try:
+                candidate = loader(ticker)
+                if data is None or candidate['period_end'] > data['period_end']:
+                    data = candidate
+                if data and not data.get('warning'):
+                    break
+            except Exception:
                 continue
-            quarter_columns = sorted(quarterly_row.index, reverse=True)
-            quarter_values = [(pd.Timestamp(column), quarterly_row[column]) for column in quarter_columns if pd.notna(quarterly_row[column])]
-            if not quarter_values:
-                missing.append(f"{item['display_name']}（季度營收欄位為空）")
-                continue
-            period_end, quarter_revenue = quarter_values[0]
-            eps = next((_to_number(quarterly_statement.loc[index, period_end])
-                        for index in quarterly_statement.index
-                        if str(index).replace(' ', '').lower() == 'dilutedeps'), None)
-            previous_quarter = quarter_values[1][1] if len(quarter_values) > 1 else None
-            expected_year_ago = period_end - pd.DateOffset(years=1)
-            year_ago_candidates = [
-                (abs((candidate_date - expected_year_ago).days), candidate_value)
-                for candidate_date, candidate_value in quarter_values[1:]
-                if abs((candidate_date - expected_year_ago).days) <= 45
-            ]
-            year_ago_quarter = min(year_ago_candidates, default=(None, None))[1]
-            qoq_value = _growth_percent(quarter_revenue, previous_quarter)
-            yoy_value = _growth_percent(quarter_revenue, year_ago_quarter)
-            annual_values = []
-            if annual_row is not None:
-                annual_columns = sorted(annual_row.index, reverse=True)
-                annual_values = [(pd.Timestamp(column), annual_row[column]) for column in annual_columns if pd.notna(annual_row[column])]
-            annual_revenue = annual_values[0][1] if annual_values else None
-            previous_annual = annual_values[1][1] if len(annual_values) > 1 else None
-            annual_yoy_value = _growth_percent(annual_revenue, previous_annual)
-            qoq = "--" if qoq_value is None else f"{_format_compact_number(qoq_value, 2, signed=True)}%"
-            yoy = "--" if yoy_value is None else f"{_format_compact_number(yoy_value, 2, signed=True)}%"
-            annual_yoy = "--" if annual_yoy_value is None else f"{_format_compact_number(annual_yoy_value, 2, signed=True)}%"
-            revenue_data = {
-                "company": item["display_name"],
-                "ticker": ticker,
-                "period_end": period_end.date().isoformat(),
-                "quarter_revenue": quarter_revenue,
-                "previous_quarter": previous_quarter,
-                "year_ago_quarter": year_ago_quarter,
-                "qoq": qoq,
-                "yoy": yoy,
-                "annual_revenue": annual_revenue,
-                "previous_annual": previous_annual,
-                "annual_yoy": annual_yoy,
-                "eps": eps,
-            }
-            events.append({
-                "date": period_end.date().isoformat(),
-                "title": f"{item['display_name']} 季營收（期末）QoQ{qoq}／YOY{yoy}",
-                "detail": f"最新已公告財報期間截至 {period_end:%Y/%m/%d}；EPS {eps if eps is not None else '未取得'}；點擊事件名稱查看季度及年度營收。",
-                "closed": False,
-                "temporary": False,
-                "source": "Yahoo Finance（季度／年度營收）",
-                "revenue": revenue_data,
-            })
-        except Exception:
-            missing.append(f"{item['display_name']}（查詢季度／年度營收失敗）")
-    return {"events": events, "missing": missing}
-
+        if data is None:
+            missing.append(f"{item['display_name']}（官方／備援財報暫未取得）")
+            continue
+        if data.get('warning'):
+            missing.append(f"{item['display_name']}（{data['warning']}）")
+        data = dict(data, company=item['display_name'], ticker=ticker)
+        for key, current_key, prior_key in (('qoq', 'quarter_revenue', 'previous_quarter'),
+                                          ('yoy', 'quarter_revenue', 'year_ago_quarter'),
+                                          ('annual_yoy', 'annual_revenue', 'previous_annual')):
+            growth = _growth_percent(data.get(current_key), data.get(prior_key))
+            data[key] = '--' if growth is None else f'{_format_compact_number(growth, 2, signed=True)}%'
+        published = data.get('filed_date', '')
+        events.append({'date': published or data['period_end'], 'ticker': ticker, 'market': '美股',
+            'event_id': f"us-revenue:{ticker}:{data['period_end']}",
+            'data_asof': published or data['period_end'],
+            'title': f"{item['display_name']} 季營收 QoQ{data['qoq']}／YoY{data['yoy']}",
+            'detail': f"公告／申報日 {published or '未取得'}；財報期間截至 {data['period_end']}；GAAP EPS {data.get('eps') if data.get('eps') is not None else '未取得'}。",
+            'closed': False, 'temporary': False, 'source': data['source'], 'revenue': data})
+    return {'events': events, 'missing': missing}
 
 
 
@@ -3382,7 +3468,7 @@ def render_company_tracking_status(active):
         st.caption('同步查詢後即加入背景追蹤；行事曆仍只加入勾選公司。')
         return
     result = get_public_maintenance_jobs().poll(('company', symbols),
-        lambda: fetch_tracked_company_updates(symbols), interval=1800)
+        lambda: fetch_tracked_company_updates(symbols), interval=600)
     previous = snapshot.get('updated_at')
     apply_company_background_result(result, symbols)
     if st.session_state.get('_company_auto_pending_local'):
@@ -3728,14 +3814,21 @@ def render_company_event_snapshot(snapshot):
             st.info("未取得台股月營收：" + "； ".join(taiwan_result["missing"]))
 
     with us_tab:
-        us_events = us_result.get("events", [])
+        latest_us = {}
+        for event in us_result.get('events', []):
+            revenue = event.get('revenue', {})
+            ticker = event.get('ticker') or revenue.get('ticker') or event.get('title', '')
+            if revenue.get('period_end', '') >= latest_us.get(ticker, {}).get('revenue', {}).get('period_end', ''):
+                latest_us[ticker] = event
+        us_events = list(latest_us.values())
         if not us_events:
             st.info("目前快照沒有美股季度／年度營收；按上方按鈕同步最新資料。")
         else:
-            st.caption("美股沒有統一月營收申報；以下顯示最新已公告財報期間，金額單位為美元。")
+            st.caption("美股財報優先採 SEC 官方 GAAP 資料；MU 可使用官方新聞稿，Yahoo 作備援。金額單位為美元。")
             for event in us_events:
                 revenue = event.get("revenue", {})
                 st.markdown(f"#### {revenue.get('company', '')}（{revenue.get('ticker', '')}）｜財報期間截至 {revenue.get('period_end', '')}")
+                st.caption(f"公告／申報日：{revenue.get('filed_date') or '未取得'}｜來源：{event.get('source', '')}｜年度期間：{revenue.get('annual_period_end') or '未取得'}")
                 metric_cols = st.columns(3)
                 metric_cols[0].markdown(_revenue_metric_html("季度營收", _usd_currency(revenue.get("quarter_revenue")), str(revenue.get("qoq", "--")) + " QoQ"), unsafe_allow_html=True)
                 metric_cols[1].markdown(_revenue_metric_html("去年同期季營收", _usd_currency(revenue.get("year_ago_quarter")), str(revenue.get("yoy", "--")) + " YoY"), unsafe_allow_html=True)
@@ -9830,7 +9923,15 @@ def _newer_timestamped_state(first, second):
         return dict(second)
     if second_time is None:
         return dict(first)
-    return dict(first if first_time >= second_time else second)
+    selected, other = (first, second) if first_time >= second_time else (second, first)
+    merged = dict(selected)
+    if (selected.get('supplemented') and selected.get('target_date') == other.get('target_date')
+            and isinstance(selected.get('entries'), list) and isinstance(other.get('entries'), list)):
+        entries = {entry['code']: entry for entry in [*other['entries'], *selected['entries']]
+                   if isinstance(entry, dict) and entry.get('code')
+                   and isinstance(entry.get('score'), (int, float)) and math.isfinite(entry['score'])}
+        merged['entries'] = sorted(entries.values(), key=lambda entry: (-entry['score'], entry['code']))
+    return merged
 
 
 def save_futures_strategy_state(
@@ -17382,7 +17483,7 @@ def refresh_strategy_ranking_snapshots(rows, asset_type, analysis=False):
                 'errors': list(context.get('errors', [])),
                 'using_last_success': bool(context.get('using_last_success')),
                 'complete': True,
-                'entries': entries[:50],
+                'entries': entries,
             }
     if not refreshed:
         return False
@@ -17408,7 +17509,12 @@ def render_strategy_ranking(rows, strategy_mode, room_label, allow_refresh=True)
     state_key = f'{asset_type}_strategy_ranking_snapshots'
     # Rendering never waits for official APIs. The maintenance fragment owns
     # background refresh, independently of the intraday quote toggle.
-    st.session_state[f'_postclose_visible_{asset_type}'] = rows.copy(deep=True)
+    visible = rows.copy(deep=True)
+    if asset_type == 'stock':
+        tables = st.session_state.setdefault('_postclose_stock_tables', {})
+        tables[room_label] = visible
+        visible = pd.concat(tables.values()).drop_duplicates('代號')
+    st.session_state[f'_postclose_visible_{asset_type}'] = visible
     waiting = st.session_state.get(f'_{asset_type}_ranking_waiting', [])
     if waiting:
         st.caption('盤後資料待補齊，保留原排名：' + '、'.join(waiting[:4]))
@@ -17418,6 +17524,9 @@ def render_strategy_ranking(rows, strategy_mode, room_label, allow_refresh=True)
     code_column = '期貨代碼' if asset_type == 'futures' else '代號'
     codes = set(rows[code_column].astype(str))
     entries = [entry for entry in snapshot.get('entries', []) if entry['code'] in codes]
+    missing_codes = codes - {entry['code'] for entry in entries}
+    if missing_codes:
+        st.caption('盤前排名待補：' + '、'.join(sorted(missing_codes)) + '；背景補算同日盤後資料，既有評分保持不變。')
     if not entries:
         st.info(f'尚無盤前{room_label}{"當沖" if snapshot_key == "daytrade" else "波段"}排名快照；正在等待資料。')
         return
@@ -18580,7 +18689,7 @@ def completed_stock_strategy_history(history, now_value=None):
 def fetch_stock_data_raw(
     code, name_hint="", extra_data=None, futures_set=None,
     saved_notes_dict=None, name_map_dict=None, sj_logged_in=False,
-    sj_api=None, include_live_quote=True,
+    sj_api=None, include_live_quote=True, strategy_target_date=None,
 ):
     code = str(code).strip()
     hist = pd.DataFrame()
@@ -18721,7 +18830,9 @@ def fetch_stock_data_raw(
             # available): the latest completed close is today's reference.
             current_session_prev_close = current_session_close
 
-    hist, strategy_data_date = completed_stock_strategy_history(hist, now_tw_calc)
+    hist, strategy_data_date = completed_stock_strategy_history(
+        hist, pd.Timestamp(strategy_target_date).replace(hour=21) if strategy_target_date else now_tw_calc,
+    )
     if hist.empty:
         return None
 
@@ -20344,7 +20455,7 @@ def postclose_futures_seed_rows(saved):
 @st.cache_data(ttl=86400, max_entries=256, show_spinner=False)
 def fetch_postclose_stock_row(code, name, target_text):
     # No login, snapshots or intraday subscription is needed for daily analysis.
-    row = fetch_stock_data_raw(code, name, include_live_quote=False)
+    row = fetch_stock_data_raw(code, name, include_live_quote=False, strategy_target_date=target_text)
     if not row or _ranking_market_date(row.get('_strategy_data_as_of')) != target_text:
         raise ValueError(f'{code} 日 K 尚未就緒')
     return row
@@ -20360,7 +20471,7 @@ def fetch_postclose_futures_rows(target_text):
     return rows, meta
 
 
-def build_postclose_job(row_sets, target, need_turnover, need_risk, previous_risk):
+def build_postclose_job(row_sets, target, need_turnover, need_risk, previous_risk, frozen_stock=None):
     """Worker returns immutable results; never reads or writes session state."""
     result = {'rankings': {}, 'errors': {}}
     target_text = target.strftime('%Y%m%d')
@@ -20432,13 +20543,19 @@ def build_postclose_job(row_sets, target, need_turnover, need_risk, previous_ris
                 entries = build_strategy_ranking_entries(rows, mode, market_context=context, asset_type=asset)
                 if not entries:
                     raise ValueError('尚無完整策略排名')
+                previous = (frozen_stock or {}).get(key, {}) if asset == 'stock' else {}
+                if previous.get('target_date') == target.isoformat():
+                    old_entries = {entry['code']: entry for entry in previous.get('entries', [])}
+                    entries = sorted([*old_entries.values(), *(entry for entry in entries if entry['code'] not in old_entries)],
+                                     key=lambda entry: (-entry['score'], entry['code']))
                 snapshots[key] = {
+                    **previous,
                     'updated_at': pd.Timestamp.now(tz='Asia/Taipei').isoformat(),
                     'target_date': target.isoformat(), 'source_date': target_text,
                     'source_dates': context['source_dates'], 'errors': [],
                     'complete': True, 'scope': postclose_scope(visible, asset),
                     'risk_version': postclose_risk_version(risk) if asset == 'stock' else '',
-                    'entries': entries[:50], 'using_last_success': False,
+                    'entries': entries, 'using_last_success': False,
                 }
             result['rankings'][asset] = snapshots
         except Exception as exc:
@@ -20511,6 +20628,70 @@ def sync_postclose_scopes(cloud_url, assets):
     return completed
 
 
+def supplement_frozen_stock_rankings(current, state):
+    """Only add missing symbols from the same completed date, through the existing worker."""
+    if is_market_closed_func(current.date()) or not dt_time(8, 30) <= current.time() < dt_time(21):
+        return
+    rows = st.session_state.get('_postclose_visible_stock')
+    if rows is None or rows.empty:
+        return
+    snapshots = st.session_state.get('stock_strategy_ranking_snapshots', {})
+    _, target = _post_close_target_date(current)
+    saved_targets = {item.get('target_date') for item in snapshots.values() if item.get('target_date')}
+    # An explicit after-close analysis may already have frozen today's complete data.
+    if saved_targets == {current.date().isoformat()} and current.time() >= dt_time(13, 30):
+        target = current.date()
+    if saved_targets and saved_targets != {target.isoformat()}:
+        return  # Never supplement a stale or mixed-day snapshot.
+    scope = postclose_scope(rows, 'stock')
+    signature = (target.isoformat(), tuple(scope), data_version(snapshots))
+    job = state.get('supplement')
+    if job and job['future'].done():
+        state.pop('supplement')
+        state['supplement_retry'] = (job['signature'], time.monotonic() + 900)
+        if job['signature'] != signature:
+            return  # Scope, source day or snapshot changed while the job ran.
+        try:
+            result = job['future'].result()
+        except Exception as exc:
+            st.session_state['_stock_ranking_waiting'] = [type(exc).__name__]
+            return
+        completed = result.get('rankings', {}).get('stock')
+        if not completed:
+            st.session_state['_stock_ranking_waiting'] = [result.get('errors', {}).get('stock', '盤前排名待補')]
+            return
+        for item in completed.values():
+            item['scope'] = scope
+            item['supplemented'] = True
+        st.session_state['stock_strategy_ranking_snapshots'] = completed
+        st.session_state['_stock_ranking_waiting'] = []
+        save_data_cache(st.session_state.stock_data, st.session_state.ignored_stocks,
+                        st.session_state.all_candidates, st.session_state.saved_notes, sync_cloud=False)
+        if get_app_secret('gsheet_api_url'):
+            state.setdefault('pending_sync', {})['stock'] = time.monotonic()
+            state['sync_retry_at'] = 0
+        st.rerun()
+        return
+    if job:
+        return
+    missing = set()
+    for mode in ('daytrade', 'swing'):
+        missing.update(set(scope) - {entry['code'] for entry in snapshots.get(mode, {}).get('entries', [])})
+    if not missing:
+        return
+    retry_signature, retry_time = state.get('supplement_retry', (None, 0))
+    if signature == retry_signature and time.monotonic() < retry_time:
+        return
+    worker = get_postclose_worker()
+    if not worker['slot'].acquire(blocking=False):
+        return
+    pending = rows[rows['代號'].astype(str).isin(missing)].copy(deep=True)
+    risk = dict(st.session_state.get('risk_filter_market_data', {}))
+    state['supplement'] = {'signature': signature,
+        'future': worker['executor'].submit(run_postclose_job, worker, build_postclose_job,
+                                            {'stock': pending}, target, False, False, risk, snapshots)}
+
+
 @st.fragment(run_every=60)
 def render_postclose_maintenance():
     # Reuse this minute tick to resume paused tables; no extra polling fragment.
@@ -20518,6 +20699,7 @@ def render_postclose_maintenance():
         check_intraday_auto_timer(room)
     current, target, sources_open, ranking_open = postclose_maintenance_window(pd.Timestamp.now(tz='Asia/Taipei'))
     state = st.session_state.setdefault('_postclose_maintenance', {})
+    supplement_frozen_stock_rankings(current, state)
     if not state.get('sync_restored'):
         state['sync_restored'] = True
         if get_app_secret('gsheet_api_url'):
@@ -20691,6 +20873,7 @@ tab1, tab_fibo, tab2, tab_db, tab_company, tab3 = st.tabs([
 ], key="main_workspace_active_tab", on_change="rerun")
 
 with tab1:
+    st.session_state.pop('_postclose_stock_tables', None)
     # Only timers registered during this full app run belong to visible tables.
     for room in ('stock', 'stock_independent', 'futures', 'futures_independent'):
         st.session_state.pop(f'{room}_auto_timer_seconds', None)
@@ -25571,7 +25754,9 @@ with tab_company:
             fetch_mops_monthly_revenue_announcement.clear()
             fetch_finmind_monthly_revenue_rows.clear()
             fetch_taiwan_monthly_revenue_events.clear()
-            fetch_us_revenue_events.clear()
+            for fetcher in (fetch_us_revenue_events, fetch_sec_revenue, fetch_sec_submissions,
+                            fetch_sec_facts, fetch_micron_revenue, fetch_yahoo_revenue):
+                fetcher.clear()
             with st.spinner("正在同步財報日期與營收資料，請稍候……"):
                 company_sections, company_sync_errors, used_tickers = (
                     fetch_company_event_sections(ticker_symbols)
@@ -25579,29 +25764,11 @@ with tab_company:
             previous_snapshot = normalize_company_event_snapshot(
                 st.session_state.company_event_snapshot
             )
-            earnings_result = company_sections.get(
-                'earnings', previous_snapshot.get('earnings', {'events': []})
-            )
-            taiwan_revenue_result = company_sections.get(
-                'taiwan_revenue', previous_snapshot.get('taiwan_revenue', {'events': []})
-            )
-            us_revenue_result = company_sections.get(
-                'us_revenue', previous_snapshot.get('us_revenue', {'events': []})
-            )
-            combined_events = (
-                earnings_result.get("events", [])
-                + taiwan_revenue_result.get("events", [])
-                + us_revenue_result.get("events", [])
-            )
             new_snapshot = {
-                **previous_snapshot,
+                **merge_company_sections(previous_snapshot, company_sections),
                 "updated_at": datetime.now(pytz.timezone("Asia/Taipei")).strftime("%Y/%m/%d %H:%M"),
                 "tickers": company_ticker_input,
                 "calendar_companies": previous_snapshot.get("calendar_companies", []),
-                "events": combined_events,
-                "earnings": earnings_result,
-                "taiwan_revenue": taiwan_revenue_result,
-                "us_revenue": us_revenue_result,
             }
             # Persisted corrections are supplied during sync; public-source
             # reconciliation still occurs inside the helper for stale values.
