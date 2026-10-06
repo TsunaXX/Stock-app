@@ -690,10 +690,19 @@ def fetch_official_market_holidays(year):
             title = str(row[1]).strip()
             if pd.isna(parsed) or any(word in title for word in ("開始交易", "最後交易日", "封關日")):
                 continue
-            holidays[(parsed.month, parsed.day)] = title or "市場無交易"
+            holidays[(parsed.month, parsed.day)] = market_holiday_title(parsed, title, row[2] if len(row) > 2 else '')
         return holidays
     except (requests.RequestException, ValueError, TypeError, KeyError):
         return {}
+
+
+def market_holiday_title(event_date, title, detail=''):
+    """Label the observed closure date without relabeling the actual holiday."""
+    title = str(title or '市場無交易').replace('(補)', ' 補假')
+    observed = re.search(r'於\s*(\d{1,2})月\s*(\d{1,2})日[^。；，]*補假', str(detail))
+    if observed and tuple(map(int, observed.groups())) == (event_date.month, event_date.day) and '補假' not in title:
+        title += ' 補假'
+    return title
 
 
 def get_holidays(year):
@@ -709,10 +718,10 @@ def get_holidays(year):
             (1, 1): "元旦", (2, 11): "封關日", (2, 12): "市場無交易", (2, 13): "市場無交易",
             (2, 14): "春節", (2, 15): "春節", (2, 16): "春節", (2, 17): "春節",
             (2, 18): "春節", (2, 19): "春節", (2, 20): "春節", (2, 21): "春節", (2, 22): "春節",
-            (2, 27): "和平紀念日(補)", (2, 28): "和平紀念日",
-            (4, 3): "兒童節(補)", (4, 4): "兒童節", (4, 5): "清明節", (4, 6): "清明節(補)",
+            (2, 27): "和平紀念日 補假", (2, 28): "和平紀念日",
+            (4, 3): "兒童節 補假", (4, 4): "兒童節", (4, 5): "清明節", (4, 6): "清明節 補假",
             (5, 1): "勞動節", (6, 19): "端午節", (9, 25): "中秋節", (9, 28): "教師節",
-            (10, 9): "國慶日(補)", (10, 10): "國慶日", (10, 25): "光復節", (10, 26): "光復節(補)",
+            (10, 9): "國慶日 補假", (10, 10): "國慶日", (10, 25): "臺灣光復暨金門古寧頭大捷紀念日", (10, 26): "臺灣光復暨金門古寧頭大捷紀念日 補假",
             (12, 25): "行憲紀念日"
         })
     if not h:
@@ -1303,7 +1312,7 @@ def fetch_twse_holiday_events(year):
             is_closed = not any(word in title for word in ("開始交易", "最後交易日", "封關日"))
             events.append({
                 "date": event_date.date().isoformat(),
-                "title": title,
+                "title": market_holiday_title(event_date, title, detail),
                 "detail": detail,
                 "closed": is_closed,
                 "temporary": False,
@@ -3472,6 +3481,7 @@ def fetch_tracked_company_updates(symbols):
                         raise ValueError('EPS 年季或數值未取得')
                     title = f'{company} {year}年第{quarter}季 EPS {eps:g}'
                     detail = f'營業收入 {row.get("營業收入", "未取得")}；稅後淨利 {row.get("稅後淨利", "未取得")}；資料版本 {row.get("出表日期", row.get("Date", ""))}；實際公告日未取得，不加入行事曆。'
+                    detail = format_company_event_detail({'category': 'financials', 'detail': detail})
                     identity = f'{code}:{year}:{quarter}'
                 elif label == 'disclosures':
                     subject = str(row.get('主旨 ', row.get('主旨', ''))).strip()
@@ -3824,6 +3834,35 @@ def merge_calendar_last_success(current_sources, previous_sources):
     return merged, retained
 
 
+def format_company_event_detail(event):
+    """Official EPS feed money is in thousands of TWD; also format saved old rows."""
+    detail = str(event.get('detail') or '')
+    if event.get('category') != 'financials' and not str(event.get('event_id', '')).startswith('financials:'):
+        return detail
+
+    def money(match):
+        amount = Decimal(match[2].replace(',', '')) * 1000
+        if not amount.is_finite():
+            return match[0]
+        sign, amount = ('-' if amount < 0 else ''), abs(amount)
+        parts = []
+        for scale, unit in ((10**12, '兆'), (10**8, '億'), (10**7, '千萬'), (10**4, '萬')):
+            count = int(amount // scale)
+            amount %= scale
+            if count:
+                parts.append(f'{count}{unit}')
+        if amount or not parts:
+            value = format(amount, 'f')
+            if '.' in value:
+                value = value.rstrip('0').rstrip('.')
+            parts.append(value + '元')
+        else:
+            parts.append('元')
+        return match[1] + ' ' + sign + ''.join(parts)
+
+    return re.sub(r'(營業收入|稅後淨利)\s+([+-]?[\d,]+(?:\.\d+)?)(?=；|$)', money, detail)
+
+
 def render_company_event_snapshot(snapshot):
     """在獨立分頁顯示財報與營收明細；此函式不執行任何網路查詢。"""
     earnings_result = snapshot.get("earnings", {})
@@ -3836,7 +3875,7 @@ def render_company_event_snapshot(snapshot):
                   for e in snapshot.get(section, {}).get('events', [])]
         if events:
             frame = pd.DataFrame([{'日期': e.get('date') or '公告日未取得',
-                                   '公司／事件': e.get('title'), '說明': e.get('detail'),
+                                   '公司／事件': e.get('title'), '說明': format_company_event_detail(e),
                                    '來源': e.get('source')} for e in events])
             st.dataframe(frame, hide_index=True, width='stretch')
         else:
@@ -7455,10 +7494,7 @@ def render_index_scenario_tracking(plan):
     if quote:
         state['quote'] = quote
     quote = state.get('quote')
-    if not quote or not state.get('fresh'):
-        st.caption('盤中情境：等待最新串流；保留原操作計畫。')
     if quote:
-        st.info(f"盤中情境｜微台 {quote['price']:,.0f}｜{index_scenario(plan, quote['price'])}")
         st.caption('來源時間：' + _stream_datetime(quote['updated']).strftime('%Y/%m/%d %H:%M:%S'))
     return quote
 
@@ -10824,6 +10860,9 @@ def save_futures_strategy_state(
         st.session_state['_futures_cloud_save_status'] = 'ok' if sync_ok else 'local_only'
         if gsheet_api_url and not sync_cloud:
             st.session_state['_futures_cloud_save_status'] = 'pending'
+            maintenance = st.session_state.setdefault('_postclose_maintenance', {})
+            maintenance.setdefault('pending_sync', {})['futures'] = time.monotonic()
+            maintenance['sync_retry_at'] = 0
         return True
     except (OSError, TypeError, ValueError):
         return False
@@ -11064,7 +11103,7 @@ def compact_futures_strategy_state(state, max_chars=45000):
     universe = pd.DataFrame(state.get('universe', []))
     rank_cache = dict(state.get('rank_cache', {}))
     live_cache = dict(state.get('live_cache', {}))
-    manual = [str(key) for key in state.get('manual', [])][-12:]
+    manual = list(dict.fromkeys(str(key) for key in state.get('manual', [])))
     ignored = [str(key) for key in state.get('ignored', [])][-12:]
     forced_keys = list(dict.fromkeys(manual + ignored))
 
@@ -11742,7 +11781,7 @@ def filter_active_futures_rows(rows, now_dt=None):
 
 
 def prune_futures_settlement_state(state, now_dt=None):
-    """清除已結算契約及其 rank/live/manual/ignored 快取，避免下一輪復活。"""
+    """清除已結算行情；保留使用者查詢清單，不讓舊行情復活。"""
     payload = dict(state) if isinstance(state, dict) else {}
     universe = pd.DataFrame(payload.get('universe', []))
     if not universe.empty:
@@ -11768,7 +11807,7 @@ def prune_futures_settlement_state(state, now_dt=None):
                 if is_futures_contract_settled(root, month, now_dt=now_dt):
                     cache.pop(key, None)
         payload[cache_name] = cache
-    for list_name in ('manual', 'ignored'):
+    for list_name in ('ignored',):
         values = list(payload.get(list_name, []) or [])
         payload[list_name] = [str(key) for key in values if str(key) not in removed]
     return payload, sorted(removed)
@@ -12472,6 +12511,8 @@ def get_stock_quick_search_state():
     current = normalize_stock_quick_search_state(
         st.session_state.get('_stock_quick_search_state', {})
     )
+    if current:
+        return current
     return normalize_stock_quick_search_state({
         'main': st.session_state.get('search_multiselect', current.get('main', [])),
         'independent': st.session_state.get(
@@ -13484,6 +13525,9 @@ def save_data_cache(
 
         if gsheet_api_url and not sync_cloud:
             st.session_state['_data_cache_sync_status'] = 'pending'
+            maintenance = st.session_state.setdefault('_postclose_maintenance', {})
+            maintenance.setdefault('pending_sync', {})['stock'] = time.monotonic()
+            maintenance['sync_retry_at'] = 0
         return sync_ok
 
     except (
@@ -13735,14 +13779,22 @@ def load_data_cache():
         if isinstance(data.get('display_settings', {}), dict)
         else {}
     )
-    quick_search_state = normalize_stock_quick_search_state(
-        data.get('quick_search_state')
-    )
+    quick_search_state = normalize_stock_quick_search_state(_newer_timestamped_state(
+        (remote_payload or {}).get('quick_search_state'), local_payload.get('quick_search_state'),
+    ))
     if not quick_search_state:
         legacy_search = load_search_cache()
         if legacy_search:
             quick_search_state = {'main': legacy_search, 'independent': [], 'updated_at': ''}
     st.session_state['_stock_quick_search_state'] = quick_search_state
+    data['quick_search_state'] = quick_search_state
+    if local_payload.get('postclose_sync_pending'):
+        data['postclose_sync_pending'] = True
+    if data:
+        try:
+            _write_json_atomic(STOCK_STRATEGY_CACHE_FILE, _json_safe(data), indent=2)
+        except (OSError, TypeError, ValueError):
+            pass
 
     st.session_state[
         '_stock_data_updated_at'
@@ -14033,12 +14085,12 @@ def save_search_cache(selected_items):
         pass
 
 
-def persist_stock_quick_search_state():
+def persist_stock_quick_search_state(section=None):
     """Save both stock selectors locally and in the Google Sheet stock scope."""
     previous = get_stock_quick_search_state()
     state = normalize_stock_quick_search_state({
-        'main': st.session_state.get('search_multiselect', previous.get('main', [])),
-        'independent': st.session_state.get(
+        'main': previous.get('main', []) if section == 'independent' else st.session_state.get('search_multiselect', previous.get('main', [])),
+        'independent': previous.get('independent', []) if section == 'main' else st.session_state.get(
             'indep_search_multiselect', previous.get('independent', []),
         ),
         'updated_at': datetime.now(pytz.timezone('Asia/Taipei')).isoformat(),
@@ -14051,6 +14103,20 @@ def persist_stock_quick_search_state():
         st.session_state.all_candidates,
         st.session_state.saved_notes,
         replace_stock_data=False,
+        sync_cloud=False,
+    )
+
+
+def render_stock_quick_search(section):
+    key = 'search_multiselect' if section == 'main' else 'indep_search_multiselect'
+    selected = get_stock_quick_search_state().get(section, [])
+    if key not in st.session_state:
+        st.session_state[key] = selected
+    options = list(dict.fromkeys(build_stock_search_options() + selected))
+    return st.multiselect(
+        '🔍 快速查詢 (中文/代號)', options=options, key=key,
+        on_change=persist_stock_quick_search_state, args=(section,),
+        placeholder='輸入 2330 或 台積電...',
     )
 
 if 'stock_data' not in st.session_state:
@@ -14105,7 +14171,7 @@ cached_stock_quick_search = normalize_stock_quick_search_state(
 )
 if 'search_multiselect' not in st.session_state:
     st.session_state.search_multiselect = (
-        cached_stock_quick_search.get('main') or load_search_cache()
+        cached_stock_quick_search.get('main', load_search_cache())
     )
 if 'indep_search_multiselect' not in st.session_state:
     st.session_state.indep_search_multiselect = cached_stock_quick_search.get(
@@ -14642,7 +14708,6 @@ def build_stock_search_options(allow_warrants=None):
 def render_stock_data_source_controls():
     """Render sources and quick search in the same settings panel."""
     st.markdown("#### 選股資料來源與快速查詢")
-    stock_options = build_stock_search_options()
 
     uploaded_file = None
     selected_sheet = 0
@@ -14687,11 +14752,7 @@ def render_stock_data_source_controls():
                     st.rerun()
         st.text_input("輸入連結 (CSV/Excel/Google Sheet)", key="cloud_url_input", placeholder="https://...")
 
-    search_selection = st.multiselect(
-        "🔍 快速查詢 (中文/代號)", options=stock_options,
-        key="search_multiselect", on_change=persist_stock_quick_search_state,
-        placeholder="輸入 2330 或 台積電...",
-    )
+    search_selection = render_stock_quick_search('main')
     render_stock_external_resources()
     return uploaded_file, selected_sheet, search_selection
 
@@ -20400,6 +20461,39 @@ if 'pending_unignore' in st.session_state and st.session_state.pending_unignore:
     st.rerun()
 
 
+def render_futures_quick_add(universe, container, persist):
+    labels = {
+        str(row['契約鍵']): f"{row['期貨代碼']} {row['契約月份']}｜{row['名稱']}｜成交 {int(row['當日成交口數']):,} 口"
+        for _, row in universe.iterrows()
+    }
+    saved = list(st.session_state.futures_strategy_manual)
+    for key in saved:
+        labels.setdefault(key, key + '｜暫無有效行情')
+    st.session_state['futures_quick_add'] = saved
+
+    def changed():
+        selected = list(st.session_state['futures_quick_add'])
+        removed = set(st.session_state.futures_strategy_manual) - set(selected)
+        st.session_state.futures_strategy_manual = selected
+        for key in selected:
+            st.session_state.futures_strategy_ignored.discard(key)
+        for name in ('futures_strategy_live_cache', 'futures_strategy_rank_cache'):
+            for key in removed:
+                st.session_state.get(name, {}).pop(key, None)
+        st.session_state.futures_strategy_editor_revision += 1
+        persist(sync_cloud=False)
+
+    with container:
+        st.markdown('#### 🔍 快速新增期貨')
+        st.multiselect(
+            '輸入中文名稱或期貨代碼（取消選取即移除）', list(labels),
+            format_func=labels.get, key='futures_quick_add', on_change=changed,
+            placeholder='例如：CDF、台積電期貨',
+        )
+        st.caption('自動記憶所選契約並同步 Google Sheet；暫無行情的契約保留至自行移除。')
+    return {label: key for key, label in labels.items()}
+
+
 def render_futures_strategy_room():
     """期貨成交量排行、即時分析、忽略遞補與獨立計算介面。"""
     persisted_futures_state = load_futures_strategy_state()
@@ -20483,6 +20577,7 @@ def render_futures_strategy_room():
                     "隱藏次月期貨", value=True, key="futures_hide_next",
                     help="隱藏次月與更遠月契約；結算日 13:30 後接手月份會自動視為近月。",
                 )
+            quick_add_container = st.container()
     with info_col:
         render_futures_strategy_explanation()
 
@@ -20563,12 +20658,8 @@ def render_futures_strategy_room():
             axis=1,
         )
 
-    # 契約到期或從官方清單移除後，同步清掉快速新增與行情快取，避免舊列黏在表尾。
+    # 缺席或已到期的契約不顯示行情；查詢清單只由使用者移除。
     valid_contract_keys = set(universe.get('契約鍵', pd.Series(dtype=str)).astype(str))
-    expired_manual_keys = {
-        str(key) for key in st.session_state.futures_strategy_manual
-        if str(key) not in valid_contract_keys
-    }
     stale_cache_keys = set()
     for cache_name in ('futures_strategy_live_cache', 'futures_strategy_rank_cache'):
         cache_value = st.session_state.get(cache_name, {})
@@ -20576,18 +20667,14 @@ def render_futures_strategy_room():
             str(key) for key in list(cache_value)
             if str(key) not in valid_contract_keys
         )
-    settlement_removed_keys = expired_manual_keys | stale_cache_keys
+    settlement_removed_keys = stale_cache_keys
     if settlement_removed_keys:
-        st.session_state.futures_strategy_manual = [
-            key for key in st.session_state.futures_strategy_manual
-            if str(key) not in settlement_removed_keys
-        ]
         for cache_name in ('futures_strategy_live_cache', 'futures_strategy_rank_cache'):
             cache_value = st.session_state.get(cache_name, {})
             for key in settlement_removed_keys:
                 cache_value.pop(key, None)
 
-    def persist_futures_room_state(snapshot=None):
+    def persist_futures_room_state(snapshot=None, sync_cloud=True):
         return save_futures_strategy_state(
             universe=snapshot if isinstance(snapshot, pd.DataFrame) else universe,
             metadata=universe_meta,
@@ -20597,7 +20684,10 @@ def render_futures_strategy_room():
             ignored=st.session_state.futures_strategy_ignored,
             rank_time=st.session_state.futures_strategy_rank_time,
             live_time=st.session_state.futures_strategy_live_time,
+            sync_cloud=sync_cloud,
         )
+
+    option_map = render_futures_quick_add(universe, quick_add_container, persist_futures_room_state)
 
     rank_cache = st.session_state.futures_strategy_rank_cache
     if rank_cache:
@@ -21044,35 +21134,6 @@ def render_futures_strategy_room():
     (futures_column_config, style_futures_row, futures_display_columns, futures_compact_columns,
      futures_full_columns, futures_basic_columns) = render_futures_main_table(display_rows)
 
-    st.markdown("#### 🔍 快速新增期貨")
-    option_map = {
-        f"{row['期貨代碼']} {row['契約月份']}｜{row['名稱']}｜成交 {int(row['當日成交口數']):,} 口": str(row['契約鍵'])
-        for _, row in universe.iterrows()
-    }
-    key_to_option = {key: label for label, key in option_map.items()}
-    default_manual_labels = [
-        key_to_option[key] for key in st.session_state.futures_strategy_manual
-        if key in key_to_option
-    ]
-    selected_to_add = st.multiselect(
-        "輸入中文名稱或期貨代碼（取消選取即從快速新增清單移除）",
-        list(option_map), default=default_manual_labels, key='futures_quick_add',
-        placeholder='例如：CDF、台積電期貨'
-    )
-    selected_manual_keys = [option_map[label] for label in selected_to_add if label in option_map]
-    if selected_manual_keys != st.session_state.futures_strategy_manual:
-        removed_manual_keys = set(st.session_state.futures_strategy_manual) - set(selected_manual_keys)
-        st.session_state.futures_strategy_manual = selected_manual_keys
-        for key in selected_manual_keys:
-            st.session_state.futures_strategy_ignored.discard(key)
-        for cache_name in ('futures_strategy_live_cache', 'futures_strategy_rank_cache'):
-            cache_value = st.session_state.get(cache_name, {})
-            for key in removed_manual_keys:
-                cache_value.pop(key, None)
-        st.session_state.futures_strategy_editor_revision += 1
-        persist_futures_room_state()
-        st.rerun()
-
     if st.session_state.futures_strategy_ignored:
         with st.expander("🚫 管理已隱藏期貨", expanded=False):
             ignored_options = {
@@ -21421,7 +21482,7 @@ def run_postclose_job(worker, function, *args):
 
 
 def merge_postclose_scope(remote, local, asset):
-    """Only automated rankings/risk may change; cloud selections stay intact."""
+    """Merge rankings/risk and timestamped query edits independently."""
     remote = remote if isinstance(remote, dict) else {}
     merged = dict(remote or local)
     first, second = remote.get('strategy_ranking_snapshots', {}), local.get('strategy_ranking_snapshots', {})
@@ -21429,6 +21490,9 @@ def merge_postclose_scope(remote, local, asset):
         key: _newer_timestamped_state(first.get(key), second.get(key)) for key in set(first) | set(second)
     }
     if asset == 'stock':
+        merged['quick_search_state'] = _newer_timestamped_state(
+            remote.get('quick_search_state'), local.get('quick_search_state'),
+        )
         old, new = remote.get('market_risk_data', {}), local.get('market_risk_data', {})
         selected = _newer_timestamped_state(
             {**old, 'updated_at': old.get('last_attempt') or old.get('updated')},
@@ -21440,6 +21504,11 @@ def merge_postclose_scope(remote, local, asset):
                 new['errors'], market_by_code=new.get('market_by_code'), attempted_at=new.get('last_attempt'),
             )
         merged['market_risk_data'] = selected
+    elif asset == 'futures':
+        selection = _prefer_futures_state_section(remote, local, 'selection_updated_at')
+        for key in ('manual', 'ignored', 'selection_updated_at'):
+            if key in selection:
+                merged[key] = selection[key]
     merged.pop('postclose_sync_pending', None)
     merged['updated_at'] = pd.Timestamp.now(tz='Asia/Taipei').isoformat()
     return merged
@@ -21580,11 +21649,11 @@ def render_postclose_maintenance():
     sync_task = state.get('sync_task')
     if sync_task is not None and sync_task.done():
         state.pop('sync_task')
-        state['sync_retry_at'] = time.monotonic() + 900
         try:
             completed = sync_task.result()
         except Exception:
             completed = []
+        state['sync_retry_at'] = 0 if set(completed) == set(state.get('sync_versions', {})) else time.monotonic() + 900
         for asset in completed:
             if state.get('sync_versions', {}).get(asset) == state.get('pending_sync', {}).get(asset):
                 state['pending_sync'].pop(asset, None)
@@ -21599,7 +21668,7 @@ def render_postclose_maintenance():
                 list(state['pending_sync']),
             )
     if state.get('pending_sync'):
-        st.caption('排名已保留本機，Google Sheet 背景同步中；失敗會自動重試。')
+        st.caption('查詢清單與分析已保留本機，Google Sheet 背景同步中；失敗會自動重試。')
     seed_task = state.get('seed_task')
     if seed_task is not None and seed_task.done():
         state.pop('seed_task')
@@ -23027,13 +23096,7 @@ if tab1.open and stock_strategy_tab.open:
                     st.caption("VWAP 判讀：偏多＝站上 VWAP（紅色）；偏空＝跌破 VWAP（綠色）。09:00–09:15 使用快照＋1 分 K，之後使用 5 分 K。")
             col_q1, col_q2 = st.columns([5, 1.5])
             with col_q1:
-                indep_selection = st.multiselect(
-                    "🔍 快速查詢 (中文/代號)",
-                    options=build_stock_search_options(),
-                    key="indep_search_multiselect",
-                    on_change=persist_stock_quick_search_state,
-                    placeholder="輸入 2330 或 台積電..."
-                )
+                indep_selection = render_stock_quick_search('independent')
             with col_q2:
                 st.markdown("<div style='margin-top: 28px;'></div>", unsafe_allow_html=True)
                 btn_indep_run = st.button("🚀 執行分析", key="btn_indep_run", width='stretch')
@@ -24572,15 +24635,16 @@ with tab_fibo:
             )
             st.session_state[timer_key + '_saved'] = seconds
             interval = intraday_auto_interval('options' if option_page else 'index', True, seconds)
-            st.caption(
-                f'⏰ 全頁自動更新：每 {seconds} 秒｜分析與即時點位同步更新'
-                if interval else '⏰ 自動追蹤：等待 Shioaji 登入；保留最近完整資料。'
-            )
             seed_date = _post_close_target_date()[1]
             @st.fragment(run_every=interval)
             def render_active_operation_plan():
                 if _post_close_target_date()[1] != seed_date:
                     st.rerun()
+                checked_at = datetime.now(pytz.timezone('Asia/Taipei')).strftime('%Y/%m/%d %H:%M:%S')
+                st.caption(
+                    f'⏰ 全頁自動更新：每 {seconds} 秒｜分析與即時點位同步更新｜自動更新時間：{checked_at}'
+                    if interval else '⏰ 自動追蹤：等待 Shioaji 登入；保留最近完整資料。'
+                )
                 render_operation_plan(thermometer_data, option_page)
             render_active_operation_plan()
 
