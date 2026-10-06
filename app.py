@@ -9929,6 +9929,12 @@ def _newer_timestamped_state(first, second):
         return dict(second)
     if not second:
         return dict(first)
+    if first.get('target_date') and first.get('target_date') == second.get('target_date'):
+        # An older client saving later must not replace the migrated daytrade formula.
+        if first.get('weights') and not second.get('weights'):
+            return dict(first)
+        if second.get('weights') and not first.get('weights'):
+            return dict(second)
     first_time = _state_updated_at(first)
     second_time = _state_updated_at(second)
     if first_time is None and second_time is None:

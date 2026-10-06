@@ -117,3 +117,6 @@ def test_cloud_supplements_merge_same_day_additions_without_rolling_back_scores(
     new['target_date'] = old['target_date']
     new['weights'] = {'technical': .6, 'chips': .4, 'fundamental': 0}
     assert ns['_newer_timestamped_state'](old, new)['entries'] == new['entries']
+    old['updated_at'] = '2026-10-06T12:00:00+08:00'
+    assert ns['_newer_timestamped_state'](old, new)['entries'] == new['entries']
+    assert ns['_newer_timestamped_state'](new, old)['entries'] == new['entries']
