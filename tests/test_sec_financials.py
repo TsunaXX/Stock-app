@@ -18,6 +18,36 @@ def test_actual_micron_release_keeps_gaap_and_rejects_future_guidance():
     assert release_revenue('<table>Revenue $61.5 billion GAAP Outlook</table>') is None
 
 
+def test_micron_requests_identify_the_app_and_follow_only_official_release_links():
+    from types import SimpleNamespace
+    ns = load_app_symbols('fetch_micron_revenue')
+    ns['release_revenue'] = release_revenue
+    calls = []
+    def get(url, **kwargs):
+        calls.append((url, kwargs))
+        assert kwargs['headers']['User-Agent'] == 'Stock-app github.com/TsunaXX/Stock-app'
+        document = ('<a href="/news/press-release/2026/Micron-Reports-Results/default.aspx">Press release</a>'
+                    if '/overview/' in url else
+                    '<span class="evergreen-news-date-text">September 30, 2026</span>' + FIXTURE.read_text(encoding='utf-8'))
+        return SimpleNamespace(content=document.encode(), raise_for_status=lambda: None)
+    ns['requests'] = SimpleNamespace(get=get)
+    data = ns['fetch_micron_revenue']()
+    assert data['period_end'] == '2026-09-03' and data['filed_date'] == '2026-09-30'
+    assert len(calls) == 2 and calls[1][0].startswith('https://investors.micron.com/news/press-release/')
+
+
+def test_saved_legacy_and_new_source_for_same_quarter_count_only_once():
+    ns = load_app_symbols('normalize_company_event_snapshot', 'empty_company_event_snapshot')
+    old = {'date': '2026-05-31', 'source': 'Yahoo Finance', 'title': 'MU 季營收（期末）',
+           'revenue': {'ticker': 'MU', 'period_end': '2026-05-31', 'quarter_revenue': 1}}
+    new = {**old, 'ticker': 'MU', 'source': 'Yahoo 備援', 'title': 'MU 季營收',
+           'data_asof': '2026-05-31', 'revenue': {**old['revenue'], 'quarter_revenue': 2}}
+    saved = {'us_revenue': {'events': [new, old]}, 'events': [new, old], 'calendar_companies': ['MU']}
+    normalized = ns['normalize_company_event_snapshot'](saved)
+    assert normalized['us_revenue']['events'] == [new]
+    assert normalized['events'] == [new] and normalized['calendar_companies'] == ['MU']
+
+
 def test_sec_facts_use_actual_quarters_and_derive_q4_revenue_without_deriving_eps():
     def row(start, end, value, form='10-Q', accession='quarter'):
         return {'start': start, 'end': end, 'val': value, 'form': form,

@@ -2844,7 +2844,8 @@ def fetch_sec_revenue(ticker):
 @st.cache_data(ttl=600, max_entries=2, show_spinner=False)
 def fetch_micron_revenue():
     # Official issuer fallback also covers SEC IP restrictions; never hard-code a fiscal date/value.
-    response = requests.get('https://investors.micron.com/overview/default.aspx', timeout=(4, 10))
+    headers = {'User-Agent': 'Stock-app github.com/TsunaXX/Stock-app'}
+    response = requests.get('https://investors.micron.com/overview/default.aspx', headers=headers, timeout=(4, 10))
     response.raise_for_status()
     soup = BeautifulSoup(response.content, 'html.parser')
     links = [urljoin('https://investors.micron.com/', a['href']).replace('http://', 'https://', 1)
@@ -2852,7 +2853,7 @@ def fetch_micron_revenue():
     links = [url for url in links if url.startswith('https://investors.micron.com/news/press-release/')]
     if not links:
         raise ValueError('Micron 最新財報連結未取得')
-    response = requests.get(links[0], timeout=(4, 10))
+    response = requests.get(links[0], headers=headers, timeout=(4, 10))
     response.raise_for_status()
     data = release_revenue(response.content)
     if not data:
@@ -2971,6 +2972,9 @@ def normalize_company_event_snapshot(saved):
             normalized[section]['events'] = []
 
     def event_key(event):
+        revenue = event.get('revenue') if isinstance(event.get('revenue'), dict) else {}
+        if revenue.get('period_end') and revenue.get('ticker'):
+            return ('us-revenue', str(event.get('ticker') or revenue['ticker']).upper(), str(revenue['period_end']))
         return (
             str(event.get('date', '')), str(event.get('title', '')),
             str(event.get('ticker', '')), str(event.get('source', '')),
@@ -2997,6 +3001,9 @@ def normalize_company_event_snapshot(saved):
         elif '月營收' in title or 'MOPS' in source or '每月營收' in source:
             section = 'taiwan_revenue'
             event.setdefault('market', '台股')
+        elif isinstance(event.get('revenue'), dict) and event['revenue'].get('period_end'):
+            section = 'us_revenue'
+            event.setdefault('market', '美股')
         elif '財報' in title or source == 'Yahoo Finance':
             if not market:
                 market = '台股' if re.fullmatch(r'\d{4,6}\.(?:TW|TWO)', ticker, re.I) else '美股'
@@ -3014,6 +3021,10 @@ def normalize_company_event_snapshot(saved):
 
     all_events, all_keys = [], set()
     for section in ('earnings', 'taiwan_revenue', 'us_revenue', 'financials', 'disclosures', 'dividends'):
+        if section == 'us_revenue':
+            section_events[section] = list({event_key(event): event for event in sorted(
+                (e for e in section_events[section] if isinstance(e, dict)),
+                key=lambda e: str(e.get('data_asof') or ''))}.values())
         normalized[section]['events'] = section_events[section]
         for event in section_events[section]:
             if not isinstance(event, dict):
