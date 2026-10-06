@@ -745,6 +745,48 @@ def test_taiwan_revenue_uses_mops_before_twse_and_keeps_actual_time():
     assert fallback["revenue"]["date_source"] == "TWSE OpenAPI 出表日期（公告時間未取得）"
 
 
+def test_nanya_published_month_overrides_stale_aggregate_and_keeps_source_date():
+    ns = load_app_symbols('_to_number', '_roc_month_text', '_signed_percent', '_thousand_currency',
+                          '_format_compact_number', '_roc_compact_date',
+                          'parse_nanya_monthly_revenue_release', 'fetch_taiwan_monthly_revenue_events')
+    content = '''<div>2026/10/05 南亞科技2026年9月營收報告 (單位: 新台幣千元)</div>
+    <table><tr><td>2026年9月營收</td><td>45,091,089</td></tr>
+    <tr><td>2026年8月營收</td><td>44,690,268</td></tr>
+    <tr><td>月增(減)%</td><td>0.9%</td></tr>
+    <tr><td>2025年9月營收</td><td>6,664,140</td></tr>
+    <tr><td>年增(減)%</td><td>576.62%</td></tr></table>'''
+    parse = ns['parse_nanya_monthly_revenue_release']
+    latest = parse(content, 115, 9, 'https://www.nanya.com/tw/IR/16/?IRId=14187')
+    assert latest['營業收入-當月營收'] == 45_091_089
+    assert latest['營業收入-上月比較增減(%)'] == .9
+    assert latest['營業收入-去年同月增減(%)'] == 576.62
+    assert parse(content, 115, 10, 'official') is None
+    assert parse(content.replace('新台幣千元', '新台幣億元'), 115, 9, 'official') is None
+    ns.update({
+        'resolve_earnings_ticker': lambda _: {'candidates':['2408.TW'], 'display_name':'南亞科'},
+        '_mops_monthly_revenue_probe_months': lambda: [(115,9),(115,8)],
+        'fetch_mops_company_monthly_revenue': lambda *a: None,
+        'fetch_twse_monthly_revenue_rows': lambda: [{'公司代號':'2408','資料年月':'11508'}],
+        'select_latest_monthly_revenue_rows': lambda rows: {'2408':rows[0]},
+        'fetch_nanya_monthly_revenue': lambda *a: latest,
+        'fetch_finmind_monthly_revenue_rows': lambda *a: (_ for _ in ()).throw(AssertionError('new official month already available')),
+        'fetch_mops_monthly_revenue_announcement': lambda *a: None,
+    })
+    event = ns['fetch_taiwan_monthly_revenue_events'](['2408'])['events'][0]
+    assert event['revenue']['revenue_month'] == '11509'
+    assert event['date'] == '2026-10-05'
+    assert event['revenue']['yoy'] == '+576.62%'
+    assert 'www.nanya.com' in event['source']
+    # All companies must still probe a newer fallback when an older TWSE row exists.
+    ns.update({
+        'resolve_earnings_ticker': lambda _: {'candidates':['2330.TW'], 'display_name':'台積電'},
+        'select_latest_monthly_revenue_rows': lambda rows: {'2330':{'公司代號':'2330','資料年月':'11508'}},
+        'fetch_finmind_monthly_revenue_rows': lambda *a: [],
+        'build_finmind_monthly_revenue_row': lambda *a: {**latest,'公司代號':'2330','公司名稱':'台積電'},
+    })
+    assert ns['fetch_taiwan_monthly_revenue_events'](['2330'])['events'][0]['revenue']['revenue_month'] == '11509'
+
+
 def test_finmind_monthly_revenue_fallback_converts_july_data():
     symbols = load_app_symbols(
         "_to_number", "_roc_month_text", "build_finmind_monthly_revenue_row",
@@ -1718,7 +1760,7 @@ def test_stock_ranking_and_option_plan_skip_redundant_fetches():
     assert "'tpex_daily'" not in ranking_source
     assert "if asset_type in ('futures', 'combined')" in ranking_source
 
-    option_start = source.index("if tab_fibo.open and tab_option_plan.open and (")
+    option_start = source.index("if refresh_option_plan or settings_changed or direction_changed:")
     option_end = source.index("directional_quote = option_cache.get", option_start)
     option_source = source[option_start:option_end]
     assert option_source.count("select_txo_expiry(") == 1
@@ -2243,8 +2285,8 @@ def test_index_operation_plan_colors_entry_stop_target_and_reward_risk_metrics()
 
 def test_index_operation_plan_waits_and_retries_without_missing_data_warning():
     source = APP_PATH.read_text(encoding='utf-8')
-    start = source.index('        if plan is None:')
-    end = source.index('        else:', start)
+    start = source.index('    if plan is None:', source.index('def render_operation_plan'))
+    end = source.index("    st.session_state.pop('_index_trade_plan_auto_retry'", start)
     waiting_source = source[start:end]
     assert '正在載入加權與期貨日 K' in waiting_source
     assert "clear_index_market_data_cache()" in waiting_source
@@ -2255,6 +2297,8 @@ def test_index_operation_plan_waits_and_retries_without_missing_data_warning():
     assert "'label': '短波停損', 'label_color': '#ffc107'" in source
     assert "entry_rr_color" in source
     assert "short_rr_color" in source
+    assert 'seed_date = _post_close_target_date()[1]' in source
+    assert 'if _post_close_target_date()[1] != seed_date:' in source
 
 
 def test_phone_charts_keep_payoff_levels_outside_the_plot_canvas():
