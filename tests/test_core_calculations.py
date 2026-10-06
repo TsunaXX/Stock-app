@@ -1321,8 +1321,7 @@ def test_stock_search_options_are_shared_without_leaking_local_scope():
         "123456 測試權證", "2330 台積電",
     ]
     source = APP_PATH.read_text(encoding="utf-8")
-    independent_start = source.index('key="indep_search_multiselect"')
-    assert "options=build_stock_search_options()" in source[independent_start - 180:independent_start]
+    assert "render_stock_quick_search('independent')" in source
 
 
 def test_futures_ranking_derives_curve_oi_range_and_spot_basis_without_fake_values():
@@ -2409,7 +2408,7 @@ def test_prune_futures_settlement_state_removes_old_rank_and_live_keys():
     assert removed == ["CDF:202608"]
     assert "CDF:202608" not in pruned["rank_cache"]
     assert "CDF:202608" not in pruned["live_cache"]
-    assert pruned["manual"] == ["CDF:202609"]
+    assert pruned["manual"] == ["CDF:202608", "CDF:202609"]
     assert pruned["ignored"] == []
 
 

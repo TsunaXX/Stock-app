@@ -316,16 +316,19 @@ plan = get_stable_index_trade_plan(data,{},data,{})
 render_index_scenario_tracking(plan)
 '''
     app = AppTest.from_string(source).run()
-    assert not app.exception and '接近支撐' in app.info[0].value
+    assert not app.exception and not app.info
+    assert app.session_state['_index_scenario_live']['quote']['price'] == 20010
     assert len(app.toggle) == 0
     app.session_state['live'] = 19970
     app.run()
-    assert not app.exception and '失效' in app.info[0].value
+    assert not app.exception and not app.info
+    assert app.session_state['_index_scenario_live']['quote']['price'] == 19970
     assert app.session_state['builds'] == 1
     app.session_state['stale'] = True
     app.run()
     assert not app.exception and not app.session_state['_index_scenario_live']['fresh']
-    assert '失效' in app.info[0].value and '等待最新串流' in app.caption[0].value
+    assert not app.info and app.session_state['_index_scenario_live']['quote']['price'] == 19970
+    assert '2026/10/05 10:00:00' in app.caption[0].value
 
 
 def test_company_event_ui_renders_eps_and_disclosures_without_network():
@@ -339,6 +342,7 @@ from datetime import datetime
 compact_table_column_config = lambda frame: {}
 _revenue_metric_html = lambda label,value,note: label + str(value) + note
 _thousand_currency = str
+format_company_event_detail = lambda e: e.get('detail')
 snapshot = {'earnings':{},'taiwan_revenue':{},'us_revenue':{},'financials':{'events':[
  {'date':'','title':'台積電 EPS 10','detail':'實際公告日未取得','source':'上市官方公開資料'}]},
  'disclosures':{'events':[{'date':'2026-10-05','title':'台積電 重大訊息','detail':'公告內容','source':'上市官方公开資料'}]}}
@@ -409,6 +413,8 @@ render_postclose_maintenance = lambda: None
         assert not app.exception
         assert all(t.key not in ('option_auto_enabled','index_scenario_auto') for t in app.toggle)
         assert app.session_state['analysis_price'] == 20110.
+        assert any('全頁自動更新' in c.value and '自動更新時間：' in c.value for c in app.caption)
+        assert not any('盤中情境' in c.value for c in [*app.caption, *app.info])
         app.number_input(key='option_auto_seconds').set_value(7).run()
         assert not app.exception and app.session_state['timer_seconds'] == 7
         assert app.session_state['timer_room'] == 'options'
