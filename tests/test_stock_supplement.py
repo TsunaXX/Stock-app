@@ -15,7 +15,7 @@ class State(dict):
 
 def test_frozen_supplement_only_scores_missing_rows_saves_all_and_never_changes_existing_scores():
     ns = load_app_symbols('supplement_frozen_stock_rankings', 'postclose_scope', 'build_postclose_job',
-                          'run_postclose_job', '_ranking_market_date', '_ranking_number', '_as_float', 'postclose_risk_version', 'strategy_ranking_weights')
+                          'run_postclose_job', '_ranking_market_date', '_ranking_number', '_as_float', 'postclose_risk_version', 'strategy_ranking_weights', 'merge_market_risk_refresh')
     now = pd.Timestamp('2026-10-06 10:00:00')
     original = [{'code': str(i), 'score': 80 - i, 'reason': 'frozen', 'coverage': 100} for i in range(5)]
     snapshots = {mode: {'target_date': '2026-10-05', 'updated_at': '2026-10-06T08:00:00+08:00',
@@ -26,8 +26,13 @@ def test_frozen_supplement_only_scores_missing_rows_saves_all_and_never_changes_
                          '_daytrade_vwap': 998} for i in range(56)])
     state = State(stock_strategy_ranking_snapshots=snapshots, _postclose_visible_stock=rows,
                   stock_data=rows, ignored_stocks=[], all_candidates=[], saved_notes={},
-                  risk_filter_market_data={'updated': '2026/10/05', 'errors': []})
+                  risk_filter_market_data={})
     reruns, saved, scored = [], [], []
+    risk_calls = []
+    def fetch_risk():
+        risk_calls.append(True)
+        return {'1815': 1}, [], [], {'1815': '上櫃'}, []
+    ns['fetch_market_risk_lists'] = fetch_risk
     ns['st'] = SimpleNamespace(session_state=state, rerun=lambda: reruns.append(True))
     ns['is_market_closed_func'] = lambda day: False
     ns['_post_close_target_date'] = lambda *a: (now, date(2026, 10, 5))
@@ -60,6 +65,8 @@ def test_frozen_supplement_only_scores_missing_rows_saves_all_and_never_changes_
         assert [e for e in updated['entries'] if e['code'] in {str(i) for i in range(5)}] == original
         assert updated['target_date'] == '2026-10-05' and updated['supplemented']
     assert saved == [{'sync_cloud': False}, {'sync_cloud': False}] and maintenance['pending_sync']['stock']
+    assert risk_calls == [True] and state['risk_filter_market_data']['updated']
+    assert state['risk_filter_market_data']['attention'] == {'1815': 1}
     supplement(now, maintenance)
     assert len(scored) == 2
 
@@ -68,7 +75,8 @@ def test_supplement_discards_delayed_results_and_retries_failures_without_changi
     ns = load_app_symbols('supplement_frozen_stock_rankings', 'postclose_scope', 'strategy_ranking_weights')
     old = {'daytrade': {'target_date': '2026-10-05', 'updated_at': 'a', 'entries': []}}
     state = State(stock_strategy_ranking_snapshots=old, _postclose_visible_stock=pd.DataFrame([{'代號':'2330'}]))
-    ns['st'] = SimpleNamespace(session_state=state)
+    reruns = []
+    ns['st'] = SimpleNamespace(session_state=state, rerun=lambda: reruns.append(True))
     now = pd.Timestamp('2026-10-06 10:00')
     ns['is_market_closed_func'] = lambda day: False
     ns['_post_close_target_date'] = lambda *a: (now, date(2026, 10, 5))
@@ -79,6 +87,7 @@ def test_supplement_discards_delayed_results_and_retries_failures_without_changi
     ns['supplement_frozen_stock_rankings'](now, maintenance)
     assert state['stock_strategy_ranking_snapshots'] is old
     assert state['_stock_ranking_waiting'] == ['法人缺項']
+    assert state['_stock_daytrade_ranking_waiting'] == ['法人缺項'] and reruns == [True]
     assert maintenance['supplement_retry'][0] == signature
     state['stock_strategy_ranking_snapshots'] = {'daytrade': dict(old['daytrade'], updated_at='manual-new')}
     maintenance['supplement'] = {'signature':signature, 'future':pending}
