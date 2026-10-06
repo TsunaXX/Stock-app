@@ -2756,6 +2756,28 @@ def test_fibo_scope_readback_must_match_exact_saved_tags():
     assert not matches("fibo_strategy", expected, stale)
 
 
+def test_scope_readback_ignores_envelope_time_but_verifies_query_removals():
+    symbols = load_app_symbols('_json_safe', '_remote_scope_payload_matches')
+    symbols['GOOGLE_SCOPE_FIBO'] = 'fibo_strategy'
+    expected = {
+        'quick_search_state': {'main': [], 'independent': ['2330 台積電'],
+                               'updated_at': '2026-10-06T18:04:31+08:00'},
+        '_scope_updated_at': '2026-10-06T17:14:02+08:00',
+    }
+    actual = dict(expected, _scope_updated_at='2026-10-06T18:05:11+08:00')
+    matches = symbols['_remote_scope_payload_matches']
+    for scope in ('stock_strategy', 'futures_strategy', 'company_events', 'strategy_signals'):
+        assert matches(scope, expected, actual)
+        assert matches(scope, expected, {k: v for k, v in actual.items() if k != '_scope_updated_at'})
+        stale = dict(actual, quick_search_state=dict(expected['quick_search_state'], main=['2408 南亞科']))
+        assert not matches(scope, expected, stale)
+        stale_time = dict(actual, quick_search_state=dict(expected['quick_search_state'],
+                                                          updated_at='2026-10-05T18:04:31+08:00'))
+        assert not matches(scope, expected, stale_time)
+    assert expected['_scope_updated_at'] == '2026-10-06T17:14:02+08:00'
+    assert actual['_scope_updated_at'] == '2026-10-06T18:05:11+08:00'
+
+
 def test_forced_fibo_cloud_import_never_falls_back_to_local_tags():
     symbols = load_app_symbols("load_fibo_tags_from_cloud")
 

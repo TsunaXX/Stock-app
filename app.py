@@ -12737,6 +12737,7 @@ def _remote_scope_payload_matches(scope, expected, actual):
         return len(expected_tags) >= 5 and actual_tags == expected_tags
     expected_value = _json_safe(expected)
     actual_value = _json_safe(actual)
+    expected_value.pop('_scope_updated_at', None)
     if isinstance(actual_value, dict):
         actual_value.pop('_scope_updated_at', None)
     return actual_value == expected_value
