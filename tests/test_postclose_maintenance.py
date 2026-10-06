@@ -5,12 +5,12 @@ from types import SimpleNamespace
 import pandas as pd
 import pytest
 
-from test_core_calculations import load_app_symbols
+from test_core_calculations import APP_PATH, load_app_symbols
 
 
 def helpers(*extra):
     return load_app_symbols('_as_float', '_ranking_number', '_ranking_market_date',
-                            '_ranking_clamp', 'postclose_risk_version', 'enrich_futures_ranking_fields', '_safe_number', *extra)
+                            '_ranking_clamp', 'strategy_ranking_weights', 'postclose_risk_version', 'enrich_futures_ranking_fields', '_safe_number', *extra)
 
 
 def context():
@@ -69,6 +69,102 @@ def test_tpex_parser_preserves_zero_and_missing_margin():
     assert row['trust_net'] == 12000
     assert row['margin_delta'] is None
     assert row['short_delta'] == 0
+
+
+def test_stock_daytrade_fetches_only_four_chip_sources_and_ignores_fundamental_failures():
+    ns = helpers('fetch_post_close_stock_ranking_context', 'ranking_context_issues')
+    ns.update(TWSE_MONTHLY_REVENUE_URL='revenue', TPEX_MONTHLY_REVENUE_URL='revenue')
+    calls = []
+    def fetch(name, *args):
+        calls.append(name)
+        if name.endswith(('valuation', 'revenue', 'eps')):
+            raise ConnectionError('fundamentals unavailable')
+        return []
+    ns['fetch_ranking_source'] = fetch
+    ns['fetch_post_close_stock_ranking_context']('20261002', 'stock', '當沖')
+    assert set(calls) == {'twse_institutional', 'tpex_institutional', 'twse_margin', 'tpex_margin'}
+    data = context()
+    for source in ('上市估值', '上櫃估值'):
+        data['source_dates'].pop(source)
+    data['errors'] = ['twse_valuation: ConnectionError', 'tpex_revenue: ValueError', 'twse_eps: timeout']
+    rows = pd.DataFrame([{'代號': '1815'}])
+    assert not ns['ranking_context_issues'](data, rows, 'stock', date(2026, 10, 2), '當沖')
+    assert ns['ranking_context_issues'](data, rows, 'stock', date(2026, 10, 2), '波段')
+    data['stocks']['1815']['foreign_net'] = None
+    assert ns['ranking_context_issues'](data, rows, 'stock', date(2026, 10, 2), '當沖') == ['1815 法人籌碼缺項']
+
+
+def test_daytrade_scores_all_rows_without_calling_fundamentals_and_swing_still_uses_them():
+    ns = helpers('_stock_ranking_technical_component', '_ranking_chip_component',
+                 '_ranking_average', '_ranking_component_from_items', '_combine_ranking_components', '_score_stock_post_close')
+    row = {'代號': '1815', '收盤價': 100, '_ma5': 99, '漲跌幅': 1}
+    ns['_ranking_fundamental_component'] = lambda *a: (_ for _ in ()).throw(AssertionError('must not score fundamentals'))
+    daytrade = ns['_score_stock_post_close'](row, '當沖', context())
+    assert daytrade['coverage'] == 100 and '基本' not in daytrade['reason']
+    ns['_ranking_fundamental_component'] = lambda *a: {'signal': 1, 'quality': 90, 'coverage': 1, 'text': 'EPS'}
+    assert '基本偏多' in ns['_score_stock_post_close'](row, '波段', context())['reason']
+
+
+def test_background_daytrade_survives_failed_swing_and_rebuilds_legacy_formula():
+    ns = helpers('build_postclose_job', 'ranking_context_issues', 'postclose_scope')
+    calls = []
+    def fetch(*a, **kw):
+        calls.append(kw['strategy_mode'])
+        if kw['strategy_mode'] == '波段':
+            raise ConnectionError('fundamentals offline')
+        return context()
+    ns['fetch_post_close_stock_ranking_context'] = fetch
+    ns['build_strategy_ranking_entries'] = lambda rows, *a, **kw: [
+        {'code': row['代號'], 'score': 90, 'reason': '籌碼'} for _, row in rows.iterrows()]
+    rows = pd.DataFrame([{'代號': '1815', '_strategy_close': 100, '_strategy_change_rate': 0,
+                         '_ma5': 99, '_strategy_data_as_of': '2026/10/02'}])
+    legacy = {'daytrade': {'target_date': '2026-10-02', 'entries': [{'code': '1815', 'score': 50}]}}
+    result = ns['build_postclose_job']({'stock': rows}, date(2026, 10, 2), False, False,
+                                     {'updated': '2026/10/02', 'errors': []}, legacy)
+    assert calls == ['當沖', '波段']
+    assert set(result['rankings']['stock']) == {'daytrade'}
+    snapshot = result['rankings']['stock']['daytrade']
+    assert snapshot['entries'][0]['score'] == 90
+    assert snapshot['weights'] == {'technical': .6, 'chips': .4, 'fundamental': 0}
+    assert 'stock:swing' in result['errors'] and legacy['daytrade']['entries'][0]['score'] == 50
+    calls.clear()
+    result = ns['build_postclose_job']({'stock': rows}, date(2026, 10, 2), False, False,
+                                     {'updated': '2026/10/02', 'errors': []}, legacy, ('當沖',))
+    assert calls == ['當沖'] and not result['errors']
+
+
+def test_daytrade_ranking_page_shows_60_40_and_keeps_legacy_scores_hidden():
+    import ast
+    from streamlit.testing.v1 import AppTest
+    source = APP_PATH.read_text(encoding='utf-8')
+    names = {'render_strategy_ranking', 'strategy_ranking_weights', 'format_ranking_reason_component',
+             'format_ranking_entry_identity'}
+    functions = '\n\n'.join(ast.get_source_segment(source, node) for node in ast.parse(source).body
+                            if isinstance(node, ast.FunctionDef) and node.name in names)
+    app_source = '''
+import html
+import pandas as pd
+import streamlit as st
+from datetime import date
+_post_close_target_date = lambda: (pd.Timestamp('2026-10-06 10:00'), date(2026, 10, 5))
+parse_strategy_data_time = pd.Timestamp
+st.session_state.setdefault('stock_strategy_ranking_snapshots', {'daytrade': {
+    'weights': {'technical': .6, 'chips': .4, 'fundamental': 0},
+    'source_date': '20261005', 'target_date': '2026-10-05', 'updated_at': '2026-10-06T08:00:00+08:00',
+    'entries': [{'code':'1815','name':'富喬','score':80,'direction':'多','coverage':100,'reason':'技術偏多｜籌碼偏多'}]}})
+st.session_state['_stock_swing_ranking_waiting'] = ['上櫃估值尚未就緒']
+st.session_state['_stock_daytrade_ranking_waiting'] = []
+''' + functions + "\nrender_strategy_ranking(pd.DataFrame([{'代號':'1815'}]), '當沖', '股票')"
+    app = AppTest.from_string(app_source).run()
+    assert not app.exception
+    displayed = '\n'.join(item.value for item in [*app.markdown, *app.caption])
+    assert '技術 60%' in displayed and '籌碼 40%' in displayed
+    assert '基本 0%' not in displayed and '月營收' not in displayed and 'EPS' not in displayed
+    assert '基本面採' not in displayed and '估值尚未就緒' not in displayed
+    app.session_state['stock_strategy_ranking_snapshots']['daytrade'].pop('weights')
+    app.run()
+    assert not app.exception and app.info
+    assert not any('(80·多)' in item.value for item in app.markdown)
 
 
 def test_maintenance_freeze_and_postclose_boundaries():
@@ -130,6 +226,26 @@ def test_failed_context_cannot_overwrite_existing_snapshot():
     assert not ns['refresh_strategy_ranking_snapshots'](pd.DataFrame([{'代號': '1815'}]), 'stock', analysis=True)
     assert state['stock_strategy_ranking_snapshots'] is old
     assert state['_stock_ranking_waiting']
+
+
+def test_manual_analysis_saves_daytrade_without_overwriting_failed_swing():
+    ns = helpers('refresh_strategy_ranking_snapshots', 'ranking_context_issues')
+    old_swing = {'entries': [{'code': '1815', 'score': 70}]}
+    state = {'stock_strategy_ranking_snapshots': {'swing': old_swing}}
+    ns['st'] = SimpleNamespace(session_state=state)
+    ns['ranking_snapshot_refresh_allowed'] = lambda *a: True
+    ns['_state_updated_at'] = lambda *a: None
+    ns['_post_close_target_date'] = lambda *a: (None, date(2026, 10, 2))
+    ns['is_market_closed_func'] = lambda *a: True
+    data = context()
+    data['errors'] = ['twse_eps: ConnectionError']
+    data['source_dates'].pop('上市估值')
+    ns['resolve_post_close_ranking_context'] = lambda *a, **kw: data
+    ns['build_strategy_ranking_entries'] = lambda *a, **kw: [{'code': '1815', 'score': 90}]
+    assert ns['refresh_strategy_ranking_snapshots'](pd.DataFrame([{'代號': '1815'}]), 'stock', analysis=True)
+    assert state['stock_strategy_ranking_snapshots']['daytrade']['entries'][0]['score'] == 90
+    assert state['stock_strategy_ranking_snapshots']['swing'] is old_swing
+    assert not state['_stock_daytrade_ranking_waiting'] and state['_stock_swing_ranking_waiting']
 
 def test_background_completion_respects_freeze_and_newer_manual_snapshot():
     import ast
