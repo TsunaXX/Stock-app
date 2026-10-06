@@ -65,7 +65,7 @@ def test_frozen_supplement_only_scores_missing_rows_saves_all_and_never_changes_
 
 
 def test_supplement_discards_delayed_results_and_retries_failures_without_changing_snapshot():
-    ns = load_app_symbols('supplement_frozen_stock_rankings', 'postclose_scope')
+    ns = load_app_symbols('supplement_frozen_stock_rankings', 'postclose_scope', 'strategy_ranking_weights')
     old = {'daytrade': {'target_date': '2026-10-05', 'updated_at': 'a', 'entries': []}}
     state = State(stock_strategy_ranking_snapshots=old, _postclose_visible_stock=pd.DataFrame([{'代號':'2330'}]))
     ns['st'] = SimpleNamespace(session_state=state)
@@ -101,6 +101,38 @@ def test_postclose_stock_fetch_requests_exact_historical_date_and_rejects_wrong_
     response['_strategy_data_as_of'] = '2026/10/06'
     with pytest.raises(ValueError, match='日 K 尚未就緒'):
         ns['fetch_postclose_stock_row']('2330', '台積電', '20261005')
+
+
+def test_legacy_formula_with_stale_date_migrates_daytrade_only_and_keeps_swing_frozen():
+    ns = load_app_symbols('supplement_frozen_stock_rankings', 'postclose_scope', 'strategy_ranking_weights')
+    now = pd.Timestamp('2026-10-06 10:00')
+    old = {mode: {'target_date': '2026-10-02', 'entries': [{'code': '1815', 'score': 80}]}
+           for mode in ('daytrade', 'swing')}
+    rows = pd.DataFrame([{'代號': '1815'}, {'代號': '2330'}])
+    state = State(stock_strategy_ranking_snapshots=old, _postclose_visible_stock=rows,
+                  stock_data=rows, ignored_stocks=[], all_candidates=[], saved_notes={})
+    ns['st'] = SimpleNamespace(session_state=state, rerun=lambda: None)
+    ns['is_market_closed_func'] = lambda day: False
+    ns['_post_close_target_date'] = lambda *a: (now, date(2026, 10, 5))
+    calls = []
+    def submit(*args):
+        calls.append(args)
+        updated = {'target_date': '2026-10-05', 'weights': ns['strategy_ranking_weights']('stock', '當沖'),
+                   'entries': [{'code': code, 'score': 90} for code in rows['代號']]}
+        return SimpleNamespace(done=lambda: True, result=lambda: {'rankings': {'stock': {'daytrade': updated}}, 'errors': {}})
+    ns['get_postclose_worker'] = lambda: {'slot': threading.BoundedSemaphore(1), 'executor': SimpleNamespace(submit=submit)}
+    ns['run_postclose_job'] = ns['build_postclose_job'] = lambda *a: None
+    ns['save_data_cache'] = lambda *a, **kw: None
+    ns['get_app_secret'] = lambda *a: ''
+    maintenance = {}
+    ns['supplement_frozen_stock_rankings'](now, maintenance)
+    assert calls[0][4] == date(2026, 10, 5) and calls[0][-1] == ('當沖',)
+    assert set(calls[0][3]['stock']['代號']) == {'1815', '2330'}
+    ns['supplement_frozen_stock_rankings'](now, maintenance)
+    assert state['stock_strategy_ranking_snapshots']['swing'] is old['swing']
+    assert state['stock_strategy_ranking_snapshots']['daytrade']['target_date'] == '2026-10-05'
+    ns['supplement_frozen_stock_rankings'](now, maintenance)
+    assert len(calls) == 1  # No stale swing rebuild, and no repeat migration.
 
 
 def test_cloud_supplements_merge_same_day_additions_without_rolling_back_scores():
