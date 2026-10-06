@@ -133,6 +133,26 @@ def test_background_daytrade_survives_failed_swing_and_rebuilds_legacy_formula()
     assert calls == ['當沖'] and not result['errors']
 
 
+def test_missing_risk_retries_in_stock_job_but_failure_preserves_last_complete_lists():
+    ns = helpers('build_postclose_job', 'merge_market_risk_refresh')
+    previous = {'updated': '2026/10/02', 'attention': {'1815': 2}, 'disposition': ['2330'],
+                'errors': ['上櫃注意連線失敗']}
+    calls = []
+    def fetch():
+        calls.append(True)
+        return {}, [], [], {}, ['上櫃處置公告頁連線失敗']
+    ns['fetch_market_risk_lists'] = fetch
+    ns['fetch_post_close_stock_ranking_context'] = lambda *a, **kw: (_ for _ in ()).throw(AssertionError('incomplete risk'))
+    result = ns['build_postclose_job']({'stock': pd.DataFrame([{'代號': '1815'}])}, date(2026, 10, 2),
+                                     False, False, previous, stock_modes=('當沖',))
+    assert calls == [True] and result['rankings'] == {}
+    assert result['risk']['attention'] == previous['attention']
+    assert result['risk']['disposition'] == previous['disposition'] and result['risk']['using_last_success']
+    assert result['errors']['注意／處置'] == '上櫃處置公告頁連線失敗'
+    assert result['errors']['stock'] == '注意／處置名單尚未完整'
+    assert previous['errors'] == ['上櫃注意連線失敗']
+
+
 def test_daytrade_ranking_page_shows_60_40_and_keeps_legacy_scores_hidden():
     import ast
     from streamlit.testing.v1 import AppTest

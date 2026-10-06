@@ -20526,7 +20526,7 @@ def build_postclose_job(row_sets, target, need_turnover, need_risk, previous_ris
         except Exception as exc:
             result['errors']['週轉率'] = str(exc)
     risk = previous_risk
-    if need_risk:
+    if need_risk or ('stock' in row_sets and (not risk.get('updated') or risk.get('errors'))):
         try:
             attention, disposition, tomorrow, markets, errors = fetch_market_risk_lists()
             risk = merge_market_risk_refresh(previous_risk, attention, disposition, tomorrow,
@@ -20712,27 +20712,34 @@ def supplement_frozen_stock_rankings(current, state):
         state['supplement_retry'] = (job['signature'], time.monotonic() + 900)
         if job['signature'] != signature:
             return  # Scope, source day or snapshot changed while the job ran.
+        if job.get('risk_version', data_version({})) != data_version(st.session_state.get('risk_filter_market_data', {})):
+            return  # A manual risk refresh supersedes scores based on the previous lists.
         try:
             result = job['future'].result()
         except Exception as exc:
-            st.session_state['_stock_ranking_waiting'] = [type(exc).__name__]
-            return
+            result = {'rankings': {}, 'errors': {'stock': type(exc).__name__}}
+        risk = result.get('risk')
+        risk_changed = risk is not None and risk != st.session_state.get('risk_filter_market_data', {})
+        if risk_changed:
+            st.session_state['risk_filter_market_data'] = risk
         completed = result.get('rankings', {}).get('stock')
-        if not completed:
-            st.session_state['_stock_ranking_waiting'] = [result.get('errors', {}).get('stock', '盤前排名待補')]
-            return
-        for item in completed.values():
+        for item in (completed or {}).values():
             item['scope'] = scope
             item['supplemented'] = True
-        st.session_state['stock_strategy_ranking_snapshots'] = {**snapshots, **completed}
+        if completed:
+            st.session_state['stock_strategy_ranking_snapshots'] = {**snapshots, **completed}
+        errors = result['errors']
+        waiting = list(dict.fromkeys(errors.values()))
         for mode in ('daytrade', 'swing'):
-            st.session_state[f'_stock_{mode}_ranking_waiting'] = [result['errors'][f'stock:{mode}']] if f'stock:{mode}' in result['errors'] else []
-        st.session_state['_stock_ranking_waiting'] = list(result['errors'].values())
-        save_data_cache(st.session_state.stock_data, st.session_state.ignored_stocks,
-                        st.session_state.all_candidates, st.session_state.saved_notes, sync_cloud=False)
-        if get_app_secret('gsheet_api_url'):
-            state.setdefault('pending_sync', {})['stock'] = time.monotonic()
-            state['sync_retry_at'] = 0
+            if mode in (completed or {}) or ('當沖' if mode == 'daytrade' else '波段') in job.get('stock_modes', ('當沖', '波段')):
+                st.session_state[f'_stock_{mode}_ranking_waiting'] = waiting if not completed else ([errors[f'stock:{mode}']] if f'stock:{mode}' in errors else [])
+        st.session_state['_stock_ranking_waiting'] = waiting
+        if completed or risk_changed:
+            save_data_cache(st.session_state.stock_data, st.session_state.ignored_stocks,
+                            st.session_state.all_candidates, st.session_state.saved_notes, sync_cloud=False)
+            if get_app_secret('gsheet_api_url'):
+                state.setdefault('pending_sync', {})['stock'] = time.monotonic()
+                state['sync_retry_at'] = 0
         st.rerun()
         return
     if job:
@@ -20760,7 +20767,7 @@ def supplement_frozen_stock_rankings(current, state):
         return
     pending = rows[rows['代號'].astype(str).isin(missing)].copy(deep=True)
     risk = dict(st.session_state.get('risk_filter_market_data', {}))
-    state['supplement'] = {'signature': signature,
+    state['supplement'] = {'signature': signature, 'risk_version': data_version(risk), 'stock_modes': stock_modes,
         'future': worker['executor'].submit(run_postclose_job, worker, build_postclose_job,
                                             {'stock': pending}, target, False, False, risk, snapshots, stock_modes)}
 
