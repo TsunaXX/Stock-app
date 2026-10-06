@@ -172,7 +172,7 @@ def test_manual_company_sync_clears_source_caches_and_keeps_prior_report_on_tota
     cleared, saved = [], []
     ns['st'] = SimpleNamespace(session_state=state, spinner=lambda *a: nullcontext(),
                               toast=lambda *a, **kw: None, rerun=lambda: None, warning=lambda *a: None)
-    for name in ('fetch_earnings_events','fetch_twse_monthly_revenue_rows','fetch_mops_company_monthly_revenue',
+    for name in ('fetch_earnings_events','fetch_twse_monthly_revenue_rows','fetch_nanya_monthly_revenue','fetch_mops_company_monthly_revenue',
                  'fetch_mops_monthly_revenue_announcement','fetch_finmind_monthly_revenue_rows',
                  'fetch_taiwan_monthly_revenue_events','fetch_us_revenue_events','fetch_sec_revenue',
                  'fetch_sec_submissions','fetch_sec_facts','fetch_micron_revenue','fetch_yahoo_revenue'):

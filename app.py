@@ -497,13 +497,14 @@ def _is_contract_stream_session(contract, now_tw):
     )
 
 
-def get_stream_quotes(api, contracts, snapshot_fallback=True):
+def get_stream_quotes(api, contracts, snapshot_fallback=True, subscribe=True):
     """Return quotes in input order: stream first, throttled snapshot for cold start/failure."""
     contracts = list(contracts or [])
     if api is None or not contracts:
         return []
-    for contract in contracts:
-        ensure_market_stream_subscription(api, contract)
+    if subscribe:
+        for contract in contracts:
+            ensure_market_stream_subscription(api, contract)
 
     results = [_stream_quote_for_contract(api, contract) for contract in contracts]
     fallback_indices = []
@@ -2455,7 +2456,7 @@ def _usd_currency(value):
     return f"US${number:,.0f}"
 
 
-@st.cache_data(ttl=60 * 60 * 4, max_entries=1, show_spinner=False)
+@st.cache_data(ttl=900, max_entries=1, show_spinner=False)
 def fetch_twse_monthly_revenue_rows():
     """取得 MOPS 最新上市與上櫃公司月營收彙總表。"""
     rows = []
@@ -2488,7 +2489,7 @@ def select_latest_monthly_revenue_rows(rows):
     return latest_rows
 
 
-@st.cache_data(ttl=60 * 60 * 4, max_entries=100, show_spinner=False)
+@st.cache_data(ttl=900, max_entries=100, show_spinner=False)
 def fetch_finmind_monthly_revenue_rows(code, start_year):
     """Fetch one company's monthly revenue from FinMind as a secondary public source."""
     try:
@@ -2573,7 +2574,7 @@ def build_finmind_monthly_revenue_row(records, code, target_year, target_month, 
         if int(_to_number(record.get("revenue_year")) or 0) == selected_year - 1
         and 1 <= int(_to_number(record.get("revenue_month")) or 0) <= selected_month
     )
-    report_date = str(current.get("create_time") or current.get("date") or "")[:10]
+    report_date = str(current.get("create_time") or "")[:10]
     return {
         "公司代號": str(code),
         "公司名稱": str(company_name),
@@ -2592,9 +2593,72 @@ def build_finmind_monthly_revenue_row(records, code, target_year, target_month, 
     }
 
 
-@st.cache_data(ttl=60 * 60 * 4, max_entries=24, show_spinner=False)
+def parse_nanya_monthly_revenue_release(content, roc_year, month, source):
+    """Read exact thousand-TWD figures from the company's monthly press release."""
+    soup = BeautifulSoup(content, 'html.parser')
+    text = re.sub(r'\s+', '', soup.get_text(' ', strip=True))
+    year = int(roc_year) + 1911
+    if not re.search(r'單位[:：]新台幣千元', text):
+        return None
+    report_date = re.search(r'\b(\d{4}/\d{2}/\d{2})\b', soup.get_text(' ', strip=True))
+    values = {}
+    for table in soup.find_all('table'):
+        for tr in table.find_all('tr'):
+            cells = tr.find_all(['td', 'th'])
+            if len(cells) == 2:
+                values[re.sub(r'\s+', '', cells[0].get_text())] = _to_number(cells[1].get_text().replace('%', ''))
+    current = values.get(f'{year}年{int(month)}月營收')
+    if current is None or not math.isfinite(current) or current < 0 or not report_date:
+        return None
+    try:
+        published = datetime.strptime(report_date.group(1), '%Y/%m/%d').date()
+        if published <= date(year, int(month), calendar.monthrange(year, int(month))[1]):
+            return None
+    except ValueError:
+        return None
+    previous_year, previous_month = (year - 1, 12) if int(month) == 1 else (year, int(month) - 1)
+    return {
+        '公司代號': '2408', '公司名稱': '南亞科', '資料年月': _roc_month_text(roc_year, month),
+        '營業收入-當月營收': current,
+        '營業收入-上月營收': values.get(f'{previous_year}年{previous_month}月營收'),
+        '營業收入-去年當月營收': values.get(f'{year - 1}年{int(month)}月營收'),
+        '營業收入-上月比較增減(%)': values.get('月增(減)%'),
+        '營業收入-去年同月增減(%)': values.get('年增(減)%'),
+        '_report_date': published.isoformat(),
+        '_source': f'南亞科技官方月營收新聞稿｜{source}',
+        '備註': '官方新聞稿精確金額；累計數值未列於表格時不自行推估',
+    }
+
+
+@st.cache_data(ttl=900, max_entries=24, show_spinner=False)
+def fetch_nanya_monthly_revenue(roc_year, month):
+    """Discover the requested release from Nanya's own press-center feed."""
+    response = _calendar_get(
+        'https://www.nanya.com/tw/Activity?Action=IR_PressCenter_year_Item'
+        f'&year={int(roc_year) + 1911}&En_Pagetype=0'
+    )
+    if not response:
+        return None
+    try:
+        listing = response.json().get('msg', '')
+        title = re.compile(rf'{int(roc_year) + 1911}年0?{int(month)}月份合併營收')
+        for link in BeautifulSoup(listing, 'html.parser').select('a[href]'):
+            if not title.search(re.sub(r'\s+', '', link.get_text())):
+                continue
+            url = urljoin('https://www.nanya.com', link['href'])
+            if not url.startswith('https://www.nanya.com/tw/IR/'):
+                continue
+            release = _calendar_get(url)
+            if release:
+                return parse_nanya_monthly_revenue_release(release.text, roc_year, month, url)
+    except (ValueError, TypeError, AttributeError):
+        pass
+    return None
+
+
+@st.cache_data(ttl=900, max_entries=24, show_spinner=False)
 def fetch_taiwan_monthly_revenue_events(inputs):
-    """依追蹤清單產生台股月營收事件；MOPS 失敗才使用 TWSE 備援。"""
+    """Select the latest published month, including when the aggregate feed lags."""
     input_by_code = {}
     for user_input in inputs:
         item = resolve_earnings_ticker(user_input)
@@ -2633,14 +2697,22 @@ def fetch_taiwan_monthly_revenue_events(inputs):
     missing = []
     for code, item in input_by_code.items():
         row = direct_rows.get(code) or rows_by_code.get(code)
-        if not row:
+        if row and str(row.get('資料年月', '')) > target_month_text:
+            row = None
+        if str((row or {}).get('資料年月', '')) < target_month_text:
+            official_row = fetch_nanya_monthly_revenue(target_roc_year, target_month) if code == '2408' else None
+            if official_row:
+                row = official_row
+        if str((row or {}).get('資料年月', '')) < target_month_text:
             finmind_records = fetch_finmind_monthly_revenue_rows(
                 code, target_roc_year + 1911 - 1
             )
-            row = build_finmind_monthly_revenue_row(
+            fallback_row = build_finmind_monthly_revenue_row(
                 finmind_records, code, target_roc_year + 1911, target_month,
                 item["display_name"],
             )
+            if fallback_row and str(fallback_row.get('資料年月', '')) > str((row or {}).get('資料年月', '')):
+                row = fallback_row
         if not row:
             missing.append(f"{item['display_name']}（MOPS、TWSE 皆未提供目前月營收）")
             continue
@@ -2692,7 +2764,7 @@ def fetch_taiwan_monthly_revenue_events(inputs):
         company = str(row.get("公司名稱", item["display_name"])).strip()
         announcement = announcement_by_code.get(code)
         twse_report_date = _roc_compact_date(row.get("出表日期")) if not announcement else None
-        event_date = announcement or (twse_report_date.isoformat() if twse_report_date else "")
+        event_date = announcement or row.get('_report_date') or (twse_report_date.isoformat() if twse_report_date else "")
         announcement_time = ""
         if announcement and "T" in announcement:
             announcement_time = announcement.split("T", 1)[1][:5]
@@ -2720,6 +2792,7 @@ def fetch_taiwan_monthly_revenue_events(inputs):
             "note": str(row.get("備註", "-")).strip(),
             "date_source": (
                 "MOPS 公告快易查（實際公告日期時間）" if announcement
+                else "資料來源實際公布日期（公告時間未取得）" if row.get('_report_date')
                 else "TWSE OpenAPI 出表日期（公告時間未取得）" if twse_report_date
                 else "公告日期時間未取得"
             ),
@@ -3789,11 +3862,17 @@ def render_company_event_snapshot(snapshot):
             st.warning("尚未取得財報日期：" + "； ".join(earnings_result["missing"]))
 
     with taiwan_tab:
-        taiwan_events = taiwan_result.get("events", [])
+        latest_events = {}
+        for event in taiwan_result.get('events', []):
+            revenue = event.get('revenue', {})
+            code = revenue.get('code') or event.get('ticker')
+            if code and str(revenue.get('revenue_month', '')) > str(latest_events.get(code, {}).get('revenue', {}).get('revenue_month', '')):
+                latest_events[code] = event
+        taiwan_events = list(latest_events.values())
         if not taiwan_events:
             st.info("目前快照沒有台股月營收；按上方按鈕同步最新資料。")
         else:
-            st.caption("資料來源：月營收優先查 MOPS，失敗時才使用 TWSE OpenAPI；公告時間取自 MOPS 公告快易查。")
+            st.caption("僅顯示各公司最新已公布月份；優先 MOPS，彙總資料落後時比對官方公司公告與備援來源。")
             for event in taiwan_events:
                 revenue = event.get("revenue", {})
                 st.markdown(f"#### {revenue.get('company', '')}（{revenue.get('code', '')}）｜{revenue.get('revenue_month', '')} 月營收")
@@ -4148,7 +4227,7 @@ def round_to_tick(price):
 # ==========================================
 # 臺灣市場溫度計
 # ==========================================
-def merge_market_temperature_snapshot(df, api, code):
+def merge_market_temperature_snapshot(df, api, code, stream_only=False):
     """Merge the current Shioaji snapshot into a daily series.
 
     Futures snapshots after 15:00 are assigned to the following trading date,
@@ -4175,11 +4254,13 @@ def merge_market_temperature_snapshot(df, api, code):
         else:
             return df
 
-        snapshots = get_stream_quotes(api, [contract])
+        snapshots = get_stream_quotes(api, [contract], snapshot_fallback=not stream_only)
         if not snapshots:
             return df
 
         snap = snapshots[0]
+        if stream_only and not fresh_strategy_stream_quote(snap):
+            return df
         close = float(getattr(snap, 'close', 0) or 0)
         if close <= 0:
             return df
@@ -5206,7 +5287,11 @@ def get_txo_snapshot_quotes(api, contracts, snapshot_fallback=True, subscribe=Tr
         snapshot_contracts = [getattr(contract, 'shioaji_contract', contract) for contract in contracts]
         snapshots = get_stream_quotes(
             api, snapshot_contracts, snapshot_fallback=snapshot_fallback,
-        ) if subscribe else (api.snapshots(snapshot_contracts) or [])
+        ) if subscribe else (
+            (api.snapshots(snapshot_contracts) or []) if snapshot_fallback else get_stream_quotes(
+                api, snapshot_contracts, snapshot_fallback=False, subscribe=False,
+            )
+        )
     except Exception:
         snapshots = []
     for index, contract in enumerate(contracts):
@@ -5912,7 +5997,7 @@ def _select_txo_spread_hedge(contracts, short_contract, is_bull_put, preferred_w
 
 
 def get_txo_spread_quote(
-    api, plan, expiry_choice, preferred_width=100, expiry_selection=None,
+    api, plan, expiry_choice, preferred_width=100, expiry_selection=None, stream_only=False,
 ):
     """Find an OTM defined-risk credit spread for the selected TXO expiry."""
     if api is None or plan is None or plan['direction'] not in ('偏多', '偏空'):
@@ -5944,7 +6029,8 @@ def get_txo_spread_quote(
     if short_contract is None or long_contract is None:
         return None
 
-    spread_quotes = get_txo_snapshot_quotes(api, [short_contract, long_contract], subscribe=False)
+    spread_quotes = get_txo_snapshot_quotes(api, [short_contract, long_contract],
+                                           snapshot_fallback=not stream_only, subscribe=False)
     return build_txo_spread_result(short_contract, long_contract, spread_quotes,
                                    selected_expiry, source, plan)
 
@@ -6010,7 +6096,7 @@ def build_txo_spread_result(short_contract, long_contract, spread_quotes, select
 
 def get_txo_directional_quote(
     api, plan, expiry_choice, moneyness_preference='自動評選',
-    expiry_selection=None,
+    expiry_selection=None, stream_only=False,
 ):
     """Compare BC/BP candidates across ITM, ATM and OTM using live quotes."""
     if api is None or plan is None or plan['direction'] not in ('偏多', '偏空'):
@@ -6047,7 +6133,9 @@ def get_txo_directional_quote(
             nearby,
             key=lambda c: min(abs(float(c.strike_price) - anchor) for anchor in anchors),
         )[:24]
-    quotes = get_txo_snapshot_quotes(api, nearby, subscribe=False)
+    if stream_only:
+        nearby = sorted(nearby, key=lambda c: abs(float(c.strike_price) - spot))[:3]
+    quotes = get_txo_snapshot_quotes(api, nearby, snapshot_fallback=not stream_only, subscribe=False)
     ranked = rank_txo_directional_candidates(
         nearby, quotes, plan, is_buy_call, moneyness_preference, selected_expiry,
     )
@@ -7359,26 +7447,723 @@ def get_stable_index_trade_plan(index_df, index_result, futures_df, futures_resu
     return plan or cached.get('plan')
 
 
-@st.fragment(run_every=1)
-def render_index_scenario_tracking(plan, enabled, seconds):
-    if not enabled:
-        return
-    now_mono = time.monotonic()
+def render_index_scenario_tracking(plan):
+    """Read the stream once per plan refresh; retain its original source time."""
     state = st.session_state.setdefault('_index_scenario_live', {})
-    if now_mono - state.get('checked', 0) >= seconds:
-        quote = get_live_futures_snapshot(st.session_state.get('sj_api'), 'TMF', stream_only=True)
-        state['checked'] = now_mono
-        if quote:
-            state['quote'] = quote
-            state['fresh'] = True
-        else:
-            state['fresh'] = False
+    quote = get_live_futures_snapshot(st.session_state.get('sj_api'), 'TMF', stream_only=True)
+    state['fresh'] = bool(quote)
+    if quote:
+        state['quote'] = quote
     quote = state.get('quote')
     if not quote or not state.get('fresh'):
         st.caption('盤中情境：等待最新串流；保留原操作計畫。')
     if quote:
         st.info(f"盤中情境｜微台 {quote['price']:,.0f}｜{index_scenario(plan, quote['price'])}")
         st.caption('來源時間：' + _stream_datetime(quote['updated']).strftime('%Y/%m/%d %H:%M:%S'))
+    return quote
+
+
+def render_operation_plan(seed_data, option_page=False):
+    """Refresh every analysis on the active page from stream/minute caches only."""
+    api = st.session_state.get('sj_api')
+    if api is not None:
+        contracts = [get_near_futures_contract(api, product) for product in ('TMF', 'TXF')]
+        contracts.append(get_taiex_contract(api))
+        sync_strategy_stream_scope(api, [c for c in contracts if c is not None], 'index')
+    thermometer_data = []
+    for label, code, data, source, result in seed_data:
+        live_data = merge_market_temperature_snapshot(data, api, code, stream_only=True)
+        if live_data is not data:
+            source = f'{source}＋即時串流'
+            result = calculate_market_temperature(live_data)
+        thermometer_data.append((label, code, live_data, source, result))
+    index_item = next((item for item in thermometer_data if item[1] == '^TWII'), None)
+    futures_item = next((item for item in thermometer_data if item[1] == 'TWF=F'), None)
+    plan = get_stable_index_trade_plan(
+        index_item[2] if index_item else pd.DataFrame(), index_item[4] if index_item else None,
+        futures_item[2] if futures_item else pd.DataFrame(), futures_item[4] if futures_item else None,
+    )
+    if plan is None:
+        st.info('⏳ 正在載入加權與期貨日 K；資料足夠後會直接顯示操作計畫。')
+        if time.monotonic() - st.session_state.get('_index_trade_plan_auto_retry', 0) >= 180:
+            st.session_state['_index_trade_plan_auto_retry'] = time.monotonic()
+            clear_index_market_data_cache()
+            st.rerun()
+        return
+    st.session_state.pop('_index_trade_plan_auto_retry', None)
+    entry_profile = st.session_state.get('trade_plan_entry_profile', '積極（提早確認）')
+    if not option_page:
+        profile_col, refresh_col = st.columns([6, 1])
+        with profile_col:
+            entry_profile = st.radio(
+                "進場靈敏度",
+                ["積極（提早確認）", "穩健（完整確認）"],
+                horizontal=True,
+                key="trade_plan_entry_profile",
+                help="積極模式會擴大費波觀察區，並允許即時價站穩／跌破 VWAP 後提早小部位進場；過熱與反向急漲跌保護仍保留。",
+            )
+        with refresh_col:
+            st.button("↻ 即時更新", key="refresh_trade_plan_live", width='stretch')
+    live_snapshot = render_index_scenario_tracking(plan)
+    live_price = live_snapshot['price'] if live_snapshot else plan['latest']
+    live_change = live_snapshot['change'] if live_snapshot else float((futures_item[4] or {}).get('change', 0))
+    intraday_state = get_cached_futures_intraday_state(
+        st.session_state.get('sj_api'), plan['direction'], max_age_seconds=0,
+    )
+    previous_temperature = None
+    if futures_item is not None and len(futures_item[2]) > 20:
+        previous_temperature = calculate_market_temperature(futures_item[2].iloc[:-1].copy())
+    temperature_delta = (
+        float(futures_item[4]['score']) - float(previous_temperature['score'])
+        if futures_item and futures_item[4] and previous_temperature else 0.0
+    )
+    trade_state = evaluate_trade_entry_state(
+        plan, live_price, live_change, intraday_state, temperature_delta, entry_profile,
+    )
+    if not st.session_state.get('_index_scenario_live', {}).get('fresh'):
+        trade_state = {**trade_state, 'can_enter': False, 'permission': '等待最新串流',
+                       'reason': '行情尚未更新；保留原點位，等待最新串流後再判斷進場。', 'color': '#ffc107'}
+    short_wave_direction, short_direction_note = resolve_short_wave_direction(
+        plan, trade_state, intraday_state,
+    )
+    short_wave = get_cached_short_wave_plan(st.session_state.get('sj_api'), short_wave_direction, max_age_seconds=0)
+    if short_wave and not st.session_state.get('_index_scenario_live', {}).get('fresh'):
+        short_wave = {**short_wave, 'momentum_ready': False}
+    if not option_page:
+        confirmation_text = intraday_state['confirmation_text']
+        display_direction, direction_color = {
+            '偏多': ('偏多', '#ff4b4b'), '偏空': ('偏空', '#00c853'),
+        }.get(plan['direction'], ('區間盤整', '#ffc107'))
+        if trade_state['can_enter'] and trade_state['execution_direction'] == '偏多':
+            position_recommendation = '建議做多｜可快進快出'
+            position_color = '#ff4b4b'
+        elif trade_state['can_enter'] and trade_state['execution_direction'] == '偏空':
+            position_recommendation = '建議做空｜可快進快出'
+            position_color = '#00c853'
+        else:
+            position_recommendation = f"保守不進場｜{trade_state['permission']}"
+            position_color = '#ffc107'
+        st.markdown(
+            f"""<div style='border-left:5px solid {plan['action_color']};background:#151a22;padding:14px 18px;border-radius:7px;margin-bottom:12px'>
+            <div style='font-size:14px;color:#b7c0cc'>{plan['market_label']}</div>
+            <div style='font-size:15px;font-weight:700;color:{direction_color};margin-top:3px'>趨勢背景：{display_direction}</div>
+            <div style='font-size:21px;font-weight:800;color:{trade_state['color']};margin-top:3px'>{trade_state['stage']}｜{trade_state['permission']}</div>
+            <div style='font-size:14px;color:#dfe6e9;margin-top:4px'>{plan['alignment_note']}</div>
+            </div>""", unsafe_allow_html=True
+        )
+        st.info(f"**即時判斷：** {trade_state['reason']}")
+        if live_snapshot:
+            latest_card = {
+                'label': f"最新微台（{live_snapshot['contract_code']}）",
+                'value': f"{live_snapshot['price']:,.0f}",
+                'detail': (
+                    f"{live_snapshot['arrow']} {abs(live_snapshot['change']):,.0f} "
+                    f"({_format_compact_number(live_snapshot['change_pct'], 2, signed=True)}%)"
+                ),
+                'color': live_snapshot['color'],
+            }
+        else:
+            latest_card = {
+                'label': '最新期貨（日 K）',
+                'value': f"{plan['latest']:,.0f}",
+                'color': '#f5f5f5',
+            }
+        render_compact_metric_card_grid(
+            [
+                latest_card,
+                {'label': '費波支撐', 'value': _format_compact_number(plan['support'], 0), 'color': '#40c4ff'},
+                {'label': '費波壓力', 'value': _format_compact_number(plan['resistance'], 0), 'color': '#ff5252'},
+                {'label': '費波區寬', 'value': f"± {_format_compact_number(plan['zone_points'], 0)} 點", 'color': '#f5f5f5'},
+            ],
+            columns=4,
+            class_name='compact-metric-grid index-level-metric-grid',
+        )
+
+        index_result = index_item[4] if index_item else None
+        if index_result is not None:
+            index_price = float(index_result['close'])
+            basis = live_price - index_price
+            if basis > 0:
+                basis_label, basis_color = "正價差", "#ff4b4b"
+                basis_advice = (
+                    "期貨高於加權，反映期貨相對現貨偏強。僅在市場判讀同為偏多、"
+                    "且價格回測費波支撐後獲確認時，才考慮順勢做多；不可只因正價差追價。"
+                )
+            elif basis < 0:
+                basis_label, basis_color = "逆價差", "#00c853"
+                basis_advice = (
+                    "期貨低於加權，反映期貨相對現貨偏弱。僅在市場判讀同為偏空、"
+                    "且價格反彈至費波壓力後受壓時，才考慮順勢做空；不可只因逆價差追空。"
+                )
+            else:
+                basis_label, basis_color = "平價", "#dfe6e9"
+                basis_advice = "期現價格貼近，價差不提供方向優勢；以費波位置與 15 分 K 確認作為主要進出依據。"
+
+            now_tw = datetime.now(pytz.timezone('Asia/Taipei'))
+            updated_at = pd.Timestamp(index_result['updated_at']).date()
+            is_cash_snapshot = (
+                updated_at == now_tw.date()
+                and dt_time(9, 0) <= now_tw.time() < dt_time(13, 35)
+                and index_item[3] and '即時串流' in index_item[3]
+            )
+            basis_reference = "加權盤中快照" if is_cash_snapshot else "最近加權日收盤"
+            index_change = float(index_result.get('change', 0) or 0)
+            index_change_pct = float(index_result.get('change_pct', 0) or 0)
+            index_color = '#ff4b4b' if index_change > 0 else ('#00c853' if index_change < 0 else '#dfe6e9')
+            index_arrow = '▲' if index_change > 0 else ('▼' if index_change < 0 else '◆')
+            futures_result = (futures_item[4] or {}) if futures_item else {}
+            futures_change = float(live_snapshot['change']) if live_snapshot else float(futures_result.get('change', 0) or 0)
+            futures_change_pct = float(live_snapshot['change_pct']) if live_snapshot else float(futures_result.get('change_pct', 0) or 0)
+            futures_color = '#ff4b4b' if futures_change > 0 else ('#00c853' if futures_change < 0 else '#dfe6e9')
+            futures_arrow = '▲' if futures_change > 0 else ('▼' if futures_change < 0 else '◆')
+            st.markdown("##### ⚖️ 期現價差判讀")
+            render_compact_metric_card_grid(
+                [
+                    {
+                        'label': basis_reference,
+                        'value': f"{index_price:,.0f}",
+                        'detail': f"{index_arrow} {abs(index_change):,.0f} ({_format_compact_number(index_change_pct, 2, signed=True)}%)",
+                        'color': index_color,
+                    },
+                    {
+                        'label': '期貨指數',
+                        'value': f"{live_price:,.0f}",
+                        'detail': f"{futures_arrow} {abs(futures_change):,.0f} ({_format_compact_number(futures_change_pct, 2, signed=True)}%)",
+                        'color': futures_color,
+                    },
+                    {
+                        'label': '期貨－加權價差',
+                        'value': f"{basis:+,.0f} 點",
+                        'detail': basis_label,
+                        'color': basis_color,
+                    },
+                ],
+                columns=3,
+                class_name='compact-metric-grid index-basis-metric-grid',
+            )
+            st.caption(
+                f"計算：期貨 {live_price:,.0f} − {basis_reference} {index_price:,.0f} = {basis:+,.0f} 點。"
+                "夜盤因現貨已收盤，價差主要反映夜盤預期與海外市場，不宜單獨作為交易訊號。"
+            )
+            st.info(f"**操作建議：** {basis_advice}")
+
+        st.divider()
+        st.markdown(
+            f"#### 🎯 進出依據 <span style='font-size:15px;color:{position_color};font-weight:700'>　{position_recommendation}</span>",
+            unsafe_allow_html=True,
+        )
+        st.caption("以日線費波支撐／壓力與 15 分 K 確認，作為順勢進場、停損與目標依據。")
+        st.info(f"**進場確認：** {plan['trigger']}")
+        position_count = st.selectbox(
+            "預計進場口數",
+            options=[1, 2, 3, 4, 5],
+            format_func=lambda count: f"{count} 口微型臺指",
+            key="trade_plan_position_count",
+            help="此設定會連動更新進出依據與短波當沖的停損金額及預估收益。",
+        )
+        execution_direction = trade_state.get('execution_direction') or plan.get('direction')
+        execution_color = (
+            '#ff4b4b' if execution_direction == '偏多'
+            else ('#00c853' if execution_direction == '偏空' else '#ffc107')
+        )
+        entry_rr_color = (
+            '#40c4ff' if (trade_state['rr_ratio'] or 0) >= 1.25 else '#ffc107'
+        )
+        render_index_plan_metric_cards([
+            {
+                'label': '觀察進場區', 'label_color': '#40c4ff',
+                'value': _format_compact_number(trade_state['entry_level'], 0),
+                'color': execution_color,
+            },
+            {
+                'label': '失效／停損', 'label_color': '#ffc107',
+                'value': _format_compact_number(trade_state['invalidation'], 0),
+                'color': '#ffc107',
+            },
+            {
+                'label': '第一目標', 'label_color': '#40c4ff',
+                'value': _format_compact_number(trade_state['target'], 0),
+                'color': execution_color,
+            },
+            {
+                'label': '預估風報比', 'label_color': '#40c4ff',
+                'value': (
+                    f"1 : {_format_compact_number(trade_state['rr_ratio'], 2)}"
+                    if trade_state['rr_ratio'] is not None else "—"
+                ),
+                'color': entry_rr_color,
+            },
+        ])
+        entry_risk_level, entry_risk_color, entry_risk_ratio = get_trade_risk_level(
+            trade_state['risk_points'], plan['atr'],
+        )
+        entry_risk_amount = trade_state['risk_points'] * 10 * position_count
+        entry_reward_amount = trade_state['reward_points'] * 10 * position_count
+        render_compact_metric_card_grid([
+            {
+                'label': '計畫風險點數',
+                'value': f"{trade_state['risk_points']:,.0f} 點",
+                'detail': f'風險等級：{entry_risk_level}',
+                'color': entry_risk_color,
+            },
+            {
+                'label': '預估盈利點數',
+                'value': f"{trade_state['reward_points']:,.0f} 點",
+                'color': '#ff4b4b',
+            },
+            {
+                'label': f'{position_count} 口最大風險',
+                'value': f'${entry_risk_amount:,.0f}',
+                'color': entry_risk_color,
+            },
+            {
+                'label': f'{position_count} 口預估收益',
+                'value': f'${entry_reward_amount:,.0f}',
+                'color': '#ff4b4b',
+            },
+        ], columns=4, class_name='compact-metric-grid index-entry-risk-grid')
+        st.caption(
+            f"風險等級以停損距離相對日 ATR 判定：{_format_compact_number(entry_risk_ratio, 2)} ATR；"
+            "微台每點 10 元。"
+        )
+        if trade_state['can_enter']:
+            st.info(f"15 分 K：{confirmation_text} 目前符合「{trade_state['permission']}」條件，仍須依設定停損控制部位。")
+        elif plan['direction'] in ('偏多', '偏空'):
+            st.warning(f"15 分 K：{confirmation_text} 目前狀態為「{trade_state['permission']}」，不觸發進場。")
+        else:
+            st.info(f"區間策略：{trade_state['reason']}")
+
+        signal_details = []
+        if intraday_state['available']:
+            signal_details.append(f"15 分 K VWAP {intraday_state['vwap']:,.0f}")
+            signal_details.append(
+                f"本段開盤區間 {intraday_state['opening_low']:,.0f}–{intraday_state['opening_high']:,.0f}"
+            )
+        signal_details.append(
+            f"即時漲跌為日 ATR 的 {_format_compact_number(trade_state['shock_ratio'], 2, signed=True)} 倍"
+        )
+        signal_details.append(
+            f"溫度變化 {_format_compact_number(trade_state['temperature_delta'], 0, signed=True)} 度"
+        )
+        st.caption("｜".join(signal_details))
+
+        st.divider()
+        if short_wave_direction == '偏多':
+            short_recommendation, short_color = '短多觀察', '#ff4b4b'
+        elif short_wave_direction == '偏空':
+            short_recommendation, short_color = '短空觀察', '#00c853'
+        else:
+            short_recommendation, short_color = '等待盤中動能', '#ffc107'
+        st.markdown(
+            f"#### ⚡ 短波當沖（5 分 K） <span style='font-size:15px;color:{short_color};font-weight:700'>　{short_recommendation}</span>",
+            unsafe_allow_html=True,
+        )
+        st.caption(f"{short_direction_note}。短波採 EMA5 或前根高低點即時觸發，不等待完整 5 分 K 收盤。")
+        if short_wave:
+            short_rr_color = '#40c4ff' if (short_wave['rr'] or 0) >= 1.25 else '#ffc107'
+            render_index_plan_metric_cards([
+                {
+                    'label': '短波進場區', 'label_color': '#40c4ff',
+                    'value': (
+                        f"{_format_compact_number(short_wave['entry'], 0)} ± "
+                        f"{_format_compact_number(short_wave['zone'], 0)}"
+                    ),
+                    'color': short_color,
+                },
+                {
+                    'label': '短波停損', 'label_color': '#ffc107',
+                    'value': _format_compact_number(short_wave['stop'], 0),
+                    'color': '#ffc107',
+                },
+                {
+                    'label': '短波目標', 'label_color': '#40c4ff',
+                    'value': _format_compact_number(short_wave['target'], 0),
+                    'color': short_color,
+                },
+                {
+                    'label': '短波風報比', 'label_color': '#40c4ff',
+                    'value': (
+                        f"1 : {_format_compact_number(short_wave['rr'], 2)}"
+                        if short_wave['rr'] is not None else "—"
+                    ),
+                    'color': short_rr_color,
+                },
+            ])
+            st.info(f"**快速進場條件：** {short_wave['trigger']}")
+            momentum_label = "已達快速觸發" if short_wave['momentum_ready'] else "接近觸發，等待穿越前根高低點"
+            momentum_color = '#ff4b4b' if short_wave_direction == '偏多' else '#00c853'
+            st.markdown(
+                f"<div style='font-size:14px;font-weight:700;color:{momentum_color}'>即時狀態：{momentum_label}｜"
+                f"EMA5 {short_wave['ema_fast']:,.0f}｜量比 {_format_compact_number(short_wave['volume_ratio'], 2)}</div>",
+                unsafe_allow_html=True,
+            )
+            short_risk_level, short_risk_color, short_risk_ratio = get_trade_risk_level(
+                short_wave['risk'], plan['atr'],
+            )
+            short_risk_amount = short_wave['risk'] * 10 * position_count
+            short_reward_amount = short_wave['reward'] * 10 * position_count
+            render_compact_metric_card_grid([
+                {
+                    'label': '短波風險點數',
+                    'value': f"{short_wave['risk']:,.0f} 點",
+                    'detail': f'風險等級：{short_risk_level}',
+                    'color': short_risk_color,
+                },
+                {
+                    'label': '短波盈利點數',
+                    'value': f"{short_wave['reward']:,.0f} 點",
+                    'color': '#ff4b4b',
+                },
+                {
+                    'label': f'{position_count} 口最大風險',
+                    'value': f'${short_risk_amount:,.0f}',
+                    'color': short_risk_color,
+                },
+                {
+                    'label': f'{position_count} 口預估收益',
+                    'value': f'${short_reward_amount:,.0f}',
+                    'color': '#ff4b4b',
+                },
+            ], columns=4, class_name='compact-metric-grid index-short-risk-grid')
+            st.caption(
+                "以最新 6 根 5 分 K、EMA5 與前根高低點計算；短波停損為日 ATR 的 "
+                f"{_format_compact_number(short_risk_ratio, 2)} 倍。"
+                "短波可先於日線進場許可觸發，但只適合小部位快進快出。"
+            )
+        elif short_wave_direction:
+            st.info("即時條件已通過，但尚未取得足夠的 5 分 K，暫不提供短波點位。")
+        else:
+            st.info("尚未形成可辨識的盤中方向；短波暫不啟用，避免在區間中段雙向追價。")
+
+    else:
+        option_mode_choices = [
+            "自動評選（單買／價差）",
+            "價差單（限定風險，偏結算）",
+            "單買 BC／BP（快進快出）",
+        ]
+        saved_option_mode = st.session_state.get('trade_plan_option_mode_saved', '')
+        if saved_option_mode not in option_mode_choices:
+            if str(saved_option_mode).startswith('價差單'):
+                saved_option_mode = option_mode_choices[1]
+            elif str(saved_option_mode).startswith('單買'):
+                saved_option_mode = option_mode_choices[2]
+            else:
+                saved_option_mode = option_mode_choices[0]
+            st.session_state['trade_plan_option_mode_saved'] = saved_option_mode
+        st.caption("獨立載入最近到期週三選、週五選或月選；比較價外／平價／價內單買與限定風險價差。")
+        option_now = datetime.now(pytz.timezone('Asia/Taipei'))
+        data_status = []
+        for label, item in (("加權", index_item), ("期貨", futures_item)):
+            data_frame = item[2] if item else pd.DataFrame()
+            source_name = item[3] if item else "尚未取得資料來源"
+            required_columns = {'High', 'Low', 'Close'}
+            valid_rows = (
+                len(data_frame.dropna(subset=['High', 'Low', 'Close']))
+                if not data_frame.empty and required_columns.issubset(data_frame.columns) else 0
+            )
+            latest_date = (
+                pd.Timestamp(data_frame.index[-1]).strftime('%Y/%m/%d')
+                if valid_rows else "無資料"
+            )
+            data_status.append(f"{label} {valid_rows} 根（最新 {latest_date}；{source_name}）")
+        st.caption("計畫資料：" + "｜".join(data_status))
+        if is_market_closed_func(option_now.date()):
+            st.info(
+                "目前為休市日，計畫會沿用最近完整交易日的日 K；不會建立假日零成交量 K 棒。"
+                "履約價與損益曲線仍可試算，但即時買賣價、價差與流動性應等開盤後重新更新。"
+            )
+        option_is_closed = is_market_closed_func(option_now.date())
+        option_direction = short_wave_direction
+        if option_is_closed and plan and plan.get('direction') in ('偏多', '偏空'):
+            # 休市時沒有有效的盤中 5 分 K，改採最近完整交易日的日線方向。
+            option_direction = plan['direction']
+        if plan is None:
+            st.info(
+                "目前可用日 K 少於 20 根或高低價欄位不完整，暫時無法建立選擇權操作計畫。"
+                "系統已同時嘗試期貨日 K 與證交所加權指數備援；請檢查上方資料根數與最新日期。"
+            )
+        elif option_direction not in ('偏多', '偏空'):
+            st.info("盤中方向尚未形成，暫不建立 BC／BP 或方向價差；等待 VWAP 與 5 分 K 動能確認。")
+        else:
+            control_expiry, control_mode, control_money, control_width, control_refresh = st.columns([1.1, 2, 1.25, 1.35, 0.75])
+            with control_expiry:
+                expiry_choice = st.selectbox(
+                    "到期別", ["最近到期", "週三選", "週五選", "月選"], key="trade_plan_expiry_choice",
+                    help="最近到期會比較週三、週五與月選，優先採最早仍可交易的契約。",
+                )
+            target_specs = get_txo_target_contract_specs(expiry_choice)
+            expected_contract = target_specs[0]['delivery_month'] if target_specs else "依永豐最近到期契約"
+            if target_specs:
+                st.caption(
+                    f"永豐商品根：`{target_specs[0]['root']}`｜目標契約：`{expected_contract}`｜預定到期日：{target_specs[0]['expiry'].strftime('%Y/%m/%d')}"
+                    f"｜剩餘 {(target_specs[0]['expiry'] - datetime.now(pytz.timezone('Asia/Taipei')).date()).days} 天"
+                )
+            if st.session_state.get('trade_plan_option_mode_widget') not in option_mode_choices:
+                st.session_state['trade_plan_option_mode_widget'] = st.session_state['trade_plan_option_mode_saved']
+            with control_mode:
+                option_mode = st.selectbox("操作方式", option_mode_choices, key="trade_plan_option_mode_widget")
+            st.session_state['trade_plan_option_mode_saved'] = option_mode
+            moneyness_choices = ["自動評選", "價外", "平價", "價內"]
+            saved_moneyness = st.session_state.get('trade_plan_moneyness_saved', moneyness_choices[0])
+            if saved_moneyness not in moneyness_choices:
+                saved_moneyness = moneyness_choices[0]
+            if st.session_state.get('trade_plan_moneyness_widget') not in moneyness_choices:
+                st.session_state['trade_plan_moneyness_widget'] = saved_moneyness
+            with control_money:
+                moneyness_preference = st.selectbox(
+                    "履約價偏好", moneyness_choices, key="trade_plan_moneyness_widget",
+                    help="自動評選會同時比較價外、平價與價內的模型獲利機率、成本效率及流動性。",
+                )
+            st.session_state['trade_plan_moneyness_saved'] = moneyness_preference
+            with control_width:
+                spread_width_label = st.selectbox(
+                    "價差寬度", ["100 點優先", "50 點"], key="trade_plan_spread_width",
+                    help="100 點優先：先找相差 100 點的保護腿，缺少該履約價時自動退回 50 點。",
+                )
+            spread_width = 50 if spread_width_label.startswith('50') else 100
+            with control_refresh:
+                # Align the button with the lower selectbox control instead of its label.
+                st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+                refresh_option_plan = st.button("↻ 更新", key="refresh_option_plan", width='stretch')
+
+            use_intraday_option_levels = not option_is_closed and short_wave
+            option_entry = short_wave['entry'] if use_intraday_option_levels else plan['entry_level']
+            option_stop = short_wave['stop'] if use_intraday_option_levels else plan['invalidation']
+            option_target = short_wave['target'] if use_intraday_option_levels else plan['target']
+            option_price = live_price if not option_is_closed else plan['latest']
+            quote_plan = {
+                **plan,
+                'latest': option_price,
+                'direction': option_direction,
+                'entry_level': option_entry,
+                'invalidation': option_stop,
+                'target': option_target,
+            }
+            quote_signature = (
+                expiry_choice, option_mode, moneyness_preference, spread_width,
+                tuple((item['root'], item['delivery_month']) for item in target_specs),
+                id(st.session_state.get('sj_api')),
+            )
+            option_cache = st.session_state.get('_option_plan_quote_cache')
+            settings_changed = not option_cache or option_cache.get('signature') != quote_signature
+            direction_changed = bool(option_cache and option_cache.get('direction') != option_direction)
+            if refresh_option_plan or settings_changed or direction_changed:
+                directional_quote = None
+                spread_quote = None
+                stream_only = direction_changed and not settings_changed and not refresh_option_plan
+                expiry_selection = option_cache['expiry_selection'] if stream_only else select_txo_expiry(
+                    st.session_state.get('sj_api'), expiry_choice,
+                )
+                if option_mode.startswith("自動") or option_mode.startswith("單買"):
+                    directional_quote = get_txo_directional_quote(
+                        st.session_state.get('sj_api'), quote_plan, expiry_choice, moneyness_preference,
+                        expiry_selection=expiry_selection, stream_only=stream_only,
+                    )
+                if option_mode.startswith("自動") or option_mode.startswith("價差單"):
+                    spread_quote = get_txo_spread_quote(
+                        st.session_state.get('sj_api'), quote_plan, expiry_choice, spread_width,
+                        expiry_selection=expiry_selection, stream_only=stream_only,
+                    )
+                option_cache = {
+                    'signature': quote_signature, 'directional': directional_quote,
+                    'spread': spread_quote, 'updated_at': None,
+                    'direction': option_direction, 'expiry_selection': expiry_selection,
+                    'expiry': expiry_selection[1], 'source': expiry_selection[2],
+                    'profile': moneyness_preference,
+                }
+                if directional_quote:
+                    option_cache['tracked_contracts'] = [c['contract'] for c in directional_quote['alternatives'][:3]]
+                elif not option_mode.startswith('價差單'):
+                    right = 'C' if option_direction == '偏多' else 'P'
+                    eligible_contracts = [c for c in expiry_selection[0] if txo_right_value(c) == right]
+                    option_cache['tracked_contracts'] = sorted(eligible_contracts,
+                        key=lambda c: abs(float(c.strike_price) - option_price))[:3]
+                st.session_state['_option_plan_quote_cache'] = option_cache
+            if not option_cache:
+                option_cache = {'directional': None, 'spread': None,
+                                'updated_at': None}
+            refresh_option_candidate_cache(quote_plan)
+            directional_quote = option_cache.get('directional')
+            spread_quote = option_cache.get('spread')
+            strategy_view = recommend_txo_strategy(directional_quote, spread_quote, quote_plan)
+            st.markdown(
+                f"<div style='border-left:5px solid {strategy_view['color']};background:#151a22;padding:12px 16px;border-radius:7px'>"
+                f"<div style='font-size:13px;color:#b7c0cc'>綜合波動率、量價、流動性與短波方向</div>"
+                f"<div style='font-size:20px;font-weight:800;color:{strategy_view['color']}'>建議：{strategy_view['choice']}</div>"
+                f"<div style='font-size:14px;color:#dfe6e9'>{strategy_view['reason']}</div></div>",
+                unsafe_allow_html=True,
+            )
+            st.caption(
+                f"方向：{'BC／Call' if option_direction == '偏多' else 'BP／Put'}｜"
+                f"報價更新：{option_cache['updated_at'].strftime('%H:%M:%S') if option_cache.get('updated_at') else '等待串流'}｜追蹤前三名候選與價差兩腿。"
+            )
+            st.caption(option_cache.get('status', '等待候選串流'))
+            with st.expander("🧮 模型數字怎麼看"):
+                st.markdown(
+                    "- **模型機率**：估算到期時跨過損益兩平點的機率，不是歷史勝率。\n"
+                    "- **目標／停損情境**：假設快進快出後仍有約 65% 剩餘時間，估算當時權利金；未含手續費與稅。\n"
+                    "- **模型估值差**：理論價減保守買進價。負值常反映買賣價差，不代表這筆交易的期望報酬。\n"
+                    "- **單買門檻**：一般單買需目標越過損益兩平、目標情境為正、報酬風險比至少 1.25。\n"
+                    "- **放寬試單**：機率／價差較不理想但仍符合最低條件時，只顯示小部位試單；不代表一般單買通過。\n"
+                    "- 夜盤以最新期貨代替現貨，期現價差可能造成估算誤差。"
+                )
+
+            display_spread = option_mode.startswith("價差單") or (
+                option_mode.startswith("自動") and strategy_view['choice'] == '價差單'
+            )
+            option_quote = spread_quote if display_spread else directional_quote
+            if option_quote and option_quote.get('quote_time'):
+                st.caption('本組報價來源時間：' + _stream_datetime(option_quote['quote_time']).strftime('%Y/%m/%d %H:%M:%S'))
+            if display_spread and option_quote and option_quote.get('quote_stale'):
+                st.warning('價差報價已延遲；以下保留上次數字，等待兩腿最新串流，暫不進場。')
+            if option_quote and display_spread:
+                option_title = f"{option_quote['name']}｜{option_quote['delivery_month']}｜{option_quote['expiry'].strftime('%Y/%m/%d')} 到期（剩 {option_quote['dte']} 天）"
+                st.markdown(f"**{option_title}**")
+                spread_width_value = abs(option_quote['short_strike'] - option_quote['long_strike'])
+                render_option_metric_cards("契約組合", [
+                    ("賣方價外履約價", f"{_format_compact_number(option_quote['short_strike'], 0)} {option_quote['right']}", '#f5f5f5'),
+                    ("保護買方履約價", f"{_format_compact_number(option_quote['long_strike'], 0)} {option_quote['right']}", '#f5f5f5'),
+                    ("履約價差", f"{_format_compact_number(spread_width_value, 0)} 點", '#29b6f6'),
+                ])
+                render_option_metric_cards("風險與模型", [
+                    ("預估淨權利金", f"${_format_compact_number(option_quote['net_credit'], 0)}" if option_quote['net_credit'] is not None else "報價不足", '#ffb300'),
+                    ("最大獲利", f"${_format_compact_number(option_quote['max_profit'], 0)}" if option_quote['max_profit'] is not None else "報價不足", '#ff4b4b'),
+                    ("單組最大風險", f"${_format_compact_number(option_quote['max_loss'], 0)}", '#00c853'),
+                    ("損益兩平", _format_compact_number(option_quote['breakeven'], 2) if option_quote['breakeven'] is not None else "報價不足", '#f5f5f5'),
+                    ("模型勝率", f"{_format_compact_number(option_quote['model_probability'] * 100, 2)}%" if option_quote['model_probability'] is not None else "無法估算", '#29b6f6'),
+                    ("模型估值差", f"${_format_compact_number(option_quote['expected_pnl'], 0, signed=True)}" if option_quote['expected_pnl'] is not None else "無法估算", '#cbd5e1'),
+                ])
+                premium_detail = "即時買賣價不足，最大風險先以履約價差 × 50 元估算。"
+                if option_quote['short_premium'] is not None and option_quote['long_premium'] is not None:
+                    premium_detail = (
+                        f"賣方權利金 {_format_compact_number(option_quote['short_premium'], 2)}、"
+                        f"保護買方權利金 {_format_compact_number(option_quote['long_premium'], 2)}，"
+                        "以賣方買價與買方賣價保守估算。"
+                    )
+                st.caption(
+                    f"風險指標：{option_quote['risk_level']}；{premium_detail} 到期週 Gamma 風險高，"
+                    "價格有效跌破／突破日線失效點時應優先退出，絕不留裸賣部位。"
+                )
+                st.caption(f"資料來源：{option_quote['source']}（契約與即時串流）")
+            elif option_quote:
+                option_title = f"{option_quote['name']}｜{option_quote['delivery_month']}｜{option_quote['expiry'].strftime('%Y/%m/%d')} 到期（剩 {option_quote['dte']} 天）"
+                st.markdown(f"**{option_title}**")
+                render_option_metric_cards("契約與成交", [
+                    ("候選履約價" if not option_quote.get('trade_ready', False) else "建議買進", f"{_format_compact_number(option_quote['strike'], 0)} {option_quote['right']}", '#f5f5f5'),
+                    ("買進參考價", f"{_format_compact_number(option_quote['premium'], 2)} 點" if option_quote['premium'] is not None else "報價不足", '#ffb300'),
+                    ("價內外", f"{option_quote['moneyness']}｜距現價 {_format_compact_number(option_quote['distance_points'], 0)} 點", '#29b6f6'),
+                    ("買賣價差", f"{_format_compact_number(option_quote['spread'], 2)} 點" if option_quote['spread'] is not None else "報價不足", '#f5f5f5'),
+                    ("流動性", option_quote['liquidity'], '#f5f5f5'),
+                ])
+                render_option_metric_cards("成本、風險與模型", [
+                    ("單口權利金成本", f"${_format_compact_number(option_quote['max_loss'], 0)}" if option_quote['max_loss'] is not None else "報價不足", '#00c853'),
+                    ("損益兩平", _format_compact_number(option_quote['breakeven'], 2) if option_quote['breakeven'] is not None else "報價不足", '#f5f5f5'),
+                    ("模型勝率", f"{_format_compact_number(option_quote['model_probability'] * 100, 2)}%" if option_quote['model_probability'] is not None else "無法估算", '#29b6f6'),
+                    ("模型波動率", f"{_format_compact_number(option_quote['model_volatility'] * 100, 2)}%", '#f5f5f5'),
+                    ("模型估值差", f"${_format_compact_number(option_quote['model_value_gap'], 0, signed=True)}" if option_quote.get('model_value_gap') is not None else "無法估算", '#cbd5e1'),
+                    ("報酬／風險", _format_compact_number(option_quote.get('payoff_ratio'), 2) if option_quote.get('payoff_ratio') is not None else "無法估算", '#29b6f6'),
+                    (
+                        "目標情境損益",
+                        f"${_format_compact_number(option_quote['target_pnl'], 0, signed=True)}",
+                        _txo_scenario_color(option_quote.get('target_pnl')),
+                    ),
+                    (
+                        "停損情境損益",
+                        f"${_format_compact_number(option_quote['stop_pnl'], 0, signed=True)}",
+                        _txo_scenario_color(option_quote.get('stop_pnl')),
+                    ),
+                ])
+                if option_quote.get('trade_ready', False):
+                    st.warning(
+                        f"⚠️ 風險：{option_quote['risk_level']}。只在 5 分 K 確認後進場；"
+                        "標的碰到失效點，或權利金回落約 40%，優先退出。"
+                    )
+                elif option_quote.get('small_position_ready', False):
+                    st.warning(
+                        "⚠️ 放寬試單條件：這筆 BC／BP 尚未達一般單買門檻，"
+                        "只可用可承受歸零的小部位，5 分 K 未確認或碰到失效點就退出。"
+                    )
+                else:
+                    st.warning(
+                        "⏸️ 本候選未達單買門檻："
+                        + "、".join(option_quote.get('quality_notes') or ['條件不足'])
+                        + "。先等待，不以候選價直接進場。"
+                    )
+                st.caption(
+                    f"報價依據：{option_quote.get('premium_basis', '最後成交價')}。單口權利金成本 = 參考價 × 50 元，"
+                    "未含手續費與交易稅；買方最大風險即已付權利金。"
+                )
+                st.caption(
+                    f"篩選模式：{option_quote['profile']}；目前選為{option_quote['moneyness']}。"
+                    f"短波目標{'可涵蓋' if option_quote['target_reachable'] else '尚未涵蓋'}此履約價；"
+                    f"波動率來源：{option_quote['volatility_source']}。"
+                    "模型勝率是到期超越損益兩平點的估算，不是歷史回測命中率。"
+                    f"資料來源：{option_quote['source']}（契約與報價）。"
+                )
+                render_txo_scenario_note(option_quote)
+                if option_quote.get('alternatives'):
+                    comparison_rows = []
+                    for candidate in option_quote['alternatives']:
+                        comparison_rows.append({
+                            "價內外": candidate['moneyness'],
+                            "履約價": _format_compact_number(candidate['strike'], 0),
+                            "買進價": _format_compact_number(candidate['premium'], 2),
+                            "模型勝率": f"{_format_compact_number(candidate['model_probability'] * 100, 2)}%" if candidate['model_probability'] is not None else "—",
+                            "IV／模型波動率": f"{_format_compact_number(candidate['model_volatility'] * 100, 2)}%",
+                            "模型估值差": f"${_format_compact_number(candidate['model_value_gap'], 0, signed=True)}" if candidate.get('model_value_gap') is not None else "—",
+                            "報酬／風險": _format_compact_number(candidate.get('payoff_ratio'), 2) if candidate.get('payoff_ratio') is not None else "—",
+                            "單買門檻": (
+                                "✅ 通過" if candidate.get('trade_ready')
+                                else "⚠️ 小部位" if candidate.get('small_position_ready')
+                                else "⏸️ 等待"
+                            ),
+                            "目標損益": f"${_format_compact_number(candidate['target_pnl'], 0, signed=True)}",
+                            "停損損益": f"${_format_compact_number(candidate['stop_pnl'], 0, signed=True)}",
+                            "流動性": candidate['liquidity'],
+                            "綜合分數": _format_compact_number(candidate['score'], 2),
+                        })
+                    st.markdown("##### 履約價比較")
+                    comparison_frame = pd.DataFrame(comparison_rows)
+                    st.dataframe(
+                        comparison_frame,
+                        column_config=compact_table_column_config(comparison_frame),
+                        width='stretch', hide_index=True,
+                    )
+            elif display_spread:
+                st.warning(
+                    f"永豐 Shioaji 尚未取得 {expiry_choice}（預期 `{expected_contract}`）的夜盤即時契約／報價，"
+                    "本次不提供價差單履約價與權利金建議，避免使用日盤資料造成誤判。"
+                )
+            else:
+                operation = "BC（買進 Call）" if quote_plan['direction'] == '偏多' else "BP（買進 Put）"
+                st.warning(
+                    f"永豐 Shioaji 尚未取得 {expiry_choice}（預期 `{expected_contract}`） 的可用選擇權契約／報價，暫不推薦單買 {operation}。"
+                    "請確認已登入期貨帳戶，並在交易日重新載入永豐契約檔。"
+                )
+            if not option_quote:
+                diagnostic = st.session_state.get('txo_contract_diagnostic')
+                if diagnostic:
+                    st.caption(f"契約讀取診斷：{diagnostic}")
+            else:
+                payoff_chart = build_txo_payoff_chart(option_quote, quote_plan, display_spread)
+                if payoff_chart is not None:
+                    st.markdown("#### 到期損益曲線（每口／每組）")
+                    render_compact_metric_card_grid(
+                        get_txo_payoff_level_items(option_quote, quote_plan),
+                        columns=4,
+                        class_name='compact-metric-grid txo-payoff-level-grid',
+                    )
+                    st.plotly_chart(
+                        payoff_chart, width='stretch',
+                        config={'displayModeBar': False, 'scrollZoom': False},
+                    )
+                    st.caption(
+                        "曲線為到期結算損益，每口／每組乘數 50 元；紅色為獲利、綠色為虧損。"
+                        "到期前的實際損益仍會受剩餘時間、隱含波動率與買賣價差影響。"
+                    )
+                else:
+                    st.info("即時權利金或淨收權利金不足，暫時無法繪製可驗證的損益曲線。")
+
 
 
 def calculate_index_trade_plan(index_df, index_result, futures_df, futures_result):
@@ -23769,715 +24554,35 @@ with tab_fibo:
             result = calculate_market_temperature(temp_df)
             thermometer_data.append((label, code, temp_df, source, result))
 
-    with tab_trade_plan:
-        st.subheader("指數操作計畫")
-        st.caption("日線費波決定主方向，5 分 K 提供短波當沖點位；即時報價僅供觀察，不會自動下單或構成投資建議。")
-        option_mode_choices = [
-            "自動評選（單買／價差）",
-            "價差單（限定風險，偏結算）",
-            "單買 BC／BP（快進快出）",
-        ]
-        saved_option_mode = st.session_state.get('trade_plan_option_mode_saved', '')
-        if saved_option_mode not in option_mode_choices:
-            if str(saved_option_mode).startswith('價差單'):
-                saved_option_mode = option_mode_choices[1]
-            elif str(saved_option_mode).startswith('單買'):
-                saved_option_mode = option_mode_choices[2]
-            else:
-                saved_option_mode = option_mode_choices[0]
-            st.session_state['trade_plan_option_mode_saved'] = saved_option_mode
-        index_item = next((item for item in thermometer_data if item[1] == '^TWII'), None)
-        futures_item = next((item for item in thermometer_data if item[1] == 'TWF=F'), None)
-        plan = get_stable_index_trade_plan(
-            index_item[2] if index_item else pd.DataFrame(), index_item[4] if index_item else None,
-            futures_item[2] if futures_item else pd.DataFrame(), futures_item[4] if futures_item else None,
-        )
-        if plan is None:
-            st.info("⏳ 正在載入加權與期貨日 K；取得足夠資料後會直接顯示操作計畫。")
-            if not st.session_state.get('_index_trade_plan_auto_retry', False):
-                st.session_state['_index_trade_plan_auto_retry'] = True
-                clear_index_market_data_cache()
-                st.rerun()
-            st.caption("資料來源仍在回應中，可先停留在此頁等待下一次更新。")
-        else:
-            st.session_state.pop('_index_trade_plan_auto_retry', None)
-            display_direction, direction_color = {
-                '偏多': ('偏多', '#ff4b4b'),
-                '偏空': ('偏空', '#00c853'),
-            }.get(plan['direction'], ('區間盤整', '#ffc107'))
-            profile_col, refresh_col = st.columns([6, 1])
-            with profile_col:
-                entry_profile = st.radio(
-                    "進場靈敏度",
-                    ["積極（提早確認）", "穩健（完整確認）"],
-                    horizontal=True,
-                    key="trade_plan_entry_profile",
-                    help="積極模式會擴大費波觀察區，並允許即時價站穩／跌破 VWAP 後提早小部位進場；過熱與反向急漲跌保護仍保留。",
-                )
-            with refresh_col:
-                st.button("↻ 即時更新", key="refresh_trade_plan_live", width='stretch')
-            index_auto = st.toggle('⏰ 盤中情境追蹤', value=False, key='index_scenario_auto')
-            index_seconds = st.number_input('情境更新間隔（秒）', 2, 300, 5, key='index_scenario_seconds')
-            render_index_scenario_tracking(plan, index_auto, index_seconds)
-            live_snapshot = get_live_futures_snapshot(st.session_state.get('sj_api'), 'TMF')
-            live_price = live_snapshot['price'] if live_snapshot else plan['latest']
-            live_change = live_snapshot['change'] if live_snapshot else float((futures_item[4] or {}).get('change', 0))
-            intraday_state = get_cached_futures_intraday_state(
-                st.session_state.get('sj_api'), plan['direction'],
+    active_plan = tab_fibo.open and (tab_trade_plan.open or tab_option_plan.open)
+    if st.session_state.get('sj_api') is not None:
+        if not active_plan:
+            sync_strategy_stream_scope(st.session_state.sj_api, [], 'index')
+        if not (tab_fibo.open and tab_option_plan.open):
+            sync_strategy_stream_scope(st.session_state.sj_api, [], 'options')
+    if active_plan:
+        option_page = tab_option_plan.open
+        page = tab_option_plan if option_page else tab_trade_plan
+        timer_key = 'option_auto_seconds' if option_page else 'index_scenario_seconds'
+        with page:
+            st.subheader('選擇權操作計畫' if option_page else '指數操作計畫')
+            seconds = st.number_input(
+                '自動更新間隔（秒）', 2, 300,
+                value=int(st.session_state.get(timer_key + '_saved', 5)), key=timer_key,
             )
-            previous_temperature = None
-            if futures_item is not None and len(futures_item[2]) > 20:
-                previous_temperature = calculate_market_temperature(futures_item[2].iloc[:-1].copy())
-            temperature_delta = (
-                float(futures_item[4]['score']) - float(previous_temperature['score'])
-                if futures_item and futures_item[4] and previous_temperature else 0.0
-            )
-            trade_state = evaluate_trade_entry_state(
-                plan, live_price, live_change, intraday_state, temperature_delta, entry_profile,
-            )
-            confirmation_text = intraday_state['confirmation_text']
-            if trade_state['can_enter'] and trade_state['execution_direction'] == '偏多':
-                position_recommendation = '建議做多｜可快進快出'
-                position_color = '#ff4b4b'
-            elif trade_state['can_enter'] and trade_state['execution_direction'] == '偏空':
-                position_recommendation = '建議做空｜可快進快出'
-                position_color = '#00c853'
-            else:
-                position_recommendation = f"保守不進場｜{trade_state['permission']}"
-                position_color = '#ffc107'
-            st.markdown(
-                f"""<div style='border-left:5px solid {plan['action_color']};background:#151a22;padding:14px 18px;border-radius:7px;margin-bottom:12px'>
-                <div style='font-size:14px;color:#b7c0cc'>{plan['market_label']}</div>
-                <div style='font-size:15px;font-weight:700;color:{direction_color};margin-top:3px'>趨勢背景：{display_direction}</div>
-                <div style='font-size:21px;font-weight:800;color:{trade_state['color']};margin-top:3px'>{trade_state['stage']}｜{trade_state['permission']}</div>
-                <div style='font-size:14px;color:#dfe6e9;margin-top:4px'>{plan['alignment_note']}</div>
-                </div>""", unsafe_allow_html=True
-            )
-            st.info(f"**即時判斷：** {trade_state['reason']}")
-            if live_snapshot:
-                latest_card = {
-                    'label': f"最新微台（{live_snapshot['contract_code']}）",
-                    'value': f"{live_snapshot['price']:,.0f}",
-                    'detail': (
-                        f"{live_snapshot['arrow']} {abs(live_snapshot['change']):,.0f} "
-                        f"({_format_compact_number(live_snapshot['change_pct'], 2, signed=True)}%)"
-                    ),
-                    'color': live_snapshot['color'],
-                }
-            else:
-                latest_card = {
-                    'label': '最新期貨（日 K）',
-                    'value': f"{plan['latest']:,.0f}",
-                    'color': '#f5f5f5',
-                }
-            render_compact_metric_card_grid(
-                [
-                    latest_card,
-                    {'label': '費波支撐', 'value': _format_compact_number(plan['support'], 0), 'color': '#40c4ff'},
-                    {'label': '費波壓力', 'value': _format_compact_number(plan['resistance'], 0), 'color': '#ff5252'},
-                    {'label': '費波區寬', 'value': f"± {_format_compact_number(plan['zone_points'], 0)} 點", 'color': '#f5f5f5'},
-                ],
-                columns=4,
-                class_name='compact-metric-grid index-level-metric-grid',
-            )
-            if live_snapshot:
-                st.caption(
-                    f"微台快照於 {datetime.now(pytz.timezone('Asia/Taipei')).strftime('%H:%M:%S')} 擷取；"
-                    "盤中情境只讀串流；日線計畫沿用完整資料版本，15 分／5 分 K 重用背景分鐘快取。"
-                )
-
-            index_result = index_item[4] if index_item else None
-            if index_result is not None:
-                index_price = float(index_result['close'])
-                basis = live_price - index_price
-                if basis > 0:
-                    basis_label, basis_color = "正價差", "#ff4b4b"
-                    basis_advice = (
-                        "期貨高於加權，反映期貨相對現貨偏強。僅在市場判讀同為偏多、"
-                        "且價格回測費波支撐後獲確認時，才考慮順勢做多；不可只因正價差追價。"
-                    )
-                elif basis < 0:
-                    basis_label, basis_color = "逆價差", "#00c853"
-                    basis_advice = (
-                        "期貨低於加權，反映期貨相對現貨偏弱。僅在市場判讀同為偏空、"
-                        "且價格反彈至費波壓力後受壓時，才考慮順勢做空；不可只因逆價差追空。"
-                    )
-                else:
-                    basis_label, basis_color = "平價", "#dfe6e9"
-                    basis_advice = "期現價格貼近，價差不提供方向優勢；以費波位置與 15 分 K 確認作為主要進出依據。"
-
-                now_tw = datetime.now(pytz.timezone('Asia/Taipei'))
-                updated_at = pd.Timestamp(index_result['updated_at']).date()
-                is_cash_snapshot = (
-                    updated_at == now_tw.date()
-                    and dt_time(9, 0) <= now_tw.time() < dt_time(13, 35)
-                    and index_item[3] and '即時串流' in index_item[3]
-                )
-                basis_reference = "加權盤中快照" if is_cash_snapshot else "最近加權日收盤"
-                index_change = float(index_result.get('change', 0) or 0)
-                index_change_pct = float(index_result.get('change_pct', 0) or 0)
-                index_color = '#ff4b4b' if index_change > 0 else ('#00c853' if index_change < 0 else '#dfe6e9')
-                index_arrow = '▲' if index_change > 0 else ('▼' if index_change < 0 else '◆')
-                futures_result = (futures_item[4] or {}) if futures_item else {}
-                futures_change = float(live_snapshot['change']) if live_snapshot else float(futures_result.get('change', 0) or 0)
-                futures_change_pct = float(live_snapshot['change_pct']) if live_snapshot else float(futures_result.get('change_pct', 0) or 0)
-                futures_color = '#ff4b4b' if futures_change > 0 else ('#00c853' if futures_change < 0 else '#dfe6e9')
-                futures_arrow = '▲' if futures_change > 0 else ('▼' if futures_change < 0 else '◆')
-                st.markdown("##### ⚖️ 期現價差判讀")
-                render_compact_metric_card_grid(
-                    [
-                        {
-                            'label': basis_reference,
-                            'value': f"{index_price:,.0f}",
-                            'detail': f"{index_arrow} {abs(index_change):,.0f} ({_format_compact_number(index_change_pct, 2, signed=True)}%)",
-                            'color': index_color,
-                        },
-                        {
-                            'label': '期貨指數',
-                            'value': f"{live_price:,.0f}",
-                            'detail': f"{futures_arrow} {abs(futures_change):,.0f} ({_format_compact_number(futures_change_pct, 2, signed=True)}%)",
-                            'color': futures_color,
-                        },
-                        {
-                            'label': '期貨－加權價差',
-                            'value': f"{basis:+,.0f} 點",
-                            'detail': basis_label,
-                            'color': basis_color,
-                        },
-                    ],
-                    columns=3,
-                    class_name='compact-metric-grid index-basis-metric-grid',
-                )
-                st.caption(
-                    f"計算：期貨 {live_price:,.0f} − {basis_reference} {index_price:,.0f} = {basis:+,.0f} 點。"
-                    "夜盤因現貨已收盤，價差主要反映夜盤預期與海外市場，不宜單獨作為交易訊號。"
-                )
-                st.info(f"**操作建議：** {basis_advice}")
-
-            st.divider()
-            st.markdown(
-                f"#### 🎯 進出依據 <span style='font-size:15px;color:{position_color};font-weight:700'>　{position_recommendation}</span>",
-                unsafe_allow_html=True,
-            )
-            st.caption("以日線費波支撐／壓力與 15 分 K 確認，作為順勢進場、停損與目標依據。")
-            st.info(f"**進場確認：** {plan['trigger']}")
-            position_count = st.selectbox(
-                "預計進場口數",
-                options=[1, 2, 3, 4, 5],
-                format_func=lambda count: f"{count} 口微型臺指",
-                key="trade_plan_position_count",
-                help="此設定會連動更新進出依據與短波當沖的停損金額及預估收益。",
-            )
-            execution_direction = trade_state.get('execution_direction') or plan.get('direction')
-            execution_color = (
-                '#ff4b4b' if execution_direction == '偏多'
-                else ('#00c853' if execution_direction == '偏空' else '#ffc107')
-            )
-            entry_rr_color = (
-                '#40c4ff' if (trade_state['rr_ratio'] or 0) >= 1.25 else '#ffc107'
-            )
-            render_index_plan_metric_cards([
-                {
-                    'label': '觀察進場區', 'label_color': '#40c4ff',
-                    'value': _format_compact_number(trade_state['entry_level'], 0),
-                    'color': execution_color,
-                },
-                {
-                    'label': '失效／停損', 'label_color': '#ffc107',
-                    'value': _format_compact_number(trade_state['invalidation'], 0),
-                    'color': '#ffc107',
-                },
-                {
-                    'label': '第一目標', 'label_color': '#40c4ff',
-                    'value': _format_compact_number(trade_state['target'], 0),
-                    'color': execution_color,
-                },
-                {
-                    'label': '預估風報比', 'label_color': '#40c4ff',
-                    'value': (
-                        f"1 : {_format_compact_number(trade_state['rr_ratio'], 2)}"
-                        if trade_state['rr_ratio'] is not None else "—"
-                    ),
-                    'color': entry_rr_color,
-                },
-            ])
-            entry_risk_level, entry_risk_color, entry_risk_ratio = get_trade_risk_level(
-                trade_state['risk_points'], plan['atr'],
-            )
-            entry_risk_amount = trade_state['risk_points'] * 10 * position_count
-            entry_reward_amount = trade_state['reward_points'] * 10 * position_count
-            render_compact_metric_card_grid([
-                {
-                    'label': '計畫風險點數',
-                    'value': f"{trade_state['risk_points']:,.0f} 點",
-                    'detail': f'風險等級：{entry_risk_level}',
-                    'color': entry_risk_color,
-                },
-                {
-                    'label': '預估盈利點數',
-                    'value': f"{trade_state['reward_points']:,.0f} 點",
-                    'color': '#ff4b4b',
-                },
-                {
-                    'label': f'{position_count} 口最大風險',
-                    'value': f'${entry_risk_amount:,.0f}',
-                    'color': entry_risk_color,
-                },
-                {
-                    'label': f'{position_count} 口預估收益',
-                    'value': f'${entry_reward_amount:,.0f}',
-                    'color': '#ff4b4b',
-                },
-            ], columns=4, class_name='compact-metric-grid index-entry-risk-grid')
+            st.session_state[timer_key + '_saved'] = seconds
+            interval = intraday_auto_interval('options' if option_page else 'index', True, seconds)
             st.caption(
-                f"風險等級以停損距離相對日 ATR 判定：{_format_compact_number(entry_risk_ratio, 2)} ATR；"
-                "微台每點 10 元。"
+                f'⏰ 全頁自動更新：每 {seconds} 秒｜分析與即時點位同步更新'
+                if interval else '⏰ 自動追蹤：等待 Shioaji 登入；保留最近完整資料。'
             )
-            if trade_state['can_enter']:
-                st.info(f"15 分 K：{confirmation_text} 目前符合「{trade_state['permission']}」條件，仍須依設定停損控制部位。")
-            elif plan['direction'] in ('偏多', '偏空'):
-                st.warning(f"15 分 K：{confirmation_text} 目前狀態為「{trade_state['permission']}」，不觸發進場。")
-            else:
-                st.info(f"區間策略：{trade_state['reason']}")
-
-            signal_details = []
-            if intraday_state['available']:
-                signal_details.append(f"15 分 K VWAP {intraday_state['vwap']:,.0f}")
-                signal_details.append(
-                    f"本段開盤區間 {intraday_state['opening_low']:,.0f}–{intraday_state['opening_high']:,.0f}"
-                )
-            signal_details.append(
-                f"即時漲跌為日 ATR 的 {_format_compact_number(trade_state['shock_ratio'], 2, signed=True)} 倍"
-            )
-            signal_details.append(
-                f"溫度變化 {_format_compact_number(trade_state['temperature_delta'], 0, signed=True)} 度"
-            )
-            st.caption("｜".join(signal_details))
-
-            st.divider()
-            short_wave_direction, short_direction_note = resolve_short_wave_direction(
-                plan, trade_state, intraday_state,
-            )
-            if short_wave_direction == '偏多':
-                short_recommendation, short_color = '短多｜可提早小部位進場', '#ff4b4b'
-            elif short_wave_direction == '偏空':
-                short_recommendation, short_color = '短空｜可提早小部位進場', '#00c853'
-            else:
-                short_recommendation, short_color = '等待盤中動能', '#ffc107'
-            st.markdown(
-                f"#### ⚡ 短波當沖（5 分 K） <span style='font-size:15px;color:{short_color};font-weight:700'>　{short_recommendation}</span>",
-                unsafe_allow_html=True,
-            )
-            st.caption(f"{short_direction_note}。短波採 EMA5 或前根高低點即時觸發，不等待完整 5 分 K 收盤。")
-            short_wave = get_cached_short_wave_plan(st.session_state.get('sj_api'), short_wave_direction)
-            if short_wave:
-                short_rr_color = '#40c4ff' if (short_wave['rr'] or 0) >= 1.25 else '#ffc107'
-                render_index_plan_metric_cards([
-                    {
-                        'label': '短波進場區', 'label_color': '#40c4ff',
-                        'value': (
-                            f"{_format_compact_number(short_wave['entry'], 0)} ± "
-                            f"{_format_compact_number(short_wave['zone'], 0)}"
-                        ),
-                        'color': short_color,
-                    },
-                    {
-                        'label': '短波停損', 'label_color': '#ffc107',
-                        'value': _format_compact_number(short_wave['stop'], 0),
-                        'color': '#ffc107',
-                    },
-                    {
-                        'label': '短波目標', 'label_color': '#40c4ff',
-                        'value': _format_compact_number(short_wave['target'], 0),
-                        'color': short_color,
-                    },
-                    {
-                        'label': '短波風報比', 'label_color': '#40c4ff',
-                        'value': (
-                            f"1 : {_format_compact_number(short_wave['rr'], 2)}"
-                            if short_wave['rr'] is not None else "—"
-                        ),
-                        'color': short_rr_color,
-                    },
-                ])
-                st.info(f"**快速進場條件：** {short_wave['trigger']}")
-                momentum_label = "已達快速觸發" if short_wave['momentum_ready'] else "接近觸發，等待穿越前根高低點"
-                momentum_color = '#ff4b4b' if short_wave_direction == '偏多' else '#00c853'
-                st.markdown(
-                    f"<div style='font-size:14px;font-weight:700;color:{momentum_color}'>即時狀態：{momentum_label}｜"
-                    f"EMA5 {short_wave['ema_fast']:,.0f}｜量比 {_format_compact_number(short_wave['volume_ratio'], 2)}</div>",
-                    unsafe_allow_html=True,
-                )
-                short_risk_level, short_risk_color, short_risk_ratio = get_trade_risk_level(
-                    short_wave['risk'], plan['atr'],
-                )
-                short_risk_amount = short_wave['risk'] * 10 * position_count
-                short_reward_amount = short_wave['reward'] * 10 * position_count
-                render_compact_metric_card_grid([
-                    {
-                        'label': '短波風險點數',
-                        'value': f"{short_wave['risk']:,.0f} 點",
-                        'detail': f'風險等級：{short_risk_level}',
-                        'color': short_risk_color,
-                    },
-                    {
-                        'label': '短波盈利點數',
-                        'value': f"{short_wave['reward']:,.0f} 點",
-                        'color': '#ff4b4b',
-                    },
-                    {
-                        'label': f'{position_count} 口最大風險',
-                        'value': f'${short_risk_amount:,.0f}',
-                        'color': short_risk_color,
-                    },
-                    {
-                        'label': f'{position_count} 口預估收益',
-                        'value': f'${short_reward_amount:,.0f}',
-                        'color': '#ff4b4b',
-                    },
-                ], columns=4, class_name='compact-metric-grid index-short-risk-grid')
-                st.caption(
-                    "以最新 6 根 5 分 K、EMA5 與前根高低點計算；短波停損為日 ATR 的 "
-                    f"{_format_compact_number(short_risk_ratio, 2)} 倍。"
-                    "短波可先於日線進場許可觸發，但只適合小部位快進快出。"
-                )
-            elif short_wave_direction:
-                st.info("即時條件已通過，但尚未取得足夠的 5 分 K，暫不提供短波點位。")
-            else:
-                st.info("尚未形成可辨識的盤中方向；短波暫不啟用，避免在區間中段雙向追價。")
-
-    with tab_option_plan:
-        if tab_option_plan.open:
-            st.subheader("選擇權操作計畫")
-            st.caption("獨立載入最近到期週三選、週五選或月選；比較價外／平價／價內單買與限定風險價差。")
-            option_now = datetime.now(pytz.timezone('Asia/Taipei'))
-            data_status = []
-            for label, item in (("加權", index_item), ("期貨", futures_item)):
-                data_frame = item[2] if item else pd.DataFrame()
-                source_name = item[3] if item else "尚未取得資料來源"
-                required_columns = {'High', 'Low', 'Close'}
-                valid_rows = (
-                    len(data_frame.dropna(subset=['High', 'Low', 'Close']))
-                    if not data_frame.empty and required_columns.issubset(data_frame.columns) else 0
-                )
-                latest_date = (
-                    pd.Timestamp(data_frame.index[-1]).strftime('%Y/%m/%d')
-                    if valid_rows else "無資料"
-                )
-                data_status.append(f"{label} {valid_rows} 根（最新 {latest_date}；{source_name}）")
-            st.caption("計畫資料：" + "｜".join(data_status))
-            if is_market_closed_func(option_now.date()):
-                st.info(
-                    "目前為休市日，計畫會沿用最近完整交易日的日 K；不會建立假日零成交量 K 棒。"
-                    "履約價與損益曲線仍可試算，但即時買賣價、價差與流動性應等開盤後重新更新。"
-                )
-            option_is_closed = is_market_closed_func(option_now.date())
-            option_direction = locals().get('short_wave_direction')
-            if option_is_closed and plan and plan.get('direction') in ('偏多', '偏空'):
-                # 休市時沒有有效的盤中 5 分 K，改採最近完整交易日的日線方向。
-                option_direction = plan['direction']
-            if plan is None:
-                st.info(
-                    "目前可用日 K 少於 20 根或高低價欄位不完整，暫時無法建立選擇權操作計畫。"
-                    "系統已同時嘗試期貨日 K 與證交所加權指數備援；請檢查上方資料根數與最新日期。"
-                )
-            elif option_direction not in ('偏多', '偏空'):
-                st.info("盤中方向尚未形成，暫不建立 BC／BP 或方向價差；等待 VWAP 與 5 分 K 動能確認。")
-            else:
-                control_expiry, control_mode, control_money, control_width, control_refresh = st.columns([1.1, 2, 1.25, 1.35, 0.75])
-                with control_expiry:
-                    expiry_choice = st.selectbox(
-                        "到期別", ["最近到期", "週三選", "週五選", "月選"], key="trade_plan_expiry_choice",
-                        help="最近到期會比較週三、週五與月選，優先採最早仍可交易的契約。",
-                    )
-                target_specs = get_txo_target_contract_specs(expiry_choice)
-                expected_contract = target_specs[0]['delivery_month'] if target_specs else "依永豐最近到期契約"
-                if target_specs:
-                    st.caption(
-                        f"永豐商品根：`{target_specs[0]['root']}`｜目標契約：`{expected_contract}`｜預定到期日：{target_specs[0]['expiry'].strftime('%Y/%m/%d')}"
-                        f"｜剩餘 {(target_specs[0]['expiry'] - datetime.now(pytz.timezone('Asia/Taipei')).date()).days} 天"
-                    )
-                if st.session_state.get('trade_plan_option_mode_widget') not in option_mode_choices:
-                    st.session_state['trade_plan_option_mode_widget'] = st.session_state['trade_plan_option_mode_saved']
-                with control_mode:
-                    option_mode = st.selectbox("操作方式", option_mode_choices, key="trade_plan_option_mode_widget")
-                st.session_state['trade_plan_option_mode_saved'] = option_mode
-                moneyness_choices = ["自動評選", "價外", "平價", "價內"]
-                saved_moneyness = st.session_state.get('trade_plan_moneyness_saved', moneyness_choices[0])
-                if saved_moneyness not in moneyness_choices:
-                    saved_moneyness = moneyness_choices[0]
-                if st.session_state.get('trade_plan_moneyness_widget') not in moneyness_choices:
-                    st.session_state['trade_plan_moneyness_widget'] = saved_moneyness
-                with control_money:
-                    moneyness_preference = st.selectbox(
-                        "履約價偏好", moneyness_choices, key="trade_plan_moneyness_widget",
-                        help="自動評選會同時比較價外、平價與價內的模型獲利機率、成本效率及流動性。",
-                    )
-                st.session_state['trade_plan_moneyness_saved'] = moneyness_preference
-                with control_width:
-                    spread_width_label = st.selectbox(
-                        "價差寬度", ["100 點優先", "50 點"], key="trade_plan_spread_width",
-                        help="100 點優先：先找相差 100 點的保護腿，缺少該履約價時自動退回 50 點。",
-                    )
-                spread_width = 50 if spread_width_label.startswith('50') else 100
-                with control_refresh:
-                    # Align the button with the lower selectbox control instead of its label.
-                    st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
-                    refresh_option_plan = st.button("↻ 更新", key="refresh_option_plan", width='stretch')
-
-                option_auto_enabled = st.toggle('⏰ 候選合約自動追蹤', value=False, key='option_auto_enabled')
-                option_auto_seconds = st.number_input('候選更新間隔（秒）', 2, 300, 5, key='option_auto_seconds')
-                if not option_auto_enabled and st.session_state.get('sj_api') is not None:
-                    sync_strategy_stream_scope(st.session_state.sj_api, [], 'options')
-
-                use_intraday_option_levels = not option_is_closed and short_wave
-                option_entry = short_wave['entry'] if use_intraday_option_levels else plan['entry_level']
-                option_stop = short_wave['stop'] if use_intraday_option_levels else plan['invalidation']
-                option_target = short_wave['target'] if use_intraday_option_levels else plan['target']
-                option_price = live_price if not option_is_closed else plan['latest']
-                quote_plan = {
-                    **plan,
-                    'latest': option_price,
-                    'direction': option_direction,
-                    'entry_level': option_entry,
-                    'invalidation': option_stop,
-                    'target': option_target,
-                }
-                quote_signature = (
-                    expiry_choice, option_mode, moneyness_preference, spread_width, option_direction,
-                    tuple((item['root'], item['delivery_month']) for item in target_specs),
-                    id(st.session_state.get('sj_api')),
-                )
-                option_cache = st.session_state.get('_option_plan_quote_cache')
-                if tab_fibo.open and tab_option_plan.open and (
-                    refresh_option_plan or not option_cache or option_cache.get('signature') != quote_signature
-                ):
-                    directional_quote = None
-                    spread_quote = None
-                    expiry_selection = select_txo_expiry(
-                        st.session_state.get('sj_api'), expiry_choice,
-                    )
-                    if option_mode.startswith("自動") or option_mode.startswith("單買"):
-                        directional_quote = get_txo_directional_quote(
-                            st.session_state.get('sj_api'), quote_plan, expiry_choice, moneyness_preference,
-                            expiry_selection=expiry_selection,
-                        )
-                    if option_mode.startswith("自動") or option_mode.startswith("價差單"):
-                        spread_quote = get_txo_spread_quote(
-                            st.session_state.get('sj_api'), quote_plan, expiry_choice, spread_width,
-                            expiry_selection=expiry_selection,
-                        )
-                    option_cache = {
-                        'signature': quote_signature, 'directional': directional_quote,
-                        'spread': spread_quote, 'updated_at': datetime.now(pytz.timezone('Asia/Taipei')),
-                        'expiry': expiry_selection[1], 'source': expiry_selection[2],
-                        'profile': moneyness_preference,
-                    }
-                    if directional_quote:
-                        option_cache['tracked_contracts'] = [c['contract'] for c in directional_quote['alternatives'][:3]]
-                    elif not option_mode.startswith('價差單'):
-                        right = 'C' if option_direction == '偏多' else 'P'
-                        eligible_contracts = [c for c in expiry_selection[0] if txo_right_value(c) == right]
-                        option_cache['tracked_contracts'] = sorted(eligible_contracts,
-                            key=lambda c: abs(float(c.strike_price) - option_price))[:3]
-                    st.session_state['_option_plan_quote_cache'] = option_cache
-                if not option_cache:
-                    option_cache = {'directional': None, 'spread': None,
-                                    'updated_at': datetime.now(pytz.timezone('Asia/Taipei'))}
-                @st.fragment(run_every=option_auto_seconds if option_auto_enabled else None)
-                def render_option_candidates(seed=option_cache):
-                    if option_auto_enabled and tab_fibo.open and tab_option_plan.open:
-                        specs = get_txo_target_contract_specs(expiry_choice)
-                        if tuple((item['root'], item['delivery_month']) for item in specs) != quote_signature[-2]:
-                            if st.session_state.get('sj_api') is not None:
-                                sync_strategy_stream_scope(st.session_state.sj_api, [], 'options')
-                            st.session_state.pop('_option_plan_quote_cache', None)
-                            st.rerun()
-                        refresh_option_candidate_cache(quote_plan)
-                    option_cache = st.session_state.get('_option_plan_quote_cache', seed)
-                    directional_quote = option_cache.get('directional')
-                    spread_quote = option_cache.get('spread')
-                    strategy_view = recommend_txo_strategy(directional_quote, spread_quote, quote_plan)
-                    st.markdown(
-                        f"<div style='border-left:5px solid {strategy_view['color']};background:#151a22;padding:12px 16px;border-radius:7px'>"
-                        f"<div style='font-size:13px;color:#b7c0cc'>綜合波動率、量價、流動性與短波方向</div>"
-                        f"<div style='font-size:20px;font-weight:800;color:{strategy_view['color']}'>建議：{strategy_view['choice']}</div>"
-                        f"<div style='font-size:14px;color:#dfe6e9'>{strategy_view['reason']}</div></div>",
-                        unsafe_allow_html=True,
-                    )
-                    st.caption(
-                        f"方向：{'BC／Call' if option_direction == '偏多' else 'BP／Put'}｜"
-                        f"報價更新：{option_cache['updated_at'].strftime('%H:%M:%S')}｜僅追蹤前三名候選與價差兩腿；來源時間與延遲狀態如下。"
-                    )
-                    if option_auto_enabled:
-                        st.caption(option_cache.get('status', '等待候選串流'))
-                    with st.expander("🧮 模型數字怎麼看"):
-                        st.markdown(
-                            "- **模型機率**：估算到期時跨過損益兩平點的機率，不是歷史勝率。\n"
-                            "- **目標／停損情境**：假設快進快出後仍有約 65% 剩餘時間，估算當時權利金；未含手續費與稅。\n"
-                            "- **模型估值差**：理論價減保守買進價。負值常反映買賣價差，不代表這筆交易的期望報酬。\n"
-                            "- **單買門檻**：一般單買需目標越過損益兩平、目標情境為正、報酬風險比至少 1.25。\n"
-                            "- **放寬試單**：機率／價差較不理想但仍符合最低條件時，只顯示小部位試單；不代表一般單買通過。\n"
-                            "- 夜盤以最新期貨代替現貨，期現價差可能造成估算誤差。"
-                        )
-
-                    display_spread = option_mode.startswith("價差單") or (
-                        option_mode.startswith("自動") and strategy_view['choice'] == '價差單'
-                    )
-                    option_quote = spread_quote if display_spread else directional_quote
-                    if option_quote and option_quote.get('quote_time'):
-                        st.caption('本組報價來源時間：' + _stream_datetime(option_quote['quote_time']).strftime('%Y/%m/%d %H:%M:%S'))
-                    if display_spread and option_quote and option_quote.get('quote_stale'):
-                        st.warning('價差報價已延遲；以下保留上次數字，等待兩腿最新串流，暫不進場。')
-                    if option_quote and display_spread:
-                        option_title = f"{option_quote['name']}｜{option_quote['delivery_month']}｜{option_quote['expiry'].strftime('%Y/%m/%d')} 到期（剩 {option_quote['dte']} 天）"
-                        st.markdown(f"**{option_title}**")
-                        spread_width_value = abs(option_quote['short_strike'] - option_quote['long_strike'])
-                        render_option_metric_cards("契約組合", [
-                            ("賣方價外履約價", f"{_format_compact_number(option_quote['short_strike'], 0)} {option_quote['right']}", '#f5f5f5'),
-                            ("保護買方履約價", f"{_format_compact_number(option_quote['long_strike'], 0)} {option_quote['right']}", '#f5f5f5'),
-                            ("履約價差", f"{_format_compact_number(spread_width_value, 0)} 點", '#29b6f6'),
-                        ])
-                        render_option_metric_cards("風險與模型", [
-                            ("預估淨權利金", f"${_format_compact_number(option_quote['net_credit'], 0)}" if option_quote['net_credit'] is not None else "報價不足", '#ffb300'),
-                            ("最大獲利", f"${_format_compact_number(option_quote['max_profit'], 0)}" if option_quote['max_profit'] is not None else "報價不足", '#ff4b4b'),
-                            ("單組最大風險", f"${_format_compact_number(option_quote['max_loss'], 0)}", '#00c853'),
-                            ("損益兩平", _format_compact_number(option_quote['breakeven'], 2) if option_quote['breakeven'] is not None else "報價不足", '#f5f5f5'),
-                            ("模型勝率", f"{_format_compact_number(option_quote['model_probability'] * 100, 2)}%" if option_quote['model_probability'] is not None else "無法估算", '#29b6f6'),
-                            ("模型估值差", f"${_format_compact_number(option_quote['expected_pnl'], 0, signed=True)}" if option_quote['expected_pnl'] is not None else "無法估算", '#cbd5e1'),
-                        ])
-                        premium_detail = "即時買賣價不足，最大風險先以履約價差 × 50 元估算。"
-                        if option_quote['short_premium'] is not None and option_quote['long_premium'] is not None:
-                            premium_detail = (
-                                f"賣方權利金 {_format_compact_number(option_quote['short_premium'], 2)}、"
-                                f"保護買方權利金 {_format_compact_number(option_quote['long_premium'], 2)}，"
-                                "以賣方買價與買方賣價保守估算。"
-                            )
-                        st.caption(
-                            f"風險指標：{option_quote['risk_level']}；{premium_detail} 到期週 Gamma 風險高，"
-                            "價格有效跌破／突破日線失效點時應優先退出，絕不留裸賣部位。"
-                        )
-                        st.caption(f"資料來源：{option_quote['source']}（契約與即時串流）")
-                    elif option_quote:
-                        option_title = f"{option_quote['name']}｜{option_quote['delivery_month']}｜{option_quote['expiry'].strftime('%Y/%m/%d')} 到期（剩 {option_quote['dte']} 天）"
-                        st.markdown(f"**{option_title}**")
-                        render_option_metric_cards("契約與成交", [
-                            ("候選履約價" if not option_quote.get('trade_ready', False) else "建議買進", f"{_format_compact_number(option_quote['strike'], 0)} {option_quote['right']}", '#f5f5f5'),
-                            ("買進參考價", f"{_format_compact_number(option_quote['premium'], 2)} 點" if option_quote['premium'] is not None else "報價不足", '#ffb300'),
-                            ("價內外", f"{option_quote['moneyness']}｜距現價 {_format_compact_number(option_quote['distance_points'], 0)} 點", '#29b6f6'),
-                            ("買賣價差", f"{_format_compact_number(option_quote['spread'], 2)} 點" if option_quote['spread'] is not None else "報價不足", '#f5f5f5'),
-                            ("流動性", option_quote['liquidity'], '#f5f5f5'),
-                        ])
-                        render_option_metric_cards("成本、風險與模型", [
-                            ("單口權利金成本", f"${_format_compact_number(option_quote['max_loss'], 0)}" if option_quote['max_loss'] is not None else "報價不足", '#00c853'),
-                            ("損益兩平", _format_compact_number(option_quote['breakeven'], 2) if option_quote['breakeven'] is not None else "報價不足", '#f5f5f5'),
-                            ("模型勝率", f"{_format_compact_number(option_quote['model_probability'] * 100, 2)}%" if option_quote['model_probability'] is not None else "無法估算", '#29b6f6'),
-                            ("模型波動率", f"{_format_compact_number(option_quote['model_volatility'] * 100, 2)}%", '#f5f5f5'),
-                            ("模型估值差", f"${_format_compact_number(option_quote['model_value_gap'], 0, signed=True)}" if option_quote.get('model_value_gap') is not None else "無法估算", '#cbd5e1'),
-                            ("報酬／風險", _format_compact_number(option_quote.get('payoff_ratio'), 2) if option_quote.get('payoff_ratio') is not None else "無法估算", '#29b6f6'),
-                            (
-                                "目標情境損益",
-                                f"${_format_compact_number(option_quote['target_pnl'], 0, signed=True)}",
-                                _txo_scenario_color(option_quote.get('target_pnl')),
-                            ),
-                            (
-                                "停損情境損益",
-                                f"${_format_compact_number(option_quote['stop_pnl'], 0, signed=True)}",
-                                _txo_scenario_color(option_quote.get('stop_pnl')),
-                            ),
-                        ])
-                        if option_quote.get('trade_ready', False):
-                            st.warning(
-                                f"⚠️ 風險：{option_quote['risk_level']}。只在 5 分 K 確認後進場；"
-                                "標的碰到失效點，或權利金回落約 40%，優先退出。"
-                            )
-                        elif option_quote.get('small_position_ready', False):
-                            st.warning(
-                                "⚠️ 放寬試單條件：這筆 BC／BP 尚未達一般單買門檻，"
-                                "只可用可承受歸零的小部位，5 分 K 未確認或碰到失效點就退出。"
-                            )
-                        else:
-                            st.warning(
-                                "⏸️ 本候選未達單買門檻："
-                                + "、".join(option_quote.get('quality_notes') or ['條件不足'])
-                                + "。先等待，不以候選價直接進場。"
-                            )
-                        st.caption(
-                            f"報價依據：{option_quote.get('premium_basis', '最後成交價')}。單口權利金成本 = 參考價 × 50 元，"
-                            "未含手續費與交易稅；買方最大風險即已付權利金。"
-                        )
-                        st.caption(
-                            f"篩選模式：{option_quote['profile']}；目前選為{option_quote['moneyness']}。"
-                            f"短波目標{'可涵蓋' if option_quote['target_reachable'] else '尚未涵蓋'}此履約價；"
-                            f"波動率來源：{option_quote['volatility_source']}。"
-                            "模型勝率是到期超越損益兩平點的估算，不是歷史回測命中率。"
-                            f"資料來源：{option_quote['source']}（契約與報價）。"
-                        )
-                        render_txo_scenario_note(option_quote)
-                        if option_quote.get('alternatives'):
-                            comparison_rows = []
-                            for candidate in option_quote['alternatives']:
-                                comparison_rows.append({
-                                    "價內外": candidate['moneyness'],
-                                    "履約價": _format_compact_number(candidate['strike'], 0),
-                                    "買進價": _format_compact_number(candidate['premium'], 2),
-                                    "模型勝率": f"{_format_compact_number(candidate['model_probability'] * 100, 2)}%" if candidate['model_probability'] is not None else "—",
-                                    "IV／模型波動率": f"{_format_compact_number(candidate['model_volatility'] * 100, 2)}%",
-                                    "模型估值差": f"${_format_compact_number(candidate['model_value_gap'], 0, signed=True)}" if candidate.get('model_value_gap') is not None else "—",
-                                    "報酬／風險": _format_compact_number(candidate.get('payoff_ratio'), 2) if candidate.get('payoff_ratio') is not None else "—",
-                                    "單買門檻": (
-                                        "✅ 通過" if candidate.get('trade_ready')
-                                        else "⚠️ 小部位" if candidate.get('small_position_ready')
-                                        else "⏸️ 等待"
-                                    ),
-                                    "目標損益": f"${_format_compact_number(candidate['target_pnl'], 0, signed=True)}",
-                                    "停損損益": f"${_format_compact_number(candidate['stop_pnl'], 0, signed=True)}",
-                                    "流動性": candidate['liquidity'],
-                                    "綜合分數": _format_compact_number(candidate['score'], 2),
-                                })
-                            st.markdown("##### 履約價比較")
-                            comparison_frame = pd.DataFrame(comparison_rows)
-                            st.dataframe(
-                                comparison_frame,
-                                column_config=compact_table_column_config(comparison_frame),
-                                width='stretch', hide_index=True,
-                            )
-                    elif display_spread:
-                        st.warning(
-                            f"永豐 Shioaji 尚未取得 {expiry_choice}（預期 `{expected_contract}`）的夜盤即時契約／報價，"
-                            "本次不提供價差單履約價與權利金建議，避免使用日盤資料造成誤判。"
-                        )
-                    else:
-                        operation = "BC（買進 Call）" if quote_plan['direction'] == '偏多' else "BP（買進 Put）"
-                        st.warning(
-                            f"永豐 Shioaji 尚未取得 {expiry_choice}（預期 `{expected_contract}`） 的可用選擇權契約／報價，暫不推薦單買 {operation}。"
-                            "請確認已登入期貨帳戶，並在交易日重新載入永豐契約檔。"
-                        )
-                    if not option_quote:
-                        diagnostic = st.session_state.get('txo_contract_diagnostic')
-                        if diagnostic:
-                            st.caption(f"契約讀取診斷：{diagnostic}")
-                    else:
-                        payoff_chart = build_txo_payoff_chart(option_quote, quote_plan, display_spread)
-                        if payoff_chart is not None:
-                            st.markdown("#### 到期損益曲線（每口／每組）")
-                            render_compact_metric_card_grid(
-                                get_txo_payoff_level_items(option_quote, quote_plan),
-                                columns=4,
-                                class_name='compact-metric-grid txo-payoff-level-grid',
-                            )
-                            st.plotly_chart(
-                                payoff_chart, width='stretch',
-                                config={'displayModeBar': False, 'scrollZoom': False},
-                            )
-                            st.caption(
-                                "曲線為到期結算損益，每口／每組乘數 50 元；紅色為獲利、綠色為虧損。"
-                                "到期前的實際損益仍會受剩餘時間、隱含波動率與買賣價差影響。"
-                            )
-                        else:
-                            st.info("即時權利金或淨收權利金不足，暫時無法繪製可驗證的損益曲線。")
-
-                render_option_candidates()
+            seed_date = _post_close_target_date()[1]
+            @st.fragment(run_every=interval)
+            def render_active_operation_plan():
+                if _post_close_target_date()[1] != seed_date:
+                    st.rerun()
+                render_operation_plan(thermometer_data, option_page)
+            render_active_operation_plan()
 
     with tab_fibo_thermometer:
         title_col, refresh_col = st.columns([6, 1])
@@ -25847,6 +25952,7 @@ with tab_company:
                 )
             fetch_earnings_events.clear()
             fetch_twse_monthly_revenue_rows.clear()
+            fetch_nanya_monthly_revenue.clear()
             fetch_mops_company_monthly_revenue.clear()
             fetch_mops_monthly_revenue_announcement.clear()
             fetch_finmind_monthly_revenue_rows.clear()

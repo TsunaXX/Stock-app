@@ -262,6 +262,19 @@ def test_option_timer_tracks_at_most_three_candidates_and_two_legs_without_queri
     assert cache['updated_at'] == pd.Timestamp('2026-10-05')
 
 
+def test_option_direction_change_can_read_cache_without_querying_or_leaking_subscriptions():
+    ns = load_app_symbols('get_stream_quotes', 'get_txo_snapshot_quotes')
+    def forbidden(*args, **kwargs):
+        raise AssertionError('cache-only selection must not query or create subscriptions')
+    ns['ensure_market_stream_subscription'] = forbidden
+    ns['_stream_state'] = lambda api: {'lock':threading.RLock()}
+    ns['_stream_quote_for_contract'] = lambda api, contract: SimpleNamespace(close=100., buy_price=99., sell_price=100.)
+    ns['fresh_strategy_stream_quote'] = lambda quote: quote is not None
+    api = SimpleNamespace(snapshots=forbidden)
+    quotes = ns['get_txo_snapshot_quotes'](api, [SimpleNamespace(code='C')], snapshot_fallback=False, subscribe=False)
+    assert quotes[0]['premium'] == 100. and quotes[0]['fresh']
+
+
 def test_index_intraday_resample_reuses_history_and_never_downloads_on_timer():
     ns = load_app_symbols('get_cached_index_minutes')
     ns['get_near_futures_contract'] = lambda *args: object()
@@ -291,6 +304,8 @@ def calculate_index_trade_plan(*args):
     return {'support':20000,'resistance':20500,'zone_points':20,'invalidation':19980,'direction':'偏多'}
 def get_live_futures_snapshot(api, product, stream_only=False):
     assert stream_only
+    if st.session_state.get('stale'):
+        return None
     return {'price':st.session_state.get('live',20010),'updated':datetime(2026,10,5,10)}
 _stream_datetime = lambda value: value
 ''' + definitions + '''
@@ -298,18 +313,19 @@ data = pd.DataFrame({'High':[20100,20200,st.session_state.get('live',20010)],
                      'Low':[19800,19900,19800],'Close':[20000,20100,20010]},
                      index=pd.to_datetime(['2026-10-01','2026-10-02','2026-10-05']))
 plan = get_stable_index_trade_plan(data,{},data,{})
-enabled = st.toggle('盤中情境追蹤',key='auto',value=False)
-st.session_state.setdefault('_index_scenario_live',{})['checked'] = 0
-render_index_scenario_tracking(plan,enabled,5)
+render_index_scenario_tracking(plan)
 '''
     app = AppTest.from_string(source).run()
-    assert not app.exception and app.session_state['builds'] == 1
-    app.toggle(key='auto').set_value(True).run()
     assert not app.exception and '接近支撐' in app.info[0].value
+    assert len(app.toggle) == 0
     app.session_state['live'] = 19970
     app.run()
     assert not app.exception and '失效' in app.info[0].value
     assert app.session_state['builds'] == 1
+    app.session_state['stale'] = True
+    app.run()
+    assert not app.exception and not app.session_state['_index_scenario_live']['fresh']
+    assert '失效' in app.info[0].value and '等待最新串流' in app.caption[0].value
 
 
 def test_company_event_ui_renders_eps_and_disclosures_without_network():
@@ -319,26 +335,36 @@ def test_company_event_ui_renders_eps_and_disclosures_without_network():
     source = '''
 import streamlit as st
 import pandas as pd
+from datetime import datetime
+compact_table_column_config = lambda frame: {}
+_revenue_metric_html = lambda label,value,note: label + str(value) + note
+_thousand_currency = str
 snapshot = {'earnings':{},'taiwan_revenue':{},'us_revenue':{},'financials':{'events':[
  {'date':'','title':'台積電 EPS 10','detail':'實際公告日未取得','source':'上市官方公開資料'}]},
  'disclosures':{'events':[{'date':'2026-10-05','title':'台積電 重大訊息','detail':'公告內容','source':'上市官方公开資料'}]}}
+snapshot['taiwan_revenue']['events'] = [
+ {'ticker':'2408','revenue':{'company':'南亞科','code':'2408','revenue_month':'11508','current_month':10}},
+ {'ticker':'2408','revenue':{'company':'南亞科','code':'2408','revenue_month':'11509','current_month':20}}]
 ''' + ast.unparse(node) + '\nrender_company_event_snapshot(snapshot)'
     app = AppTest.from_string(source).run()
     assert not app.exception
-    frame = app.dataframe[0].value
+    frame = next(d.value for d in app.dataframe if '公司／事件' in d.value.columns)
     assert 'EPS 10' in frame.iloc[0]['公司／事件']
     assert frame.iloc[0]['日期'] == '公告日未取得'
     assert '重大訊息' in frame.iloc[1]['公司／事件']
+    headings = [m.value for m in app.markdown if m.value.startswith('#### ') and '月營收' in m.value]
+    assert len(headings) == 1 and '11509' in headings[0]
+    assert len(app.dataframe) == 2  # Latest company row plus the unchanged public events.
 
 
-def test_full_index_option_page_controls_can_toggle_without_losing_cached_plan(tmp_path):
+def test_full_index_option_pages_update_all_analysis_without_toggles(tmp_path):
     from unittest.mock import patch
     import requests
     from streamlit.testing.v1 import AppTest
     source = (Path(__file__).parents[1] / 'app.py').read_text(encoding='utf-8')
     setup = '''
-st.session_state.main_workspace_active_tab = '📈 指數操盤室'
-st.session_state.index_workspace_active_tab = '📅 選擇權操作計畫'
+st.session_state.setdefault('main_workspace_active_tab', '📈 指數操盤室')
+st.session_state['index_workspace_active_tab'] = st.session_state.get('_test_page', '📅 選擇權操作計畫')
 fixture = pd.DataFrame({'Open':[20000.]*90,'High':[20500.]*90,'Low':[19500.]*90,
                         'Close':[20100.]*90,'Volume':[1000.]*90},
                        index=pd.date_range('2026-07-05',periods=90,freq='D'))
@@ -350,15 +376,27 @@ get_stable_index_trade_plan = lambda *a: {'market_label':'測試市場','alignme
     'risk_points':100.,'reward_points':500.,'realized_volatility':.25,'latest_volume_ratio':1.,
     'rr_ratio':5.,'micro_risk_1':1000.,'micro_risk_2':2000.,'option_name':'價差',
     'short_strike':19900,'long_strike':19800,'max_spread_risk_before_credit':5000.}
-get_live_futures_snapshot = lambda *a, **kw: None
+get_live_futures_snapshot = lambda *a, **kw: {'price':st.session_state.get('live',20110.),
+    'change':10.,'change_pct':.05,'color':'#ff4b4b','arrow':'▲',
+    'contract_code':'TMF','updated':datetime(2026,10,6,10)}
 get_cached_futures_intraday_state = lambda *a, **kw: {'available':False,'confirmation_text':'背景分 K',
     'confirmed':False,'is_up_bar':False,'is_down_bar':False,'bullish_break':False,'bearish_break':False,
     'vwap':None,'opening_high':None,'opening_low':None,'latest':None}
 get_cached_short_wave_plan = lambda *a, **kw: None
-resolve_short_wave_direction = lambda *a: ('偏多','測試方向')
+resolve_short_wave_direction = lambda *a: ('偏多' if st.session_state.get('live',20110.) >= 20000 else '偏空','測試方向')
 select_txo_expiry = lambda *a, **kw: ([],None,'測試來源')
-get_txo_directional_quote = lambda *a, **kw: None
+def get_txo_directional_quote(api, plan, *a, **kw):
+    st.session_state['quote_reads'] = st.session_state.get('quote_reads',[]) + [kw.get('stream_only')]
+    return None
 get_txo_spread_quote = lambda *a, **kw: None
+def refresh_option_candidate_cache(plan):
+    st.session_state['analysis_price'] = plan['latest']
+    st.session_state['analysis_direction'] = plan['direction']
+def intraday_auto_interval(room, enabled, seconds):
+    assert enabled
+    st.session_state['timer_room'] = room
+    st.session_state['timer_seconds'] = seconds
+    return seconds
 render_postclose_maintenance = lambda: None
 '''
     anchor = 'tab1, tab_fibo, tab2, tab_db, tab_company, tab3 = st.tabs(['
@@ -369,14 +407,27 @@ render_postclose_maintenance = lambda: None
          patch('yfinance.Ticker', return_value=SimpleNamespace(history=lambda *a, **kw: pd.DataFrame(), fast_info={}, info={})):
         app = AppTest.from_string(source, default_timeout=120).run()
         assert not app.exception
-        assert app.toggle(key='option_auto_enabled').value is False
-        app.toggle(key='option_auto_enabled').set_value(True).run()
-        assert not app.exception
+        assert all(t.key not in ('option_auto_enabled','index_scenario_auto') for t in app.toggle)
+        assert app.session_state['analysis_price'] == 20110.
         app.number_input(key='option_auto_seconds').set_value(7).run()
-        assert not app.exception and app.toggle(key='option_auto_enabled').value is True
-        app.toggle(key='option_auto_enabled').set_value(False).run()
-        assert not app.exception
+        assert not app.exception and app.session_state['timer_seconds'] == 7
+        assert app.session_state['timer_room'] == 'options'
+        app.session_state['live'] = 19970.
+        app.run()
+        assert not app.exception and app.session_state['analysis_price'] == 19970.
+        assert app.session_state['analysis_direction'] == '偏空'
+        assert app.session_state['quote_reads'] == [False, True]
         assert app.session_state['_option_plan_quote_cache']['signature'][0] == '最近到期'
+        app.session_state['_test_page'] = '🧭 指數操作計畫'
+        app.run()
+        assert not app.exception
+        assert any('19,970' in m.value for m in app.markdown)
+        app.number_input(key='index_scenario_seconds').set_value(9).run()
+        assert not app.exception and app.session_state['timer_seconds'] == 9
+        assert app.session_state['timer_room'] == 'index'
+        app.session_state['_test_page'] = '📅 選擇權操作計畫'
+        app.run()
+        assert not app.exception and app.number_input(key='option_auto_seconds').value == 7
 
 
 def test_background_sheet_merge_preserves_remote_selection_dates_and_own_timestamp():
