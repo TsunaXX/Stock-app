@@ -106,6 +106,8 @@ def test_sec_latest_filing_parses_exhibit_and_flags_unparsed_new_release():
     ns['fetch_sec_facts'] = lambda cik, version: {'facts': {'us-gaap': {'Revenues': {'units': {'USD': [
         {'start':'2026-02-27','end':'2026-05-28','val':41_456_000_000,
          'form':'10-Q','filed':'2026-06-24','accn':'old'}]}}}}}
+    cleared = []
+    ns['fetch_sec_facts'].clear = lambda *a: cleared.append(a)
     paths = []
     def document(url):
         paths.append(url)
@@ -118,6 +120,7 @@ def test_sec_latest_filing_parses_exhibit_and_flags_unparsed_new_release():
     ns['fetch_sec_document'] = lambda url: (_ for _ in ()).throw(ValueError('unsupported/offline'))
     result = ns['fetch_sec_revenue']('MU')
     assert result['period_end'] == '2026-05-28' and result['warning']
+    assert cleared == [(723125, '0000723125-26-000018')]
 
 
 def test_manual_company_sync_clears_source_caches_and_keeps_prior_report_on_total_failure():

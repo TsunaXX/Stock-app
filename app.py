@@ -2817,7 +2817,7 @@ def fetch_sec_revenue(ticker):
                         source_url=f"https://www.sec.gov/Archives/edgar/data/{cik}/{data['accession'].replace('-', '')}/")
     except Exception:
         pass
-    if latest['form'] in ('8-K', '6-K') and (not data or latest['filingDate'] > data.get('filed_date', '')):
+    if latest['form'] in ('8-K', '6-K'):
         base = f"https://www.sec.gov/Archives/edgar/data/{cik}/{latest['accessionNumber'].replace('-', '')}/"
         try:
             cover = BeautifulSoup(fetch_sec_document(base + latest['primaryDocument']), 'html.parser')
@@ -2836,6 +2836,7 @@ def fetch_sec_revenue(ticker):
     if not data:
         raise ValueError('SEC 尚無可解析季度財報')
     if latest['filingDate'] > data.get('filed_date', ''):
+        fetch_sec_facts.clear(cik, latest['accessionNumber'])
         data['warning'] = 'SEC 有較新申報，季度數值尚待解析；保留已取得財報'
     return data
 
