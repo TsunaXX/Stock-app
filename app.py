@@ -11,6 +11,7 @@ from lxml.etree import XMLSyntaxError
 import math
 import time
 import threading
+import weakref
 import os
 import itertools
 import json
@@ -37,7 +38,7 @@ import fitz  # PyMuPDF 用於將 PDF 轉為圖片
 from sec_financials import facts_revenue, release_revenue, sec_get
 
 from market_automation import (
-    BackgroundJobs, attach_macro_results, data_version, index_scenario,
+    BackgroundJobs, IntradayBackground, attach_macro_results, data_version, index_scenario,
     macro_results, merge_company_sections, merge_macro_results, vwap_guard,
 )
 
@@ -658,6 +659,8 @@ def clear_market_stream(api):
     with registry_lock:
         state = registry.get(id(api))
     if state is not None:
+        for worker in list(state.get('intraday_background_workers', ())):
+            worker.close()
         pool = state.get('strategy_history_pool')
         if pool is not None:
             pool.shutdown(wait=False, cancel_futures=True)
@@ -20125,6 +20128,7 @@ def render_intraday_auto_controls(room):
             except (OSError, TypeError, ValueError):
                 st.warning('更新間隔已套用，但暫時無法寫入設定檔。')
         if not config.get('enabled', False) and st.session_state.get('sj_api') is not None:
+            stop_intraday_background(room)
             sync_strategy_stream_scope(st.session_state.sj_api, [], room)
         if room == 'stock':
             st.session_state['_stock_auto_settings_changed'] = True
@@ -20143,7 +20147,7 @@ def render_intraday_auto_controls(room):
                         key=f'{room}_auto_start', on_change=save_settings)
         right.time_input('結束時間', value=config.get('end', dt_time(13, 30)),
                          key=f'{room}_auto_end', on_change=save_settings)
-    st.caption('僅更新此表顯示標的；需登入 Shioaji 並保持此頁開啟。更新完成後才計算下一次間隔。')
+    st.caption('僅更新此表顯示標的；登入後由伺服器背景執行，縮小視窗或切到其他瀏覽器分頁仍持續更新。登出即停止，關閉或斷線超過 2 分鐘停止。')
     return intraday_auto_settings(room)
 
 
@@ -20217,6 +20221,114 @@ def check_intraday_auto_timer(room):
     key = f'{room}_auto_timer_seconds'
     if key in st.session_state and st.session_state[key] != intraday_auto_interval(room, *intraday_auto_settings(room)):
         st.rerun()
+
+
+def get_intraday_background():
+    from streamlit.runtime import exists, get_instance
+    from streamlit.runtime.scriptrunner import get_script_run_ctx
+    ctx = get_script_run_ctx()
+    if ctx is None or not exists():
+        return None
+    runtime, session_id = get_instance(), ctx.session_id
+    # AppTest has no live browser session; its synchronous fallback tests the same updater.
+    if runtime.is_active_session(session_id) is not True:
+        return None
+    worker = st.session_state.get('_intraday_background')
+    if worker is None or worker.closed:
+        worker = IntradayBackground(lambda: runtime.is_active_session(session_id))
+        st.session_state['_intraday_background'] = worker
+    return worker
+
+
+def stop_intraday_background(room):
+    worker = st.session_state.get('_intraday_background')
+    if worker is not None:
+        worker.remove(room)
+
+
+def background_intraday_rows(room, rows, visible_codes=None, strategy_mode='當沖', direction_choice='自動'):
+    """UI configures/reads a server job; the job never accesses session_state."""
+    enabled, seconds, start, end = intraday_auto_settings(room)
+    api = st.session_state.get('sj_api')
+    stock = room.startswith('stock')
+    if not enabled or not st.session_state.get('sj_logged_in', False) or api is None:
+        stop_intraday_background(room)
+        return rows
+    selected = rows.copy().astype(object)
+    key = '代號' if stock else '契約鍵'
+    if selected.empty or key not in selected:
+        stop_intraday_background(room)
+        return rows
+    if stock and visible_codes is not None:
+        selected = selected[selected[key].astype(str).isin(set(map(str, visible_codes)))]
+    if selected.empty:
+        stop_intraday_background(room)
+        return rows
+    worker = get_intraday_background()
+    scope = room if worker is None else f'{room}_{id(worker)}'
+    window_open = intraday_auto_window_open
+
+    def update(seed):
+        if stock:
+            refreshed, _, count = refresh_daytrade_metrics_for_codes(
+                seed, True, api, stream_only=True, stream_room=scope,
+            )
+        else:
+            if futures_auto_night_scope(True, datetime.now(pytz.timezone('Asia/Taipei'))):
+                seed = filter_futures_strategy_display_rows(seed, only_night=True)
+            refreshed, count = update_futures_live_rows(
+                seed, api, strategy_mode, direction_choice, stream_only=True, stream_room=scope,
+            )
+        return refreshed, count
+
+    if worker is None:
+        if not begin_intraday_auto_update(room, enabled, seconds, start, end):
+            return rows
+        started, count, error = time.monotonic(), 0, None
+        try:
+            refreshed, count = update(selected)
+        except Exception as exc:
+            refreshed, error = selected, exc
+        finally:
+            finish_intraday_auto_update(room, started, count, error)
+    else:
+        state = _stream_state(api)
+        with state['lock']:
+            state.setdefault('intraday_background_workers', weakref.WeakSet()).add(worker)
+        base_columns = [c for c in selected if c.startswith('_strategy_') or c in (
+            key, '_ma5', '_points', '資料日期', '契約月份', '交易時段')]
+        signature = (id(api), seconds, start, end, strategy_mode, direction_choice,
+                     data_version(selected[base_columns].to_dict('records')),
+                     st.session_state.get('stock_manual_refresh_status' if stock else 'futures_strategy_live_time'))
+        worker.configure(
+            room, signature, selected, seconds, update,
+            lambda: window_open(datetime.now(pytz.timezone('Asia/Taipei')), start, end, stock=stock),
+            lambda: sync_strategy_stream_scope(api, [], scope),
+        )
+        result = worker.result(room)
+        if result is None:
+            st.session_state[f'{room}_auto_status'] = '伺服器背景更新啟動中；保留上次資料與來源時間。'
+            return rows
+        checked = pd.Timestamp(result['checked_at']).tz_convert('Asia/Taipei').strftime('%Y/%m/%d %H:%M:%S')
+        status = (f"伺服器背景更新｜本輪 {result['count']} 檔｜耗時 {result['duration']:.2f} 秒｜檢查時間：{checked}"
+                  if result['count'] else f'等待新串流或背景分 K 資料；保留上次資料與來源時間。｜背景檢查時間：{checked}')
+        if result['outside']:
+            status = '目前不在更新時段；保留上次資料與來源時間。｜背景檢查時間：' + checked
+        if result['error']:
+            status = '本輪更新失敗，下一輪重試；保留上次資料與來源時間。｜背景檢查時間：' + checked
+        st.session_state[f'{room}_auto_status'] = status
+        if result['updated_at']:
+            st.session_state[f'{room}_auto_updated_at'] = pd.Timestamp(result['updated_at']).tz_convert('Asia/Taipei').strftime('%Y/%m/%d %H:%M:%S')
+        refreshed = result['rows']
+    merged = rows.copy().astype(object)
+    for _, row in refreshed.iterrows():
+        indexes = merged.index[merged[key].astype(str) == str(row[key])]
+        for column, value in row.items():
+            if stock and column not in ('收盤價', '漲跌幅', '成交價價差') and not column.startswith(('_daytrade_', '_quote_')):
+                continue
+            for index in indexes:
+                set_futures_row_values(merged, index, {column: value})
+    return merged
 
 
 def begin_intraday_auto_update(room, enabled, seconds, start=None, end=None):
@@ -20848,47 +20960,26 @@ def render_futures_strategy_room():
         if futures_auto_night_scope(futures_auto_enabled, datetime.now(pytz.timezone('Asia/Taipei'))) != auto_night:
             st.rerun()
         display_rows = display_rows.copy()
-        if begin_intraday_auto_update('futures', futures_auto_enabled, futures_auto_seconds, futures_auto_start, futures_auto_end):
-            started = time.monotonic()
-            count, error = 0, None
-            try:
-                # Start with the last live rows, while the official selection stays fixed.
-                for index, row in display_rows.iterrows():
-                    cached = st.session_state.futures_strategy_live_cache.get(str(row['契約鍵']), {})
-                    for column, value in cached.items():
-                        if column != '交易時段' and (column in display_rows.columns or column.startswith(('_daytrade_guard_', '_last_intraday_'))):
-                            set_futures_row_values(display_rows, index, {column: value})
-                updated, count = update_futures_live_rows(
-                    display_rows, st.session_state.sj_api, strategy_mode, direction_choice, stream_only=True,
-                )
-                for _, row in updated.iterrows():
-                    values = row.to_dict()
-                    values.update({'_策略週期': strategy_mode, '_分析方向': direction_choice})
-                    st.session_state.futures_strategy_live_cache[str(row['契約鍵'])] = values
-                display_rows = updated
-            except Exception as exc:
-                error = exc
-                _remember_stream_error(_stream_state(st.session_state.sj_api), f'futures auto: {exc}')
-            finally:
-                finish_intraday_auto_update('futures', started, count, error)
+        for index, row in display_rows.iterrows():
+            cached = st.session_state.futures_strategy_live_cache.get(str(row['契約鍵']), {})
+            for column, value in cached.items():
+                if column != '交易時段' and (column in display_rows.columns or column.startswith(('_daytrade_guard_', '_last_intraday_')) or column in ('支撐壓力', '進出場點位', '方向', '觸發條件', '實際契約', 'VWAP', 'ATR', '買價', '賣價', '報價時間', '_intraday_history_pending')):
+                    set_futures_row_values(display_rows, index, {column: value})
+        cache = st.session_state.futures_strategy_live_cache
+        for index, row in display_rows.iterrows():
+            cached = cache.get(str(row['契約鍵']))
+            if not cached or cached.get('_策略週期') != strategy_mode or cached.get('_分析方向') != direction_choice:
+                analysis = calculate_futures_strategy_levels(display_rows.loc[index], strategy_mode, direction_choice)
+                set_futures_row_values(display_rows, index, analysis)
+        display_rows = background_intraday_rows('futures', display_rows, strategy_mode=strategy_mode,
+                                                direction_choice=direction_choice)
+        for _, row in display_rows.iterrows():
+            values = row.to_dict()
+            values.update({'_策略週期': strategy_mode, '_分析方向': direction_choice})
+            cache[str(row['契約鍵'])] = values
         st.caption(f'市場環境：{market_bias}｜' + intraday_auto_status_text('futures', futures_auto_enabled))
         if st.session_state.get('futures_auto_updated_at'):
             st.caption('自動更新時間：' + st.session_state['futures_auto_updated_at'])
-        cache = st.session_state.futures_strategy_live_cache
-
-        for index, row in display_rows.iterrows():
-            contract_key = str(row['契約鍵'])
-            cached = cache.get(contract_key)
-            if cached:
-                for column, value in cached.items():
-                    if column == '交易時段':
-                        continue
-                    if column in display_rows.columns or column.startswith(('_daytrade_guard_', '_last_intraday_')) or column in ('支撐壓力', '進出場點位', '方向', '觸發條件', '實際契約', 'VWAP', 'ATR', '買價', '賣價', '報價時間', '_intraday_history_pending'):
-                        set_futures_row_values(display_rows, index, {column: value})
-            if not cached or cached.get('_策略週期') != strategy_mode or cached.get('_分析方向') != direction_choice:
-                analysis = calculate_futures_strategy_levels(display_rows.loc[index], strategy_mode, direction_choice)
-                for column, value in analysis.items():
-                    set_futures_row_values(display_rows, index, {column: value})
 
         def refresh_futures_live_data():
             if not st.session_state.get('sj_logged_in', False) or st.session_state.get('sj_api') is None:
@@ -21218,26 +21309,17 @@ def render_futures_strategy_room():
         all_independent_rows = independent_rows.astype(object)
         night_scope = futures_auto_night_scope(independent_auto[0], datetime.now(pytz.timezone('Asia/Taipei')))
         independent_rows = filter_futures_strategy_display_rows(all_independent_rows, only_night=True) if night_scope else all_independent_rows.copy()
-        if begin_intraday_auto_update('futures_independent', *independent_auto):
-            started, count, error = time.monotonic(), 0, None
-            try:
-                updated, count = update_futures_live_rows(
-                    independent_rows, st.session_state.sj_api, strategy_mode, direction_choice,
-                    stream_only=True, stream_room='futures_independent',
-                )
-                for _, row in updated.iterrows():
-                    for index in all_independent_rows.index[all_independent_rows['契約鍵'].astype(str) == str(row['契約鍵'])]:
-                        set_futures_row_values(all_independent_rows, index, row.to_dict())
-                st.session_state.futures_independent_result = {
-                    'strategy_mode': strategy_mode,
-                    'rows': _json_safe(all_independent_rows.to_dict(orient='records')),
-                }
-                independent_rows = updated
-            except Exception as exc:
-                error = exc
-                _remember_stream_error(_stream_state(st.session_state.sj_api), f'futures independent: {exc}')
-            finally:
-                finish_intraday_auto_update('futures_independent', started, count, error)
+        independent_rows = background_intraday_rows(
+            'futures_independent', independent_rows, strategy_mode=strategy_mode,
+            direction_choice=direction_choice,
+        )
+        for _, row in independent_rows.iterrows():
+            for index in all_independent_rows.index[all_independent_rows['契約鍵'].astype(str) == str(row['契約鍵'])]:
+                set_futures_row_values(all_independent_rows, index, row.to_dict())
+        st.session_state.futures_independent_result = {
+            'strategy_mode': strategy_mode,
+            'rows': _json_safe(all_independent_rows.to_dict(orient='records')),
+        }
         st.caption(intraday_auto_status_text('futures_independent', independent_auto[0]))
         if st.session_state.get('futures_independent_auto_updated_at'):
             st.caption('自動更新時間：' + st.session_state['futures_independent_auto_updated_at'])
@@ -21839,10 +21921,14 @@ with tab1:
     )
     if st.session_state.get('sj_api') is not None:
         if not tab1.open or not stock_strategy_tab.open:
+            stop_intraday_background('stock')
             sync_strategy_stream_scope(st.session_state.sj_api, [], 'stock')
+            stop_intraday_background('stock_independent')
             sync_strategy_stream_scope(st.session_state.sj_api, [], 'stock_independent')
         if not tab1.open or not futures_strategy_tab.open:
+            stop_intraday_background('futures')
             sync_strategy_stream_scope(st.session_state.sj_api, [], 'futures')
+            stop_intraday_background('futures_independent')
             sync_strategy_stream_scope(st.session_state.sj_api, [], 'futures_independent')
     with stock_strategy_tab:
         stock_strategy_container = st.container()
@@ -22152,24 +22238,13 @@ if tab1.open and stock_strategy_tab.open:
                 if st.session_state.pop('_stock_auto_settings_changed', False):
                     st.rerun()
                 check_intraday_auto_timer('stock')
-                if begin_intraday_auto_update('stock', stock_auto_enabled, stock_auto_seconds, stock_auto_start, stock_auto_end):
-                    started = time.monotonic()
-                    count, error = 0, None
-                    try:
-                        codes = st.session_state.get('stock_main_visible_codes', [])
-                        if hide_non_stock:
-                            codes = [c for c in codes if len(c) == 4 and not c.startswith('00')]
-                        codes = [c for c in codes if c not in st.session_state.ignored_stocks]
-                        refreshed, _, count = refresh_daytrade_metrics_for_codes(
-                            st.session_state.stock_data, True, st.session_state.sj_api,
-                            visible_codes=codes, stream_only=True,
-                        )
-                        st.session_state.stock_data = refreshed
-                    except Exception as exc:
-                        error = exc
-                        _remember_stream_error(_stream_state(st.session_state.sj_api), f'stock auto: {exc}')
-                    finally:
-                        finish_intraday_auto_update('stock', started, count, error)
+                codes = st.session_state.get('stock_main_visible_codes', [])
+                if hide_non_stock:
+                    codes = [c for c in codes if len(c) == 4 and not c.startswith('00')]
+                codes = [c for c in codes if c not in st.session_state.ignored_stocks]
+                st.session_state.stock_data = background_intraday_rows(
+                    'stock', st.session_state.stock_data, visible_codes=codes,
+                )
                 if not risk_preview_enabled:
                     st.caption(intraday_auto_status_text('stock', stock_auto_enabled))
                 if st.session_state.get('stock_auto_updated_at'):
@@ -22813,6 +22888,9 @@ if tab1.open and stock_strategy_tab.open:
                     f"main_editor_{st.session_state.stock_strategy_editor_revision}_{stock_table_signature}"
                 )
                 st.session_state.stock_main_visible_codes = df_display['代號'].astype(str).tolist()
+                if stock_auto_enabled:
+                    background_intraday_rows('stock', st.session_state.stock_data,
+                                             visible_codes=st.session_state.stock_main_visible_codes)
                 if st.session_state.get('sj_logged_in', False) and st.session_state.get('sj_api') is not None:
                     # Warm the manual button's history without blocking table display.
                     for code in st.session_state.stock_main_visible_codes:
@@ -23191,22 +23269,11 @@ if tab1.open and stock_strategy_tab.open:
                     check_intraday_auto_timer('stock_independent')
                     indep_data = st.session_state.get('stock_independent_raw_results', [])
                     indep_data = [row for row in indep_data if str(row.get('_strategy_data_as_of', '')) == latest_completed_stock_trading_date().strftime('%Y/%m/%d')]
-                    if begin_intraday_auto_update('stock_independent', *independent_auto):
-                        started, count, error = time.monotonic(), 0, None
-                        try:
-                            raw_rows = pd.DataFrame(indep_data)
-                            codes = st.session_state.get('stock_independent_visible_codes', raw_rows.get('代號', pd.Series(dtype=str)).tolist())
-                            refreshed, _, count = refresh_daytrade_metrics_for_codes(
-                                raw_rows, True, st.session_state.sj_api, visible_codes=codes,
-                                stream_only=True, stream_room='stock_independent',
-                            )
-                            indep_data = refreshed.to_dict(orient='records')
-                            st.session_state.stock_independent_raw_results = indep_data
-                        except Exception as exc:
-                            error = exc
-                            _remember_stream_error(_stream_state(st.session_state.sj_api), f'stock independent: {exc}')
-                        finally:
-                            finish_intraday_auto_update('stock_independent', started, count, error)
+                    raw_rows = pd.DataFrame(indep_data)
+                    codes = st.session_state.get('stock_independent_visible_codes', raw_rows.get('代號', pd.Series(dtype=str)).tolist())
+                    refreshed = background_intraday_rows('stock_independent', raw_rows, visible_codes=codes)
+                    indep_data = refreshed.to_dict(orient='records')
+                    st.session_state.stock_independent_raw_results = indep_data
                     st.caption(intraday_auto_status_text('stock_independent', independent_auto[0]))
                     if st.session_state.get('stock_independent_auto_updated_at'):
                         st.caption('自動更新時間：' + st.session_state['stock_independent_auto_updated_at'])
