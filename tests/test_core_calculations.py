@@ -3722,3 +3722,82 @@ def test_quote_only_refresh_keeps_reported_rates_with_the_same_prices():
     missing, _ = ns['merge_realtime_stock_snapshots'](
         source, {'4956':SimpleNamespace(close=47.4)}, price_only=True)
     assert pd.isna(missing.loc[0,'漲跌幅'])
+
+
+def test_replacements_append_after_source_rows_before_quick_queries():
+    ns = load_app_symbols('append_replacement_stock_rows', '_merge_refreshed_stock_rows')
+    rows = pd.DataFrame([
+        {'代號':'3441', '_source':'upload', '_source_rank':1, '_order':0},
+        {'代號':'2413', '_source':'upload', '_source_rank':1, '_order':1},
+        {'代號':'7751', '_source':'upload', '_source_rank':1, '_order':4},
+        {'代號':'1815', '_source':'search', '_source_rank':2, '_order':0},
+    ])
+    remaining = rows[rows['代號'] != '3441']
+    for replacement in ({'代號':'8111', '_source_rank':2, '_order':0}, {'代號':'8111', '_order':99}):
+        result = ns['append_replacement_stock_rows'](remaining, [replacement])
+        assert result['代號'].tolist() == ['2413','7751','8111','1815']
+        refreshed, count = ns['_merge_refreshed_stock_rows'](result, [(c, {'代號':c,'收盤價':100}) for c in result['代號']])
+        assert count == 4 and refreshed['代號'].tolist() == result['代號'].tolist()
+        second = ns['append_replacement_stock_rows'](result[result['代號'] != '2413'], [{'代號':'1727','_order':0}])
+        assert second['代號'].tolist() == ['7751','8111','1727','1815']
+    assert rows['代號'].tolist() == ['3441','2413','7751','1815']
+    legacy = ns['append_replacement_stock_rows'](pd.DataFrame([{'代號':'7751'}]), [{'代號':'8111'}])
+    assert legacy['_source'].tolist() == ['upload', 'upload']
+
+
+def test_stream_status_names_actual_fallbacks_and_clears_recovered_warning():
+    ns = load_app_symbols('get_market_stream_status', '_stream_quote_for_contract', '_stream_contract_codes', '_stream_number')
+    ns['SimpleNamespace'] = SimpleNamespace
+    contract = lambda code, name: SimpleNamespace(code=code, name=name)
+    state = {'lock':threading.RLock(), 'subscriptions':{
+        '2330':{'contract':contract('2330','台積電'), 'status':'active'},
+        'TXFJ6':{'contract':contract('TXFJ6','臺股期貨'), 'status':'error'},
+        '1815':{'contract':contract('1815','富喬'), 'status':'pending'}},
+        'aliases':{}, 'quotes':{'2330':{'code':'2330','source':'stream','close':100},
+        'TXFJ6':{'code':'TXFJ6','source':'snapshot_seed','close':30000}},
+        'errors':['historical connection error']}
+    ns['_stream_state'] = lambda api: state
+    status = ns['get_market_stream_status'](object())
+    assert status['fallback_products'] == [
+        {'code':'TXFJ6','name':'臺股期貨','status':'暖機報價備援'},
+        {'code':'1815','name':'富喬','status':'等待串流／報價'}]
+    for code in ('TXFJ6','1815'):
+        state['subscriptions'][code]['status'] = 'active'
+        state['quotes'][code] = {'code':code,'source':'stream','close':100}
+    assert not ns['get_market_stream_status'](object())['fallback_products']
+    state['connection_down'] = True
+    assert len(ns['get_market_stream_status'](object())['fallback_products']) == 3
+    assert not ns['get_market_stream_status'](None)['fallback_products']
+
+
+def test_stock_refill_ui_keeps_quick_query_after_cached_replacement():
+    from unittest.mock import patch
+    import requests
+    from streamlit.testing.v1 import AppTest
+    source = APP_PATH.read_text(encoding='utf-8')
+    setup = """
+st.session_state.stock_data = pd.DataFrame([
+    {'代號':code, '名稱':name, '收盤價':100, '漲跌幅':0, '狀態':'', '期貨':'無', '戰略備註':'固定', '_ma5':99, '_points':[],
+     '_source':src, '_source_rank':1 if src=='upload' else 2, '_order':order}
+    for code,name,src,order in [('2413','環科','upload',1),('6226','光鼎','upload',2),
+        ('4989','榮科','upload',3),('7751','天二科技','upload',4),('1815','富喬','search',0)]])
+st.session_state.ignored_stocks = {'3441'}
+st.session_state.limit_rows = 5
+st.session_state.all_candidates = [('8111','立碁','upload',0)]
+st.session_state.prefetch_cache = {'8111':{'代號':'8111','名稱':'立碁','收盤價':100,
+    '_ma5':99,'_points':[],'狀態':'','期貨':'無','戰略備註':'固定','漲跌幅':0,'_source':'search','_source_rank':2,'_order':0}}
+save_data_cache = lambda *args, **kwargs: True
+render_postclose_maintenance = lambda: None
+render_opening_direction_prompt = lambda: None
+"""
+    # Set up once: the deletion path reruns after a replacement is inserted.
+    setup = "if not st.session_state.get('_refill_fixture'):\n" + ''.join('    '+line+'\n' for line in setup.strip().splitlines()) + "    st.session_state['_refill_fixture'] = True\n"
+    anchor = 'tab1, tab_fibo, tab2, tab_db, tab_company, tab3 = st.tabs(['
+    source = source.replace(anchor, setup + '\n' + anchor)
+    with patch('requests.get', side_effect=requests.ConnectionError('offline')), \
+         patch('requests.post', side_effect=requests.ConnectionError('offline')), \
+         patch('yfinance.download', return_value=pd.DataFrame()), \
+         patch('yfinance.Ticker', return_value=SimpleNamespace(history=lambda *a, **kw: pd.DataFrame(), fast_info={}, info={})):
+        app = AppTest.from_string(source, default_timeout=120).run()
+        assert not app.exception
+        assert app.session_state['stock_data']['代號'].tolist() == ['2413','6226','4989','7751','8111','1815']

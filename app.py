@@ -635,19 +635,31 @@ def merge_stream_quote_into_intraday(df, quote, interval):
 
 def get_market_stream_status(api):
     if api is None:
-        return {'subscriptions': 0, 'stream_quotes': 0, 'errors': []}
+        return {'subscriptions': 0, 'stream_quotes': 0, 'errors': [], 'fallback_products': []}
     state = _stream_state(api)
     with state['lock']:
         streamed_codes = {
             value.get('code') for value in state['quotes'].values()
             if value.get('source') == 'stream' and value.get('code')
         }
+        fallback_products = []
+        for code, subscription in state['subscriptions'].items():
+            contract = subscription.get('contract')
+            quote = _stream_quote_for_contract(api, contract) if contract is not None else None
+            if (subscription.get('status') == 'active' and not state.get('connection_down')
+                    and getattr(quote, 'source', '') == 'stream'):
+                continue
+            name = str(getattr(contract, 'name', '') or code)
+            seed = getattr(quote, 'source', '') == 'snapshot_seed' and (_stream_number(getattr(quote, 'close', None), 0) or 0) > 0
+            fallback_products.append({'code': str(code), 'name': name,
+                                      'status': '暖機報價備援' if seed else '等待串流／報價'})
         return {
             'subscriptions': sum(
                 value.get('status') == 'active' for value in state['subscriptions'].values()
             ),
             'stream_quotes': len(streamed_codes),
             'errors': list(state['errors']),
+            'fallback_products': fallback_products,
         }
 
 
@@ -14437,8 +14449,12 @@ with st.sidebar:
                 f"📡 串流已訂閱 {stream_status['subscriptions']} 項｜"
                 f"已接收 {stream_status['stream_quotes']} 項即時行情"
             )
-            if stream_status['errors']:
-                st.caption("⚠️ 部分商品暫無串流，已自動使用暖機報價備援。")
+            if stream_status['fallback_products']:
+                products = '；'.join(
+                    f"{item['name']}（{item['code']}）：{item['status']}"
+                    for item in stream_status['fallback_products']
+                )
+                st.caption('⚠️ 暫無串流商品：' + products)
 
             col_logout, col_relogin = st.columns(2)
             with col_logout:
@@ -19861,6 +19877,24 @@ def _stale_stock_identity_row(row):
     return stale_row
 
 
+def append_replacement_stock_rows(stock_data, replacements):
+    """Append replacements after source rows and before quick-query rows."""
+    if not replacements:
+        return stock_data
+    rows = stock_data.copy()
+    source = rows.get('_source', pd.Series('upload', index=rows.index)).fillna('upload')
+    rows['_source'] = source
+    orders = pd.to_numeric(rows.get('_order', pd.Series(range(len(rows)), index=rows.index)), errors='coerce')
+    last = orders[source == 'upload'].max()
+    next_order = int(last) + 1 if pd.notna(last) else 0
+    added = [{**row, '_source': 'upload', '_source_rank': 1, '_order': next_order + i}
+             for i, row in enumerate(replacements)]
+    rows['_source_rank'] = np.where(source == 'upload', 1, 2)
+    rows['_order'] = orders.fillna(pd.Series(range(len(rows)), index=rows.index))
+    return pd.concat([rows, pd.DataFrame(added)], ignore_index=True).sort_values(
+        ['_source_rank', '_order'], kind='stable').reset_index(drop=True)
+
+
 def _merge_refreshed_stock_rows(stock_data, fetched_results):
     """Replace cached rows with fresh results while retaining ordering metadata."""
     if not isinstance(stock_data, pd.DataFrame) or stock_data.empty:
@@ -22991,9 +23025,6 @@ if tab1.open and stock_strategy_tab.open:
                                     else:
                                         remaining_to_fetch.append(cand)
 
-                                if ready_results:
-                                    st.session_state.stock_data = pd.concat([st.session_state.stock_data, pd.DataFrame(ready_results)], ignore_index=True)
-
                                 # 🚀 2. 若快取不足(例如剛開啟網頁還沒預載完)，才即時抓取剩下的
                                 if remaining_to_fetch:
                                     worker_sj_logged_in = st.session_state.get('sj_logged_in', False)
@@ -23011,12 +23042,13 @@ if tab1.open and stock_strategy_tab.open:
                                     with ThreadPoolExecutor(max_workers=ANALYSIS_MAX_WORKERS) as executor:
                                         results = list(executor.map(_replenish_worker, remaining_to_fetch))
                                         valid_results = [r for r in results if r]
-                                        if valid_results:
-                                            st.session_state.stock_data = pd.concat([st.session_state.stock_data, pd.DataFrame(valid_results)], ignore_index=True)
+                                        ready_results.extend(valid_results)
 
-                                # 修正：強制依據來源優先權進行排序，讓自動遞補的新股票排在查詢的股票之前
-                                if '_source_rank' in st.session_state.stock_data.columns:
-                                    st.session_state.stock_data = st.session_state.stock_data.sort_values(by=['_source_rank', '_order']).reset_index(drop=True)
+                                candidate_order = {str(cand[0]): i for i, cand in enumerate(cand_to_fetch)}
+                                ready_results.sort(key=lambda row: candidate_order[str(row['代號'])])
+                                st.session_state.stock_data = append_replacement_stock_rows(
+                                    st.session_state.stock_data, ready_results,
+                                )
 
                                 save_data_cache(st.session_state.stock_data, st.session_state.ignored_stocks, st.session_state.all_candidates, st.session_state.saved_notes)
                                 st.rerun() # 遞補完成，立刻更新畫面
