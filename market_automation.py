@@ -5,10 +5,114 @@ import json
 import math
 import threading
 import time
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pandas as pd
+
+
+class IntradayBackground:
+    """One serial server timer per connected browser; no Streamlit state or writes."""
+
+    def __init__(self, alive, disconnected_grace=120):
+        self.alive, self.disconnected_grace = alive, disconnected_grace
+        self.lock = threading.RLock()
+        self.wake = threading.Event()
+        self.jobs = {}
+        self.closed = False
+        self.thread = threading.Thread(target=self._run, name='intraday-background', daemon=True)
+        self.thread.start()
+
+    def configure(self, room, signature, rows, seconds, update, ready, release):
+        with self.lock:
+            prior = self.jobs.get(room)
+            if prior and prior['signature'] == signature:
+                return
+            if prior:
+                prior['cancelled'] = True
+                if not prior['running']:
+                    self._release(prior)
+            self.jobs[room] = {'signature': signature, 'rows': rows.copy(deep=True),
+                               'seconds': seconds, 'update': update, 'ready': ready,
+                               'release': release, 'next': 0, 'result': None,
+                               'running': False, 'cancelled': False}
+        self.wake.set()
+
+    def result(self, room):
+        with self.lock:
+            value = self.jobs.get(room, {}).get('result')
+            return {**value, 'rows': value['rows'].copy(deep=True)} if value else None
+
+    def remove(self, room):
+        with self.lock:
+            job = self.jobs.pop(room, None)
+            if job:
+                job['cancelled'] = True
+                if not job['running']:
+                    self._release(job)
+        self.wake.set()
+
+    @staticmethod
+    def _release(job):
+        try:
+            job['release']()
+        except Exception:
+            pass  # Logout may already have closed this quote connection.
+
+    def close(self):
+        with self.lock:
+            self.closed = True
+            for room in list(self.jobs):
+                self.remove(room)
+        self.wake.set()
+
+    def _run(self):
+        disconnected = None
+        while not self.closed:
+            try:
+                connected = self.alive()
+            except Exception:
+                connected = False
+            if connected:
+                disconnected = None
+            else:
+                disconnected = disconnected or time.monotonic()
+                if time.monotonic() - disconnected >= self.disconnected_grace:
+                    self.close()
+                    break
+            with self.lock:
+                jobs = list(self.jobs.values())
+            for job in jobs:
+                with self.lock:
+                    if self.closed or job['cancelled'] or time.monotonic() < job['next']:
+                        continue
+                    job['running'] = True
+                started = time.monotonic()
+                rows, count, error, outside = job['rows'], 0, None, False
+                try:
+                    outside = not job['ready']()
+                    if not outside:
+                        rows, count = job['update'](rows.copy(deep=True))
+                except Exception as exc:
+                    error = type(exc).__name__
+                checked = datetime.now().astimezone().isoformat()
+                with self.lock:
+                    job['running'] = False
+                    if job['cancelled']:
+                        self._release(job)
+                        continue
+                    prior = job['result'] or {}
+                    changed = count and data_version(rows.to_dict('records')) != prior.get('version')
+                    job['result'] = {'rows': rows, 'count': count, 'error': error,
+                                     'outside': outside, 'checked_at': checked,
+                                     'updated_at': checked if changed and not error else prior.get('updated_at'),
+                                     'version': data_version(rows.to_dict('records')),
+                                     'duration': time.monotonic() - started}
+                    job['rows'] = rows
+                    job['next'] = time.monotonic() + (max(1, job['seconds']) if outside else job['seconds'])
+            self.wake.wait(0.25)
+            self.wake.clear()
 
 
 def finite_number(value):
