@@ -3134,7 +3134,7 @@ def normalize_company_event_snapshot(saved):
 
     all_events, all_keys = [], set()
     for section in ('earnings', 'taiwan_revenue', 'us_revenue', 'financials', 'disclosures', 'dividends'):
-        if section == 'us_revenue':
+        if section in ('us_revenue', 'taiwan_revenue'):
             section_events[section] = list({event_key(event): event for event in sorted(
                 (e for e in section_events[section] if isinstance(e, dict)),
                 key=lambda e: str(e.get('data_asof') or ''))}.values())
@@ -3152,6 +3152,15 @@ def normalize_company_event_snapshot(saved):
             all_events.append(event)
             all_keys.add(key)
     normalized['events'] = all_events
+    aliases = {}
+    for event in all_events:
+        revenue = event.get('revenue') if isinstance(event.get('revenue'), dict) else {}
+        company = str(event.get('ticker') or revenue.get('code') or revenue.get('ticker') or '').upper().removesuffix('.TW').removesuffix('.TWO')
+        if company:
+            aliases.setdefault(str(event.get('title','')), set()).add(company)
+    normalized['calendar_companies'] = list(dict.fromkeys(
+        next(iter(aliases[v])) if len(aliases.get(v, set())) == 1 else v.upper().removesuffix('.TW').removesuffix('.TWO')
+        for v in normalized['calendar_companies']))
     return normalized
 
 
@@ -26450,6 +26459,11 @@ with tab_company:
     st.markdown("<div class='company-step'><span class='company-step-number'>2</span>選擇加入股市行事曆的公司</div>", unsafe_allow_html=True)
     st.caption("只會加入勾選並儲存的公司；未勾選公司的查詢結果仍保留在本頁。")
     company_options = sorted({company_calendar_key(e) for e in snapshot.get('events', [])})
+    if 'company_calendar_selection' in st.session_state:
+        previous_selection = st.session_state['company_calendar_selection']
+        migrated_selection = normalize_company_event_snapshot({**snapshot, 'calendar_companies':previous_selection})['calendar_companies']
+        if migrated_selection != previous_selection:
+            st.session_state['company_calendar_selection'] = migrated_selection
     select_col, save_col = st.columns([3, 1], vertical_alignment="bottom")
     with select_col:
         chosen_companies = st.multiselect(

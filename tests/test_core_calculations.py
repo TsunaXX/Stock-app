@@ -3823,6 +3823,9 @@ def test_calendar_same_day_revenues_keep_both_legacy_company_codes():
     exec(compile(ast.fix_missing_locations(ast.Module(body=[node],type_ignores=[])),APP_PATH,'exec'),symbols)
     content=symbols['calendar_day_content'](date(2026,10,8))
     assert content.count('台積電 9月')==1 and content.count('富喬 9月')==1
+    legacy_events=[{**e,'title':e['revenue']['company']+'月營收'} for e in events]
+    migrated=symbols['normalize_company_event_snapshot']({'taiwan_revenue':{'events':legacy_events+[dict(legacy_events[0])]},'calendar_companies':['台積電月營收','富喬月營收']})
+    assert migrated['calendar_companies']==['2330','1815'] and len(migrated['taiwan_revenue']['events'])==2
     snapshot['calendar_companies']=['2330']
     assert len(symbols['selected_company_calendar_snapshot'](snapshot)['taiwan_revenue']['events'])==1
 
@@ -3831,12 +3834,13 @@ def test_full_calendar_shows_same_day_company_revenues_on_desktop_and_mobile(tmp
     from unittest.mock import patch
     import requests
     from streamlit.testing.v1 import AppTest
-    events=[{'date':'2026-10-08T16:00:00+08:00','title':'月營收','source':'MOPS','market':'台股',
+    events=[{'date':'2026-10-08T16:00:00+08:00','title':name+'月營收','source':'MOPS','market':'台股',
              'revenue':{'code':code,'company':name,'revenue_month':'11509','mom':'+1%','yoy':'+2%'}}
             for code,name in [('2330','台積電'),('1815','富喬')]]
     source=APP_PATH.read_text(encoding='utf-8')
     setup=f"CONFIG_FILE={str(tmp_path/'calendar-config.json')!r}\n"+f"st.session_state.company_event_snapshot={dict(events=events,calendar_companies=['2330','1815'],tickers='2330,1815')!r}\n"+"""
 st.session_state['main_workspace_active_tab']='📅 股市行事曆'
+st.session_state.company_calendar_selection=['台積電月營收','富喬月營收']
 st.session_state.cal_year=2026
 st.session_state.cal_month=10
 st.session_state.calendar_preferences={'groups':['台股公司營收與財報'],'macro_events':[],'tickers':'2330,1815'}
@@ -3852,6 +3856,7 @@ get_app_secret=lambda key,default=None:default
          patch('yfinance.Ticker',return_value=SimpleNamespace(history=lambda *a,**kw:pd.DataFrame(),fast_info={},info={})):
         app=AppTest.from_string(source,default_timeout=120).run()
         assert not app.exception
+        assert app.session_state['company_calendar_selection']==['2330','1815']
         calendar_html=next(e.value for e in app.markdown if "<div class='calendar-desktop-grid'>" in e.value)
         for mode in ('calendar-desktop-grid','calendar-mobile-list'):
             section=BeautifulSoup(calendar_html,'html.parser').find('div',class_=mode)
