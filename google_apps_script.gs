@@ -92,7 +92,9 @@ function getScopeRowMap_(sheet) {
   const result = {};
   const rowCount = Math.max(sheet.getLastRow() - 1, 0);
   if (!rowCount) return result;
-  const values = sheet.getRange(2, 1, rowCount, HEADER.length).getDisplayValues();
+  // Read the small index first; a stock/calendar request must not load all model history JSON.
+  const values = sheet.getRange(2, 1, rowCount, 2).getDisplayValues();
+  const timestamps = sheet.getRange(2, 4, rowCount, 1).getDisplayValues();
   values.forEach(function(row, index) {
     const scope = normalizeScope_(row[0]);
     if (!scope) return;
@@ -105,10 +107,10 @@ function getScopeRowMap_(sheet) {
       generation: revision ? Number(revision[1]) : 0,
       count: revision ? Number(revision[3]) : 0,
       part: revision ? Number(revision[2]) : Number(row[1]) || 0,
-      data: String(row[2] || ''),
-      updated_at: String(row[3] || ''),
+      row: index + 2,
+      updated_at: String(timestamps[index][0] || ''),
     });
-    if (row[3]) result[scope].updated_at = String(row[3]);
+    if (timestamps[index][0]) result[scope].updated_at = String(timestamps[index][0]);
   });
   return result;
 }
@@ -156,9 +158,13 @@ function readScopeData_(sheet, scope, row) {
     }) && new Set(parts.map(function(p) {return p.part;})).size === parts.length);
   }).sort(function(a,b) {return Number(b) - Number(a);});
   if (!complete.length) throw new Error('儲存分段尚未完整提交');
-  const serialized = generations[complete[0]]
+  const selectedParts = generations[complete[0]];
+  const firstRow = Math.min.apply(null, selectedParts.map(function(p) {return p.row;}));
+  const lastRow = Math.max.apply(null, selectedParts.map(function(p) {return p.row;}));
+  const data = sheet.getRange(firstRow, 3, lastRow - firstRow + 1, 1).getDisplayValues();
+  const serialized = selectedParts
     .sort(function(a, b) { return a.part - b.part; })
-    .map(function(part) { return part.data; })
+    .map(function(part) { return String(data[part.row - firstRow][0] || ''); })
     .join('');
   return {
     success: true,

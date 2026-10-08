@@ -267,10 +267,10 @@ def test_apps_script_full_read_write_lock_and_partial_commit_recovery():
     program=r"""
 const fs=require('fs'),vm=require('vm'),assert=require('assert');
 const rows=[['scope','part','data','updated_at']];
-let held=false,fail=false;
+let held=false,fail=false;const reads=[];
 const sheet={getLastRow:()=>rows.length,
   getRange:(start,col,count,width)=>({
-    getDisplayValues:()=>Array.from({length:count},(_,i)=>Array.from({length:width},(_,j)=>String((rows[start+i-1]||[])[col+j-1]||''))),
+    getDisplayValues:()=>{reads.push({start,col,count,width});return Array.from({length:count},(_,i)=>Array.from({length:width},(_,j)=>String((rows[start+i-1]||[])[col+j-1]||'')));},
     setNumberFormat(){return this;},
     setValues(values){assert(held); for(let i=0;i<values.length;i++) {rows[start+i-1]=values[i]; if(fail && values[i][0].includes(':')) {fail=false; throw Error('partial write');}} return this;}
   }),deleteRow:(r)=>rows.splice(r-1,1),clearContents:()=>rows.splice(0)};
@@ -286,7 +286,9 @@ const stale={model_trades:[{...a,'交易ID':'b'.repeat(64)}]};
 assert(post('strategy_signals:202610',stale).success);
 let read=doGet({parameter:{scope:'strategy_signals:202610'}});
 assert.equal(read.data.model_trades.length,2);
+reads.length=0;
 let catalog=doGet({parameter:{scope:'strategy_signals'}}).data;
+assert(reads.filter(r=>r.start>1 && r.col<=3 && r.col+r.width>3).every(r=>r.count===1)); // Catalog read must not load other scopes' JSON.
 assert(catalog.model_months.includes('202610') && catalog.strategy_signal_log[0].dedupe_key==='manual');
 fail=true;
 assert(!post('strategy_signals:202610',{model_trades:[{...a,'交易ID':'c'.repeat(64),'指標快照':{text:'x'.repeat(60000)}}]}).success);
