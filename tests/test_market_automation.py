@@ -615,3 +615,18 @@ def test_table_timers_use_user_interval_and_stop_or_resume_at_session_boundaries
         assert configure(room) == 12
         current[0] = current[0].replace(hour=9)
     check('unrendered_room')  # Hidden or absent tables cannot restart old timers.
+
+
+def test_same_day_revenue_company_code_identity_and_partial_resync():
+    events=[{'event_id':'2026-10-08','date':'2026-10-08','title':'月營收','market':'台股',
+             'revenue':{'code':code,'company':name,'revenue_month':'11509','mom':mom,'yoy':yoy}}
+            for code,name,mom,yoy in [('2330','台積電','+10%','+20%'),('1815','富喬','+3%','+4%')]]
+    snapshot={'calendar_companies':['2330','1815'],'taiwan_revenue':{'events':events}}
+    merged=merge_company_sections(snapshot,{'taiwan_revenue':{'events':events}})
+    assert len(merged['taiwan_revenue']['events'])==2
+    update={**events[0],'ticker':'2330.TW','revenue':{**events[0]['revenue'],'mom':'+11%'}}
+    merged=merge_company_sections(merged,{'taiwan_revenue':{'events':[update]}})
+    assert len(merged['taiwan_revenue']['events'])==2
+    assert [e['revenue']['company'] for e in merged['events']]==['台積電','富喬']
+    assert merged['events'][0]['revenue']['mom']=='+11%'
+    assert merged['calendar_companies']==['2330','1815']

@@ -18,3 +18,5 @@ cal_override.json
 
 # Local Streamlit secrets
 .streamlit/secrets.toml
+
+model_tracking.sqlite3*

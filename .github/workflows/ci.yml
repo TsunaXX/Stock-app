@@ -36,9 +36,9 @@ jobs:
     - name: 執行阻斷性程式碼檢查 (Ruff)
       run: |
         # 停止建構：如果程式碼有語法錯誤或未定義的變數
-        python -m ruff check app.py market_automation.py sec_financials.py tests --select=E9,F63,F7,F82
+        python -m ruff check app.py market_automation.py model_tracking.py sec_financials.py tests --select=E9,F63,F7,F82
 
     - name: 執行單元測試 (Pytest)
       run: |
-        python -m py_compile app.py market_automation.py sec_financials.py
+        python -m py_compile app.py market_automation.py model_tracking.py sec_financials.py
         python -m pytest -q
