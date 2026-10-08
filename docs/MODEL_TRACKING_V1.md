@@ -56,9 +56,18 @@ Google Sheets 使用原 `strategy_signals` 為月份索引，`strategy_signals:Y
 
 以上是隔離的本機紀錄入口與儲存測量，基線僅 DataFrame 複製，**不是正式站完整每輪更新／CPU／RSS 的前後實測**。測試提供的 API 物件無行情查詢方法，證明紀錄入口沒有額外 snapshots/ticks/kbars；正式永豐帳戶流量尚未實測。
 
-完整 pytest、Ruff 與 CI 結果以此改版 PR 為準。本次瀏覽器及電腦工具初始化均失敗：`windows sandbox failed: helper_unknown_error: setup refresh had errors`；正式 Apps Script 部署／POST-GET 回讀、真實電腦＋手機同步、700px 以下正式畫面及雲端效能比較尚未驗收。不能把受控測試替代上述實測。
+完整 pytest、Ruff 與 CI 結果以此改版 PR 為準。瀏覽器及電腦工具初始化仍失敗：`windows sandbox failed: helper_unknown_error: setup refresh had errors`／`trusted Node process exited unexpectedly`；真實電腦＋手機訊號同步、700px 以下正式畫面及雲端效能比較尚未驗收。不能把受控測試替代上述實測。
 
 
 ## 本次追加：同日月營收行事曆
 
 舊事件只有 revenue.code，或事件 ID 只有公告日期時，同月份不同公司可能被合併或未被選取。快照讀取遷移公司代碼、合併依公司＋月份識別、勾選沿用該代碼，公告日校正欄位也不再使用空公司鍵。三項新增回歸測試涵蓋同日台積電／富喬、部分同步、同公司更新、勾選限制與完整桌機／手機日曆 HTML。未確認公告日不推估為今天。
+
+
+## 2026-10-08 正式端點回讀驗證
+
+使用使用者提供的既有 `/exec` 端點，已讀得 `model_schema:1`。兩個獨立 HTTP 客戶端同時向 `strategy_signals:202610` 寫入空交易批次，POST 與 GET 均成功，月份索引及版本也完成回讀；之後兩個獨立 SQLite 客戶端還原同一資料。沒有加入人工測試訊號或交易。目前正式模型與手動紀錄均為零，因此這次驗證證明傳輸、月分區及索引可用，**不等於非空真實交易的兩裝置驗收**。既有非空資料合併／去重／失敗重試仍以行為測試驗證。
+
+實際空批次寫入加回讀分別花 25.46／24.19 秒；完整上述驗證為 89.4 秒。原模型 HTTP 使用固定 scope URL 與 8 秒逾時，在實測出現 404／ReadTimeout；模型 GET 改用專案既有 `_ts` 與 no-cache 標頭，GET／POST 採 5 秒連線、35 秒讀取逾時，以容納 Apps Script 最多 30 秒共享鎖等待。網路只在原背景寫入工作內執行，不阻塞主表；失敗仍保留 dirty 待同步旗標。新增回歸測試核對兩次 GET 不共用快取鍵及 POST 逾時後仍可重試。
+
+只讀正式 `company_events`，確認台積電（2330）與富喬（1815）都已勾選，且保存了 2026/10/08 公布的 11509 月營收。將正式快照帶入實際正規化、勾選篩選與單日 HTML 函式，兩筆各顯示一次：台積電 9月 MoM-0.57%／YoY+54.65%；富喬 9月 MoM+2.87%／YoY+82.14%。這是正式資料＋目前程式函式的驗證，正式瀏覽器畫面尚未取得。
