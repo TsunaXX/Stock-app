@@ -521,3 +521,29 @@ def test_stale_tick_is_not_a_fresh_snapshot_signal():
     state['model_tick_buffers']['2330'][0]['來源時間']=(ns['datetime'].now(ns['pytz'].timezone('Asia/Taipei'))-timedelta(minutes=2)).isoformat()
     signals,quotes=ns['model_tracking_samples'](rows,True,'當沖','多',config,5,object())
     assert not signals and not quotes['股票|2330']['有效']
+
+
+def test_cloud_readback_does_not_reuse_cached_reads_and_keeps_pending_on_timeout(tmp_path):
+    import requests
+    tracker = ModelTracker(tmp_path/'http.sqlite', 'https://example.test/exec', start=False)
+    tracker.process([signal()], {'股票|2330':quote(100)})
+    seen = []
+    def read(url, **kwargs):
+        params = kwargs['params']
+        assert kwargs['timeout'][1] > 30  # Apps Script can wait 30 seconds for its shared lock.
+        assert 'no-cache' in kwargs['headers']['Cache-Control']
+        seen.append(params['_ts'])
+        data = {'model_schema':1, 'model_months':[], 'model_versions':{}}
+        return SimpleNamespace(raise_for_status=lambda:None, json=lambda:{'success':True, 'data':data})
+    with patch('model_tracking.requests.get', side_effect=read), patch('model_tracking.time.time_ns', side_effect=[1,2]):
+        tracker.remote_get('strategy_signals')
+        tracker.remote_get('strategy_signals')
+    assert seen == [1,2]
+    def post(url, **kwargs):
+        assert kwargs['timeout'][1] > 30
+        raise requests.ReadTimeout('slow shared storage')
+    tracker.remote_get=lambda scope:{'model_schema':1, 'model_months':[], 'model_versions':{}}
+    with patch('model_tracking.requests.post', side_effect=post), pytest.raises(requests.ReadTimeout):
+        tracker.sync()
+    with tracker.db() as db:
+        assert db.execute('SELECT dirty FROM trades').fetchone()[0] == 1

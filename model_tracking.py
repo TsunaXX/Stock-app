@@ -441,7 +441,9 @@ class ModelTracker:
                 self.revision += 1
 
     def remote_get(self, scope):
-        response = requests.get(self.url, params={'scope': scope}, timeout=8)
+        response = requests.get(self.url, params={'scope': scope, '_ts': time.time_ns()},
+                                headers={'Cache-Control': 'no-cache, no-store, max-age=0', 'Pragma': 'no-cache'},
+                                timeout=(5, 35))
         response.raise_for_status()
         payload = response.json()
         if payload.get('success') is not True:
@@ -453,7 +455,7 @@ class ModelTracker:
 
     def remote_save(self, scope, data):
         response = requests.post(self.url, json={'scope': scope, 'data': json.dumps(data, ensure_ascii=False),
-                                                'updated_at': datetime.now(TZ).isoformat()}, timeout=8)
+                                                'updated_at': datetime.now(TZ).isoformat()}, timeout=(5, 35))
         response.raise_for_status()
         payload = response.json()
         if payload.get('success') is not True:
