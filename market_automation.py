@@ -233,8 +233,11 @@ def merge_company_sections(snapshot, sections, prefer_existing=False):
             if label == 'us_revenue':
                 revenue = e.get('revenue', {})
                 return str((e.get('ticker') or revenue.get('ticker'), revenue.get('period_end')))
-            month = e.get('revenue', {}).get('revenue_month')
-            return str(e.get('event_id') or (e.get('ticker'), month) if month else
+            revenue = e.get('revenue', {})
+            month = revenue.get('revenue_month')
+            company = str(e.get('ticker') or revenue.get('code') or revenue.get('ticker') or revenue.get('company') or e.get('title', '')).upper().removesuffix('.TW').removesuffix('.TWO')
+            # A date-only legacy event_id must not collapse different companies.
+            return str((company, month) if month else
                        e.get('event_id') or (e.get('ticker'), e.get('date'), e.get('title')))
         events = {event_key(e): e for e in old_events}
         for event in incoming['events']:

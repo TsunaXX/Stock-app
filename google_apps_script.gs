@@ -92,7 +92,9 @@ function getScopeRowMap_(sheet) {
   const result = {};
   const rowCount = Math.max(sheet.getLastRow() - 1, 0);
   if (!rowCount) return result;
-  const values = sheet.getRange(2, 1, rowCount, HEADER.length).getDisplayValues();
+  // Read the small index first; a stock/calendar request must not load all model history JSON.
+  const values = sheet.getRange(2, 1, rowCount, 2).getDisplayValues();
+  const timestamps = sheet.getRange(2, 4, rowCount, 1).getDisplayValues();
   values.forEach(function(row, index) {
     const scope = normalizeScope_(row[0]);
     if (!scope) return;
@@ -100,18 +102,24 @@ function getScopeRowMap_(sheet) {
       result[scope] = {rows: [], parts: [], updated_at: ''};
     }
     result[scope].rows.push(index + 2);
+    const revision = /^(\d+)\|(\d+)\|(\d+)$/.exec(String(row[1]));
     result[scope].parts.push({
-      part: Number(row[1]) || 0,
-      data: String(row[2] || ''),
+      generation: revision ? Number(revision[1]) : 0,
+      count: revision ? Number(revision[3]) : 0,
+      part: revision ? Number(revision[2]) : Number(row[1]) || 0,
+      row: index + 2,
+      updated_at: String(timestamps[index][0] || ''),
     });
-    if (row[3]) result[scope].updated_at = String(row[3]);
+    if (timestamps[index][0]) result[scope].updated_at = String(timestamps[index][0]);
   });
   return result;
 }
 
 
 function doGet(e) {
+  const lock = LockService.getScriptLock();
   try {
+    lock.waitLock(30000);
     const requested = normalizeScope_(e && e.parameter ? e.parameter.scope : '');
     const sheet = getStoreSheet_();
     const rows = getScopeRowMap_(sheet);
@@ -128,23 +136,41 @@ function doGet(e) {
     return jsonResponse_({success: true, scopes: scopes});
   } catch (error) {
     return jsonResponse_({success: false, error: String(error)});
+  } finally {
+    try { lock.releaseLock(); } catch (_) {}
   }
 }
 
 
 function readScopeData_(sheet, scope, row) {
   if (!row || !row.parts || !row.parts.length) {
-    return {success: true, scope: scope, data: null, updated_at: ''};
+    return {success: true, scope: scope, data: scope === 'strategy_signals' ? {model_schema: 1, model_months: [], model_versions: {}} : null, updated_at: ''};
   }
-  const serialized = row.parts
+  const generations = {};
+  row.parts.forEach(function(part) {
+    if (!generations[part.generation || 0]) generations[part.generation || 0] = [];
+    generations[part.generation || 0].push(part);
+  });
+  const complete = Object.keys(generations).filter(function(key) {
+    const parts = generations[key];
+    return !parts[0].count || (parts.length === parts[0].count && parts.every(function(p) {
+      return p.count === parts.length && p.part >= 0 && p.part < parts.length;
+    }) && new Set(parts.map(function(p) {return p.part;})).size === parts.length);
+  }).sort(function(a,b) {return Number(b) - Number(a);});
+  if (!complete.length) throw new Error('儲存分段尚未完整提交');
+  const selectedParts = generations[complete[0]];
+  const firstRow = Math.min.apply(null, selectedParts.map(function(p) {return p.row;}));
+  const lastRow = Math.max.apply(null, selectedParts.map(function(p) {return p.row;}));
+  const data = sheet.getRange(firstRow, 3, lastRow - firstRow + 1, 1).getDisplayValues();
+  const serialized = selectedParts
     .sort(function(a, b) { return a.part - b.part; })
-    .map(function(part) { return part.data; })
+    .map(function(part) { return String(data[part.row - firstRow][0] || ''); })
     .join('');
   return {
     success: true,
     scope: scope,
-    data: parseJsonSafe_(serialized),
-    updated_at: String(row.updated_at || ''),
+    data: scope === 'strategy_signals' ? Object.assign({model_schema: 1, model_months: [], model_versions: {}}, parseJsonSafe_(serialized)) : parseJsonSafe_(serialized),
+    updated_at: String(generations[complete[0]][0].updated_at || row.updated_at || ''),
   };
 }
 
@@ -198,11 +224,26 @@ function doPost(e) {
 
 
 function saveScopeData_(scope, data, updatedAt) {
+  if (/^strategy_signals:\d{6}$/.test(scope)) {
+    if (!Array.isArray(data.model_trades) || data.model_trades.some(function(r) {
+      return !r || !/^[a-f0-9]{64}$/.test(r['交易ID'] || '') || typeof r['商品鍵'] !== 'string' || !r['商品鍵'] ||
+        typeof r['策略版本'] !== 'string' || !r['策略版本'] || isNaN(Date.parse(r['來源時間'] || '')) ||
+        ['多頭','空頭','偏多','偏空'].indexOf(r['方向']) < 0 ||
+        ['進場價','停損價','目標價'].some(function(k) {return typeof r[k] !== 'number' || !isFinite(r[k]) || r[k] <= 0;}) ||
+        !Array.isArray(r['事件']) || !/^\d{4}-\d{2}-\d{2}$/.test(r['交易日'] || '') ||
+        r['交易日'].slice(0,7).replace('-', '') !== scope.split(':')[1] ||
+        ['股票','期貨'].indexOf(r['市場']) < 0 || ['當沖','波段'].indexOf(r['策略']) < 0 ||
+        ['等待進場','模擬持倉','已平倉','訊號失效','資料不足','監控中斷'].indexOf(r['狀態']) < 0;
+    })) throw new Error('模型交易資料格式或月份無效');
+  }
   const sheet = getStoreSheet_();
-  const serialized = JSON.stringify(data);
-  const chunks = splitJsonChunks_(serialized);
   const rows = getScopeRowMap_(sheet);
   const existing = rows[scope] || null;
+  if (scope === 'strategy_signals' || /^strategy_signals:\d{6}$/.test(scope)) {
+    const prior = readScopeData_(sheet, scope, existing).data || {};
+    data = mergeSignalPayload_(prior, data);
+  }
+  const chunks = splitJsonChunks_(JSON.stringify(data));
   const existingRow = existing && existing.rows.length ? existing.rows[0] : 0;
   const incomingUpdatedAt = String(updatedAt || new Date().toISOString());
 
@@ -226,18 +267,29 @@ function saveScopeData_(scope, data, updatedAt) {
     }
   }
 
-  if (existing && existing.rows.length) {
-    existing.rows.sort(function(a, b) { return b - a; }).forEach(function(row) {
-      sheet.deleteRow(row);
-    });
+  const signalScope = scope === 'strategy_signals' || /^strategy_signals:\d{6}$/.test(scope);
+  if (!signalScope && existing && existing.rows.length) {
+    existing.rows.sort(function(a, b) { return b - a; }).forEach(function(row) { sheet.deleteRow(row); });
   }
   const row = Math.max(sheet.getLastRow() + 1, 2);
+  const generation = Math.max(Date.now() * 1000, existing ? existing.parts.reduce(function(n,p) {return Math.max(n, p.generation + 1);}, 0) : 0);
   const values = chunks.map(function(chunk, part) {
-    return [scope, part, chunk, incomingUpdatedAt];
+    return [scope, signalScope ? generation + '|' + part + '|' + chunks.length : part, chunk, incomingUpdatedAt];
   });
-  sheet.getRange(row, 1, values.length, HEADER.length)
-    .setNumberFormat('@')
-    .setValues(values);
+  sheet.getRange(row, 1, values.length, HEADER.length).setNumberFormat('@').setValues(values);
+  SpreadsheetApp.flush();
+  // Preserve the last complete generation until the new one has been written in full.
+  if (signalScope && existing && existing.rows.length) {
+    try {
+      existing.rows.sort(function(a,b) {return b-a;}).forEach(function(oldRow) {sheet.deleteRow(oldRow);});
+    } catch (_) {} // A leftover generation is harmless; reads select the newest complete one.
+  }
+  if (/^strategy_signals:\d{6}$/.test(scope)) {
+    const month = scope.split(':')[1];
+    const versions = {};
+    versions[month] = String(generation);
+    saveScopeData_('strategy_signals', {model_schema: 1, model_months: [month], model_versions: versions}, incomingUpdatedAt);
+  }
   return row;
 }
 
@@ -315,9 +367,79 @@ function buildStockPayload_(payload) {
 }
 
 
+// doPost holds ScriptLock across read/merge/write, including the month catalog.
+function mergeModelTrades_(remote, incoming) {
+  const merged = Object.create(null);
+  [].concat(remote || [], incoming || []).forEach(function(item) {
+    if (!item || !item['交易ID']) return;
+    const key = item['交易ID'];
+    const old = merged[key];
+    let row = Object.assign({}, item);
+    if (old) {
+      const newer = String(item['來源時間'] || '') > String(old['來源時間'] || '');
+      const terminal = item['狀態'] === '已平倉';
+      const oldTerminal = old['狀態'] === '已平倉';
+      let chosen = ((newer && !oldTerminal) || (terminal && !oldTerminal)) ? item : old;
+      if (terminal && oldTerminal) {
+        const oldKey = String(old['結案時間'] || old['來源時間'] || '') + String(old['進場時間'] || '');
+        const newKey = String(item['結案時間'] || item['來源時間'] || '') + String(item['進場時間'] || '');
+        chosen = Boolean(old['資料缺口']) !== Boolean(item['資料缺口']) ? (old['資料缺口'] ? item : old) : (newKey < oldKey ? item : old);
+      }
+      row = Object.assign({}, chosen);
+      row['資料缺口'] = row['狀態'] === '已平倉' ? Boolean(row['資料缺口']) : Boolean(old['資料缺口'] || item['資料缺口']);
+      if (old['模擬進場價'] != null && item['模擬進場價'] != null && old['模擬進場價'] !== item['模擬進場價']) {
+        row['資料缺口'] = true;
+        row['異常原因'] = '跨裝置模擬成交證據不一致，排除有效績效';
+      }
+      if (Object.keys(Object.assign({}, old['成本設定'], item['成本設定'])).some(function(k) {
+        return (old['成本設定'] || {})[k] !== (item['成本設定'] || {})[k];
+      })) {
+        row['資料缺口'] = true;
+        row['異常原因'] = '跨裝置成本設定不一致，排除有效績效';
+      }
+      const first = String(old['建立時間'] || '') <= String(item['建立時間'] || '') ? old : item;
+      ['建立時間', '指標快照', '成本設定', '訊號價', '市場環境', '觸發條件', '條件快照'].forEach(function(k) {
+        if (first[k] !== undefined) row[k] = first[k];
+      });
+      const events = {};
+      [].concat(old['事件'] || [], item['事件'] || []).forEach(function(e) {
+        if (e && e['事件ID']) events[e['事件ID']] = e;
+      });
+      row['事件'] = Object.keys(events).map(function(k) {return events[k];}).sort(function(a,b) {
+        return String(a['時間']).localeCompare(String(b['時間']));
+      });
+    }
+    merged[key] = row;
+  });
+  return Object.keys(merged).sort().map(function(k) {return merged[k];});
+}
+
+function mergeSignalPayload_(prior, incoming) {
+  const result = Object.assign({}, prior, incoming, {model_schema: 1});
+  result.model_months = Array.from(new Set([].concat(prior.model_months || [], incoming.model_months || []))).sort();
+  result.model_versions = Object.assign({}, prior.model_versions || {});
+  Object.keys(incoming.model_versions || {}).forEach(function(k) {
+    if (String(incoming.model_versions[k]) > String(result.model_versions[k] || '')) result.model_versions[k] = incoming.model_versions[k];
+  });
+  if (prior.model_trades || incoming.model_trades) result.model_trades = mergeModelTrades_(prior.model_trades, incoming.model_trades);
+  const deleted = Array.from(new Set([].concat(prior.strategy_signal_deleted_keys || [], incoming.strategy_signal_deleted_keys || [])));
+  if (prior.strategy_signal_log || incoming.strategy_signal_log) {
+    const manual = {};
+    [].concat(prior.strategy_signal_log || [], incoming.strategy_signal_log || []).forEach(function(r) {
+      if (!r || !r.dedupe_key || deleted.indexOf(r.dedupe_key) >= 0) return;
+      const old = manual[r.dedupe_key];
+      if (!old || String(r['最後更新'] || '') >= String(old['最後更新'] || '')) manual[r.dedupe_key] = r;
+    });
+    result.strategy_signal_log = Object.keys(manual).map(function(k) {return manual[k];});
+  }
+  result.strategy_signal_deleted_keys = deleted;
+  return result;
+}
+
+
 function normalizeScope_(value) {
   const scope = String(value || '').trim();
-  return SCOPES.indexOf(scope) >= 0 ? scope : '';
+  return SCOPES.indexOf(scope) >= 0 || /^strategy_signals:\d{6}$/.test(scope) ? scope : '';
 }
 
 
