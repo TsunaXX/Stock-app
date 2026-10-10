@@ -3219,12 +3219,28 @@ def taiwan_revenue_calendar_text(revenue):
 
 def selected_company_calendar_snapshot(snapshot):
     selected = set(snapshot.get('calendar_companies', []))
-    return {**snapshot, **{
+    filtered = {**snapshot, **{
         section: {**snapshot.get(section, {}), 'events': [
             event for event in snapshot.get(section, {}).get('events', [])
             if company_calendar_key(event) in selected
         ]} for section in ('earnings', 'taiwan_revenue', 'us_revenue', 'financials', 'disclosures', 'dividends')
     }}
+
+    reported = {(company_calendar_key(e), str(e.get('revenue', {}).get('revenue_month', '')))
+                for e in filtered['taiwan_revenue']['events'] if isinstance(e.get('revenue'), dict)}
+    def duplicate_revenue_report(event):
+        title = str(event.get('title', ''))
+        if re.search(r'更正|修正|延後|延期|變更|誤植|子公司|代.*公告', title):
+            return False
+        match = re.search(r'(?<!\d)(\d{3,4})年\s*(\d{1,2})月(?:份)?(?:合併)?營收報告', title)
+        if not match:
+            return False
+        year, month = map(int, match.groups())
+        year = year - 1911 if year >= 1911 else year
+        return (company_calendar_key(event), f'{year:03d}{month:02d}') in reported
+    filtered['disclosures']['events'] = [e for e in filtered['disclosures']['events']
+                                        if not duplicate_revenue_report(e)]
+    return filtered
 
 
 def parse_calendar_event_date(value):
@@ -8743,6 +8759,10 @@ def plot_fibonacci_chart(
 ):
     if ma_flags is None:
         ma_flags = {'5': True, '10': True, '20': True, '60': True}
+
+    if not st.session_state.get('sj_logged_in', False) or st.session_state.get('sj_api') is None:
+        st.info('尚未登入永豐 API；請先登入後再使用費波圖表，避免將延遲或過期備援資料當成即時行情。')
+        return
 
     code_map_fibo, name_map_fibo = load_local_stock_names()
     
@@ -20620,9 +20640,6 @@ def render_model_tracking_room():
             if show_evidence:
                 st.dataframe(view[['交易ID','指標快照','事件']], hide_index=True, width='stretch')
     render_model_report()
-    with st.expander('舊版手動紀錄（獨立統計）'):
-        if st.checkbox('顯示舊版手動紀錄', key='show_legacy_model_records'):
-            render_strategy_validation_room()
 
 
 @st.cache_resource(max_entries=4)
