@@ -367,6 +367,12 @@ def test_full_index_option_pages_update_all_analysis_without_toggles(tmp_path):
     from streamlit.testing.v1 import AppTest
     source = (Path(__file__).parents[1] / 'app.py').read_text(encoding='utf-8')
     setup = '''
+class ScenarioFixtureDatetime(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        fixed = pytz.timezone('Asia/Taipei').localize(cls(2026, 10, 6, 10))
+        return fixed.astimezone(tz) if tz else fixed.replace(tzinfo=None)
+datetime = ScenarioFixtureDatetime
 st.session_state.setdefault('main_workspace_active_tab', '📈 指數操盤室')
 st.session_state['index_workspace_active_tab'] = st.session_state.get('_test_page', '📅 選擇權操作計畫')
 fixture = pd.DataFrame({'Open':[20000.]*90,'High':[20500.]*90,'Low':[19500.]*90,
