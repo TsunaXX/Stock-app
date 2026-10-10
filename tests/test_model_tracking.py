@@ -208,6 +208,8 @@ with outer:
     app = AppTest.from_string(script).run()
     assert not app.exception and app.session_state['profit'] == '模型勝率追蹤'
     assert len(app.get('download_button')) == 1
+    assert not any('舊版手動紀錄' in e.label for e in app.expander)
+    assert not any(e.key == 'show_legacy_model_records' for e in app.checkbox)
     app.text_input(key='model_code').set_value('2330').run()
     assert not app.exception
     tracker.close()
