@@ -259,17 +259,20 @@ def test_model_display_frame_keeps_blank_cells_arrow_compatible():
     rows = pa.Table.from_pandas(frame.data, preserve_index=False).to_pylist()
     assert '>None<' not in frame.to_html()
     assert rows == [
-        {'勝率(%)': None, '平均獲利': None, '平均虧損': None, '方向': '偏多'},
-        {'勝率(%)': 0.0, '平均獲利': 120.5, '平均虧損': -20.0, '方向': '偏空'},
+        {'勝率(%)': '', '平均獲利': '', '平均虧損': '', '方向': '偏多'},
+        {'勝率(%)': '0.0', '平均獲利': '120.5', '平均虧損': '-20.0', '方向': '偏空'},
     ]
+    assert '0.000000' not in frame.to_html()
 
     empty_metrics = namespace['_model_display_frame'](pd.DataFrame([
         {'勝率(%)': None, '平均獲利': None, '獲利因子': None},
     ]))
     empty_table = pa.Table.from_pandas(empty_metrics.data, preserve_index=False)
-    assert all(empty_metrics.data[column].dtype == 'float64' for column in empty_metrics.data)
-    assert all(empty_table.schema.field(column).type == pa.float64() for column in empty_metrics.data)
-    assert empty_table.to_pylist() == [{'勝率(%)': None, '平均獲利': None, '獲利因子': None}]
+    assert all(empty_table.schema.field(column).type == pa.string() for column in empty_metrics.data), [
+        (column, str(empty_table.schema.field(column).type), empty_metrics.data[column].dtype,
+         empty_metrics.data[column].tolist()) for column in empty_metrics.data
+    ]
+    assert empty_table.to_pylist() == [{'勝率(%)': '', '平均獲利': '', '獲利因子': ''}]
     assert '>None<' not in empty_metrics.to_html()
 
 

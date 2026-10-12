@@ -21072,9 +21072,9 @@ def _model_display_frame(frame, color=False):
     result = frame.copy()
     for column in result.columns:
         result[column] = result[column].map(lambda value: _model_display_value(value, str(column)))
-        if not result.empty and result[column].isna().all():
-            result[column] = pd.Series(float('nan'), index=result.index, dtype='float64')
-    styled = result.style.format(na_rep='')
+        if result[column].isna().any():
+            result[column] = result[column].map(lambda value: '' if pd.isna(value) else str(value)).astype(object)
+    styled = result.style
     if not color:
         return styled
 
@@ -21137,7 +21137,7 @@ def render_model_tracking_room():
             config['model_tracking_costs'] = {**changed, '_cathay_fee_schedule': CATHAY_FEE_SCHEDULE_VERSION}
             with _RUNTIME_FILE_LOCK:
                 _write_json_atomic(CONFIG_FILE, config)
-        st.caption('股票依國泰網路下單 2.8 折為預設；臺指 TX／MTX／TMF 單邊 38／18／10 元、股票／小型股票／ETF 期貨 18／10／18 元，月選／週五選／週三選 12／12／18 元。個人約定不同可自行修改；外匯及其他商品請依國泰帳戶費率填寫。設定只套用新訊號。')
+        st.caption('費用依國泰電子下單費率估算：股票網路下單 2.8 折；臺指 TX／MTX／TMF 單邊 38／18／10 元、股票／小型股票／ETF 期貨 18／10／18 元，月選／週五選／週三選 12／12／18 元。費率可修改，設定只套用新訊號。')
         st.caption('指數計畫使用畫面設定的微型臺指口數，每點 10 元；選擇權契約每點 50 元是合約乘數，手續費按到期別及每口費率估算。價差組合依實際口數計費，舊紀錄成本不變。')
         st.markdown('[國泰證券網路下單費率](https://www.cathaysec.com.tw/cathaysec/Products/TradeFee/TWS.aspx)｜[國泰期貨手續費](https://eservice.cathaysec.com.tw/sign/handling_fee.html)｜股票稅費沿用交易損益室規則；停利停損先後或行情缺口未確認時不計入有效績效。')
     cols = st.columns(4)
