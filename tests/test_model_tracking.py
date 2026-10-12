@@ -262,6 +262,14 @@ def test_model_display_frame_keeps_blank_cells_arrow_compatible():
         {'勝率(%)': 0.0, '平均獲利': 120.5, '平均虧損': -20.0, '方向': '偏空'},
     ]
 
+    empty_metrics = namespace['_model_display_frame'](pd.DataFrame([
+        {'勝率(%)': None, '平均獲利': None, '獲利因子': None},
+    ]))
+    empty_table = pa.Table.from_pandas(empty_metrics, preserve_index=False)
+    assert all(empty_metrics[column].dtype == 'float64' for column in empty_metrics)
+    assert all(empty_table.schema.field(column).type == pa.float64() for column in empty_metrics)
+    assert empty_table.to_pylist() == [{'勝率(%)': None, '平均獲利': None, '獲利因子': None}]
+
 
 def test_invalid_settings_and_plans_fail_safely():
     assert normalize_costs({'stock_shares':-2,'stock_discount':float('nan')}) == DEFAULT_COSTS

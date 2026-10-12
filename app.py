@@ -21072,6 +21072,8 @@ def _model_display_frame(frame, color=False):
     result = frame.copy()
     for column in result.columns:
         result[column] = result[column].map(lambda value: _model_display_value(value, str(column)))
+        if not result.empty and result[column].isna().all():
+            result[column] = pd.Series(float('nan'), index=result.index, dtype='float64')
     if not color:
         return result
 
