@@ -192,10 +192,17 @@ import streamlit as st
 import pandas as pd, json, pytz, threading, time
 from datetime import date,datetime,timedelta
 from model_tracking import ModelTracker,DEFAULT_COSTS,performance,excel_report,normalize_costs
+class ModelFixtureDatetime(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        fixed = pytz.timezone('Asia/Taipei').localize(cls(2026,10,12,16))
+        return fixed.astimezone(tz) if tz else fixed.replace(tzinfo=None)
+datetime = ModelFixtureDatetime
 '''+f"tracker=ModelTracker({str(tmp_path/'ui.sqlite')!r},start=False)\n"+'''
 get_model_tracker=lambda *a: tracker
 get_app_secret=lambda *a: None
 load_config=lambda: {}
+get_futures_trading_date=lambda value: value + timedelta(days=1)
 render_strategy_validation_room=lambda: st.info('legacy')
 '''+defs+'''
 outer,other=st.tabs(['交易損益室','其他'],key='main',on_change='rerun')
@@ -207,7 +214,13 @@ with outer:
 '''
     app = AppTest.from_string(script, default_timeout=30).run()
     assert not app.exception and app.session_state['profit'] == '模型勝率追蹤'
+    assert str(app.date_input(key='model_period').value[-1]) == '2026-10-13'
     assert len(app.get('download_button')) == 1
+    assert app.selectbox(key='model_plan_source').options == ['全部','股期戰略室','指數操作計畫','選擇權操作計畫']
+    app.selectbox(key='model_plan_source').select('選擇權操作計畫').run()
+    assert not app.exception
+    app.selectbox(key='model_market').select('選擇權').run()
+    assert not app.exception
     assert not any('舊版手動紀錄' in e.label for e in app.expander)
     assert not any(e.key == 'show_legacy_model_records' for e in app.checkbox)
     app.text_input(key='model_code').set_value('2330').run()

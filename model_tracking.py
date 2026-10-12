@@ -8,6 +8,7 @@ import sqlite3
 import threading
 import time
 from datetime import datetime
+from decimal import Decimal, ROUND_HALF_UP
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -50,9 +51,39 @@ def number(value):
         return None
 
 
+def option_tick(price):
+    """TXO premium ticks, not the underlying index tick."""
+    return next((tick for ceiling, tick in ((10, .1), (50, .5), (500, 1), (1000, 5))
+                 if price < ceiling), 10)
+
+
+def option_fills(record, quote, opening):
+    prices = quote.get('權利金證據', {})
+    fills = {}
+    for leg in record.get('選擇權腿', []):
+        evidence = prices.get(leg['代碼'], {})
+        price, source, trigger_time = number(evidence.get('價格')), stamp(evidence.get('來源時間')), stamp(quote.get('來源時間'))
+        if (price is None or price <= 0 or source is None or trigger_time is None
+                or not 0 <= (trigger_time - source).total_seconds() <= 2):
+            return None
+        sign = leg['買賣'] * (1 if opening else -1)
+        fill = max(0, price + sign * option_tick(price) * record['成本設定']['slippage_ticks'])
+        step = option_tick(fill)
+        fills[leg['代碼']] = round((math.ceil(fill / step - 1e-9) if sign > 0 else math.floor(fill / step + 1e-9)) * step, 2)
+    if len(fills) == 2:
+        credit = -sum(leg['買賣'] * fills[leg['代碼']] for leg in record['選擇權腿'])
+        raw_credit = -sum(leg['買賣'] * prices[leg['代碼']]['價格'] for leg in record['選擇權腿'])
+        width = number(record.get('限定風險寬度'))
+        if width is None or not 0 <= raw_credit <= width or (opening and not 0 <= credit < width):
+            return None
+    return fills
+
+
 def trade_id(signal):
     # Decimal spellings and different device receipt times cannot change identity.
     fields = [signal.get(k, '') for k in ('交易日', '市場', '商品鍵', '策略', '策略版本', '方向')]
+    if signal.get('選擇權腿'):
+        fields.append(json.dumps(signal['選擇權腿'], sort_keys=True, ensure_ascii=False))
     fields += [format(float(signal[k]), '.10g') for k in ('進場價', '停損價', '目標價')]
     return hashlib.sha256('|'.join(map(str, fields)).encode()).hexdigest()
 
@@ -110,6 +141,14 @@ def new_trade(signal):
         raise ValueError('訊號方向、策略版本或交易日無效')
     if not signal.get('商品鍵') or signal.get('市場') not in ('股票','期貨') or stamp(signal.get('來源時間')) is None:
         raise ValueError('訊號商品或來源時間無效')
+    legs = signal.get('選擇權腿')
+    if legs is not None and (not isinstance(legs, list) or len(legs) not in (1, 2)
+            or any(not isinstance(leg, dict) or not leg.get('代碼') or leg.get('買賣') not in (-1, 1) for leg in legs)
+            or len({leg['代碼'] for leg in legs}) != len(legs)
+            or sum(leg['買賣'] for leg in legs) != (1 if len(legs) == 1 else 0)
+            or (len(legs) == 2 and number(signal.get('限定風險寬度')) not in (50, 100))
+            or signal.get('乘數') != 50 or stamp(signal.get('到期時間')) is None):
+        raise ValueError('選擇權腿、乘數或到期時間無效')
     row = {**signal, '交易ID': trade_id(signal), '紀錄類型': '自動', '資料缺口': False,
            'MFE(R)': 0.0, 'MAE(R)': 0.0, '事件': []}
     row['成本設定'] = normalize_costs(row.get('成本設定'))
@@ -121,11 +160,17 @@ def new_trade(signal):
 def advance(record, quote):
     """Only ordered observed prices establish fills. Gaps never count as verified wins."""
     row = json.loads(json.dumps(record, ensure_ascii=False))
-    if row['狀態'] not in ACTIVE:
+    if row['狀態'] not in ACTIVE or row.get('到期未確認'):
         return row
     ts, prior = stamp(quote.get('來源時間')), stamp(row.get('來源時間'))
     price = number(quote.get('價格'))
     if ts is None or (prior is not None and ts < prior):
+        return row
+    if row.get('到期時間') and ts >= stamp(row['到期時間']):
+        row['到期未確認'] = row.get('模擬進場價') is not None
+        row['資料缺口'] = bool(row['到期未確認'] or row.get('資料缺口'))
+        event(row, '資料不足' if row['到期未確認'] else '訊號失效', ts.isoformat(),
+              '契約已到期；沒有結算或到期前平倉證據，不估算損益')
         return row
     if prior is not None and ts == prior and row['狀態'] != '等待進場' and quote.get('序號') == row.get('最後序號'):
         return row
@@ -158,7 +203,7 @@ def advance(record, quote):
         event(row, '監控中斷', text, '兩次可驗證行情之間有缺口；不回填當時進出場')
     if row['狀態'] in ('監控中斷', '資料不足'):
         event(row, '模擬持倉' if row.get('模擬進場價') is not None else '等待進場', text,
-              '恢復追蹤；缺口仍保留並排除有效績效')
+              '恢復追蹤；缺口仍保留並排除有效績效' if row.get('資料缺口') else '串流成交證據已就緒')
     if row['策略'] == '當沖' and row['交易日'] != quote.get('交易日'):
         row['資料缺口'] = bool(row.get('模擬進場價') is not None or row.get('資料缺口'))
         event(row, '訊號失效', text, '當沖交易日已結束；缺少收盤成交證據時不估算損益')
@@ -171,7 +216,8 @@ def advance(record, quote):
         event(row, '資料不足', text, '缺少有效跳動點或契約乘數，無法驗證成本')
         row['資料缺口'] = True
         return row
-    slip = tick * row['成本設定']['slippage_ticks']
+    option_legs = row.get('選擇權腿')
+    slip = 0 if option_legs else tick * row['成本設定']['slippage_ticks']
     if row['狀態'] == '等待進場':
         invalid = price <= stop if long else price >= stop
         if invalid or (row.get('策略') == '當沖' and str(row.get('交易日')) != str(quote.get('交易日'))):
@@ -180,16 +226,31 @@ def advance(record, quote):
         if sign * (price - entry) < 0:
             row['來源時間'] = text
             return row
+        if (not quote.get('進場許可', True) or
+                (quote.get('許可方向') and quote['許可方向'] != row['方向']) or
+                (quote.get('進場許可時間') and ts < stamp(quote['進場許可時間']))):
+            row['來源時間'] = text
+            return row
         fill = price + sign * slip
         if sign * (target - fill) <= 0:
             event(row, '訊號失效', text, '首個成交證據已越過目標；不得回填計畫價成交')
             return row
+        if option_legs:
+            fills = option_fills(row, quote, True)
+            if fills is None:
+                row['資料缺口'] = True
+                event(row, '資料不足', text, '觸及進場但缺少同時段的各腿權利金成交證據')
+                return row
+            row['進場權利金'] = fills
+            row['觸發進場點位'] = price
+            fill = sum(leg['買賣'] * fills[leg['代碼']] for leg in option_legs)
         row['模擬進場價'], row['進場時間'], row['最新價'] = fill, text, price
         event(row, '模擬持倉', text)
         return row  # The entry sample cannot also prove a later exit.
     fill = row['模擬進場價']
-    risk = abs(fill - stop)
-    r = sign * (price - fill) / risk if risk else 0
+    trigger_fill = row.get('觸發進場點位', fill)
+    risk = abs(trigger_fill - stop)
+    r = sign * (price - trigger_fill) / risk if risk else 0
     row['MFE(R)'] = max(row['MFE(R)'], r)
     row['MAE(R)'] = max(row['MAE(R)'], -r)
     row['來源時間'], row['最新價'] = text, price
@@ -215,6 +276,19 @@ def advance(record, quote):
                       for p in (fill, exit_price))
             sell = exit_price if long else fill
             tax = math.floor(sell * qty * (.0015 if row['策略'] == '當沖' else .003))
+        elif option_legs:
+            fills = option_fills(row, quote, False)
+            if fills is None:
+                row['資料缺口'] = True
+                event(row, '資料不足', text, '觸及出場但缺少同時段的各腿權利金成交證據')
+                return row
+            exit_price = sum(leg['買賣'] * fills[leg['代碼']] for leg in option_legs)
+            gross = sum(leg['買賣'] * (fills[leg['代碼']] - row['進場權利金'][leg['代碼']])
+                        for leg in option_legs) * multiplier * qty
+            fee = costs['futures_fee'] * qty * 2 * len(option_legs)
+            tax = sum(int((Decimal(str(p)) * Decimal(str(multiplier)) * qty * Decimal('.001')).quantize(Decimal('1'), rounding=ROUND_HALF_UP))
+                      for values in (row['進場權利金'], fills) for p in values.values())
+            row['出場權利金'] = fills
         else:
             fee = costs['futures_fee'] * qty * 2
             rate = row.get('期交稅率')
@@ -225,7 +299,7 @@ def advance(record, quote):
             tax = sum(round(p * multiplier * qty * rate) for p in (fill, exit_price))
         row.update({'模擬出場價': exit_price, '結案時間': text, '毛損益': round(gross, 2),
                     '交易成本': round(fee + tax, 2), '模擬損益': round(gross - fee - tax, 2),
-                    '結果(R)': round(sign * (exit_price - fill) / risk, 4),
+                    '結果(R)': round(sign * (price - trigger_fill) / risk, 4) if option_legs else round(sign * (exit_price - fill) / risk, 4),
                     '出場原因': '停損' if stopped else ('停利' if targeted else '收盤')})
         event(row, '已平倉', text)
     return row
@@ -238,7 +312,7 @@ def performance(records, state=None):
     closed.sort(key=lambda r: (r.get('結案時間', ''), r.get('交易ID', '')))
     # Only newly completed trades are folded. Cloud corrections/removals rebuild this filtered view.
     state = {} if state is None else state
-    fingerprints = [json.dumps({k:r.get(k) for k in ('交易ID','結案時間','模擬損益','市場','策略','策略版本','方向','市場環境','指標快照','條件快照')}, ensure_ascii=False, sort_keys=True) for r in closed]
+    fingerprints = [json.dumps({k:r.get(k) for k in ('交易ID','結案時間','模擬損益','市場','策略','策略版本','方向','市場環境','指標快照','條件快照','計畫來源','計畫類型')}, ensure_ascii=False, sort_keys=True) for r in closed]
     previous = state.get('fingerprints', [])
     if fingerprints[:len(previous)] != previous:
         state.clear()
@@ -256,6 +330,7 @@ def performance(records, state=None):
         state['peak'] = max(state['peak'], state['equity'])
         state['drawdown'] = max(state['drawdown'], state['peak'] - state['equity'])
         labels = [{k:r.get(k, '未取得') for k in keys} for keys in (('市場','策略','策略版本'), ('方向','市場環境'))]
+        labels.append({'計畫來源': r.get('計畫來源', '股期戰略室'), '計畫類型': r.get('計畫類型', r.get('策略'))})
         labels += [{'指標':k} for k,v in r.get('指標快照', {}).items() if v is not None]
         labels += [{'進場條件':k,'判定':'符合' if v else '未符合'} for k,v in r.get('條件快照', {}).items() if isinstance(v,bool)]
         for label in labels:
@@ -271,7 +346,7 @@ def performance(records, state=None):
                '獲利因子': state['profit'] / abs(state['loss']) if losses else None,
                '每筆期望值': state['equity'] / count if count else None, '最大回撤': state['drawdown'],
                '訊號有效率(%)': count / len(records) * 100 if records else None,
-               '資料完整率(%)': sum(not r.get('資料缺口', False) for r in records) / len(records) * 100 if records else None}
+               '資料完整率(%)': sum(not r.get('資料缺口', False) and r.get('狀態') != '資料不足' for r in records) / len(records) * 100 if records else None}
     groups = [{**g, '勝率(%)':g['獲勝']/g['有效交易數']*100} for g in state['groups'].values()]
 
     return metrics, pd.DataFrame(groups), data
@@ -280,7 +355,7 @@ def performance(records, state=None):
 def excel_report(records):
     metrics, groups, data = performance(records)
     events = [{**e, '交易ID': r['交易ID']} for r in records for e in r.get('事件', [])]
-    for key in ('指標快照', '成本設定', '事件', '條件快照'):
+    for key in ('指標快照', '成本設定', '事件', '條件快照', '選擇權腿', '進場權利金', '出場權利金'):
         if key in data:
             data[key] = data[key].map(lambda x: json.dumps(x, ensure_ascii=False))
     output = io.BytesIO()
@@ -357,6 +432,12 @@ class ModelTracker:
                               (start or '000000', end or '999999')).fetchall()
         return [json.loads(r[0]) for r in rows]
 
+    def active_plans(self, source, day):
+        month = day[:7].replace('-', '')
+        with self.db() as db:
+            rows = db.execute("SELECT body FROM trades WHERE month=? AND state IN ('等待進場','模擬持倉','監控中斷','資料不足')", (month,)).fetchall()
+        return [row for raw in rows if (row := json.loads(raw[0])).get('計畫來源') == source and row.get('交易日') == day]
+
     def store(self, db, row, dirty=1):
         db.execute('INSERT INTO trades VALUES (?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET state=excluded.state,body=excluded.body,dirty=MAX(trades.dirty,excluded.dirty)',
                    (row['交易ID'], row['交易日'][:7].replace('-', '').replace('/', ''),
@@ -410,6 +491,13 @@ class ModelTracker:
                 row = json.loads(raw[0])
                 quote = quotes.get(row['市場'] + '|' + row['商品鍵'])
                 if quote is None or (quote.get('休市') and not quote.get('收盤確認')) or row['狀態'] not in ACTIVE:
+                    continue
+                if (quote.get('暖機等待') and row.get('最後序號') is None and row.get('模擬進場價') is None
+                        and (not row.get('到期時間') or stamp(quote['來源時間']) < stamp(row['到期時間']))):
+                    if row['狀態'] != '資料不足':
+                        event(row, '資料不足', row['來源時間'], '等待第一組串流成交證據，尚未確認進場')
+                        self.store(db, row)
+                        self.revision += 1
                     continue
                 updated = row
                 evidence = quote.get('成交證據', [])
