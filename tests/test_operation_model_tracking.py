@@ -18,6 +18,7 @@ NOW = pytz.timezone('Asia/Taipei').localize(datetime(2026, 10, 12, 10))
 
 def adapter():
     ns = load_app_symbols('operation_model_spec', 'operation_model_samples', 'record_operation_models',
+                          'cathay_futures_fee', 'cathay_option_fee',
                           '_safe_number', 'parse_strategy_data_time')
     state = {'lock': threading.RLock(), 'strategy_stream_scopes': {'index': {'TMFJ6'}, 'options': {'C1', 'P1', 'P2'}},
              'model_tick_buffers': {}, 'aliases': {}}
@@ -25,7 +26,13 @@ def adapter():
         @classmethod
         def now(cls, tz=None):
             return NOW.astimezone(tz) if tz else NOW.replace(tzinfo=None)
+    fee_schedule = {'futures_tx_fee':38, 'futures_mtx_fee':18, 'futures_tmf_fee':10,
+                    'futures_stock_fee':18, 'futures_small_stock_fee':10, 'futures_etf_fee':18,
+                    'option_monthly_fee':12, 'option_wednesday_fee':18, 'option_friday_fee':12,
+                    'futures_fee':DEFAULT_COSTS['futures_fee']}
     ns.update(datetime=Clock, deque=deque, normalize_costs=lambda c: dict(DEFAULT_COSTS),
+              CATHAY_FEE_DEFAULTS=fee_schedule,
+              load_model_tracking_costs=lambda: {**DEFAULT_COSTS, **fee_schedule},
               load_config=lambda: {}, get_operation_model_version=lambda s:'test-'+s,
               get_futures_trading_date=lambda now:now, model_market_open=lambda *a:True,
               _stream_state=lambda api:state)
@@ -42,6 +49,7 @@ def spec(ns, option=None, spread=False, direction='偏多', kind='日線／15分
 
 def option(spread=False, put=False):
     result = {'name':'價差單' if spread else ('單買BP' if put else '單買BC'), 'expiry':date(2026,10,14),
+              'delivery_month':'202610W2',
               'contract':SimpleNamespace(code='P1' if put else 'C1'), 'model_probability':.99,
               'target_option_price':999999.}
     if spread:
@@ -103,7 +111,7 @@ def test_single_bc_bp_use_observed_premium_and_option_tax(tmp_path, put):
     assert row['狀態'] == '已平倉' and row['毛損益'] == (46.5-32.5)*50
     code = 'P1' if put else 'C1'
     assert row['進場權利金'] == {code:32.5} and row['出場權利金'] == {code:46.5}
-    assert row['交易成本'] == 104 and row['模擬損益'] == 596
+    assert row['交易成本'] == 40 and row['模擬損益'] == 660
     assert row['乘數'] == 50 and row['計畫來源'] == '選擇權操作計畫'
     assert 'target_option_price' not in row  # An exaggerated model estimate never becomes evidence.
 
@@ -120,7 +128,7 @@ def test_credit_spread_preserves_both_legs_and_costs(tmp_path):
     row = tracker.records()[0]
     assert row['進場權利金'] == {'P1':29.5, 'P2':12.5}
     assert row['出場權利金'] == {'P1':10.5, 'P2':3.9}
-    assert row['毛損益'] == 520 and row['交易成本'] == 203 and row['模擬損益'] == 317
+    assert row['毛損益'] == 520 and row['交易成本'] == 75 and row['模擬損益'] == 445
     assert len(row['選擇權腿']) == 2 and performance(tracker.records())[0]['有效交易數'] == 1
 
 
@@ -167,13 +175,13 @@ def test_premium_tick_boundaries_expiry_and_impossible_spread():
     assert option_fills(spread,q,False) == {'P1':102., 'P2':.9}  # Maximum-loss spread still includes adverse slippage.
     with pytest.raises(ValueError):
         new_trade({**spread, '選擇權腿':[{'代碼':'P1','買賣':-1}]})
-    no_slip = {**row, '成本設定':{**DEFAULT_COSTS,'slippage_ticks':0}}
+    no_slip = {**row, '成本設定':{**row['成本設定'],'slippage_ticks':0}}
     q = {'有效':True,'價格':20000.,'來源時間':NOW.isoformat(),'交易日':NOW.date().isoformat(),
          '權利金證據':{'C1':{'價格':50.,'來源時間':NOW.isoformat()}}}
     holding = advance(no_slip,q)
     q.update(價格=20200.,來源時間=(NOW+timedelta(seconds=1)).isoformat())
     q['權利金證據']['C1']['來源時間'] = q['來源時間']
-    assert advance(holding,q)['交易成本'] == 106  # 2.5 NTD tax per side rounds half up to 3.
+    assert advance(holding,q)['交易成本'] == 42  # 2.5 NTD tax per side rounds half up to 3.
     expired_holding = advance({**holding,'到期時間':NOW.isoformat()}, {**q,'有效':False})
     assert expired_holding['狀態'] == '資料不足' and expired_holding['到期未確認']
     assert advance(expired_holding,{**q,'來源時間':(NOW+timedelta(seconds=2)).isoformat()}) == expired_holding
