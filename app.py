@@ -44,7 +44,7 @@ from market_automation import (
     macro_results, merge_company_sections, merge_macro_results, vwap_guard,
 )
 
-from model_tracking import ModelTracker, DEFAULT_COSTS, VERSION as MODEL_VERSION, performance, excel_report, normalize_costs
+from model_tracking import ModelTracker, DEFAULT_COSTS, VERSION as MODEL_VERSION, performance, excel_report, normalize_costs, option_fills, option_tick, advance as advance_model_trade
 
 logger = logging.getLogger(__name__)
 
@@ -20590,7 +20590,7 @@ def get_operation_model_version(source):
     functions = (calculate_index_trade_plan, evaluate_trade_entry_state, calculate_short_wave_plan,
                  operation_model_spec, operation_model_samples)
     if source == '選擇權操作計畫':
-        functions += (recommend_txo_strategy, evaluate_txo_directional_quality)
+        functions += (recommend_txo_strategy, evaluate_txo_directional_quality, option_fills, option_tick, advance_model_trade)
     return MODEL_VERSION + '-plan-' + data_version([source, *[inspect.getsource(f) for f in functions]])[:10]
 
 
