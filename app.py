@@ -7600,6 +7600,7 @@ def render_index_scenario_tracking(plan):
 def render_operation_plan(seed_data, option_page=False):
     """Refresh every analysis on the active page from stream/minute caches only."""
     api = st.session_state.get('sj_api')
+    option_model_specs = []
     if api is not None:
         contracts = [get_near_futures_contract(api, product) for product in ('TMF', 'TXF')]
         contracts.append(get_taiex_contract(api))
@@ -7618,6 +7619,8 @@ def render_operation_plan(seed_data, option_page=False):
         futures_item[2] if futures_item else pd.DataFrame(), futures_item[4] if futures_item else None,
     )
     if plan is None:
+        record_operation_models('選擇權操作計畫' if option_page else '指數操作計畫', [], api,
+                                st.session_state.get('option_auto_seconds_saved' if option_page else 'index_scenario_seconds_saved', 5))
         st.info('⏳ 正在載入加權與期貨日 K；資料足夠後會直接顯示操作計畫。')
         if time.monotonic() - st.session_state.get('_index_trade_plan_auto_retry', 0) >= 180:
             st.session_state['_index_trade_plan_auto_retry'] = time.monotonic()
@@ -7795,6 +7798,21 @@ def render_operation_plan(seed_data, option_page=False):
             key="trade_plan_position_count",
             help="此設定會連動更新進出依據與短波當沖的停損金額及預估收益。",
         )
+        model_specs = [operation_model_spec(
+            '指數操作計畫', '日線／15分K', live_snapshot,
+            trade_state.get('execution_direction') or plan.get('direction'),
+            trade_state['entry_level'], trade_state['invalidation'], trade_state['target'],
+            trade_state['can_enter'], position_count, entry_profile,
+            {'VWAP': intraday_state.get('vwap'), 'ATR': plan.get('atr')}, plan['trigger'],
+        )]
+        if short_wave:
+            model_specs.append(operation_model_spec(
+                '指數操作計畫', '短波5分K', live_snapshot, short_wave_direction,
+                short_wave['entry'], short_wave['stop'], short_wave['target'],
+                short_wave['momentum_ready'], position_count, entry_profile,
+                {'EMA5': short_wave.get('ema_fast'), '量比': short_wave.get('volume_ratio')}, short_wave['trigger'],
+            ))
+        record_operation_models('指數操作計畫', model_specs, api, st.session_state.get('index_scenario_seconds_saved', 5))
         execution_direction = trade_state.get('execution_direction') or plan.get('direction')
         execution_color = (
             '#ff4b4b' if execution_direction == '偏多'
@@ -8146,6 +8164,18 @@ def render_operation_plan(seed_data, option_page=False):
                 option_mode.startswith("自動") and strategy_view['choice'] == '價差單'
             )
             option_quote = spread_quote if display_spread else directional_quote
+            option_ready = bool(option_quote and not option_quote.get('quote_stale') and
+                                (display_spread or option_quote.get('trade_ready') or option_quote.get('small_position_ready')))
+            model_spec = operation_model_spec(
+                '選擇權操作計畫', '價差單' if display_spread else '單買' + ('BC' if option_direction == '偏多' else 'BP'),
+                live_snapshot, option_direction, option_entry, option_stop, option_target,
+                option_ready and bool(short_wave and short_wave.get('momentum_ready')),
+                1, (option_mode, expiry_choice, moneyness_preference, spread_width),
+                {'模型機率': (option_quote or {}).get('model_probability'),
+                 '模型波動率': (option_quote or {}).get('model_volatility')},
+                strategy_view['reason'], option_quote=option_quote, spread=display_spread,
+            ) if option_ready else None
+            option_model_specs = [model_spec]
             if option_quote and option_quote.get('quote_time'):
                 st.caption('本組報價來源時間：' + _stream_datetime(option_quote['quote_time']).strftime('%Y/%m/%d %H:%M:%S'))
             if display_spread and option_quote and option_quote.get('quote_stale'):
@@ -8297,6 +8327,7 @@ def render_operation_plan(seed_data, option_page=False):
                     )
                 else:
                     st.info("即時權利金或淨收權利金不足，暫時無法繪製可驗證的損益曲線。")
+        record_operation_models('選擇權操作計畫', option_model_specs, api, st.session_state.get('option_auto_seconds_saved', 5))
 
 
 
@@ -20554,6 +20585,146 @@ def get_model_tracker(url=''):
     return ModelTracker('model_tracking.sqlite3', url, market_open=model_market_open)
 
 
+@st.cache_resource(max_entries=4)
+def get_operation_model_version(source):
+    functions = (calculate_index_trade_plan, evaluate_trade_entry_state, calculate_short_wave_plan,
+                 operation_model_spec, operation_model_samples)
+    if source == '選擇權操作計畫':
+        functions += (recommend_txo_strategy, evaluate_txo_directional_quality)
+    return MODEL_VERSION + '-plan-' + data_version([source, *[inspect.getsource(f) for f in functions]])[:10]
+
+
+def operation_model_spec(source, kind, live, direction, entry, stop, target, allowed,
+                         quantity, profile, indicators, rule, option_quote=None, spread=False):
+    """Freeze published levels and actual contract identities, never theoretical option fills."""
+    levels = [_safe_number(value) for value in (entry, stop, target)]
+    entry, stop, target = levels
+    if (not live or direction not in ('偏多', '偏空') or None in levels
+            or min(levels) <= 0
+            or not (stop < entry < target if direction == '偏多' else target < entry < stop)):
+        return None
+    costs = normalize_costs(load_config().get('model_tracking_costs', {}))
+    costs['futures_contracts'] = int(quantity)
+    underlying = str(live['contract_code'])
+    spec = {'市場': '期貨', '商品鍵': underlying + '|' + kind, '代碼': underlying,
+            '名稱': '微台 ' + kind, '交易時段': '日盤+夜盤', '策略': '當沖',
+            '計畫來源': source, '計畫類型': kind, '觸發商品': underlying,
+            '策略版本': get_operation_model_version(source) + '-' + data_version([kind, profile, costs])[:10],
+            '方向': direction, '進場價': levels[0], '停損價': levels[1], '目標價': levels[2],
+            '進場許可': bool(allowed), '跳動點': 1, '乘數': 10, '期交稅率': .00002,
+            '觀察價格': _safe_number(live.get('price')), '觀察時間': str(live.get('updated', '')),
+            '觸發條件': rule, '指標快照': indicators, '條件快照': {'原計畫進場許可': bool(allowed)},
+            '成本設定': costs, '市場環境': direction}
+    if source == '選擇權操作計畫':
+        if not option_quote or not option_quote.get('expiry'):
+            return None
+        contracts = [(option_quote.get('short_contract'), -1), (option_quote.get('long_contract'), 1)] if spread else [(option_quote.get('contract'), 1)]
+        if any(contract is None for contract, _ in contracts):
+            return None
+        legs = [{'代碼': str(contract.code), '買賣': action} for contract, action in contracts]
+        code = '/'.join(leg['代碼'] for leg in legs)
+        spec.update({'商品鍵': code + '@' + underlying, '代碼': code, '名稱': option_quote['name'],
+                     '商品類型': '選擇權', '選擇權腿': legs, '乘數': 50, '期交稅率': .001,
+                     '到期時間': datetime.combine(option_quote['expiry'], dt_time(13, 30)).isoformat(),
+                     '限定風險寬度': abs(option_quote['short_strike'] - option_quote['long_strike']) if spread else 0})
+    return spec
+
+
+def operation_model_samples(specs, api, seconds, now_value=None, after=None):
+    """Read only subscribed tick buffers; option legs must precede the trigger by at most two seconds."""
+    specs = [spec for spec in specs if spec]
+    if not specs:
+        return [], {}
+    now = now_value or datetime.now(pytz.timezone('Asia/Taipei'))
+    state = _stream_state(api)
+    codes = {spec['觸發商品'] for spec in specs} | {leg['代碼'] for spec in specs for leg in spec.get('選擇權腿', [])}
+    with state['lock']:
+        buffers = state.setdefault('model_tick_buffers', {})
+        retained = set().union(*state.get('strategy_stream_scopes', {}).values())
+        retained.update(state.get('subscriptions', {}))
+        aliases = state.get('aliases', {})
+        for code in codes:
+            code = aliases.get(code, code)
+            if code in retained and code not in buffers and len(buffers) < 200:
+                buffers[code] = deque(maxlen=4096)
+                epochs = state.setdefault('model_buffer_epochs', {})
+                epochs[code] = epochs.get(code, 0) + 1
+        ticks = {code: list(buffers.get(aliases.get(code, code), [])) for code in codes}
+        disconnected = bool(state.get('connection_down') or state.get('auth_error'))
+    signals, quotes = [], {}
+    day = get_futures_trading_date(now).date().isoformat()
+    for spec in specs:
+        observed = ticks[spec['觸發商品']]
+        cursor = (after or {}).get(spec['商品鍵'])
+        if cursor and observed and observed[-1].get('串流識別') == cursor['stream']:
+            observed = [tick for tick in observed if tick.get('序號', 0) >= cursor['sequence']]
+        else:
+            cursor = None
+        permission_time = observed[-1]['來源時間'] if observed else None
+        evidence, positions = [], {leg['代碼']: 0 for leg in spec.get('選擇權腿', [])}
+        for tick in observed:
+            tick = dict(tick)
+            previous_permission = cursor and cursor['time'] <= tick['來源時間'] < permission_time
+            tick['進場許可'] = cursor['allowed'] if previous_permission else spec['進場許可']
+            tick['許可方向'] = cursor['direction'] if previous_permission else spec['方向']
+            tick['進場許可時間'] = cursor['time'] if previous_permission else permission_time
+            premiums = {}
+            for code in positions:
+                leg_ticks = ticks[code]
+                pos = positions[code]
+                while pos < len(leg_ticks) and leg_ticks[pos]['來源時間'] <= tick['來源時間']:
+                    pos += 1
+                positions[code] = pos
+                if pos:
+                    premiums[code] = leg_ticks[pos - 1]
+            if positions:
+                tick['權利金證據'] = premiums
+                tick['串流識別'] += ':' + data_version([premiums.get(code, {}).get('串流識別') for code in positions])[:10]
+            evidence.append(tick)
+        last = evidence[-1] if evidence else {}
+        source = parse_strategy_data_time(last.get('來源時間') or spec.get('觀察時間'))
+        age = (now.replace(tzinfo=None) - source.to_pydatetime()).total_seconds() if source is not None else None
+        signal_valid = not disconnected and age is not None and 0 <= age <= 30
+        valid = signal_valid and bool(last)
+        source_time = pytz.timezone('Asia/Taipei').localize(source.to_pydatetime()).isoformat() if source is not None else now.isoformat()
+        if spec.get('選擇權腿'):
+            valid = valid and all(
+                (premium := last.get('權利金證據', {}).get(leg['代碼'])) is not None
+                and 0 <= (datetime.fromisoformat(last['來源時間']) - datetime.fromisoformat(premium['來源時間'])).total_seconds() <= 2
+                for leg in spec['選擇權腿'])
+        quote = {**last, '有效': valid, '成交證據': evidence, '交易日': day, '更新秒數': seconds,
+                 '來源時間': last.get('來源時間', source_time), '休市': not model_market_open(spec, now),
+                 '進場許可': spec['進場許可'], '許可方向': spec['方向'], '進場許可時間': last.get('來源時間'), '收盤確認': valid and (
+                     dt_time(13, 45) <= source.time() < dt_time(15) or dt_time(5) <= source.time() < dt_time(8, 45))}
+        quote['暖機等待'] = signal_valid and not valid
+        quotes['期貨|' + spec['商品鍵']] = quote
+        if signal_valid and spec.get('新訊號', True) and not quote['休市'] and (not spec.get('到期時間') or source < pd.Timestamp(spec['到期時間'])):
+            signals.append({**spec, '交易日': day, '來源時間': source_time, '訊號價': last.get('價格', spec.get('觀察價格'))})
+    return signals, quotes
+
+
+def record_operation_models(source, specs, api, seconds):
+    if api is None or not st.session_state.get('sj_logged_in', False):
+        return
+    tracker = get_model_tracker(get_app_secret('gsheet_api_url') or '')
+    specs = [spec for spec in specs if spec]
+    current_keys = {spec['商品鍵'] for spec in specs}
+    day = get_futures_trading_date(datetime.now(pytz.timezone('Asia/Taipei'))).date().isoformat()
+    specs += [{**row, '新訊號': False, '進場許可': False} for row in tracker.active_plans(source, day)
+              if row['商品鍵'] not in current_keys]
+    cursors = st.session_state.setdefault('_operation_model_cursors', {})
+    signals, quotes = operation_model_samples(specs, api, seconds, after=cursors)
+    if signals or quotes:
+        if tracker.submit(signals, quotes):
+            for spec in specs:
+                quote = quotes.get('期貨|' + spec['商品鍵'], {})
+                if quote.get('序號') is not None:
+                    # Option composite identity appends a leg hash to the original three-part stream epoch.
+                    stream = quote['串流識別'].rsplit(':', 1)[0] if spec.get('選擇權腿') else quote['串流識別']
+                    cursors[spec['商品鍵']] = {'stream': stream, 'sequence': quote['序號'],
+                                            'time': quote['來源時間'], 'allowed': spec['進場許可'], 'direction': spec['方向']}
+
+
 def model_tracking_samples(rows, stock, mode, direction_choice, config, seconds, api=None):
     """Use the same existing strategy helpers on quotes already obtained by the main table."""
     now = datetime.now(pytz.timezone('Asia/Taipei'))
@@ -20725,7 +20896,7 @@ def record_model_table(room, rows, stock, mode, direction_choice='自動'):
 
 
 def render_model_tracking_room():
-    st.caption('以股期主表及獨立分析的進出場預判記錄模擬訊號；不讀取帳戶交易。觸及進場、停損或目標後記錄，只有證據完整的已平倉交易計入勝率。')
+    st.caption('自動記錄股期進出場預判、指數操作計畫與選擇權操作計畫；不讀取帳戶交易。只有成交證據完整的已平倉模擬交易計入勝率。')
     tracker = get_model_tracker(get_app_secret('gsheet_api_url') or '')
     tracker.last_activity = time.monotonic()
     with st.expander('模擬成交與成本設定', expanded=False):
@@ -20745,19 +20916,22 @@ def render_model_tracking_room():
             with _RUNTIME_FILE_LOCK:
                 _write_json_atomic(CONFIG_FILE, config)
         st.caption('設定僅套用新訊號，舊紀錄保留原計畫及原成本。預設股票 1,000 股、期貨 1 口、每次成交滑價 1 跳；期貨手續費為可調模擬值。')
+        st.caption('指數計畫使用畫面的微台口數、每點 10 元；選擇權每組 1 口、每腿每點 50 元，沿用期貨單邊每口手續費。選擇權損益使用成交推播權利金，非理論估價；結果(R)為標的觸價距離。')
         st.markdown('[期交所費率表](https://www.taifex.com.tw/cht/4/feeSchedules)｜股票稅費沿用交易損益室規則。停利停損順序或行情缺口未確認時排除有效績效。')
     cols = st.columns(4)
     with cols[0]:
-        today_tw = datetime.now(pytz.timezone('Asia/Taipei')).date()
-        period = st.date_input('日期區間', value=(today_tw - timedelta(days=30), today_tw), key='model_period')
+        now_tw = datetime.now(pytz.timezone('Asia/Taipei'))
+        report_day = max(now_tw.date(), get_futures_trading_date(now_tw).date())
+        period = st.date_input('日期區間', value=(report_day - timedelta(days=30), report_day), key='model_period')
     with cols[1]:
-        market = st.selectbox('市場', ['全部','股票','期貨'], key='model_market')
+        market = st.selectbox('市場', ['全部','股票','期貨','選擇權'], key='model_market')
     with cols[2]:
         mode = st.selectbox('策略', ['全部','當沖','波段'], key='model_mode')
     with cols[3]:
         direction = st.selectbox('多空方向', ['全部','多','空'], key='model_direction')
     if len(period) != 2:
         return
+    plan_source = st.selectbox('計畫來源', ['全部', '股期戰略室', '指數操作計畫', '選擇權操作計畫'], key='model_plan_source')
     records = tracker.records(period[0].strftime('%Y%m'), period[1].strftime('%Y%m'))
     versions = ['全部'] + sorted({r.get('策略版本', MODEL_VERSION) for r in records})
     version_col, code_col = st.columns(2)
@@ -20776,11 +20950,13 @@ def render_model_tracking_room():
             st.warning(tracker.error)
         tracker.last_activity = time.monotonic()
         records = tracker.records(period[0].strftime('%Y%m'), period[1].strftime('%Y%m'))
+        records = [{**row, '市場':'選擇權'} if row.get('選擇權腿') else row for row in records]
         records = [r for r in records if period[0].isoformat() <= r['交易日'] <= period[1].isoformat()
                    and (market == '全部' or r['市場'] == market) and (mode == '全部' or r['策略'] == mode)
                    and (direction == '全部' or direction in r['方向']) and (version == '全部' or r['策略版本'] == version)
+                   and (plan_source == '全部' or r.get('計畫來源', '股期戰略室') == plan_source)
                    and (not code or code in r['商品鍵'] or code in r['名稱'])]
-        metrics, groups, frame = cached_model_performance(json.dumps(records, ensure_ascii=False), str((period, market, mode, direction, version, code)))
+        metrics, groups, frame = cached_model_performance(json.dumps(records, ensure_ascii=False), str((period, market, mode, direction, version, code, plan_source)))
         tiles = st.columns(5)
         for col,key in zip(tiles, ('有效交易數','勝率(%)','累積模擬損益','獲利因子','最大回撤')):
             col.metric(key, '未確認' if metrics[key] is None else f'{metrics[key]:,.2f}'.rstrip('0').rstrip('.'))
@@ -20788,7 +20964,7 @@ def render_model_tracking_room():
                            file_name='模型勝率追蹤.xlsx', mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
                            on_click='ignore', key='model_excel')
         if not records:
-            st.info('尚無自動紀錄；股期表格出現有效進出場預判後會自動記錄，以串流行情確認模擬進出場。')
+            st.info('尚無自動紀錄；開啟股期戰略室或指數／選擇權操作計畫後，依原計畫與串流行情自動追蹤。')
         else:
             st.dataframe(pd.DataFrame([metrics]), hide_index=True, width='stretch')
             st.markdown('##### 策略、方向與指標分析')
@@ -25189,6 +25365,7 @@ with tab_fibo:
         timer_key = 'option_auto_seconds' if option_page else 'index_scenario_seconds'
         with page:
             st.subheader('選擇權操作計畫' if option_page else '指數操作計畫')
+            st.caption('模型勝率追蹤已自動記錄此分頁計畫；保留原進場條件，成交證據不足不計入勝率。')
             seconds = st.number_input(
                 '自動更新間隔（秒）', 2, 300,
                 value=int(st.session_state.get(timer_key + '_saved', 5)), key=timer_key,

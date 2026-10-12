@@ -408,6 +408,9 @@ def intraday_auto_interval(room, enabled, seconds):
     st.session_state['timer_seconds'] = seconds
     return seconds
 render_postclose_maintenance = lambda: None
+def record_operation_models(source, specs, api, seconds):
+    st.session_state['model_plan_source'] = source
+    st.session_state['model_plan_count'] = len([spec for spec in specs if spec])
 '''
     anchor = 'tab1, tab_fibo, tab2, tab_db, tab_company, tab3 = st.tabs(['
     source = source.replace(anchor, 'CONFIG_FILE = ' + repr(str(tmp_path / 'config.json')) + '\n' + setup + '\n' + anchor)
@@ -419,6 +422,8 @@ render_postclose_maintenance = lambda: None
         assert not app.exception
         assert all(t.key not in ('option_auto_enabled','index_scenario_auto') for t in app.toggle)
         assert app.session_state['analysis_price'] == 20110.
+        assert app.session_state['model_plan_source'] == '選擇權操作計畫'
+        assert any('模型勝率追蹤已自動記錄' in c.value for c in app.caption)
         assert any('全頁自動更新' in c.value and '自動更新時間：' in c.value for c in app.caption)
         assert not any('盤中情境' in c.value for c in [*app.caption, *app.info])
         app.number_input(key='option_auto_seconds').set_value(7).run()
@@ -434,6 +439,7 @@ render_postclose_maintenance = lambda: None
         app.run()
         assert not app.exception
         assert any('19,970' in m.value for m in app.markdown)
+        assert app.session_state['model_plan_source'] == '指數操作計畫'
         app.number_input(key='index_scenario_seconds').set_value(9).run()
         assert not app.exception and app.session_state['timer_seconds'] == 9
         assert app.session_state['timer_room'] == 'index'
