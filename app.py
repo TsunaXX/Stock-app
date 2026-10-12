@@ -21074,8 +21074,9 @@ def _model_display_frame(frame, color=False):
         result[column] = result[column].map(lambda value: _model_display_value(value, str(column)))
         if not result.empty and result[column].isna().all():
             result[column] = pd.Series(float('nan'), index=result.index, dtype='float64')
+    styled = result.style.format(na_rep='')
     if not color:
-        return result
+        return styled
 
     def tone(value, column):
         try:
@@ -21089,7 +21090,6 @@ def _model_display_frame(frame, color=False):
                 return 'color: #ff4b4b' if '停利' in text or '獲利' in text else ('color: #00c853' if '停損' in text or '虧損' in text else '')
             return ''
 
-    styled = result.style
     for column in ('模擬損益', '毛損益', '結果(R)', '方向', '出場原因'):
         if column in result:
             styled = styled.map(lambda value, key=column: tone(value, key), subset=[column])
