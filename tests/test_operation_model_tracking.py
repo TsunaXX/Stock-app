@@ -174,6 +174,9 @@ def test_premium_tick_boundaries_expiry_and_impossible_spread():
     q.update(價格=20200.,來源時間=(NOW+timedelta(seconds=1)).isoformat())
     q['權利金證據']['C1']['來源時間'] = q['來源時間']
     assert advance(holding,q)['交易成本'] == 106  # 2.5 NTD tax per side rounds half up to 3.
+    expired_holding = advance({**holding,'到期時間':NOW.isoformat()}, {**q,'有效':False})
+    assert expired_holding['狀態'] == '資料不足' and expired_holding['到期未確認']
+    assert advance(expired_holding,{**q,'來源時間':(NOW+timedelta(seconds=2)).isoformat()}) == expired_holding
 
 
 def test_no_extra_broker_query_subscription_or_timer_and_gate_timestamp():

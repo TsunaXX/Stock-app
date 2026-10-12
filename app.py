@@ -25365,7 +25365,7 @@ with tab_fibo:
         timer_key = 'option_auto_seconds' if option_page else 'index_scenario_seconds'
         with page:
             st.subheader('選擇權操作計畫' if option_page else '指數操作計畫')
-            st.caption('模型勝率追蹤已自動記錄此分頁計畫；保留原進場條件，成交證據不足不計入勝率。')
+            st.caption('模型勝率追蹤：自動監控此分頁計畫；依原進場條件記錄，成交證據不足不計入勝率。')
             seconds = st.number_input(
                 '自動更新間隔（秒）', 2, 300,
                 value=int(st.session_state.get(timer_key + '_saved', 5)), key=timer_key,

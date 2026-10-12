@@ -160,11 +160,17 @@ def new_trade(signal):
 def advance(record, quote):
     """Only ordered observed prices establish fills. Gaps never count as verified wins."""
     row = json.loads(json.dumps(record, ensure_ascii=False))
-    if row['狀態'] not in ACTIVE:
+    if row['狀態'] not in ACTIVE or row.get('到期未確認'):
         return row
     ts, prior = stamp(quote.get('來源時間')), stamp(row.get('來源時間'))
     price = number(quote.get('價格'))
     if ts is None or (prior is not None and ts < prior):
+        return row
+    if row.get('到期時間') and ts >= stamp(row['到期時間']):
+        row['到期未確認'] = row.get('模擬進場價') is not None
+        row['資料缺口'] = bool(row['到期未確認'] or row.get('資料缺口'))
+        event(row, '資料不足' if row['到期未確認'] else '訊號失效', ts.isoformat(),
+              '契約已到期；沒有結算或到期前平倉證據，不估算損益')
         return row
     if prior is not None and ts == prior and row['狀態'] != '等待進場' and quote.get('序號') == row.get('最後序號'):
         return row
@@ -201,11 +207,6 @@ def advance(record, quote):
     if row['策略'] == '當沖' and row['交易日'] != quote.get('交易日'):
         row['資料缺口'] = bool(row.get('模擬進場價') is not None or row.get('資料缺口'))
         event(row, '訊號失效', text, '當沖交易日已結束；缺少收盤成交證據時不估算損益')
-        return row
-    if row.get('到期時間') and ts >= stamp(row['到期時間']):
-        row['資料缺口'] = bool(row.get('模擬進場價') is not None or row.get('資料缺口'))
-        event(row, '資料不足' if row.get('模擬進場價') is not None else '訊號失效', text,
-              '契約已到期；沒有結算或到期前平倉證據，不估算損益')
         return row
     long = row['方向'] in ('多頭', '偏多')
     sign = 1 if long else -1
@@ -491,7 +492,8 @@ class ModelTracker:
                 quote = quotes.get(row['市場'] + '|' + row['商品鍵'])
                 if quote is None or (quote.get('休市') and not quote.get('收盤確認')) or row['狀態'] not in ACTIVE:
                     continue
-                if quote.get('暖機等待') and row.get('最後序號') is None and row.get('模擬進場價') is None:
+                if (quote.get('暖機等待') and row.get('最後序號') is None and row.get('模擬進場價') is None
+                        and (not row.get('到期時間') or stamp(quote['來源時間']) < stamp(row['到期時間']))):
                     if row['狀態'] != '資料不足':
                         event(row, '資料不足', row['來源時間'], '等待第一組串流成交證據，尚未確認進場')
                         self.store(db, row)

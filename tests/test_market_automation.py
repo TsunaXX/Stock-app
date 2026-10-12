@@ -423,7 +423,7 @@ def record_operation_models(source, specs, api, seconds):
         assert all(t.key not in ('option_auto_enabled','index_scenario_auto') for t in app.toggle)
         assert app.session_state['analysis_price'] == 20110.
         assert app.session_state['model_plan_source'] == '選擇權操作計畫'
-        assert any('模型勝率追蹤已自動記錄' in c.value for c in app.caption)
+        assert any('模型勝率追蹤：自動監控' in c.value for c in app.caption)
         assert any('全頁自動更新' in c.value and '自動更新時間：' in c.value for c in app.caption)
         assert not any('盤中情境' in c.value for c in [*app.caption, *app.info])
         app.number_input(key='option_auto_seconds').set_value(7).run()
