@@ -10667,6 +10667,12 @@ ANALYSIS_MAX_WORKERS = 2
 API_REQUEST_GAP_SECONDS = 0.1
 
 _RUNTIME_FILE_LOCK = threading.RLock()
+CATHAY_FEE_SCHEDULE_VERSION = '20261012'
+CATHAY_FEE_DEFAULTS = {
+    'futures_tx_fee': 38, 'futures_mtx_fee': 18, 'futures_tmf_fee': 10,
+    'futures_stock_fee': 18, 'futures_small_stock_fee': 10, 'futures_etf_fee': 18,
+    'option_monthly_fee': 12, 'option_wednesday_fee': 18, 'option_friday_fee': 12,
+}
 
 
 @st.cache_data(max_entries=1)
@@ -10753,6 +10759,51 @@ def load_config():
             except (OSError, ValueError, TypeError):
                 return {}
         return {}
+
+
+def load_model_tracking_costs():
+    """Return editable Cathay rates, migrating only the former default fee."""
+    with _RUNTIME_FILE_LOCK:
+        config = load_config()
+        saved = config.get('model_tracking_costs')
+        saved = dict(saved) if isinstance(saved, dict) else {}
+        changed = saved.get('_cathay_fee_schedule') != CATHAY_FEE_SCHEDULE_VERSION
+        if changed and (saved.get('futures_fee') is None or saved.get('futures_fee') == 50):
+            saved['futures_fee'] = 10
+        for key, value in CATHAY_FEE_DEFAULTS.items():
+            if key not in saved:
+                saved[key] = value
+                changed = True
+        if saved.get('_cathay_fee_schedule') != CATHAY_FEE_SCHEDULE_VERSION:
+            saved['_cathay_fee_schedule'] = CATHAY_FEE_SCHEDULE_VERSION
+            changed = True
+        if changed:
+            config['model_tracking_costs'] = saved
+            _write_json_atomic(CONFIG_FILE, config)
+    costs = normalize_costs(saved)
+    for key, default in CATHAY_FEE_DEFAULTS.items():
+        value = _safe_number(saved.get(key))
+        costs[key] = max(0, min(100000, int(value))) if value is not None else default
+    return costs
+
+
+def cathay_futures_fee(costs, code, product_type='', small=False):
+    if product_type == '股票':
+        return costs['futures_small_stock_fee' if small else 'futures_stock_fee']
+    if product_type == 'ETF':
+        return costs['futures_etf_fee']
+    code = str(code or '').upper()
+    roots = {'TMF': 'futures_tmf_fee', 'MTX': 'futures_mtx_fee', 'MXF': 'futures_mtx_fee',
+             'TXF': 'futures_tx_fee', 'TX': 'futures_tx_fee'}
+    key = next((roots[root] for root in ('TMF', 'MTX', 'MXF', 'TXF', 'TX') if code.startswith(root)), None)
+    return costs.get(key, costs['futures_fee']) if key else costs['futures_fee']
+
+
+def cathay_option_fee(costs, delivery_month):
+    delivery_month = str(delivery_month or '').upper()
+    key = 'option_wednesday_fee' if 'W' in delivery_month else (
+        'option_friday_fee' if 'F' in delivery_month else 'option_monthly_fee')
+    return costs[key]
 
 
 def resolve_shioaji_credentials(config=None):
@@ -20439,13 +20490,15 @@ def stop_intraday_background(room):
 
 
 def model_tracking_config(room, stock, direction_choice='自動'):
+    cost_settings = load_model_tracking_costs()
     tracking_config = {'risk': json.loads(json.dumps(_json_safe(st.session_state.get('risk_filter_market_data', {})))),
                        'extension': st.session_state.get('risk_filter_max_extension', 2),
                        'min_score': st.session_state.get('risk_filter_min_score', 75),
                        'block_attention': st.session_state.get('risk_filter_block_attention', True),
                        'rules_version': get_model_rules_version(stock),
                        'market_bias': st.session_state.get('strategy_market_environment', {}).get('bias', '未取得'),
-                       'costs': normalize_costs(load_config().get('model_tracking_costs', {}))}
+                       'costs': normalize_costs(cost_settings),
+                       'fee_schedule': {**CATHAY_FEE_DEFAULTS, 'futures_fee': cost_settings['futures_fee']}}
     prefix = 'indep_risk_' if room == 'stock_independent' else 'risk_filter_'
     if stock:
         tracking_config.update({'extension': st.session_state.get(prefix + 'max_extension', 2),
@@ -20500,6 +20553,17 @@ def background_intraday_rows(room, rows, visible_codes=None, strategy_mode='當�
             )
         try:
             signals, quotes = model_tracking_samples(refreshed, stock, strategy_mode, stock_direction, tracking_config, seconds, api)
+            if not stock:
+                fees_by_contract = {
+                    str(row.get('契約鍵')): cathay_futures_fee(
+                        tracking_config['fee_schedule'], row.get('期貨代碼'),
+                        row.get('商品類型', ''), str(row.get('小型期貨', '')).casefold() in {'true', '1'})
+                    for _, row in refreshed.iterrows() if row.get('契約鍵')
+                }
+                for signal in signals:
+                    fee = fees_by_contract.get(str(signal.get('商品鍵') or signal.get('代碼')))
+                    signal['成本設定']['futures_fee'] = fee if fee is not None else cathay_futures_fee(
+                        tracking_config['fee_schedule'], signal.get('代碼'))
             tracker.submit(signals, quotes)
         except Exception as exc:
             tracker.error = '訊號記錄待補：' + type(exc).__name__
@@ -20603,9 +20667,11 @@ def operation_model_spec(source, kind, live, direction, entry, stop, target, all
             or min(levels) <= 0
             or not (stop < entry < target if direction == '偏多' else target < entry < stop)):
         return None
-    costs = normalize_costs(load_config().get('model_tracking_costs', {}))
+    cost_settings = load_model_tracking_costs()
+    costs = normalize_costs(cost_settings)
     costs['futures_contracts'] = int(quantity)
     underlying = str(live['contract_code'])
+    costs['futures_fee'] = cathay_futures_fee(cost_settings, underlying)
     spec = {'市場': '期貨', '商品鍵': underlying + '|' + kind, '代碼': underlying,
             '名稱': '微台 ' + kind, '交易時段': '日盤+夜盤', '策略': '當沖',
             '計畫來源': source, '計畫類型': kind, '觸發商品': underlying,
@@ -20618,6 +20684,7 @@ def operation_model_spec(source, kind, live, direction, entry, stop, target, all
     if source == '選擇權操作計畫':
         if not option_quote or not option_quote.get('expiry'):
             return None
+        costs['futures_fee'] = cathay_option_fee(cost_settings, option_quote.get('delivery_month'))
         contracts = [(option_quote.get('short_contract'), -1), (option_quote.get('long_contract'), 1)] if spread else [(option_quote.get('contract'), 1)]
         if any(contract is None for contract, _ in contracts):
             return None
@@ -20707,10 +20774,18 @@ def record_operation_models(source, specs, api, seconds):
     if api is None or not st.session_state.get('sj_logged_in', False):
         return
     tracker = get_model_tracker(get_app_secret('gsheet_api_url') or '')
-    specs = [spec for spec in specs if spec]
-    current_keys = {spec['商品鍵'] for spec in specs}
     day = get_futures_trading_date(datetime.now(pytz.timezone('Asia/Taipei'))).date().isoformat()
-    specs += [{**row, '新訊號': False, '進場許可': False} for row in tracker.active_plans(source, day)
+    specs = [dict(spec) for spec in specs if spec]
+    active = tracker.active_plans(source, day)
+    for index, spec in enumerate(specs):
+        previous = next((row for row in active if row.get('商品鍵') == spec.get('商品鍵')
+                         and row.get('計畫類型') == spec.get('計畫類型')
+                         and row.get('方向') == spec.get('方向')), None)
+        if previous:
+            specs[index]['策略版本'] = previous['策略版本']
+            specs[index]['成本設定'] = previous['成本設定']
+    current_keys = {spec['商品鍵'] for spec in specs}
+    specs += [{**row, '新訊號': False, '進場許可': False} for row in active
               if row['商品鍵'] not in current_keys]
     cursors = st.session_state.setdefault('_operation_model_cursors', {})
     signals, quotes = operation_model_samples(specs, api, seconds, after=cursors)
@@ -20895,44 +20970,206 @@ def record_model_table(room, rows, stock, mode, direction_choice='自動'):
                              release)
 
 
+def _model_market_version_key(row):
+    source = str(row.get('計畫來源', ''))
+    if row.get('選擇權腿') or row.get('商品類型') == '選擇權' or source == '選擇權操作計畫':
+        return 'option'
+    if source == '指數操作計畫':
+        return 'index'
+    return 'stock' if row.get('市場') == '股票' else 'futures'
+
+
+def _model_version_first_date(row):
+    for value in (row.get('建立時間'), row.get('來源時間'), row.get('交易日')):
+        try:
+            stamp = pd.Timestamp(value)
+            if pd.isna(stamp):
+                continue
+            if stamp.tzinfo is not None:
+                stamp = stamp.tz_convert('Asia/Taipei')
+            return stamp.strftime('%Y%m%d')
+        except (TypeError, ValueError, OverflowError):
+            continue
+    return datetime.now(pytz.timezone('Asia/Taipei')).strftime('%Y%m%d')
+
+
+def model_version_display_labels(records):
+    versions = {}
+    for row in records:
+        raw = str(row.get('策略版本') or MODEL_VERSION)
+        market = _model_market_version_key(row)
+        versions.setdefault(market, {})[raw] = min(
+            versions.setdefault(market, {}).get(raw, '99999999'), _model_version_first_date(row))
+    with _RUNTIME_FILE_LOCK:
+        config = load_config()
+        saved = config.get('model_tracking_version_labels')
+        registry = {key: dict(value) for key, value in saved.items() if isinstance(value, dict)} if isinstance(saved, dict) else {}
+        changed = False
+        for market, discovered in versions.items():
+            labels = registry.setdefault(market, {})
+            pending = sorted(((first_seen, raw) for raw, first_seen in discovered.items() if raw not in labels))
+            if not labels and pending:
+                _, raw = pending.pop(0)
+                labels[raw] = f'V1.0-{market}-20261001'
+                changed = True
+            for first_seen, raw in pending:
+                date_code = first_seen if first_seen > '20261001' else '20261001'
+                base = f'V1.0-{market}-{date_code}'
+                used = set(labels.values())
+                label, suffix = base, 1
+                while label in used:
+                    label, suffix = f'{base}-{suffix}', suffix + 1
+                labels[raw] = label
+                changed = True
+        if changed:
+            config['model_tracking_version_labels'] = registry
+            _write_json_atomic(CONFIG_FILE, config)
+    return {(market, raw): label for market, labels in registry.items() for raw, label in labels.items()}
+
+
+def _model_time_text(value):
+    try:
+        stamp = pd.Timestamp(value)
+        if pd.isna(stamp):
+            return ''
+        if stamp.tzinfo is None:
+            stamp = stamp.tz_localize('Asia/Taipei')
+        else:
+            stamp = stamp.tz_convert('Asia/Taipei')
+        return stamp.strftime('%Y-%m-%d %H:%M:%S.') + f'{stamp.microsecond // 10000:02d}'
+    except (TypeError, ValueError, OverflowError):
+        return ''
+
+
+def _model_display_value(value, column=''):
+    if value is None:
+        return ''
+    if column in {'觀察時間', '來源時間', '建立時間', '進場時間', '結案時間'} and value is not None and str(value).strip():
+        return _model_time_text(value)
+    if column == '事件' and isinstance(value, (list, tuple)):
+        lines = []
+        for item in value:
+            if isinstance(item, dict):
+                parts = [_model_time_text(item.get('時間')) if item.get('時間') else '',
+                         str(item.get('狀態') or ''), str(item.get('原因') or '')]
+                lines.append('｜'.join(part for part in parts if part))
+            else:
+                lines.append(str(item))
+        return '\n'.join(lines)
+    if isinstance(value, (dict, list, tuple)):
+        return json.dumps(value, ensure_ascii=False, default=str)
+    if isinstance(value, str) and value.strip().casefold() in {'none', 'nan', 'nat', '<na>'}:
+        return ''
+    try:
+        if pd.isna(value):
+            return ''
+    except (TypeError, ValueError):
+        pass
+    return value
+
+
+def _model_display_frame(frame, color=False):
+    result = frame.copy()
+    for column in result.columns:
+        result[column] = result[column].map(lambda value: _model_display_value(value, str(column)))
+    if not color:
+        return result
+
+    def tone(value, column):
+        try:
+            number_value = float(value)
+            return 'color: #ff4b4b' if number_value > 0 else ('color: #00c853' if number_value < 0 else '')
+        except (TypeError, ValueError):
+            text = str(value or '')
+            if column == '方向':
+                return 'color: #ff4b4b' if '多' in text else ('color: #00c853' if '空' in text else '')
+            if column == '出場原因':
+                return 'color: #ff4b4b' if '停利' in text or '獲利' in text else ('color: #00c853' if '停損' in text or '虧損' in text else '')
+            return ''
+
+    styled = result.style
+    for column in ('模擬損益', '毛損益', '結果(R)', '方向', '出場原因'):
+        if column in result:
+            styled = styled.map(lambda value, key=column: tone(value, key), subset=[column])
+    return styled
+
+
+def set_model_period_today(day):
+    st.session_state['model_period'] = (day, day)
+
+
 def render_model_tracking_room():
-    st.caption('自動記錄股期進出場預判、指數操作計畫與選擇權操作計畫；不讀取帳戶交易。只有成交證據完整的已平倉模擬交易計入勝率。')
+    st.caption('依股期進出場預判、指數操作計畫與選擇權操作計畫自動記錄；不讀取帳戶交易。只有成交證據完整的已平倉模擬交易會計入勝率。')
+    with st.expander('📘 模型勝率追蹤使用說明', expanded=False):
+        st.markdown(
+            '開啟股期戰略室或指數／選擇權操作計畫並登入 Shioaji 後，系統會依畫面原有串流自動記錄，不需另外啟動追蹤。\n\n'
+            '- 訊號依序追蹤「等待進場、模擬持倉、已平倉」；未進場、資料不足或行情中斷會保留狀態，不補造成交。\n'
+            '- 只有進出場證據完整的已平倉紀錄納入勝率；損益已估算手續費、稅費與滑價。\n'
+            '- 上方看有效交易數、勝率、累積模擬損益、獲利因子與最大回撤；下方可比較策略、方向、指標並檢視每筆事件。\n'
+            '- 日期、市場、策略、方向、計畫來源、版本及商品可篩選；指標分析呈現交易當時的條件，不代表單一指標造成結果。\n'
+            '- 成本可在「模擬成交與成本設定」修改，只影響新訊號；歷史紀錄保留原成交與成本。這是模擬分析，不會送出委託。'
+        )
     tracker = get_model_tracker(get_app_secret('gsheet_api_url') or '')
     tracker.last_activity = time.monotonic()
     with st.expander('模擬成交與成本設定', expanded=False):
         config = load_config()
-        costs = normalize_costs(config.get('model_tracking_costs', {}))
+        costs = load_model_tracking_costs()
         columns = st.columns(3)
-        labels = {'stock_shares':'股票模擬股數','stock_discount':'股票手續費折扣（折）',
-                  'stock_min_fee':'股票最低手續費（元）','futures_contracts':'期貨模擬口數',
-                  'futures_fee':'期貨單邊每口手續費（元）','slippage_ticks':'每次成交滑價（跳）'}
+        labels = {
+            'stock_shares': '股票模擬股數', 'stock_discount': '股票手續費折扣（折）',
+            'stock_min_fee': '股票單邊最低手續費（元）', 'futures_contracts': '期貨模擬口數',
+            'futures_fee': '其他期貨單邊每口手續費（元）', 'futures_tx_fee': '臺指期 TX 單邊每口（元）',
+            'futures_mtx_fee': '小型臺指 MTX 單邊每口（元）', 'futures_tmf_fee': '微型臺指 TMF 單邊每口（元）',
+            'futures_stock_fee': '股票期貨單邊每口（元）', 'futures_small_stock_fee': '小型股票期貨單邊每口（元）',
+            'futures_etf_fee': 'ETF 期貨單邊每口（元）',
+            'option_monthly_fee': '臺指月選單邊每口（元）', 'option_friday_fee': '週五選單邊每口（元）',
+            'option_wednesday_fee': '週三選單邊每口（元）', 'slippage_ticks': '每次成交滑價（跳）',
+        }
         changed = {}
-        for i,(key,label) in enumerate(labels.items()):
-            with columns[i % 3]:
-                changed[key] = st.number_input(label, min_value=0.1 if key == 'stock_discount' else (1 if key in ('stock_shares','futures_contracts') else 0),
-                                              value=float(costs[key]) if key == 'stock_discount' else int(costs[key]), key='model_cost_' + key)
-        if changed != costs:
-            config['model_tracking_costs'] = changed
+        for index, (key, label) in enumerate(labels.items()):
+            with columns[index % 3]:
+                changed[key] = st.number_input(
+                    label, min_value=0.1 if key == 'stock_discount' else (1 if key in ('stock_shares', 'futures_contracts') else 0),
+                    value=float(costs[key]) if key == 'stock_discount' else int(costs[key]), key='model_cost_' + key)
+        if changed != {key: costs[key] for key in labels}:
+            config['model_tracking_costs'] = {**changed, '_cathay_fee_schedule': CATHAY_FEE_SCHEDULE_VERSION}
             with _RUNTIME_FILE_LOCK:
                 _write_json_atomic(CONFIG_FILE, config)
-        st.caption('設定僅套用新訊號，舊紀錄保留原計畫及原成本。預設股票 1,000 股、期貨 1 口、每次成交滑價 1 跳；期貨手續費為可調模擬值。')
-        st.caption('指數計畫使用畫面的微台口數、每點 10 元；選擇權每組 1 口、每腿每點 50 元，沿用期貨單邊每口手續費。選擇權損益使用成交推播權利金，非理論估價；結果(R)為標的觸價距離。')
-        st.markdown('[期交所費率表](https://www.taifex.com.tw/cht/4/feeSchedules)｜股票稅費沿用交易損益室規則。停利停損順序或行情缺口未確認時排除有效績效。')
+        st.caption('股票依國泰網路下單 2.8 折為預設；臺指 TX／MTX／TMF 單邊 38／18／10 元、股票／小型股票／ETF 期貨 18／10／18 元，月選／週五選／週三選 12／12／18 元。個人約定不同可自行修改；外匯及其他商品請依國泰帳戶費率填寫。設定只套用新訊號。')
+        st.caption('指數計畫使用畫面設定的微型臺指口數，每點 10 元；選擇權契約每點 50 元是合約乘數，手續費按到期別及每口費率估算。價差組合依實際口數計費，舊紀錄成本不變。')
+        st.markdown('[國泰證券網路下單費率](https://www.cathaysec.com.tw/cathaysec/Products/TradeFee/TWS.aspx)｜[國泰期貨手續費](https://eservice.cathaysec.com.tw/sign/handling_fee.html)｜股票稅費沿用交易損益室規則；停利停損先後或行情缺口未確認時不計入有效績效。')
     cols = st.columns(4)
     with cols[0]:
         now_tw = datetime.now(pytz.timezone('Asia/Taipei'))
         report_day = max(now_tw.date(), get_futures_trading_date(now_tw).date())
         period = st.date_input('日期區間', value=(report_day - timedelta(days=30), report_day), key='model_period')
+        st.button('今天', key='model_period_today', on_click=set_model_period_today, args=(report_day,), width='stretch')
     with cols[1]:
-        market = st.selectbox('市場', ['全部','股票','期貨','選擇權'], key='model_market')
+        market = st.selectbox('市場', ['全部', '股票', '期貨', '選擇權'], key='model_market')
     with cols[2]:
-        mode = st.selectbox('策略', ['全部','當沖','波段'], key='model_mode')
+        mode = st.selectbox('策略', ['全部', '當沖', '波段'], key='model_mode')
     with cols[3]:
-        direction = st.selectbox('多空方向', ['全部','多','空'], key='model_direction')
+        direction = st.selectbox('多空方向', ['全部', '多', '空'], key='model_direction')
     if len(period) != 2:
         return
     plan_source = st.selectbox('計畫來源', ['全部', '股期戰略室', '指數操作計畫', '選擇權操作計畫'], key='model_plan_source')
     records = tracker.records(period[0].strftime('%Y%m'), period[1].strftime('%Y%m'))
+    version_labels = model_version_display_labels(records)
+
+    def display_records(source_records, labels=None):
+        labels = labels or version_labels
+        result = []
+        for row in source_records:
+            market_key = _model_market_version_key(row)
+            raw_version = str(row.get('策略版本') or MODEL_VERSION)
+            displayed = dict(row)
+            if row.get('選擇權腿'):
+                displayed['市場'] = '選擇權'
+            displayed['策略版本'] = labels.get((market_key, raw_version), raw_version)
+            result.append(displayed)
+        return result
+
+    records = display_records(records)
     versions = ['全部'] + sorted({r.get('策略版本', MODEL_VERSION) for r in records})
     version_col, code_col = st.columns(2)
     if st.session_state.get('model_version', '全部') not in versions:
@@ -20940,43 +21177,57 @@ def render_model_tracking_room():
     with version_col:
         version = st.selectbox('策略版本', versions, key='model_version')
     with code_col:
-        code = st.text_input('商品代碼或名稱', key='model_code')
+        product_options = sorted({
+            f"{str(row.get('代碼') or row.get('商品鍵') or '').strip()}｜{str(row.get('名稱') or '').strip()}"
+            for row in records if row.get('代碼') or row.get('商品鍵')
+        })
+        current_product = str(st.session_state.get('model_code', '') or '')
+        if current_product and current_product not in product_options:
+            product_options.append(current_product)
+        code = st.selectbox('商品代碼或名稱', [''] + product_options, key='model_code',
+                            format_func=lambda value: value or '全部商品', accept_new_options=True,
+                            placeholder='輸入代碼或名稱搜尋') or ''
     show_evidence = st.toggle('顯示指標與事件證據', key='model_evidence')
     page = st.number_input('明細頁碼', min_value=1, value=1, step=1, key='model_page')
+
     @st.fragment(run_every=30)
     def render_model_report():
         st.caption(f"資料狀態：{tracker.status}｜同步時間：{tracker.synced_at or '尚未完成'}")
         if tracker.error:
             st.warning(tracker.error)
         tracker.last_activity = time.monotonic()
-        records = tracker.records(period[0].strftime('%Y%m'), period[1].strftime('%Y%m'))
-        records = [{**row, '市場':'選擇權'} if row.get('選擇權腿') else row for row in records]
-        records = [r for r in records if period[0].isoformat() <= r['交易日'] <= period[1].isoformat()
-                   and (market == '全部' or r['市場'] == market) and (mode == '全部' or r['策略'] == mode)
-                   and (direction == '全部' or direction in r['方向']) and (version == '全部' or r['策略版本'] == version)
-                   and (plan_source == '全部' or r.get('計畫來源', '股期戰略室') == plan_source)
-                   and (not code or code in r['商品鍵'] or code in r['名稱'])]
+        current_records = tracker.records(period[0].strftime('%Y%m'), period[1].strftime('%Y%m'))
+        current_labels = model_version_display_labels(current_records)
+        current_records = display_records(current_records, current_labels)
+        query = ''.join(str(code).replace('｜', '').split()).casefold()
+        records = [row for row in current_records if period[0].isoformat() <= row['交易日'] <= period[1].isoformat()
+                   and (market == '全部' or row['市場'] == market) and (mode == '全部' or row['策略'] == mode)
+                   and (direction == '全部' or direction in row['方向'])
+                   and (version == '全部' or row['策略版本'] == version)
+                   and (plan_source == '全部' or row.get('計畫來源', '股期戰略室') == plan_source)
+                   and (not query or query in ''.join(str(row.get(key, '') or '') for key in ('代碼', '名稱', '商品鍵')).replace(' ', '').casefold())]
         metrics, groups, frame = cached_model_performance(json.dumps(records, ensure_ascii=False), str((period, market, mode, direction, version, code, plan_source)))
         tiles = st.columns(5)
-        for col,key in zip(tiles, ('有效交易數','勝率(%)','累積模擬損益','獲利因子','最大回撤')):
+        for col, key in zip(tiles, ('有效交易數', '勝率(%)', '累積模擬損益', '獲利因子', '最大回撤')):
             col.metric(key, '未確認' if metrics[key] is None else f'{metrics[key]:,.2f}'.rstrip('0').rstrip('.'))
         st.download_button('⬇️ 匯出 Excel', lambda: excel_report(records),
                            file_name='模型勝率追蹤.xlsx', mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
                            on_click='ignore', key='model_excel')
         if not records:
-            st.info('尚無自動紀錄；開啟股期戰略室或指數／選擇權操作計畫後，依原計畫與串流行情自動追蹤。')
+            st.info('目前沒有符合條件的紀錄。開啟股期戰略室或指數／選擇權操作計畫後，系統會依原計畫與串流行情自動追蹤。')
         else:
-            st.dataframe(pd.DataFrame([metrics]), hide_index=True, width='stretch')
+            st.dataframe(_model_display_frame(pd.DataFrame([metrics])), hide_index=True, width='stretch')
             st.markdown('##### 策略、方向與指標分析')
-            st.caption('指標分組代表進場當時有該指標證據的交易，並非該指標的單獨因果勝率。')
-            st.dataframe(groups, hide_index=True, width='stretch')
+            st.caption('指標分組代表進場當時有該指標證據的交易，不代表單一指標造成結果。')
+            st.dataframe(_model_display_frame(groups), hide_index=True, width='stretch')
             st.markdown('##### 歷史明細')
             start_row = (page - 1) * 100
             view = frame.sort_values('建立時間', ascending=False).iloc[start_row:start_row + 100]
             st.caption(f'每頁 100 筆｜共 {len(frame)} 筆｜第 {page} 頁；Excel 匯出全部篩選紀錄。')
-            st.dataframe(view.drop(columns=['事件','成本設定','指標快照','條件快照'], errors='ignore'), hide_index=True, width='stretch')
+            history = view.drop(columns=['事件', '成本設定', '指標快照', '條件快照'], errors='ignore')
+            st.dataframe(_model_display_frame(history, color=True), hide_index=True, width='stretch')
             if show_evidence:
-                st.dataframe(view[['交易ID','指標快照','事件']], hide_index=True, width='stretch')
+                st.dataframe(_model_display_frame(view[['交易ID', '指標快照', '事件']]), hide_index=True, width='stretch')
     render_model_report()
 
 
@@ -24184,8 +24435,8 @@ if tab1.open and stock_strategy_tab.open:
 
 with tab2:
     model_tab, tab2_1, tab2_2, tab2_3 = st.tabs(
-        ["模型勝率追蹤", "當沖損益室", "波段信用室", "期權交易室"],
-        default="模型勝率追蹤",
+        ["📊 模型勝率追蹤", "💹 當沖損益室", "📈 波段信用室", "🧾 期權交易室"],
+        default="📊 模型勝率追蹤",
         key="profit_room_active_tab", on_change="rerun",
     )
     

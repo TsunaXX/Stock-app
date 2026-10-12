@@ -18,7 +18,7 @@ VERSION = 'V1.0'
 TZ = ZoneInfo('Asia/Taipei')
 ACTIVE = {'等待進場', '模擬持倉', '監控中斷', '資料不足'}
 DEFAULT_COSTS = {'stock_shares': 1000, 'stock_discount': 2.8, 'stock_min_fee': 20,
-                 'futures_contracts': 1, 'futures_fee': 50, 'slippage_ticks': 1}
+                 'futures_contracts': 1, 'futures_fee': 10, 'slippage_ticks': 1}
 
 
 def normalize_costs(values):
