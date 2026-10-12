@@ -184,14 +184,16 @@ console.log('Apps Script merge verified');
 def test_new_home_tab_lazy_ui_and_excel(tmp_path):
     from streamlit.testing.v1 import AppTest
     source = (ROOT/'app.py').read_text(encoding='utf-8')
-    functions = {'render_model_tracking_room','cached_model_performance','model_performance_state'}
+    functions = {'render_model_tracking_room','cached_model_performance','model_performance_state',
+                 '_model_market_version_key','_model_version_first_date','model_version_display_labels',
+                 '_model_time_text','_model_display_value','_model_display_frame','set_model_period_today'}
     defs = '\n'.join(ast.unparse(n) for n in ast.parse(source).body if isinstance(n,ast.FunctionDef) and n.name in functions)
     tracker = ModelTracker(tmp_path/'ui.sqlite',start=False)
     script = '''
 import streamlit as st
 import pandas as pd, json, pytz, threading, time
 from datetime import date,datetime,timedelta
-from model_tracking import ModelTracker,DEFAULT_COSTS,performance,excel_report,normalize_costs
+from model_tracking import ModelTracker,DEFAULT_COSTS,VERSION as MODEL_VERSION,performance,excel_report,normalize_costs
 class ModelFixtureDatetime(datetime):
     @classmethod
     def now(cls, tz=None):
@@ -201,10 +203,20 @@ datetime = ModelFixtureDatetime
 '''+f"tracker=ModelTracker({str(tmp_path/'ui.sqlite')!r},start=False)\n"+'''
 get_model_tracker=lambda *a: tracker
 get_app_secret=lambda *a: None
-load_config=lambda: {}
+_model_test_config={}
+load_config=lambda: _model_test_config
+CONFIG_FILE='test-config.json'
+_write_json_atomic=lambda *a: None
+CATHAY_FEE_SCHEDULE_VERSION='20261012'
+CATHAY_FEE_DEFAULTS={'futures_tx_fee':38,'futures_mtx_fee':18,'futures_tmf_fee':10,
+ 'futures_stock_fee':18,'futures_small_stock_fee':10,'futures_etf_fee':18,
+ 'option_monthly_fee':12,'option_wednesday_fee':18,'option_friday_fee':12}
+_RUNTIME_FILE_LOCK=threading.RLock()
+load_model_tracking_costs=lambda: {**normalize_costs({}),**CATHAY_FEE_DEFAULTS}
 get_futures_trading_date=lambda value: value + timedelta(days=1)
 render_strategy_validation_room=lambda: st.info('legacy')
 '''+defs+'''
+model_version_display_labels=lambda records:{('stock','V1.0'):'V1.0-stock-20261001'}
 outer,other=st.tabs(['交易損益室','其他'],key='main',on_change='rerun')
 with outer:
     first,second=st.tabs(['模型勝率追蹤','當沖損益室'],default='模型勝率追蹤',key='profit',on_change='rerun')
@@ -212,18 +224,21 @@ with outer:
         if outer.open and first.open:
             render_model_tracking_room()
 '''
+    tracker.process([signal()], {'股票|2330':quote(100)})
     app = AppTest.from_string(script, default_timeout=30).run()
     assert not app.exception and app.session_state['profit'] == '模型勝率追蹤'
     assert str(app.date_input(key='model_period').value[-1]) == '2026-10-13'
     assert len(app.get('download_button')) == 1
+    assert any(button.label == '今天' for button in app.button)
     assert app.selectbox(key='model_plan_source').options == ['全部','股期戰略室','指數操作計畫','選擇權操作計畫']
+    assert '2330｜台積電' in app.selectbox(key='model_code').options
     app.selectbox(key='model_plan_source').select('選擇權操作計畫').run()
     assert not app.exception
     app.selectbox(key='model_market').select('選擇權').run()
     assert not app.exception
     assert not any('舊版手動紀錄' in e.label for e in app.expander)
     assert not any(e.key == 'show_legacy_model_records' for e in app.checkbox)
-    app.text_input(key='model_code').set_value('2330').run()
+    app.selectbox(key='model_code').select('2330｜台積電').run()
     assert not app.exception
     tracker.close()
 
@@ -268,7 +283,7 @@ st.session_state.setdefault('main_workspace_active_tab','💰 交易損益室 �
          patch('yfinance.Ticker',return_value=SimpleNamespace(history=lambda *a,**kw:pd.DataFrame(),fast_info={},info={})):
         app=AppTest.from_string(source,default_timeout=120).run()
         assert not app.exception
-        assert app.session_state['profit_room_active_tab']=='模型勝率追蹤'
+        assert app.session_state['profit_room_active_tab']=='📊 模型勝率追蹤'
         assert len(app.get('download_button')) >= 1
         app.session_state['main_workspace_active_tab']='⚡ 股期戰略室 ⚡'
         app.run()
