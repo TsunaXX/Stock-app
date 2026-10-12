@@ -243,6 +243,26 @@ with outer:
     tracker.close()
 
 
+def test_model_display_frame_keeps_blank_cells_arrow_compatible():
+    import pyarrow as pa
+
+    tree = ast.parse((ROOT/'app.py').read_text(encoding='utf-8'))
+    names = {'_model_display_value', '_model_display_frame', '_model_time_text'}
+    definitions = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names]
+    namespace = {'pd': pd, 'json': json}
+    exec(compile(ast.Module(body=definitions, type_ignores=[]), str(ROOT/'app.py'), 'exec'), namespace)
+    frame = namespace['_model_display_frame'](pd.DataFrame([
+        {'勝率(%)': None, '平均獲利': float('nan'), '平均虧損': '', '方向': '偏多'},
+        {'勝率(%)': 0.0, '平均獲利': 120.5, '平均虧損': -20.0, '方向': '偏空'},
+    ]))
+
+    rows = pa.Table.from_pandas(frame, preserve_index=False).to_pylist()
+    assert rows == [
+        {'勝率(%)': None, '平均獲利': None, '平均虧損': None, '方向': '偏多'},
+        {'勝率(%)': 0.0, '平均獲利': 120.5, '平均虧損': -20.0, '方向': '偏空'},
+    ]
+
+
 def test_invalid_settings_and_plans_fail_safely():
     assert normalize_costs({'stock_shares':-2,'stock_discount':float('nan')}) == DEFAULT_COSTS
     with pytest.raises(ValueError):
