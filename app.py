@@ -21043,7 +21043,7 @@ def _model_time_text(value):
 
 def _model_display_value(value, column=''):
     if value is None:
-        return ''
+        return None
     if column in {'觀察時間', '來源時間', '建立時間', '進場時間', '結案時間'} and value is not None and str(value).strip():
         return _model_time_text(value)
     if column == '事件' and isinstance(value, (list, tuple)):
@@ -21058,11 +21058,11 @@ def _model_display_value(value, column=''):
         return '\n'.join(lines)
     if isinstance(value, (dict, list, tuple)):
         return json.dumps(value, ensure_ascii=False, default=str)
-    if isinstance(value, str) and value.strip().casefold() in {'none', 'nan', 'nat', '<na>'}:
-        return ''
+    if isinstance(value, str) and value.strip().casefold() in {'', 'none', 'nan', 'nat', '<na>'}:
+        return None
     try:
         if pd.isna(value):
-            return ''
+            return None
     except (TypeError, ValueError):
         pass
     return value
