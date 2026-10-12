@@ -205,7 +205,7 @@ with outer:
         if outer.open and first.open:
             render_model_tracking_room()
 '''
-    app = AppTest.from_string(script).run()
+    app = AppTest.from_string(script, default_timeout=30).run()
     assert not app.exception and app.session_state['profit'] == '模型勝率追蹤'
     assert len(app.get('download_button')) == 1
     assert not any('舊版手動紀錄' in e.label for e in app.expander)
@@ -315,7 +315,8 @@ def real_stock_adapter():
            'get_tick_size','move_tick','fmt_price','_format_compact_number','determine_stock_direction',
            'calculate_risk_filter_result','calculate_daytrade_filter_result','build_trade_plan',
            'classify_signal_state','parse_trade_plan_numbers','parse_strategy_data_time','build_data_health',
-           'calculate_entry_confidence','calculate_market_alignment','market_risk_checked_for_row')
+           'calculate_entry_confidence','calculate_market_alignment','market_risk_checked_for_row',
+           'get_shioaji_stock_contract','_is_shioaji_auth_error')
     ns=core.load_app_symbols(*names)
     ns.update(deque=deque,DEFAULT_COSTS=DEFAULT_COSTS,MODEL_VERSION='V1.0',model_market_open=lambda r:True)
     return ns

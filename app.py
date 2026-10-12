@@ -4064,7 +4064,7 @@ def fetch_shioaji_data(api, code, interval='1d', lookback_days=10):
             contract = api.Contracts.Futures.TMF.TMFR1
         else:
             try:
-                contract = api.Contracts.Stocks[code]
+                contract = get_shioaji_stock_contract(api, code)
             except Exception:
                 pass
 
@@ -4895,6 +4895,48 @@ def _is_shioaji_auth_error(exc):
         or 'not login' in error_text
         or '尚未登入' in error_text
     )
+
+
+def get_shioaji_stock_contract(api, code):
+    """Contract lookup also detects expired authentication inside background jobs."""
+    if api is None:
+        return None
+    try:
+        return api.Contracts.Stocks[str(code)]
+    except Exception as exc:
+        if _is_shioaji_auth_error(exc):
+            state = _stream_state(api)
+            with state['lock']:
+                state['auth_error'] = type(exc).__name__
+                state['connection_down'] = True
+            return None
+        if isinstance(exc, (AttributeError, KeyError, TypeError)):
+            try:
+                return api.contracts.get(str(code))
+            except Exception as fallback_error:
+                if _is_shioaji_auth_error(fallback_error):
+                    state = _stream_state(api)
+                    with state['lock']:
+                        state['auth_error'] = type(fallback_error).__name__
+                        state['connection_down'] = True
+        return None
+
+
+def check_shioaji_connection(api):
+    """Only the UI thread clears login state; broker callbacks may reconnect transport."""
+    if api is None:
+        return False
+    state = _stream_state(api)
+    with state['lock']:
+        auth_error = state.get('auth_error')
+        disconnected = state.get('connection_down', False)
+    if auth_error:
+        invalidate_shioaji_connection()
+        st.session_state.sj_connection_error = auth_error
+    if auth_error or disconnected:
+        st.warning('永豐 API 已斷線需重新連線；保留上次資料，暫停即時訊號。')
+        return False
+    return True
 
 
 def get_near_futures_contract(api, product='TMF'):
@@ -14358,7 +14400,8 @@ def init_shioaji_connection(api_key, secret_key):
 def invalidate_shioaji_connection(exc=None, clear_resource=True):
     """將失效的登入物件退回未登入狀態，讓記住的帳密可安全重連。"""
     st.session_state.sj_logged_in = False
-    st.session_state.pop('sj_api', None)
+    old_api = st.session_state.pop('sj_api', None)
+    clear_market_stream(old_api)
     if exc is not None:
         st.session_state.sj_connection_error = type(exc).__name__
     try:
@@ -14480,6 +14523,8 @@ with st.sidebar:
             + (f"（{sj_import_error}）" if sj_import_error else "")
         )
     else:
+        if st.session_state.get('sj_connection_error'):
+            st.warning('永豐 API 已斷線需重新連線。')
         if st.session_state.get('sj_logged_in', False):
             st.success("✅ 永豐 API 已登入")
             
@@ -14995,6 +15040,45 @@ def stock_limit_state(price, limit_up, limit_down):
     if down_value is not None and math.isclose(price_value, down_value, rel_tol=0, abs_tol=tolerance):
         return 'down'
     return ''
+
+
+def strategy_row_limit_state(row, stock=True, now_tw=None):
+    """Use the quote's own reference, never yesterday's cached limit or tomorrow's forecast."""
+    now = now_tw or datetime.now(pytz.timezone('Asia/Taipei'))
+    source = parse_strategy_data_time(row.get('_quote_time' if stock else '報價時間') or row.get('_data_as_of' if stock else '資料日期'))
+    if source is not None and source > pd.Timestamp(now.replace(tzinfo=None)):
+        return ''
+    market_row = {'市場': '股票' if stock else '期貨', '交易時段': row.get('交易時段', '日盤+夜盤')}
+    if bool(row.get('_data_stale', False)):
+        return ''
+    if stock:
+        expected = now.date() if model_market_open(market_row, now) else latest_completed_stock_trading_date(now)
+        if source is None or source.date() != expected or (model_market_open(market_row, now) and source.time() < dt_time(9)):
+            return ''
+    elif source is None:
+        return ''
+    elif model_market_open(market_row, now):
+        start = now.replace(hour=8, minute=45, second=0, microsecond=0)
+        if now.time() >= dt_time(15) or now.time() <= dt_time(5):
+            start = now.replace(hour=15, minute=0, second=0, microsecond=0)
+            if now.time() <= dt_time(5):
+                start -= timedelta(days=1)
+        if source is None or source < pd.Timestamp(start.replace(tzinfo=None)):
+            return ''
+    price = _safe_number(row.get('收盤價'))
+    rate = _safe_number(row.get('漲跌幅'))
+    if price is None or price <= 0 or rate is None or rate <= -100:
+        return ''
+    reference = price / (1 + rate / 100)
+    if stock:
+        up, down = calculate_limits(apply_tick_rules(reference))
+        return stock_limit_state(price, up, down)
+    tick = get_futures_tick_size(row.get('期貨代碼'), reference, row.get('商品類型', '未知'))
+    if tick is None:
+        return ''
+    reference = round_futures_price(reference, tick)
+    return futures_limit_state(price, round_futures_price(reference * 1.1, tick, ROUND_FLOOR),
+                               round_futures_price(reference * .9, tick, ROUND_CEILING))
 
 
 TAIFEX_NIGHT_SESSION_ROOTS = {
@@ -17355,7 +17439,7 @@ def market_risk_checked_for_row(row, state, api=None):
         market = '上市'
     if market not in ('上市', '上櫃', 'TSE', 'OTC') and api is not None:
         try:
-            exchange = api.Contracts.Stocks[code].exchange
+            exchange = get_shioaji_stock_contract(api, code).exchange
             market = str(getattr(exchange, 'value', exchange)).upper()
         except (AttributeError, KeyError, TypeError):
             pass
@@ -19659,7 +19743,7 @@ def fetch_stock_data_raw(
             source_used = "shioaji"
         if include_live_quote and re.fullmatch(r'\d{4,6}', code):
             try:
-                stock_contract = sj_api.Contracts.Stocks[code]
+                stock_contract = get_shioaji_stock_contract(sj_api, code)
                 stock_snapshots = get_stream_quotes(sj_api, [stock_contract])
                 if stock_snapshots:
                     stock_snapshot = stock_snapshots[0]
@@ -20058,17 +20142,8 @@ def fetch_stock_snapshot_map(api, codes, snapshot_fallback=True):
     """以單一批次取得股票快照，避免逐檔重複請求。"""
     if api is None:
         return {}
-    contracts = []
-    for code in [str(value) for value in codes]:
-        try:
-            contract = api.Contracts.Stocks[code]
-        except (KeyError, TypeError, AttributeError):
-            try:
-                contract = api.contracts.get(code)
-            except (AttributeError, KeyError, TypeError):
-                contract = None
-        if contract is not None:
-            contracts.append(contract)
+    contracts = [contract for code in codes
+                 if (contract := get_shioaji_stock_contract(api, code)) is not None]
     if not contracts:
         return {}
     try:
@@ -20329,6 +20404,25 @@ def stop_intraday_background(room):
     worker = st.session_state.get('_intraday_background')
     if worker is not None:
         worker.remove(room)
+        worker.remove(room + '_model')
+
+
+def model_tracking_config(room, stock, direction_choice='自動'):
+    tracking_config = {'risk': json.loads(json.dumps(_json_safe(st.session_state.get('risk_filter_market_data', {})))),
+                       'extension': st.session_state.get('risk_filter_max_extension', 2),
+                       'min_score': st.session_state.get('risk_filter_min_score', 75),
+                       'block_attention': st.session_state.get('risk_filter_block_attention', True),
+                       'rules_version': get_model_rules_version(stock),
+                       'market_bias': st.session_state.get('strategy_market_environment', {}).get('bias', '未取得'),
+                       'costs': normalize_costs(load_config().get('model_tracking_costs', {}))}
+    prefix = 'indep_risk_' if room == 'stock_independent' else 'risk_filter_'
+    if stock:
+        tracking_config.update({'extension': st.session_state.get(prefix + 'max_extension', 2),
+                                'min_score': st.session_state.get(prefix + 'min_score', 75),
+                                'block_attention': st.session_state.get(prefix + 'block_attention', True)})
+    stock_direction = str(st.session_state.get(prefix + 'direction', '系統自動')) if stock else direction_choice
+    tracking_config['rules_version'] += '-' + data_version({k:tracking_config.get(k) for k in ('extension','min_score','block_attention')})[:6]
+    return tracking_config, stock_direction
 
 
 def background_intraday_rows(room, rows, visible_codes=None, strategy_mode='當沖', direction_choice='自動'):
@@ -20336,8 +20430,13 @@ def background_intraday_rows(room, rows, visible_codes=None, strategy_mode='當�
     enabled, seconds, start, end = intraday_auto_settings(room)
     api = st.session_state.get('sj_api')
     stock = room.startswith('stock')
-    if not enabled or not st.session_state.get('sj_logged_in', False) or api is None:
+    if api is not None and not check_shioaji_connection(api):
         stop_intraday_background(room)
+        return rows
+    if not enabled or not st.session_state.get('sj_logged_in', False) or api is None:
+        worker = st.session_state.get('_intraday_background')
+        if worker is not None:
+            worker.remove(room)
         return rows
     selected = rows.copy().astype(object)
     key = '代號' if stock else '契約鍵'
@@ -20353,21 +20452,9 @@ def background_intraday_rows(room, rows, visible_codes=None, strategy_mode='當�
     scope = room if worker is None else f'{room}_{id(worker)}'
     window_open = intraday_auto_window_open
     tracker = get_model_tracker(get_app_secret('gsheet_api_url') or '')
-    tracking_config = {'risk': json.loads(json.dumps(_json_safe(st.session_state.get('risk_filter_market_data', {})))),
-                       'extension': st.session_state.get('risk_filter_max_extension', 2),
-                       'min_score': st.session_state.get('risk_filter_min_score', 75),
-                       'block_attention': st.session_state.get('risk_filter_block_attention', True),
-                       'rules_version': get_model_rules_version(stock),
-                       'market_bias': st.session_state.get('strategy_market_environment', {}).get('bias', '未取得'),
-                       'costs': normalize_costs(load_config().get('model_tracking_costs', {}))}
-    prefix = 'indep_risk_' if room == 'stock_independent' else 'risk_filter_'
+    tracking_config, stock_direction = model_tracking_config(room, stock, direction_choice)
     if stock:
         strategy_mode = '當沖' if st.session_state.get('indep_strategy_mode' if room == 'stock_independent' else 'risk_filter_strategy_mode', '當沖') == '當沖' else '波段'
-        tracking_config.update({'extension': st.session_state.get(prefix + 'max_extension', 2),
-                                'min_score': st.session_state.get(prefix + 'min_score', 75),
-                                'block_attention': st.session_state.get(prefix + 'block_attention', True)})
-    stock_direction = str(st.session_state.get(prefix + 'direction', '系統自動')) if stock else direction_choice
-    tracking_config['rules_version'] += '-' + data_version({k:tracking_config.get(k) for k in ('extension','min_score','block_attention')})[:6]
 
     def update(seed):
         if stock:
@@ -20442,11 +20529,12 @@ def get_model_rules_version(stock):
     functions = (determine_stock_direction, calculate_risk_filter_result, calculate_daytrade_filter_result,
                  build_trade_plan, calculate_entry_confidence) if stock else (
                      calculate_futures_strategy_levels, enrich_futures_strategy_rows, calculate_entry_confidence)
+    functions += (model_tracking_samples,)
     return MODEL_VERSION + '-' + data_version([inspect.getsource(f) for f in functions])[:10]
 
 
-def model_market_open(row):
-    now = datetime.now(pytz.timezone('Asia/Taipei'))
+def model_market_open(row, now_value=None):
+    now = now_value or datetime.now(pytz.timezone('Asia/Taipei'))
     if row.get('市場') == '股票':
         return intraday_auto_window_open(now, dt_time(9), dt_time(13,30), stock=True)
     clock = now.time()
@@ -20469,6 +20557,7 @@ def get_model_tracker(url=''):
 def model_tracking_samples(rows, stock, mode, direction_choice, config, seconds, api=None):
     """Use the same existing strategy helpers on quotes already obtained by the main table."""
     now = datetime.now(pytz.timezone('Asia/Taipei'))
+    mode = '當沖' if mode == '當沖' else '波段'
     signals, quotes = [], {}
     if not stock:
         rows = enrich_futures_strategy_rows(rows, mode, config.get('market_bias', '盤整'))
@@ -20510,31 +20599,36 @@ def model_tracking_samples(rows, stock, mode, direction_choice, config, seconds,
             quote['串流識別'] = ticks[-1].get('串流識別')
         else:
             quote['有效'] = valid = False  # A warm-up snapshot is not ordered trade evidence.
+        signal_valid = valid or (not ticks and age is not None and 0 <= age <= 30 and not bool(row.get('_data_stale', False)))
         quote['成交證據'] = ticks
         quotes[market + '|' + key] = quote
         if stock:
-            risk = config.get('risk', {})
-            direction = determine_stock_direction(row, mode == '當沖', direction_choice)['direction']
-            args = (row, direction, config.get('extension', 2), risk.get('attention', {}),
-                    risk.get('disposition', []), market_risk_checked_for_row(row, risk, api), config.get('block_attention', True))
-            daily = calculate_risk_filter_result(*args, disposition_tomorrow_codes=risk.get('disposition_tomorrow', []))
-            result = calculate_daytrade_filter_result(row, direction, *args[3:]) if mode == '當沖' else daily
-            if mode == '當沖' and not daily['eligible']:
-                result['eligible'] = False
-            plan = build_trade_plan(row, direction, mode == '當沖', result)
-            state = classify_signal_state(result['rule'], result['eligible'], result['score'], config.get('min_score', 75))
-            health = build_data_health(row.get('_quote_time'), required_ready=bool(plan.get('valid')), live_expected=True)
-            confidence = calculate_entry_confidence(result['score'], state, price, plan['summary'], direction,
-                                                   health, calculate_market_alignment(direction, config.get('market_bias', '盤整')))
-            eligible = plan.get('valid') and result['eligible'] and confidence['score'] >= config.get('min_score', 75)
-            levels = parse_trade_plan_numbers(plan['summary'])
-            rule = result['rule']
+            if '進出場預判' in row:
+                levels = parse_trade_plan_numbers(row.get('進出場預判'))
+                direction = str(row.get('_系統方向', determine_stock_direction(row, mode == '當沖', direction_choice)['direction']))
+                state = str(row.get('訊號狀態', ''))
+                rule = str(row.get('盤中觸發' if mode == '當沖' else '隔日規則', ''))
+                eligible = None not in levels.values()
+            else:
+                risk = config.get('risk', {})
+                direction = determine_stock_direction(row, mode == '當沖', direction_choice)['direction']
+                args = (row, direction, config.get('extension', 2), risk.get('attention', {}),
+                        risk.get('disposition', []), market_risk_checked_for_row(row, risk, api), config.get('block_attention', True))
+                daily = calculate_risk_filter_result(*args, disposition_tomorrow_codes=risk.get('disposition_tomorrow', []))
+                result = calculate_daytrade_filter_result(row, direction, *args[3:]) if mode == '當沖' else daily
+                if mode == '當沖' and not daily['eligible']:
+                    result['eligible'] = False
+                plan = build_trade_plan(row, direction, mode == '當沖', result)
+                state = classify_signal_state(result['rule'], result['eligible'], result['score'], config.get('min_score', 75))
+                eligible = bool(plan.get('valid'))
+                levels = parse_trade_plan_numbers(plan['summary'])
+                rule = result['rule']
             tick, multiplier, tax_rate = get_tick_size(price) if price else None, 1, None
             indicators = {k: _safe_number(row.get(v)) for k,v in {'VWAP':'_daytrade_vwap', '均線':'_ma5', '動能斜率':'_risk_ma20_slope', 'ATR':'_risk_atr14', '量能':'_daytrade_volume_ratio'}.items()}
         else:
             direction = str(row.get('方向', '觀望'))
             state = str(row.get('訊號狀態', ''))
-            eligible = bool(row.get('_附加可記錄', False))
+            eligible = not bool(row.get('_intraday_history_pending', False))
             levels = parse_trade_plan_numbers(row.get('進出場點位'))
             rule = str(row.get('觸發條件', ''))
             tick = get_futures_tick_size(row.get('期貨代碼'), price, row.get('商品類型', '未知'))
@@ -20543,7 +20637,7 @@ def model_tracking_samples(rows, stock, mode, direction_choice, config, seconds,
                           if row.get('商品類型') == '指數' else _safe_number(row.get('乘數')))
             tax_rate = .00002 if row.get('商品類型') in ('指數', '股票', 'ETF') else None
             indicators = {k: _safe_number(row.get(k)) for k in ('VWAP', 'ATR', '量倉比')}
-        if quote['休市'] or not valid or not eligible or direction not in ('多頭','空頭','偏多','偏空') or None in levels.values():
+        if quote['休市'] or price is None or not signal_valid or not eligible or direction not in ('多頭','空頭','偏多','偏空') or None in levels.values():
             continue
         entry, stop, target = levels['entry'], levels['stop'], levels['target']
         long = direction in ('多頭', '偏多')
@@ -20551,7 +20645,7 @@ def model_tracking_samples(rows, stock, mode, direction_choice, config, seconds,
             continue
         signals.append({'交易日': day.isoformat(), '市場':market, '商品鍵':key, '代碼':key,
                         '名稱':str(row.get('名稱', key)), '交易時段':str(row.get('交易時段','日盤+夜盤')), '策略':mode, '策略版本':config.get('rules_version', MODEL_VERSION),
-                        '方向':direction, '訊號價':price, '來源時間':quote['來源時間'],
+                        '方向':direction, '訊號價':price, '來源時間':quote['來源時間'] if valid else source.isoformat(),
                         '進場價':entry, '停損價':stop, '目標價':target, '觸發條件':rule,
                         '訊號狀態':state, '指標快照':indicators,
                         '條件快照':{name + '同向': (price > value if long else price < value)
@@ -20562,8 +20656,76 @@ def model_tracking_samples(rows, stock, mode, direction_choice, config, seconds,
     return signals, quotes
 
 
+def record_model_table(room, rows, stock, mode, direction_choice='自動'):
+    """Record published plans even with display auto-refresh off; reuse the server worker and stream."""
+    api = st.session_state.get('sj_api')
+    job_room = room + '_model'
+    worker = get_intraday_background()
+    plan_column = '進出場預判' if stock else '進出場點位'
+    if (api is None or not st.session_state.get('sj_logged_in', False)
+            or rows.empty or plan_column not in rows or not check_shioaji_connection(api)):
+        if worker is not None:
+            worker.remove(job_room)
+        return
+    seed = rows[rows[plan_column].map(lambda text: None not in parse_trade_plan_numbers(text).values())].copy()
+    if seed.empty:
+        if worker is not None:
+            worker.remove(job_room)
+        return
+    mode = '當沖' if mode == '當沖' else '波段'
+    config, direction = model_tracking_config(room, stock, direction_choice)
+    tracker = get_model_tracker(get_app_secret('gsheet_api_url') or '')
+    enabled, seconds, _, _ = intraday_auto_settings(room)
+    scope = job_room + '_' + str(id(worker))
+
+    def update(plans):
+        contracts = [(index, get_shioaji_stock_contract(api, row.get('代號')) if stock else
+                      resolve_shioaji_futures_contract(api, row.get('期貨代碼'), row.get('契約月份')))
+                     for index, row in plans.iterrows()]
+        contracts = [(index, contract) for index, contract in contracts if contract is not None]
+        sync_strategy_stream_scope(api, [contract for _, contract in contracts], scope)
+        for index, contract in contracts:
+            snapshots = get_stream_quotes(api, [contract], snapshot_fallback=False)
+            snapshot = snapshots[0] if snapshots else None
+            if fresh_strategy_stream_quote(snapshot):
+                plans.at[index, '收盤價'] = _safe_number(getattr(snapshot, 'close', None))
+                plans.at[index, '_quote_time' if stock else '報價時間'] = _stream_datetime(snapshot.updated_at).isoformat()
+                plans.at[index, '_data_stale'] = False
+        signals, quotes = model_tracking_samples(plans, stock, mode, direction, config, seconds, api)
+        tracker.submit(signals, quotes)
+        return plans, len(signals)
+
+    # UI publishes exactly its displayed plan once; no broker/history query is needed.
+    signals, quotes = model_tracking_samples(seed, stock, mode, direction, config, seconds, api)
+    tracker.submit(signals, quotes)
+    if worker is not None:
+        if enabled:
+            worker.remove(job_room)
+        else:
+            state = _stream_state(api)
+            with state['lock']:
+                state.setdefault('intraday_background_workers', weakref.WeakSet()).add(worker)
+            columns = ['代號', '_系統方向'] if stock else ['契約鍵', '方向']
+            columns = [c for c in columns + [plan_column] if c in seed]
+            signature = (id(api), seconds, mode, data_version(seed[columns].to_dict('records')), data_version(config))
+            with state['lock']:
+                state.setdefault('model_scope_versions', {})[scope] = signature
+
+            def release():
+                with state['lock']:
+                    if state.get('model_scope_versions', {}).get(scope) != signature:
+                        return  # Replacing a plan must retain overlapping trade evidence.
+                    state['model_scope_versions'].pop(scope, None)
+                sync_strategy_stream_scope(api, [], scope)
+
+            worker.configure(job_room, signature, seed.astype(object), seconds, update,
+                             lambda: any(model_market_open({'市場':'股票' if stock else '期貨',
+                                         '交易時段':row.get('交易時段','日盤+夜盤')}) for _, row in seed.iterrows()),
+                             release)
+
+
 def render_model_tracking_room():
-    st.caption('僅追蹤股期主表及獨立分析背景更新中的商品；只計入成交、費用及行情完整的已平倉交易。')
+    st.caption('以股期主表及獨立分析的進出場預判記錄模擬訊號；不讀取帳戶交易。觸及進場、停損或目標後記錄，只有證據完整的已平倉交易計入勝率。')
     tracker = get_model_tracker(get_app_secret('gsheet_api_url') or '')
     tracker.last_activity = time.monotonic()
     with st.expander('模擬成交與成本設定', expanded=False):
@@ -20626,7 +20788,7 @@ def render_model_tracking_room():
                            file_name='模型勝率追蹤.xlsx', mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
                            on_click='ignore', key='model_excel')
         if not records:
-            st.info('尚無自動紀錄；開啟股期戰略室背景自動更新後，符合既有門檻的訊號將自動保存。')
+            st.info('尚無自動紀錄；股期表格出現有效進出場預判後會自動記錄，以串流行情確認模擬進出場。')
         else:
             st.dataframe(pd.DataFrame([metrics]), hide_index=True, width='stretch')
             st.markdown('##### 策略、方向與指標分析')
@@ -20777,7 +20939,9 @@ def refresh_daytrade_metrics_for_codes(stock_data, sj_logged_in=False, sj_api=No
         contracts = []
         for code in codes:
             try:
-                contracts.append(sj_api.Contracts.Stocks[code])
+                contract = get_shioaji_stock_contract(sj_api, code)
+                if contract is not None:
+                    contracts.append(contract)
             except (KeyError, TypeError, AttributeError):
                 continue
         sync_strategy_stream_scope(sj_api, contracts, stream_room)
@@ -20790,7 +20954,7 @@ def refresh_daytrade_metrics_for_codes(stock_data, sj_logged_in=False, sj_api=No
 
     def fetch_metrics(code):
         try:
-            contract = sj_api.Contracts.Stocks[code]
+            contract = get_shioaji_stock_contract(sj_api, code)
             intraday_df = get_strategy_intraday_history(sj_api, contract, wait=not stream_only)
             snapshot = snapshot_map.get(code)
             if stream_only and snapshot is None:
@@ -21370,16 +21534,17 @@ def render_futures_strategy_room():
         else:
             futures_display_columns = futures_basic_columns
 
-        def style_futures_row(row):
+        record_model_table('futures', display_rows, False, strategy_mode, direction_choice)
+
+        def style_futures_row(row, source_frame=None):
             styles = [''] * len(row)
             change = _safe_number(row.get('漲跌幅'), 0) or 0
             direction = str(row.get('方向', ''))
             signal_state = str(row.get('訊號狀態', ''))
             liquidity = str(row.get('可交易性', ''))
             data_health = str(row.get('資料狀態', ''))
-            limit_state = futures_limit_state(
-                row.get('收盤價'), row.get('當日漲停價'), row.get('當日跌停價'),
-            )
+            source_row = source_frame.loc[row.name] if source_frame is not None and row.name in source_frame.index else row
+            limit_state = strategy_row_limit_state(source_row, stock=False)
             if limit_state == 'up':
                 name_style = 'background-color: #ff4b4b; color: #ffffff; font-weight: bold;'
             elif limit_state == 'down':
@@ -21514,7 +21679,7 @@ def render_futures_strategy_room():
             editor_display['收盤價'] = editor_display['收盤價'].apply(fmt_price)
             editor_display['漲跌幅'] = editor_display['漲跌幅'].apply(_signed_percent)
             edited = st.data_editor(
-                editor_display.style.apply(style_futures_row, axis=1),
+                editor_display.style.apply(style_futures_row, axis=1, source_frame=display_rows),
                 column_config=futures_column_config(editor_display),
                 hide_index=True, width='stretch', row_height=30,
                 key=futures_editor_key
@@ -21649,6 +21814,7 @@ def render_futures_strategy_room():
             st.caption('自動更新時間：' + st.session_state['futures_independent_auto_updated_at'])
         if night_scope:
             st.caption('夜盤自動更新：僅顯示夜盤契約；關閉後還原原本分析標的。')
+        record_model_table('futures_independent', independent_rows, False, strategy_mode, direction_choice)
         if not independent_rows.empty:
             if enhanced_layer:
                 independent_source_columns = (
@@ -21666,7 +21832,7 @@ def render_futures_strategy_room():
             independent_display['收盤價'] = independent_display['收盤價'].apply(fmt_price)
             independent_display['漲跌幅'] = independent_display['漲跌幅'].apply(_signed_percent)
             st.dataframe(
-                independent_display.style.apply(style_futures_row, axis=1),
+                independent_display.style.apply(style_futures_row, axis=1, source_frame=independent_rows),
                 column_config=futures_column_config(independent_display, include_ignore=False),
                 hide_index=True, width='stretch', row_height=30
             )
@@ -23013,6 +23179,7 @@ if tab1.open and stock_strategy_tab.open:
                     )
                 else:
                     input_cols = stock_strategy_display_columns(False, False, False)
+                record_model_table('stock', df_display, True, strategy_mode, st.session_state.get('risk_filter_direction', '系統自動'))
                 for col in input_cols:
                     if col not in df_display.columns: df_display[col] = None
 
@@ -23051,11 +23218,7 @@ if tab1.open and stock_strategy_tab.open:
                     if not st_val and row.name in frame.index:
                         st_val = str(frame.at[row.name, '狀態'])
                     source_row = frame.loc[row.name] if row.name in frame.index else row
-                    limit_state = stock_limit_state(
-                        row.get('收盤價'),
-                        source_row.get('_交易日漲停價', row.get('當日漲停價')),
-                        source_row.get('_交易日跌停價', row.get('當日跌停價')),
-                    )
+                    limit_state = strategy_row_limit_state(source_row)
                     risk_val = str(row.get('風險', ''))
                     vwap_val = str(row.get('VWAP 狀態', ''))
                     signal_state = str(row.get('訊號狀態', ''))
@@ -23218,11 +23381,12 @@ if tab1.open and stock_strategy_tab.open:
                 if st.session_state.get('sj_logged_in', False) and st.session_state.get('sj_api') is not None:
                     # Warm the manual button's history without blocking table display.
                     for code in st.session_state.stock_main_visible_codes:
-                        try:
-                            contract = st.session_state.sj_api.Contracts.Stocks[code]
-                        except (KeyError, TypeError, AttributeError):
-                            continue
-                        get_strategy_intraday_history(st.session_state.sj_api, contract)
+                        api = st.session_state.sj_api
+                        contract = get_shioaji_stock_contract(api, code)
+                        if not check_shioaji_connection(api):
+                            break
+                        if contract is not None:
+                            get_strategy_intraday_history(api, contract)
                 edited_df = st.data_editor(
                     styled_df,
                     column_config={
@@ -23744,6 +23908,7 @@ if tab1.open and stock_strategy_tab.open:
                         for col in input_cols:
                             if col not in df_indep.columns: df_indep[col] = None
 
+                        record_model_table('stock_independent', df_indep, True, indep_strategy_mode, indep_direction)
                         cols_to_fmt = ["當日漲停價", "當日跌停價", "成交價價差", "5日線價差"]
                         for c in cols_to_fmt:
                             if c in df_indep.columns: df_indep[c] = df_indep[c].apply(fmt_price)

@@ -1459,7 +1459,7 @@ def test_stock_quote_refresh_uses_one_snapshot_batch_for_all_rows():
         "_safe_number", "get_tick_size", "calculate_limits", "stock_limit_context",
         "snapshot_change_rate", "price_change_amount", "stock_snapshot_limit_context",
         "fetch_stock_snapshot_map", "merge_realtime_stock_snapshots",
-        "refresh_stock_quotes_for_codes",
+        "refresh_stock_quotes_for_codes", "get_shioaji_stock_contract", "_is_shioaji_auth_error",
     )
 
     class Snapshot:
@@ -1566,7 +1566,7 @@ def test_market_risk_rejects_error_pages_and_accepts_explicit_empty():
 
 def test_risk_verification_is_scoped_to_each_stock_market():
     from types import SimpleNamespace
-    checked = load_app_symbols('market_risk_checked_for_row')['market_risk_checked_for_row']
+    checked = load_app_symbols('market_risk_checked_for_row', 'get_shioaji_stock_contract', '_is_shioaji_auth_error')['market_risk_checked_for_row']
     partial = {'last_attempt': '2026/09/05', 'updated': '', 'errors': ['上市注意: HTTPError']}
     assert not checked({'市場': '上市', '代號': '2330'}, partial)
     assert checked({'市場': '上櫃', '代號': '3441'}, partial)
@@ -3333,6 +3333,7 @@ def test_intraday_auto_window_and_completion_gate():
 def test_stream_refresh_only_visible_stocks_preserves_daily_strategy_and_quote_age():
     ns = load_app_symbols(
         'refresh_daytrade_metrics_for_codes', 'refresh_stock_quotes_for_codes',
+        'get_shioaji_stock_contract', '_is_shioaji_auth_error',
         'merge_realtime_stock_snapshots', 'fresh_strategy_stream_quote', '_stream_datetime',
         '_safe_number', '_stream_number', 'snapshot_change_rate', 'price_change_amount', 'get_tick_size',
     )
