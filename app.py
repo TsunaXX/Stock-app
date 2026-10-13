@@ -21284,7 +21284,18 @@ def model_performance_state(view_key):
 def cached_model_performance(payload, view_key='default'):
     state, lock = model_performance_state(view_key)
     with lock:
-        return performance(json.loads(payload), state)
+        records = json.loads(payload)
+        metrics, groups, frame = performance(records, state)
+        # Older Streamlit cache entries or model modules may not include new UI fields.
+        if '全部訊號數' not in metrics or '資料不足數' not in metrics:
+            metrics = dict(metrics)
+            metrics['全部訊號數'] = len(records)
+            metrics['資料不足數'] = sum(
+                bool(row.get('資料缺口') or row.get('到期未確認')
+                     or row.get('狀態') in ('資料不足', '監控中斷'))
+                for row in records
+            )
+        return metrics, groups, frame
 
 
 
