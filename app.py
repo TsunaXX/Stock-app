@@ -21068,13 +21068,40 @@ def _model_display_value(value, column=''):
     return value
 
 
+def _model_number_text(value):
+    """Trim redundant decimal zeroes without rounding or changing saved numeric data."""
+    if isinstance(value, (bool, np.bool_)):
+        return value
+    if isinstance(value, (int, float, np.integer, np.floating, Decimal)):
+        if pd.isna(value):
+            return ''
+        text = format(Decimal(str(value)), 'f')
+        return text.rstrip('0').rstrip('.') if '.' in text else text
+    return value
+
+
+def _model_history_overview(frame):
+    """Keep key trade fields first; the full dataframe remains available separately."""
+    result = frame.copy()
+    if '商品' not in result.columns:
+        codes = result['代碼'] if '代碼' in result else result.get('商品鍵', pd.Series('', index=result.index))
+        names = result['名稱'] if '名稱' in result else pd.Series('', index=result.index)
+        result['商品'] = [
+            str(code or '') + ((' ' + str(name)) if name else '')
+            for code, name in zip(codes.fillna(''), names.fillna(''))
+        ]
+    first = ['交易日', '商品', '計畫來源', '方向', '狀態', '模擬進場價', '模擬出場價', '模擬損益']
+    columns = [column for column in first if column in result.columns]
+    return result[columns], result[columns + [column for column in result.columns if column not in columns]]
+
+
 def _model_display_frame(frame, color=False):
     result = frame.copy()
     for column in result.columns:
         result[column] = result[column].map(lambda value: _model_display_value(value, str(column)))
         if result[column].isna().any():
-            result[column] = result[column].map(lambda value: '' if pd.isna(value) else str(value)).astype(object)
-    styled = result.style
+            result[column] = result[column].map(lambda value: '' if pd.isna(value) else str(_model_number_text(value))).astype(object)
+    styled = result.style.format(_model_number_text)
     if not color:
         return styled
 
@@ -21144,8 +21171,11 @@ def render_model_tracking_room():
     with cols[0]:
         now_tw = datetime.now(pytz.timezone('Asia/Taipei'))
         report_day = max(now_tw.date(), get_futures_trading_date(now_tw).date())
-        period = st.date_input('日期區間', value=(report_day - timedelta(days=30), report_day), key='model_period')
-        st.button('今天', key='model_period_today', on_click=set_model_period_today, args=(report_day,), width='stretch')
+        with st.popover('📅 日期區間'):
+            period = st.date_input('選擇起迄日期', value=(report_day - timedelta(days=30), report_day), key='model_period')
+            st.button('今天', key='model_period_today', on_click=set_model_period_today, args=(report_day,), width='stretch')
+        if len(period) == 2:
+            st.caption(f'{period[0]:%Y/%m/%d} ～ {period[1]:%Y/%m/%d}')
     with cols[1]:
         market = st.selectbox('市場', ['全部', '股票', '期貨', '選擇權'], key='model_market')
     with cols[2]:
@@ -21190,6 +21220,7 @@ def render_model_tracking_room():
                             format_func=lambda value: value or '全部商品', accept_new_options=True,
                             placeholder='輸入代碼或名稱搜尋') or ''
     show_evidence = st.toggle('顯示指標與事件證據', key='model_evidence')
+    show_full_history = st.toggle('顯示完整明細欄位', key='model_full_history', value=False)
     page = st.number_input('明細頁碼', min_value=1, value=1, step=1, key='model_page')
 
     @st.fragment(run_every=30)
@@ -21209,8 +21240,9 @@ def render_model_tracking_room():
                    and (plan_source == '全部' or row.get('計畫來源', '股期戰略室') == plan_source)
                    and (not query or query in ''.join(str(row.get(key, '') or '') for key in ('代碼', '名稱', '商品鍵')).replace(' ', '').casefold())]
         metrics, groups, frame = cached_model_performance(json.dumps(records, ensure_ascii=False), str((period, market, mode, direction, version, code, plan_source)))
-        tiles = st.columns(5)
-        for col, key in zip(tiles, ('有效交易數', '勝率(%)', '累積模擬損益', '獲利因子', '最大回撤')):
+        for col, key in zip(st.columns(3), ('全部訊號數', '有效交易數', '資料不足數')):
+            col.metric(key, str(metrics[key]))
+        for col, key in zip(st.columns(4), ('勝率(%)', '累積模擬損益', '獲利因子', '最大回撤')):
             col.metric(key, '未確認' if metrics[key] is None else f'{metrics[key]:,.2f}'.rstrip('0').rstrip('.'))
         st.download_button('⬇️ 匯出 Excel', lambda: excel_report(records),
                            file_name='模型勝率追蹤.xlsx', mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
@@ -21221,15 +21253,25 @@ def render_model_tracking_room():
             st.dataframe(_model_display_frame(pd.DataFrame([metrics])), hide_index=True, width='stretch')
             st.markdown('##### 策略、方向與指標分析')
             st.caption('指標分組代表進場當時有該指標證據的交易，不代表單一指標造成結果。')
-            st.dataframe(_model_display_frame(groups), hide_index=True, width='stretch')
+            if groups.empty:
+                st.caption('尚無有效已平倉交易，暫無分組統計。')
+            else:
+                st.dataframe(_model_display_frame(groups), hide_index=True, width='stretch')
             st.markdown('##### 歷史明細')
             start_row = (page - 1) * 100
             view = frame.sort_values('建立時間', ascending=False).iloc[start_row:start_row + 100]
             st.caption(f'每頁 100 筆｜共 {len(frame)} 筆｜第 {page} 頁；Excel 匯出全部篩選紀錄。')
-            history = view.drop(columns=['事件', '成本設定', '指標快照', '條件快照'], errors='ignore')
-            st.dataframe(_model_display_frame(history, color=True), hide_index=True, width='stretch')
-            if show_evidence:
-                st.dataframe(_model_display_frame(view[['交易ID', '指標快照', '事件']]), hide_index=True, width='stretch')
+            if view.empty:
+                st.info('此頁沒有紀錄，請選擇較前面的頁碼。')
+            else:
+                history = view.drop(columns=['事件', '成本設定', '指標快照', '條件快照'], errors='ignore')
+                overview, full_history = _model_history_overview(history)
+                st.dataframe(_model_display_frame(full_history if show_full_history else overview, color=True),
+                             hide_index=True, width='stretch')
+                if show_evidence:
+                    evidence_columns = [column for column in ('交易ID', '策略版本', '指標快照', '條件快照', '事件') if column in view]
+                    if evidence_columns:
+                        st.dataframe(_model_display_frame(view[evidence_columns]), hide_index=True, width='stretch')
     render_model_report()
 
 
