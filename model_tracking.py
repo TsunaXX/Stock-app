@@ -339,7 +339,10 @@ def performance(records, state=None):
             group['有效交易數'] += 1; group['獲勝'] += value > 0; group['累積模擬損益'] += value
     state['fingerprints'], state['added'] = fingerprints, len(added)
     count, wins, losses = len(closed), state['wins'], state['losses']
-    metrics = {'有效交易數': count, '獲勝': wins, '虧損': losses,
+    insufficient = sum(bool(r.get('資料缺口') or r.get('到期未確認') or
+                            r.get('狀態') in ('資料不足', '監控中斷')) for r in records)
+    metrics = {'全部訊號數': len(records), '資料不足數': insufficient,
+               '有效交易數': count, '獲勝': wins, '虧損': losses,
                '勝率(%)': wins / count * 100 if count else None,
                '累積模擬損益': state['equity'], '平均獲利': state['profit'] / wins if wins else None,
                '平均虧損': state['loss'] / losses if losses else None,
