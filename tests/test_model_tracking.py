@@ -646,3 +646,31 @@ def test_cloud_readback_does_not_reuse_cached_reads_and_keeps_pending_on_timeout
         tracker.sync()
     with tracker.db() as db:
         assert db.execute('SELECT dirty FROM trades').fetchone()[0] == 1
+
+
+def test_cached_model_performance_handles_legacy_metric_dict():
+    """A pre-upgrade metric cache must not crash the new summary cards."""
+    tree = ast.parse((ROOT/'app.py').read_text(encoding='utf-8'))
+    function = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                    and n.name == 'cached_model_performance')
+    function.decorator_list = []
+    ns = {
+        'json': json,
+        'model_performance_state': lambda key: ({}, threading.Lock()),
+        'performance': lambda records, state: (
+            {'有效交易數': 0, '勝率(%)': None},
+            pd.DataFrame(), pd.DataFrame(records)),
+    }
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[])),
+                 str(ROOT/'app.py'), 'exec'), ns)
+    sample = [
+        {'狀態': '等待進場', '資料缺口': False},
+        {'狀態': '資料不足', '資料缺口': False},
+        {'狀態': '已平倉', '資料缺口': True},
+        {'狀態': '監控中斷', '資料缺口': True},
+    ]
+    summary, groups, data = ns['cached_model_performance'](json.dumps(sample))
+    assert summary['全部訊號數'] == 4
+    assert summary['資料不足數'] == 3
+    assert summary['有效交易數'] == 0
+    assert len(data) == 4 and groups.empty
