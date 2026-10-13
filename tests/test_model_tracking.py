@@ -10,6 +10,8 @@ from unittest.mock import patch
 from types import SimpleNamespace
 
 import pandas as pd
+import numpy as np
+from decimal import Decimal
 import pytest
 from openpyxl import load_workbook
 from model_tracking import DEFAULT_COSTS, ModelTracker, advance, new_trade, merge_trades, performance, excel_report, normalize_costs
@@ -186,12 +188,14 @@ def test_new_home_tab_lazy_ui_and_excel(tmp_path):
     source = (ROOT/'app.py').read_text(encoding='utf-8')
     functions = {'render_model_tracking_room','cached_model_performance','model_performance_state',
                  '_model_market_version_key','_model_version_first_date','model_version_display_labels',
-                 '_model_time_text','_model_display_value','_model_display_frame','set_model_period_today'}
+                 '_model_time_text','_model_display_value','_model_display_frame',
+                  '_model_number_text','_model_history_overview','set_model_period_today'}
     defs = '\n'.join(ast.unparse(n) for n in ast.parse(source).body if isinstance(n,ast.FunctionDef) and n.name in functions)
     tracker = ModelTracker(tmp_path/'ui.sqlite',start=False)
     script = '''
 import streamlit as st
-import pandas as pd, json, pytz, threading, time
+import pandas as pd, numpy as np, json, pytz, threading, time
+from decimal import Decimal
 from datetime import date,datetime,timedelta
 from model_tracking import ModelTracker,DEFAULT_COSTS,VERSION as MODEL_VERSION,performance,excel_report,normalize_costs
 class ModelFixtureDatetime(datetime):
@@ -229,6 +233,8 @@ with outer:
     assert not app.exception and app.session_state['profit'] == '模型勝率追蹤'
     assert str(app.date_input(key='model_period').value[-1]) == '2026-10-13'
     assert len(app.get('download_button')) == 1
+    assert any(metric.label == '全部訊號數' for metric in app.metric)
+    assert any(metric.label == '資料不足數' for metric in app.metric)
     assert any(button.label == '今天' for button in app.button)
     assert app.selectbox(key='model_plan_source').options == ['全部','股期戰略室','指數操作計畫','選擇權操作計畫']
     assert '2330｜台積電' in app.selectbox(key='model_code').options
@@ -247,9 +253,9 @@ def test_model_display_frame_keeps_blank_cells_arrow_compatible():
     import pyarrow as pa
 
     tree = ast.parse((ROOT/'app.py').read_text(encoding='utf-8'))
-    names = {'_model_display_value', '_model_display_frame', '_model_time_text'}
+    names = {'_model_display_value', '_model_display_frame', '_model_time_text', '_model_number_text', '_model_history_overview'}
     definitions = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names]
-    namespace = {'pd': pd, 'json': json}
+    namespace = {'pd': pd, 'np': np, 'Decimal': Decimal, 'json': json}
     exec(compile(ast.Module(body=definitions, type_ignores=[]), str(ROOT/'app.py'), 'exec'), namespace)
     frame = namespace['_model_display_frame'](pd.DataFrame([
         {'勝率(%)': None, '平均獲利': float('nan'), '平均虧損': '', '方向': '偏多'},
@@ -260,7 +266,7 @@ def test_model_display_frame_keeps_blank_cells_arrow_compatible():
     assert '>None<' not in frame.to_html()
     assert rows == [
         {'勝率(%)': '', '平均獲利': '', '平均虧損': '', '方向': '偏多'},
-        {'勝率(%)': '0.0', '平均獲利': '120.5', '平均虧損': '-20.0', '方向': '偏空'},
+        {'勝率(%)': '0', '平均獲利': '120.5', '平均虧損': '-20', '方向': '偏空'},
     ]
     assert '0.000000' not in frame.to_html()
 
@@ -274,6 +280,35 @@ def test_model_display_frame_keeps_blank_cells_arrow_compatible():
     ]
     assert empty_table.to_pylist() == [{'勝率(%)': '', '平均獲利': '', '獲利因子': ''}]
     assert '>None<' not in empty_metrics.to_html()
+    assert namespace['_model_number_text'](100.0000) == '100'
+    assert namespace['_model_number_text'](0.001200) == '0.0012'
+    assert namespace['_model_number_text'](123456789) == '123456789'
+    assert namespace['_model_number_text']('2330') == '2330'
+    assert namespace['_model_number_text'](0.0) == '0'
+    assert namespace['_model_number_text'](True) is True
+    compact, details = namespace['_model_history_overview'](pd.DataFrame([{
+        '交易ID': 'unique-id', '交易日': '2026-10-14', '代碼': '2330',
+        '名稱': '台積電', '計畫來源': '股期戰略室', '方向': '偏多',
+        '狀態': '已平倉', '模擬進場價': 100.5, '模擬出場價': 102.0, '模擬損益': 1000.0,
+    }]))
+    assert compact.columns.tolist() == [
+        '交易日', '商品', '計畫來源', '方向', '狀態', '模擬進場價', '模擬出場價', '模擬損益']
+    assert compact.iloc[0]['商品'] == '2330 台積電'
+    assert '交易ID' not in compact and '交易ID' in details
+
+
+def test_model_signal_counts_do_not_treat_missing_evidence_as_completed_trades():
+    rows = [
+        {'交易ID': 'waiting', '狀態': '等待進場'},
+        {'交易ID': 'gap', '狀態': '已平倉', '資料缺口': True, '模擬損益': 100.0},
+        {'交易ID': 'missing', '狀態': '資料不足'},
+        {'交易ID': 'closed', '狀態': '已平倉', '資料缺口': False, '模擬損益': 12.0},
+    ]
+    stats, _, _ = performance(rows)
+    assert stats['全部訊號數'] == 4
+    assert stats['資料不足數'] == 2
+    assert stats['有效交易數'] == 1
+    assert stats['勝率(%)'] == 100
 
 
 def test_invalid_settings_and_plans_fail_safely():
