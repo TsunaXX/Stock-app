@@ -9,7 +9,7 @@ from test_core_calculations import APP_PATH, load_app_symbols
 
 
 def helpers(*extra):
-    return load_app_symbols('dispatch_postclose_sync', '_as_float', '_ranking_number', '_ranking_market_date',
+    return load_app_symbols('restore_stock_quick_search', 'dispatch_postclose_sync', '_as_float', '_ranking_number', '_ranking_market_date',
                             '_ranking_clamp', 'strategy_ranking_weights', 'postclose_risk_version', 'enrich_futures_ranking_fields', '_safe_number', *extra)
 
 
@@ -333,6 +333,7 @@ import pandas as pd
 import time
 from datetime import date, time as dt_time
 from types import SimpleNamespace
+restore_stock_quick_search = lambda: None
 check_intraday_auto_timer = lambda room: None
 supplement_frozen_stock_rankings = lambda *a: None
 postclose_maintenance_window = lambda now: (pd.Timestamp('2026-10-02 21:00'), date(2026, 10, 2), True, True)

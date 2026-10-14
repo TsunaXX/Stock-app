@@ -13832,6 +13832,8 @@ def load_data_cache():
             )
         )
 
+    st.session_state['_stock_query_restore_pending'] = bool(remote_error)
+
     data = {}
 
     if (
@@ -14293,6 +14295,7 @@ def persist_stock_quick_search_state(section=None):
 
 
 def render_stock_quick_search(section):
+    restore_stock_quick_search()
     key = 'search_multiselect' if section == 'main' else 'indep_search_multiselect'
     selected = get_stock_quick_search_state().get(section, [])
     st.session_state[key] = selected
@@ -22679,6 +22682,48 @@ def supplement_frozen_stock_rankings(current, state):
                                             {'stock': pending}, target, False, False, risk, snapshots, stock_modes)}
 
 
+
+def restore_stock_quick_search():
+    """Retry failed startup reads off the UI thread without overwriting subsequent edits."""
+    if not st.session_state.get('_stock_query_restore_pending'):
+        return
+    state = st.session_state.setdefault('_postclose_maintenance', {})
+    task = state.get('query_restore_task')
+    if task is not None and task.done():
+        state.pop('query_restore_task')
+        state['query_restore_retry_at'] = time.monotonic() + 60
+        try:
+            remote, error = task.result()
+            if error:
+                return
+            with _RUNTIME_FILE_LOCK:
+                latest = _read_json_cache_file(STOCK_STRATEGY_CACHE_FILE)
+                selected = _newer_timestamped_state(
+                    latest.get('quick_search_state'), get_stock_quick_search_state(),
+                )
+                selected = normalize_stock_quick_search_state(_newer_timestamped_state(
+                    (remote or {}).get('quick_search_state'), selected,
+                ))
+                latest['quick_search_state'] = selected
+                _write_json_atomic(STOCK_STRATEGY_CACHE_FILE, latest, indent=2)
+            st.session_state['_stock_quick_search_state'] = selected
+            st.session_state['_stock_query_restore_pending'] = False
+        except Exception as exc:
+            logger.warning('Stock query restore failed: %s', type(exc).__name__)
+            return
+        st.rerun()
+        return
+    if task is not None or time.monotonic() < state.get('query_restore_retry_at', 0):
+        return
+    cloud_url = get_app_secret('gsheet_api_url')
+    if not cloud_url:
+        return
+    worker = get_postclose_worker()
+    if worker['slot'].acquire(blocking=False):
+        state['query_restore_task'] = worker['executor'].submit(
+            run_postclose_job, worker, _fetch_remote_scope, cloud_url, GOOGLE_SCOPE_STOCK, 15,
+        )
+
 def dispatch_postclose_sync():
     """Start durable pending saves immediately, without waiting for a page timer."""
     state = st.session_state.setdefault('_postclose_maintenance', {})
@@ -22707,6 +22752,7 @@ def dispatch_postclose_sync():
 
 @st.fragment(run_every=60)
 def render_postclose_maintenance():
+    restore_stock_quick_search()
     # Reuse this minute tick to resume paused tables; no extra polling fragment.
     for room in ('stock', 'stock_independent', 'futures', 'futures_independent'):
         check_intraday_auto_timer(room)

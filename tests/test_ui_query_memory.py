@@ -76,6 +76,7 @@ st.session_state.setdefault('stock_data', pd.DataFrame())
 st.session_state.setdefault('ignored_stocks', set())
 st.session_state.setdefault('all_candidates', [])
 st.session_state.setdefault('saved_notes', {})
+restore_stock_quick_search = lambda: None
 build_stock_search_options = lambda: ['2330 台積電']
 save_search_cache = lambda v: None
 def save_data_cache(*a, **kw):
@@ -255,3 +256,55 @@ def test_restore_preserves_query_edit_made_during_remote_read():
     assert state['_stock_quick_search_state'] == selected
     assert len(writes) == 1 and writes[0]['postclose_sync_pending'] is True
     assert writes[0]['quick_search_state'] == selected
+    ns['_fetch_remote_scope_cached'] = lambda *a,**kw:(None,'timeout')
+    ns['load_data_cache']()
+    assert state['_stock_query_restore_pending'] is True
+    assert state['_stock_quick_search_state'] == selected
+
+
+def test_failed_startup_read_recovers_queries_in_background_without_erasing_edits(tmp_path):
+    import json
+    import logging
+    ns = load_app_symbols('restore_stock_quick_search','normalize_stock_quick_search_state',
+                          'get_stock_quick_search_state','_newer_timestamped_state','_state_updated_at')
+    path = tmp_path / 'stock.json'
+    cloud = {'main':['1815 富喬'], 'independent':[], 'updated_at':'2026-10-14T10:00:00+08:00'}
+    state = {'_stock_query_restore_pending':True}
+    jobs, reruns = [], []
+    task = SimpleNamespace(done=lambda:False, result=lambda:({'quick_search_state':cloud},None))
+    slot = threading.BoundedSemaphore(1)
+    worker = {'slot':slot,'executor':SimpleNamespace(submit=lambda *a:jobs.append(a) or task)}
+    ns.update(st=SimpleNamespace(session_state=state,rerun=lambda:reruns.append(True)),
+              STOCK_STRATEGY_CACHE_FILE=path, GOOGLE_SCOPE_STOCK='stock_strategy',
+              _RUNTIME_FILE_LOCK=threading.RLock(), logger=logging.getLogger('query-test'),
+              _read_json_cache_file=lambda p:json.loads(p.read_text()) if p.exists() else {},
+              _write_json_atomic=lambda p,d,**kw:p.write_text(json.dumps(d)),
+              get_postclose_worker=lambda:worker, get_app_secret=lambda _:'configured',
+              run_postclose_job=lambda *a:None, _fetch_remote_scope=lambda *a:None)
+    ns['restore_stock_quick_search']()
+    ns['restore_stock_quick_search']()
+    assert len(jobs) == 1 and jobs[0][-1] == 15
+    slot.release()
+    task.done = lambda:True
+    # A failed read is retried later, not latched as a permanently empty selection.
+    task.result = lambda:(None,'timeout')
+    ns['restore_stock_quick_search']()
+    assert state['_stock_query_restore_pending'] is True and not reruns
+    ns['restore_stock_quick_search']()
+    assert len(jobs) == 1
+    state['_postclose_maintenance']['query_restore_retry_at'] = 0
+    ns['restore_stock_quick_search']()
+    slot.release()
+    task.result = lambda:({'quick_search_state':cloud},None)
+    ns['restore_stock_quick_search']()
+    assert state['_stock_quick_search_state'] == cloud and reruns == [True]
+    assert json.loads(path.read_text())['quick_search_state'] == cloud
+    # Explicit removals made while the cloud read was in flight must win.
+    cleared = {'main':[], 'independent':[], 'updated_at':'2026-10-14T11:00:00+08:00'}
+    state['_stock_query_restore_pending'] = True
+    state['_postclose_maintenance']['query_restore_task'] = task
+    state['_stock_quick_search_state'] = cleared
+    path.write_text(json.dumps({'quick_search_state':cleared,'postclose_sync_pending':True}))
+    ns['restore_stock_quick_search']()
+    assert state['_stock_quick_search_state'] == cleared
+    assert json.loads(path.read_text())['postclose_sync_pending'] is True
