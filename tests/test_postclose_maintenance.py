@@ -9,7 +9,7 @@ from test_core_calculations import APP_PATH, load_app_symbols
 
 
 def helpers(*extra):
-    return load_app_symbols('_as_float', '_ranking_number', '_ranking_market_date',
+    return load_app_symbols('restore_stock_quick_search', 'dispatch_postclose_sync', '_as_float', '_ranking_number', '_ranking_market_date',
                             '_ranking_clamp', 'strategy_ranking_weights', 'postclose_risk_version', 'enrich_futures_ranking_fields', '_safe_number', *extra)
 
 
@@ -324,13 +324,16 @@ def test_maintenance_fragment_does_not_block_controls_while_worker_waits():
     tree = ast.parse(source)
     node = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
                 and n.name == 'render_postclose_maintenance')
-    function_source = '@st.fragment(run_every=60)\n' + ast.get_source_segment(source, node)
+    dispatch_node = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                         and n.name == 'dispatch_postclose_sync')
+    function_source = ast.get_source_segment(source, dispatch_node) + '\n@st.fragment(run_every=60)\n' + ast.get_source_segment(source, node)
     app_source = '''
 import streamlit as st
 import pandas as pd
 import time
 from datetime import date, time as dt_time
 from types import SimpleNamespace
+restore_stock_quick_search = lambda: None
 check_intraday_auto_timer = lambda room: None
 supplement_frozen_stock_rankings = lambda *a: None
 postclose_maintenance_window = lambda now: (pd.Timestamp('2026-10-02 21:00'), date(2026, 10, 2), True, True)
@@ -398,3 +401,48 @@ def test_background_merge_preserves_remote_selections_and_newer_ranking():
     assert result['quick_search_state'] == remote['quick_search_state']
     assert result['strategy_ranking_snapshots']['daytrade']['score'] == 99
     assert result['strategy_ranking_snapshots']['swing']['score'] == 80
+
+
+def test_sync_does_not_clear_new_query_edit_during_write(tmp_path):
+    import json
+    import threading
+    ns = helpers('sync_postclose_scopes')
+    path = tmp_path / 'stock.json'
+    original = {'quick_search_state':{'main':['2330'], 'updated_at':'2026-10-13'},
+                'postclose_sync_pending':True}
+    newer = {'quick_search_state':{'main':['1815'], 'updated_at':'2026-10-14'},
+             'postclose_sync_pending':True}
+    path.write_text(json.dumps(original))
+    ns.update(STOCK_STRATEGY_CACHE_FILE=path, GOOGLE_SCOPE_STOCK='stock_strategy',
+              _RUNTIME_FILE_LOCK=threading.RLock(), get_data_cache_sync_lock=lambda:threading.RLock(),
+              _fetch_remote_scope=lambda *a,**kw:({},None),
+              merge_postclose_scope=lambda remote,local,asset:dict(local),
+              _write_json_atomic=lambda p,d,**kw:p.write_text(json.dumps(d)))
+    def post(*a,**kw):
+        path.write_text(json.dumps(newer))
+        return True, None
+    ns['_save_remote_scope'] = post
+    assert ns['sync_postclose_scopes']('configured',['stock']) == []
+    assert json.loads(path.read_text()) == newer
+
+
+def test_dispatch_shares_worker_and_defers_without_blocking():
+    import threading
+    ns = helpers()
+    state = {'pending_sync':{'stock':1}, 'sync_retry_at':0}
+    slot = threading.BoundedSemaphore(1)
+    submitted = []
+    running = SimpleNamespace(done=lambda:False)
+    worker = {'slot':slot, 'executor':SimpleNamespace(submit=lambda *args:submitted.append(args) or running)}
+    ns.update(st=SimpleNamespace(session_state={'_postclose_maintenance':state}),
+              get_postclose_worker=lambda:worker, get_app_secret=lambda _:'configured',
+              run_postclose_job=lambda *a:None, sync_postclose_scopes=lambda *a:None)
+    slot.acquire()
+    ns['dispatch_postclose_sync']()
+    assert not submitted and state['pending_sync'] == {'stock':1}
+    slot.release()
+    ns['dispatch_postclose_sync']()
+    assert len(submitted) == 1 and state['sync_task'] is running
+    ns['dispatch_postclose_sync']()
+    assert len(submitted) == 1
+    slot.release()

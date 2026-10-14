@@ -2189,7 +2189,7 @@ def test_render_uses_persistent_shioaji_env_and_cached_startup_snapshots():
     assert "def _fetch_remote_scope_cached" in source
     assert "save_fibo_config(sync_cloud=False)" in source
     assert "def fetch_fibonacci_yahoo_history" in source
-    assert "shioaji==1.7.5" in requirements
+    assert "shioaji==1.7.8" in requirements
 
 
 def test_shioaji_futures_resolver_uses_v17_lazy_root_api():

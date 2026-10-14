@@ -11047,6 +11047,7 @@ def save_futures_strategy_state(
             maintenance = st.session_state.setdefault('_postclose_maintenance', {})
             maintenance.setdefault('pending_sync', {})['futures'] = time.monotonic()
             maintenance['sync_retry_at'] = 0
+            dispatch_postclose_sync()
         return True
     except (OSError, TypeError, ValueError):
         return False
@@ -13605,6 +13606,8 @@ def save_data_cache(
                 '_stock_data_updated_at'
             ] = stock_data_updated_at
 
+        gsheet_api_url = get_app_secret('gsheet_api_url')
+
         local_payload = _json_safe({
             'version': 4,
             'stock_data': (
@@ -13637,57 +13640,58 @@ def save_data_cache(
             ),
             'display_settings': get_stock_display_settings(),
             'quick_search_state': get_stock_quick_search_state(),
-            'postclose_sync_pending': not sync_cloud,
+            'postclose_sync_pending': bool(gsheet_api_url) or not sync_cloud,
         })
 
-        # 股票獨立本機快取。
-        _write_json_atomic(
-            STOCK_STRATEGY_CACHE_FILE,
-            local_payload,
-            indent=2,
-        )
-
-        gsheet_api_url = (
-            get_app_secret(
-                'gsheet_api_url'
+        # Another session may have saved newer queries while this table stayed open.
+        with _RUNTIME_FILE_LOCK:
+            existing = _read_json_cache_file(STOCK_STRATEGY_CACHE_FILE)
+            local_payload['quick_search_state'] = normalize_stock_quick_search_state(
+                _newer_timestamped_state(existing.get('quick_search_state'), local_payload['quick_search_state'])
             )
-        )
+            local_payload['postclose_sync_pending'] |= bool(existing.get('postclose_sync_pending'))
+            _write_json_atomic(STOCK_STRATEGY_CACHE_FILE, local_payload, indent=2)
+        st.session_state['_stock_quick_search_state'] = local_payload['quick_search_state']
 
         sync_ok = True
 
         if gsheet_api_url and sync_cloud:
             with get_data_cache_sync_lock():
-                remote_payload, _ = _fetch_remote_scope(
+                remote_payload, read_error = _fetch_remote_scope(
                     gsheet_api_url, GOOGLE_SCOPE_STOCK, timeout=8,
                 )
-                cloud_payload = _merge_data_cache_payload(
-                    remote_payload, local_payload,
-                    clear_stock_data=clear_stock_data,
-                    replace_ignored=replace_ignored,
-                    replace_stock_data=replace_stock_data,
-                )
-                sync_ok, _ = (
-                    _save_remote_scope(
-                        gsheet_api_url,
-                        GOOGLE_SCOPE_STOCK,
-                        cloud_payload,
-                        updated_at=cloud_payload.get('updated_at'),
-                        timeout=8,
-                        verify=True,
+                sync_ok = False
+                if not read_error:
+                    cloud_payload = _merge_data_cache_payload(
+                        remote_payload, local_payload,
+                        clear_stock_data=clear_stock_data,
+                        replace_ignored=replace_ignored,
+                        replace_stock_data=replace_stock_data,
                     )
-                )
-                if sync_ok:
-                    st.session_state['stock_strategy_ranking_snapshots'] = dict(
-                        cloud_payload.get('strategy_ranking_snapshots', {})
-                    )
-                    st.session_state['_stock_quick_search_state'] = (
-                        normalize_stock_quick_search_state(
-                            cloud_payload.get('quick_search_state')
+                    cloud_payload.pop('postclose_sync_pending', None)
+                    sync_ok, _ = (
+                        _save_remote_scope(
+                            gsheet_api_url,
+                            GOOGLE_SCOPE_STOCK,
+                            cloud_payload,
+                            updated_at=cloud_payload.get('updated_at'),
+                            timeout=8,
+                            verify=True,
                         )
                     )
-                    _write_json_atomic(
-                        STOCK_STRATEGY_CACHE_FILE, cloud_payload, indent=2,
-                    )
+                    if sync_ok:
+                        st.session_state['stock_strategy_ranking_snapshots'] = dict(
+                            cloud_payload.get('strategy_ranking_snapshots', {})
+                        )
+                        st.session_state['_stock_quick_search_state'] = (
+                            normalize_stock_quick_search_state(
+                                cloud_payload.get('quick_search_state')
+                            )
+                        )
+                        with _RUNTIME_FILE_LOCK:
+                            if _read_json_cache_file(STOCK_STRATEGY_CACHE_FILE) == local_payload:
+                                cloud_payload.pop('postclose_sync_pending', None)
+                                _write_json_atomic(STOCK_STRATEGY_CACHE_FILE, cloud_payload, indent=2)
 
         st.session_state[
             '_data_cache_sync_status'
@@ -13709,11 +13713,12 @@ def save_data_cache(
                 '但 Google Sheet 回讀未確認成功。'
             )
 
-        if gsheet_api_url and not sync_cloud:
+        if gsheet_api_url and (not sync_cloud or not sync_ok):
             st.session_state['_data_cache_sync_status'] = 'pending'
             maintenance = st.session_state.setdefault('_postclose_maintenance', {})
             maintenance.setdefault('pending_sync', {})['stock'] = time.monotonic()
             maintenance['sync_retry_at'] = 0
+            dispatch_postclose_sync()
         return sync_ok
 
     except (
@@ -13827,6 +13832,8 @@ def load_data_cache():
             )
         )
 
+    st.session_state['_stock_query_restore_pending'] = bool(remote_error)
+
     data = {}
 
     if (
@@ -13874,21 +13881,6 @@ def load_data_cache():
             ] = ''
 
             source = 'google_sheet'
-
-            try:
-                _write_json_atomic(
-                    STOCK_STRATEGY_CACHE_FILE,
-                    _json_safe(
-                        remote_payload
-                    ),
-                    indent=2,
-                )
-            except (
-                OSError,
-                TypeError,
-                ValueError,
-            ):
-                pass
 
     elif local_payload:
         data = local_payload
@@ -13978,7 +13970,16 @@ def load_data_cache():
         data['postclose_sync_pending'] = True
     if data:
         try:
-            _write_json_atomic(STOCK_STRATEGY_CACHE_FILE, _json_safe(data), indent=2)
+            with _RUNTIME_FILE_LOCK:
+                latest = _read_json_cache_file(STOCK_STRATEGY_CACHE_FILE)
+                quick_search_state = normalize_stock_quick_search_state(_newer_timestamped_state(
+                    latest.get('quick_search_state'), quick_search_state,
+                ))
+                st.session_state['_stock_quick_search_state'] = quick_search_state
+                data['quick_search_state'] = quick_search_state
+                if latest.get('postclose_sync_pending'):
+                    data['postclose_sync_pending'] = True
+                _write_json_atomic(STOCK_STRATEGY_CACHE_FILE, _json_safe(data), indent=2)
         except (OSError, TypeError, ValueError):
             pass
 
@@ -14294,10 +14295,10 @@ def persist_stock_quick_search_state(section=None):
 
 
 def render_stock_quick_search(section):
+    restore_stock_quick_search()
     key = 'search_multiselect' if section == 'main' else 'indep_search_multiselect'
     selected = get_stock_quick_search_state().get(section, [])
-    if key not in st.session_state:
-        st.session_state[key] = selected
+    st.session_state[key] = selected
     options = list(dict.fromkeys(build_stock_search_options() + selected))
     return st.multiselect(
         '🔍 快速查詢 (中文/代號)', options=options, key=key,
@@ -22586,13 +22587,13 @@ def sync_postclose_scopes(cloud_url, assets):
             ok, _ = _save_remote_scope(cloud_url, scope, merged,
                                       updated_at=merged.get('updated_at'), timeout=8, verify=True)
             if ok:
-                completed.append(asset)
                 with _RUNTIME_FILE_LOCK:
                     with open(path, encoding='utf-8') as file:
                         latest = json.load(file)
                     if latest == local:
-                        latest.pop('postclose_sync_pending', None)
-                        _write_json_atomic(path, latest, indent=2)
+                        merged.pop('postclose_sync_pending', None)
+                        _write_json_atomic(path, merged, indent=2)
+                        completed.append(asset)
     return completed
 
 
@@ -22681,26 +22682,51 @@ def supplement_frozen_stock_rankings(current, state):
                                             {'stock': pending}, target, False, False, risk, snapshots, stock_modes)}
 
 
-@st.fragment(run_every=60)
-def render_postclose_maintenance():
-    # Reuse this minute tick to resume paused tables; no extra polling fragment.
-    for room in ('stock', 'stock_independent', 'futures', 'futures_independent'):
-        check_intraday_auto_timer(room)
-    current, target, sources_open, ranking_open = postclose_maintenance_window(pd.Timestamp.now(tz='Asia/Taipei'))
+
+def restore_stock_quick_search():
+    """Retry failed startup reads off the UI thread without overwriting subsequent edits."""
+    if not st.session_state.get('_stock_query_restore_pending'):
+        return
     state = st.session_state.setdefault('_postclose_maintenance', {})
-    supplement_frozen_stock_rankings(current, state)
-    if not state.get('sync_restored'):
-        state['sync_restored'] = True
-        if get_app_secret('gsheet_api_url'):
-            for asset, path in (('stock', STOCK_STRATEGY_CACHE_FILE), ('futures', FUTURES_STATE_CACHE_FILE)):
-                try:
-                    with _RUNTIME_FILE_LOCK:
-                        with open(path, encoding='utf-8') as file:
-                            pending = json.load(file).get('postclose_sync_pending')
-                    if pending:
-                        state.setdefault('pending_sync', {})[asset] = time.monotonic()
-                except (OSError, ValueError, TypeError):
-                    pass
+    task = state.get('query_restore_task')
+    if task is not None and task.done():
+        state.pop('query_restore_task')
+        state['query_restore_retry_at'] = time.monotonic() + 60
+        try:
+            remote, error = task.result()
+            if error:
+                return
+            with _RUNTIME_FILE_LOCK:
+                latest = _read_json_cache_file(STOCK_STRATEGY_CACHE_FILE)
+                selected = _newer_timestamped_state(
+                    latest.get('quick_search_state'), get_stock_quick_search_state(),
+                )
+                selected = normalize_stock_quick_search_state(_newer_timestamped_state(
+                    (remote or {}).get('quick_search_state'), selected,
+                ))
+                latest['quick_search_state'] = selected
+                _write_json_atomic(STOCK_STRATEGY_CACHE_FILE, latest, indent=2)
+            st.session_state['_stock_quick_search_state'] = selected
+            st.session_state['_stock_query_restore_pending'] = False
+        except Exception as exc:
+            logger.warning('Stock query restore failed: %s', type(exc).__name__)
+            return
+        st.rerun()
+        return
+    if task is not None or time.monotonic() < state.get('query_restore_retry_at', 0):
+        return
+    cloud_url = get_app_secret('gsheet_api_url')
+    if not cloud_url:
+        return
+    worker = get_postclose_worker()
+    if worker['slot'].acquire(blocking=False):
+        state['query_restore_task'] = worker['executor'].submit(
+            run_postclose_job, worker, _fetch_remote_scope, cloud_url, GOOGLE_SCOPE_STOCK, 15,
+        )
+
+def dispatch_postclose_sync():
+    """Start durable pending saves immediately, without waiting for a page timer."""
+    state = st.session_state.setdefault('_postclose_maintenance', {})
     sync_task = state.get('sync_task')
     if sync_task is not None and sync_task.done():
         state.pop('sync_task')
@@ -22722,6 +22748,30 @@ def render_postclose_maintenance():
                 run_postclose_job, worker, sync_postclose_scopes, get_app_secret('gsheet_api_url'),
                 list(state['pending_sync']),
             )
+
+
+@st.fragment(run_every=60)
+def render_postclose_maintenance():
+    restore_stock_quick_search()
+    # Reuse this minute tick to resume paused tables; no extra polling fragment.
+    for room in ('stock', 'stock_independent', 'futures', 'futures_independent'):
+        check_intraday_auto_timer(room)
+    current, target, sources_open, ranking_open = postclose_maintenance_window(pd.Timestamp.now(tz='Asia/Taipei'))
+    state = st.session_state.setdefault('_postclose_maintenance', {})
+    supplement_frozen_stock_rankings(current, state)
+    if not state.get('sync_restored'):
+        state['sync_restored'] = True
+        if get_app_secret('gsheet_api_url'):
+            for asset, path in (('stock', STOCK_STRATEGY_CACHE_FILE), ('futures', FUTURES_STATE_CACHE_FILE)):
+                try:
+                    with _RUNTIME_FILE_LOCK:
+                        with open(path, encoding='utf-8') as file:
+                            pending = json.load(file).get('postclose_sync_pending')
+                    if pending:
+                        state.setdefault('pending_sync', {})[asset] = time.monotonic()
+                except (OSError, ValueError, TypeError):
+                    pass
+    dispatch_postclose_sync()
     if state.get('pending_sync'):
         st.caption('查詢清單與分析已保留本機，Google Sheet 背景同步中；失敗會自動重試。')
     seed_task = state.get('seed_task')

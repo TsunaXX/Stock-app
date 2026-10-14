@@ -1,5 +1,6 @@
 """Saved selections survive widget cleanup and independent market-data versions."""
 import ast
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -18,6 +19,7 @@ def test_restore_queries_uses_own_version_including_explicit_empty_list():
               'quick_search_state': {'main':['1815 富喬'], 'updated_at':'2026-10-05'}}
     state, writes = {}, []
     ns.update(st=SimpleNamespace(session_state=state), STOCK_STRATEGY_CACHE_FILE='stock.json',
+              _RUNTIME_FILE_LOCK=threading.RLock(),
               _read_json_cache_file=lambda _: local, get_app_secret=lambda _: 'configured',
               GOOGLE_SCOPE_STOCK='stock_strategy', _fetch_remote_scope_cached=lambda *a, **k: (remote, ''),
               _cache_payload_timestamp=lambda d: pd.Timestamp(d['stock_data_updated_at']),
@@ -74,6 +76,7 @@ st.session_state.setdefault('stock_data', pd.DataFrame())
 st.session_state.setdefault('ignored_stocks', set())
 st.session_state.setdefault('all_candidates', [])
 st.session_state.setdefault('saved_notes', {})
+restore_stock_quick_search = lambda: None
 build_stock_search_options = lambda: ['2330 台積電']
 save_search_cache = lambda v: None
 def save_data_cache(*a, **kw):
@@ -96,6 +99,9 @@ if not st.session_state.get('hide', False):
     app = AppTest.from_string(source).run()
     app.multiselect(key='search_multiselect').set_value(['2330 台積電']).run()
     app.multiselect(key='futures_quick_add').set_value(['CDF:202610']).run()
+    app.session_state['search_multiselect'] = []
+    app.run()
+    assert app.multiselect(key='search_multiselect').value == ['2330 台積電']
     app.session_state['volume'] = 200
     app.run()
     assert not app.exception and app.multiselect(key='futures_quick_add').value == ['CDF:202610']
@@ -149,3 +155,156 @@ def test_holiday_labels_distinguish_observed_and_actual_dates():
     fallback = ns['get_holidays'](2026)
     assert fallback[(10,26)] == '臺灣光復暨金門古寧頭大捷紀念日 補假'
     assert fallback[(10,25)] == '臺灣光復暨金門古寧頭大捷紀念日'
+
+
+def test_stale_session_save_preserves_newer_local_query_edit(tmp_path):
+    import json
+    import threading
+    ns = load_app_symbols('save_data_cache', 'get_stock_quick_search_state',
+                          'normalize_stock_quick_search_state', '_state_updated_at',
+                          '_newer_timestamped_state')
+    path = tmp_path / 'stock.json'
+    newer = {'main':['1815 富喬'], 'independent':[], 'updated_at':'2026-10-14T10:00:00+08:00'}
+    path.write_text(json.dumps({'quick_search_state':newer, 'postclose_sync_pending':True}))
+    ns.update(st=SimpleNamespace(session_state={'_stock_quick_search_state':
+                  {'main':[], 'independent':[], 'updated_at':'2026-10-14T09:00:00+08:00'}}),
+              STOCK_STRATEGY_CACHE_FILE=path, _RUNTIME_FILE_LOCK=threading.RLock(),
+              _json_safe=lambda v:v, get_stock_display_settings=lambda:{},
+              get_app_secret=lambda k:'',
+              _read_json_cache_file=lambda p:json.loads(p.read_text()),
+              _write_json_atomic=lambda p,d,**kw:p.write_text(json.dumps(d)))
+    assert ns['save_data_cache'](pd.DataFrame(),set(),sync_cloud=False)
+    assert json.loads(path.read_text())['quick_search_state'] == newer
+
+
+def test_restore_does_not_write_remote_before_merging_queries():
+    ns = load_app_symbols('load_data_cache', 'normalize_stock_quick_search_state',
+                          '_newer_timestamped_state', '_state_updated_at')
+    import threading
+    local = {'stock_data':[], 'stock_data_updated_at':'2026-10-13',
+             'quick_search_state':{'main':['1815 富喬'], 'independent':[], 'updated_at':'2026-10-14'},
+             'postclose_sync_pending':True}
+    remote = {'stock_data':[], 'stock_data_updated_at':'2026-10-14',
+              'quick_search_state':{'main':[], 'independent':[], 'updated_at':'2026-10-13'}}
+    writes = []
+    ns.update(st=SimpleNamespace(session_state={}), STOCK_STRATEGY_CACHE_FILE='stock.json',
+              _RUNTIME_FILE_LOCK=threading.RLock(),
+              _read_json_cache_file=lambda _:local, get_app_secret=lambda _:'configured',
+              GOOGLE_SCOPE_STOCK='stock_strategy', _fetch_remote_scope_cached=lambda *a,**k:(remote,''),
+              _cache_payload_timestamp=lambda d:pd.Timestamp(d['stock_data_updated_at']),
+              _write_json_atomic=lambda p,d,**kw:writes.append(dict(d)), _json_safe=lambda v:v,
+              normalize_stock_display_settings=lambda v:v, load_search_cache=lambda:[])
+    ns['load_data_cache']()
+    assert writes and all(w['quick_search_state'] == local['quick_search_state'] for w in writes)
+
+
+def test_failed_cloud_save_keeps_queries_pending_and_starts_retry(tmp_path):
+    import json
+    ns = load_app_symbols('save_data_cache', 'get_stock_quick_search_state',
+                          'normalize_stock_quick_search_state', '_state_updated_at',
+                          '_newer_timestamped_state')
+    path = tmp_path / 'stock.json'
+    selected = {'main':['1815 富喬'], 'independent':[], 'updated_at':'2026-10-14'}
+    state = {'_stock_quick_search_state':selected}
+    posted, dispatched = [], []
+    def post(url, scope, payload, **kwargs):
+        posted.append(dict(payload))
+        return False, None
+    ns.update(st=SimpleNamespace(session_state=state), STOCK_STRATEGY_CACHE_FILE=path,
+              _RUNTIME_FILE_LOCK=threading.RLock(), get_data_cache_sync_lock=lambda:threading.RLock(),
+              _json_safe=lambda v:v, get_stock_display_settings=lambda:{},
+              get_app_secret=lambda k:'configured', GOOGLE_SCOPE_STOCK='stock_strategy',
+              _read_json_cache_file=lambda p:json.loads(p.read_text()) if p.exists() else {},
+              _write_json_atomic=lambda p,d,**kw:p.write_text(json.dumps(d)),
+              _fetch_remote_scope=lambda *a,**kw:({},None),
+              _merge_data_cache_payload=lambda remote,local,**kw:dict(local),
+              _save_remote_scope=post, dispatch_postclose_sync=lambda:dispatched.append(True))
+    assert ns['save_data_cache'](pd.DataFrame(),set()) is False
+    disk = json.loads(path.read_text())
+    assert disk['quick_search_state'] == selected and disk['postclose_sync_pending'] is True
+    assert dispatched == [True] and state['_data_cache_sync_status'] == 'pending'
+    assert 'postclose_sync_pending' not in posted[0]
+    # Deferred edits start a job now, without waiting for render_postclose_maintenance.
+    dispatched.clear()
+    assert ns['save_data_cache'](pd.DataFrame(),set(),sync_cloud=False)
+    assert dispatched == [True] and len(posted) == 1
+    posted.clear()
+    ns['_fetch_remote_scope'] = lambda *a,**kw:(None,'timeout')
+    assert ns['save_data_cache'](pd.DataFrame(),set()) is False
+    assert not posted and json.loads(path.read_text())['postclose_sync_pending'] is True
+
+
+def test_restore_preserves_query_edit_made_during_remote_read():
+    ns = load_app_symbols('load_data_cache', 'normalize_stock_quick_search_state',
+                          '_newer_timestamped_state', '_state_updated_at')
+    original = {'stock_data':[], 'stock_data_updated_at':'2026-10-13',
+                'quick_search_state':{'main':[], 'updated_at':'2026-10-13'}}
+    latest = dict(original)
+    selected = {'main':['1815 富喬'], 'independent':[], 'updated_at':'2026-10-14T10:00:00+08:00'}
+    def fetch(*a, **kw):
+        latest.update(quick_search_state=selected, postclose_sync_pending=True)
+        return dict(original), None
+    state, writes = {}, []
+    ns.update(st=SimpleNamespace(session_state=state), STOCK_STRATEGY_CACHE_FILE='stock.json',
+              _RUNTIME_FILE_LOCK=threading.RLock(),
+              _read_json_cache_file=lambda _:dict(latest), get_app_secret=lambda _:'configured',
+              GOOGLE_SCOPE_STOCK='stock_strategy', _fetch_remote_scope_cached=fetch,
+              _cache_payload_timestamp=lambda d:pd.Timestamp(d['stock_data_updated_at']),
+              _write_json_atomic=lambda p,d,**kw:writes.append(dict(d)), _json_safe=lambda v:v,
+              normalize_stock_display_settings=lambda v:v, load_search_cache=lambda:[])
+    ns['load_data_cache']()
+    assert state['_stock_quick_search_state'] == selected
+    assert len(writes) == 1 and writes[0]['postclose_sync_pending'] is True
+    assert writes[0]['quick_search_state'] == selected
+    ns['_fetch_remote_scope_cached'] = lambda *a,**kw:(None,'timeout')
+    ns['load_data_cache']()
+    assert state['_stock_query_restore_pending'] is True
+    assert state['_stock_quick_search_state'] == selected
+
+
+def test_failed_startup_read_recovers_queries_in_background_without_erasing_edits(tmp_path):
+    import json
+    import logging
+    ns = load_app_symbols('restore_stock_quick_search','normalize_stock_quick_search_state',
+                          'get_stock_quick_search_state','_newer_timestamped_state','_state_updated_at')
+    path = tmp_path / 'stock.json'
+    cloud = {'main':['1815 富喬'], 'independent':[], 'updated_at':'2026-10-14T10:00:00+08:00'}
+    state = {'_stock_query_restore_pending':True}
+    jobs, reruns = [], []
+    task = SimpleNamespace(done=lambda:False, result=lambda:({'quick_search_state':cloud},None))
+    slot = threading.BoundedSemaphore(1)
+    worker = {'slot':slot,'executor':SimpleNamespace(submit=lambda *a:jobs.append(a) or task)}
+    ns.update(st=SimpleNamespace(session_state=state,rerun=lambda:reruns.append(True)),
+              STOCK_STRATEGY_CACHE_FILE=path, GOOGLE_SCOPE_STOCK='stock_strategy',
+              _RUNTIME_FILE_LOCK=threading.RLock(), logger=logging.getLogger('query-test'),
+              _read_json_cache_file=lambda p:json.loads(p.read_text()) if p.exists() else {},
+              _write_json_atomic=lambda p,d,**kw:p.write_text(json.dumps(d)),
+              get_postclose_worker=lambda:worker, get_app_secret=lambda _:'configured',
+              run_postclose_job=lambda *a:None, _fetch_remote_scope=lambda *a:None)
+    ns['restore_stock_quick_search']()
+    ns['restore_stock_quick_search']()
+    assert len(jobs) == 1 and jobs[0][-1] == 15
+    slot.release()
+    task.done = lambda:True
+    # A failed read is retried later, not latched as a permanently empty selection.
+    task.result = lambda:(None,'timeout')
+    ns['restore_stock_quick_search']()
+    assert state['_stock_query_restore_pending'] is True and not reruns
+    ns['restore_stock_quick_search']()
+    assert len(jobs) == 1
+    state['_postclose_maintenance']['query_restore_retry_at'] = 0
+    ns['restore_stock_quick_search']()
+    slot.release()
+    task.result = lambda:({'quick_search_state':cloud},None)
+    ns['restore_stock_quick_search']()
+    assert state['_stock_quick_search_state'] == cloud and reruns == [True]
+    assert json.loads(path.read_text())['quick_search_state'] == cloud
+    # Explicit removals made while the cloud read was in flight must win.
+    cleared = {'main':[], 'independent':[], 'updated_at':'2026-10-14T11:00:00+08:00'}
+    state['_stock_query_restore_pending'] = True
+    state['_postclose_maintenance']['query_restore_task'] = task
+    state['_stock_quick_search_state'] = cleared
+    path.write_text(json.dumps({'quick_search_state':cleared,'postclose_sync_pending':True}))
+    ns['restore_stock_quick_search']()
+    assert state['_stock_quick_search_state'] == cleared
+    assert json.loads(path.read_text())['postclose_sync_pending'] is True
