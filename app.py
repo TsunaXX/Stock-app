@@ -1004,6 +1004,7 @@ TWSE_HOLIDAY_URL = "https://www.twse.com.tw/holidaySchedule/holidaySchedule?resp
 TWSE_NEWS_URL = "https://www.twse.com.tw/news/newsList?response=json"
 FOMC_CALENDAR_URL = "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm"
 BLS_CPI_URL = "https://www.bls.gov/schedule/news_release/cpi.htm"
+BLS_PPI_URL = "https://www.bls.gov/schedule/news_release/ppi.htm"
 BLS_EMPLOYMENT_URL = "https://www.bls.gov/schedule/news_release/empsit.htm"
 BLS_YEAR_SCHEDULE_URL = "https://www.bls.gov/schedule/{year}/home.htm"
 BLS_RELEASE_ICS_URL = "https://www.bls.gov/schedule/news_release/bls.ics"
@@ -1104,6 +1105,9 @@ def _tradingview_macro_events(year, event_type):
                 title.upper() == "CPI" and indicator.lower() == "consumer price index cpi"
             )
             event_title = "美國 CPI 公布"
+        elif event_type == "ppi":
+            matched = ticker in {"ECONOMICS:USPPIMM", "ECONOMICS:USPPIYY"}
+            event_title = "美國 PPI 公布"
         elif event_type == "nfp":
             matched = title.lower() == "non farm payrolls" and ticker == "ECONOMICS:USNFP"
             event_title = "美國大非農／失業率"
@@ -1477,6 +1481,30 @@ def fetch_bls_cpi_events(year):
     return _tradingview_macro_events(year, "ism_manufacturing")
 
 
+@st.cache_data(ttl=60 * 60 * 12, max_entries=12, show_spinner=False)
+def fetch_bls_ppi_events(year):
+    """美國生產者物價指數：官方公布排程優先，TradingView 為備援。"""
+    verified_events = _verified_bls_2026_events(year, "ppi")
+    if verified_events:
+        # 2026 全年日期已核對，避免雲端環境對 BLS 被封鎖時重複等待。
+        return verified_events
+    fallback_events = _tradingview_macro_events(year, "ppi")
+    official_events = _parse_bls_release_ics(
+        _calendar_get(BLS_RELEASE_ICS_URL), year, "Producer Price Index", "美國 PPI 公布"
+    )
+    if not official_events:
+        official_events = _parse_bls_year_schedule(
+            _calendar_get(BLS_YEAR_SCHEDULE_URL.format(year=year)), year,
+            "Producer Price Index", "美國 PPI 公布",
+        )
+    if not official_events:
+        official_events = _parse_official_release_schedule(
+            _calendar_get(BLS_PPI_URL), year, "美國 PPI 公布",
+            "U.S. Bureau of Labor Statistics",
+        )
+    return _merge_macro_events(fallback_events, official_events)
+
+
 def _parse_official_release_schedule(response, year, event_title, source):
     """解析美國官方發布排程的日期與美東時間，統一換算成台灣時間。"""
     if not response or "Access Denied" in response.text:
@@ -1486,7 +1514,7 @@ def _parse_official_release_schedule(response, year, event_title, source):
         ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"], 1
     )}
     pattern = re.compile(
-        r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.\s*(\d{1,2}),\s*(\d{4})\s*(\d{1,2}):(\d{2})\s*(AM|PM)",
+        r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.?\s*(\d{1,2}),\s*(\d{4})\s*(\d{1,2}):(\d{2})\s*(AM|PM)",
         re.I,
     )
     events, seen = [], set()
@@ -1600,12 +1628,15 @@ def _verified_bls_2026_events(year, release_type):
     verified_dates = {
         "cpi": [(1, 13), (2, 13), (3, 11), (4, 10), (5, 12), (6, 10),
                 (7, 14), (8, 12), (9, 11), (10, 14), (11, 10), (12, 10)],
+        "ppi": [(1, 14), (1, 30), (2, 27), (3, 18), (4, 14), (5, 13),
+                (6, 11), (7, 15), (8, 13), (9, 10), (10, 15), (11, 13), (12, 15)],
         "employment": [(1, 9), (2, 11), (3, 6), (4, 3), (5, 8), (6, 5),
                        (7, 2), (8, 7), (9, 4), (10, 2), (11, 6), (12, 4)],
     }
     if year != 2026 or release_type not in verified_dates:
         return []
-    event_title = "美國 CPI 公布" if release_type == "cpi" else "美國大非農／失業率"
+    event_title = {"cpi": "美國 CPI 公布", "ppi": "美國 PPI 公布",
+                   "employment": "美國大非農／失業率"}[release_type]
     events = []
     for month, day in verified_dates[release_type]:
         taiwan_dt = _taiwan_time_from_eastern(year, month, day, 8, 30)
@@ -3658,7 +3689,7 @@ def fetch_recent_macro_results(start_date, end_date):
 @st.fragment(run_every=60)
 def render_macro_release_status(year, month, selected_labels, active):
     if not active or not set(selected_labels).intersection({
-        'CPI', '大非農', 'GDP', '核心 PCE', 'ISM 製造業', 'FOMC', '小非農 ADP', '初領失業金',
+        'CPI', 'PPI', '大非農', 'GDP', '核心 PCE', 'ISM 製造業', 'FOMC', '小非農 ADP', '初領失業金',
     }):
         return
     now = datetime.now(pytz.timezone('Asia/Taipei'))
@@ -3747,6 +3778,7 @@ def fetch_selected_calendar_sources(year, selected_event_types, taiwan_closed_da
 
     add('FOMC 利率決議', 'FOMC', lambda: fetch_fomc_events(year))
     add('美國 CPI', 'CPI', lambda: fetch_bls_cpi_events(year))
+    add('美國 PPI', 'PPI', lambda: fetch_bls_ppi_events(year))
     add('美國核心 PCE', '核心 PCE', lambda: fetch_bea_core_pce_events(year))
     add('美國 GDP', 'GDP', lambda: fetch_bea_gdp_events(year))
     add('美國 ISM 製造業指數', 'ISM 製造業', lambda: fetch_ism_manufacturing_events(year))
@@ -26225,6 +26257,7 @@ with tab3:
         "台股突發休市公告",
         "FOMC 利率決議",
         "美國 CPI",
+        "美國 PPI",
         "美國核心 PCE",
         "美國 GDP",
         "美國 ISM 製造業指數",
@@ -26242,12 +26275,13 @@ with tab3:
         "FOMC 利率決議", "美國 CPI", "美國大非農", "美國小非農 ADP", "美國初領失業金"
     ]
     US_HIGH_IMPACT_EVENTS = [
-        "FOMC 利率決議", "美國 CPI", "美國核心 PCE", "美國 GDP",
+        "FOMC 利率決議", "美國 CPI", "美國 PPI", "美國核心 PCE", "美國 GDP",
         "美國 ISM 製造業指數", "美國大非農", "美國小非農 ADP", "美國初領失業金",
     ]
     US_HIGH_IMPACT_DESCRIPTIONS = {
         "FOMC 利率決議": "聯準會利率決策與政策聲明",
         "美國 CPI": "消費者物價指數，觀察通膨",
+        "美國 PPI": "生產者物價指數，觀察上游生產成本與通膨壓力",
         "美國核心 PCE": "BEA 個人消費支出物價指數（排除食品與能源），Fed 重點通膨指標",
         "美國 GDP": "BEA 國內生產毛額的初值、修正值與終值",
         "美國 ISM 製造業指數": "ISM 製造業 PMI，觀察製造業景氣擴張或收縮",
@@ -26522,6 +26556,7 @@ with tab3:
                 fetch_twse_temporary_closure_events.clear()
                 fetch_fomc_events.clear()
                 fetch_bls_cpi_events.clear()
+                fetch_bls_ppi_events.clear()
                 fetch_bea_release_schedule_html.clear()
                 fetch_bea_core_pce_events.clear()
                 fetch_bea_gdp_events.clear()
@@ -26727,6 +26762,7 @@ with tab3:
         source_labels_by_option = {
             "FOMC 利率決議": "FOMC",
             "美國 CPI": "CPI",
+            "美國 PPI": "PPI",
             "美國核心 PCE": "核心 PCE",
             "美國 GDP": "GDP",
             "美國 ISM 製造業指數": "ISM 製造業",
@@ -26955,7 +26991,7 @@ with tab3:
                     color = "#FFB74D"
                 elif event.get("impact") == "routine":
                     color = "#B0BEC5"
-                elif "CPI" in event.get("title", "") or "核心 PCE" in event.get("title", ""):
+                elif "CPI" in event.get("title", "") or "PPI" in event.get("title", "") or "核心 PCE" in event.get("title", ""):
                     color = "#00FA9A"
                 elif "GDP" in event.get("title", ""):
                     color = "#42A5F5"

@@ -255,7 +255,8 @@ def merge_company_sections(snapshot, sections, prefer_existing=False):
 
 
 MACRO_TITLES = {
-    'ECONOMICS:USCPI': 'CPI', 'ECONOMICS:USNFP': '大非農',
+    'ECONOMICS:USCPI': 'CPI', 'ECONOMICS:USPPIMM': 'PPI',
+    'ECONOMICS:USPPIYY': 'PPI', 'ECONOMICS:USNFP': '大非農',
     'ECONOMICS:USGDPQQ': 'GDP', 'ECONOMICS:USCPCEPIMM': '核心 PCE',
     'ECONOMICS:USCPCEPIAC': '核心 PCE', 'ECONOMICS:USBCOI': 'ISM 製造業',
     'ECONOMICS:USADP': '小非農 ADP', 'ECONOMICS:USIR': 'FOMC',
