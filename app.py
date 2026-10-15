@@ -14999,6 +14999,10 @@ def current_stock_source_candidates(hide_non_stock=False):
         and not st.session_state.get('cloud_url_input', '').strip()
     )
     frame = st.session_state.get('turnover_ranking_df') if use_official else None
+    if kind == 'legacy' and use_official and (not isinstance(frame, pd.DataFrame) or frame.empty):
+        st.session_state['_stock_source_restore_needed'] = True
+        st.caption('正在背景還原官方選股來源；完成前保留主表，不使用舊候補遞補。')
+        return []
     if isinstance(frame, pd.DataFrame) and not frame.empty and (not source_date or ranking_date >= source_date):
         candidates = stock_source_candidates(frame)
         previous = [tuple(c) for c in st.session_state.all_candidates if len(c) >= 4 and c[2] == 'upload']
@@ -22888,9 +22892,41 @@ def dispatch_postclose_sync():
             )
 
 
+def restore_stock_source():
+    """Migrate unlabelled legacy candidates once, using the shared bounded worker."""
+    state = st.session_state.setdefault('_postclose_maintenance', {})
+    task = state.get('source_restore_task')
+    if task is not None and task.done():
+        state.pop('source_restore_task')
+        try:
+            ranking, source_date = task.result()
+            if ranking.empty:
+                raise ValueError('empty official ranking')
+        except Exception:
+            state['source_restore_retry_at'] = time.monotonic() + 60
+            return
+        # A file/cloud analysis may have replaced the source while this job ran.
+        if st.session_state.get('_stock_source_kind', 'legacy') == 'legacy':
+            st.session_state.update(turnover_ranking_df=ranking, goodinfo_df=ranking,
+                                    turnover_ranking_source='official', turnover_ranking_date=source_date.isoformat())
+            _save_official_turnover_cache(ranking, source_date)
+            current_stock_source_candidates()
+        st.session_state['_stock_source_restore_needed'] = False
+        st.rerun()
+        return
+    if task is None and time.monotonic() >= state.get('source_restore_retry_at', 0):
+        worker = get_postclose_worker()
+        if worker['slot'].acquire(blocking=False):
+            state['source_restore_task'] = worker['executor'].submit(
+                run_postclose_job, worker, fetch_official_turnover_ranking,
+            )
+
+
 @st.fragment(run_every=60)
 def render_postclose_maintenance():
     restore_stock_quick_search()
+    if st.session_state.get('_stock_source_restore_needed'):
+        restore_stock_source()
     # Reuse this minute tick to resume paused tables; no extra polling fragment.
     for room in ('stock', 'stock_independent', 'futures', 'futures_independent'):
         check_intraday_auto_timer(room)
