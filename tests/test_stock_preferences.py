@@ -97,6 +97,8 @@ if not hide:
     render_stock_strategy_controls()
 '''
     app = AppTest.from_string(source).run()
+    migrated = json.loads((tmp_path / 'settings.json').read_text())['display_settings']
+    assert migrated['updated_at'] and migrated['limit_rows'] == 5
     app.number_input(key='limit_rows_input').set_value(6).run()
     app.checkbox(key='stock_hide_non_stock').uncheck().run()
     assert not app.exception and not any(b.key == 'save_stock_room_settings' for b in app.button)

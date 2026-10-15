@@ -12722,12 +12722,15 @@ def merge_stock_preferences(remote, local):
             'stock_source_kind': source.get('kind', 'legacy'), 'stock_source_date': source.get('date', '')}
 
 
-def persist_stock_display_settings(field, widget_key):
+def persist_stock_display_settings(field=None, widget_key=None):
     with _RUNTIME_FILE_LOCK:
         latest = _read_json_cache_file(STOCK_STRATEGY_CACHE_FILE)
         settings = merge_stock_preferences(latest, {'display_settings': get_stock_display_settings()})['display_settings']
         settings = normalize_stock_display_settings(settings)
-        settings[field] = st.session_state[widget_key]
+        if field is None and settings.get('updated_at'):
+            return
+        if field is not None:
+            settings[field] = st.session_state[widget_key]
         settings['updated_at'] = datetime.now(pytz.timezone('Asia/Taipei')).isoformat()
         st.session_state['_stock_display_settings'] = settings
         st.session_state.limit_rows = int(settings['limit_rows'])
@@ -14872,6 +14875,9 @@ def render_stock_strategy_controls():
                                            {'display_settings': get_stock_display_settings()})['display_settings']
         settings = normalize_stock_display_settings(settings)
         st.session_state['_stock_display_settings'] = settings
+        if not settings.get('updated_at') and not st.session_state.get('_stock_query_restore_pending'):
+            persist_stock_display_settings()
+            settings = get_stock_display_settings()
         st.session_state.limit_rows = settings['limit_rows']
         for field, key in (('hide_non_stock', 'stock_hide_non_stock'),
                            ('allow_warrant_search', 'allow_warrant_search'),
