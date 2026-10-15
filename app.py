@@ -12792,7 +12792,6 @@ def merge_stock_preferences(remote, local):
                 'values': merged_values, 'updated_at': group_time,
                 'field_updated_at': merged_times,
             }
-    settings = normalize_stock_display_settings(settings)
     sources = []
     versioned_source = remote.get('stock_source_updated_at') or local.get('stock_source_updated_at')
     for payload in (remote, local):
@@ -20602,7 +20601,7 @@ def intraday_auto_status_text(room, enabled):
 
 def _stored_auto_time(value, fallback):
     try:
-        return datetime.strptime(str(value), '%H:%M').time()
+        return dt_time.fromisoformat(str(value)).replace(second=0, microsecond=0)
     except (TypeError, ValueError):
         return fallback
 

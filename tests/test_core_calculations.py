@@ -24,7 +24,6 @@ import plotly.graph_objects as go
 from bs4 import BeautifulSoup
 from plotly.subplots import make_subplots
 from market_automation import attach_macro_results, data_version, index_scenario, macro_results, merge_company_sections, merge_macro_results, vwap_guard
-from model_tracking import normalize_costs
 
 
 APP_PATH = Path(__file__).parents[1] / "app.py"
@@ -34,8 +33,7 @@ APPS_SCRIPT_PATH = Path(__file__).parents[1] / "google_apps_script.gs"
 def load_app_symbols(*names):
     """Compile selected top-level helpers so importing app.py cannot render the UI."""
     names = set(names) | {"merge_stock_preferences", "_newer_timestamped_state", "_state_updated_at",
-                          "normalize_stock_display_settings", "CATHAY_FEE_DEFAULTS",
-                          "CATHAY_FEE_SCHEDULE_VERSION", "_stored_auto_time"}
+                          "_stored_auto_time"}
     tree = ast.parse(APP_PATH.read_text(encoding="utf-8"))
     selected = []
     for node in tree.body:
@@ -55,7 +53,6 @@ def load_app_symbols(*names):
         "dt_time": dt_time,
         "timedelta": timedelta,
         "Decimal": Decimal,
-        "normalize_costs": normalize_costs,
         "ROUND_CEILING": ROUND_CEILING,
         "ROUND_FLOOR": ROUND_FLOOR,
         "ROUND_HALF_UP": ROUND_HALF_UP,

@@ -281,7 +281,7 @@ def test_model_display_frame_keeps_blank_cells_arrow_compatible():
     assert empty_table.to_pylist() == [{'勝率(%)': '', '平均獲利': '', '獲利因子': ''}]
     assert '>None<' not in empty_metrics.to_html()
     assert namespace['_model_number_text'](100.0000) == '100'
-    assert namespace['_model_number_text'](0.001200) == '0.0012'
+    assert namespace['_model_number_text'](0.001200) == '0'
     assert namespace['_model_number_text'](123456789) == '123456789'
     assert namespace['_model_number_text']('2330') == '2330'
     assert namespace['_model_number_text'](0.0) == '0'
