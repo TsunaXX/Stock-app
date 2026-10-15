@@ -3792,6 +3792,7 @@ st.session_state.stock_data = pd.DataFrame([
 st.session_state.ignored_stocks = {'3441'}
 st.session_state.limit_rows = 5
 st.session_state.all_candidates = [('8111','立碁','upload',0)]
+st.session_state._stock_source_kind = 'file'
 st.session_state.prefetch_cache = {'8111':{'代號':'8111','名稱':'立碁','收盤價':100,
     '_ma5':99,'_points':[],'狀態':'','期貨':'無','戰略備註':'固定','漲跌幅':0,'_source':'search','_source_rank':2,'_order':0}}
 save_data_cache = lambda *args, **kwargs: True

@@ -61,6 +61,34 @@ def test_refill_uses_loaded_official_order_and_keeps_file_source_separate():
     assert [c[0] for c in ns['stock_source_candidates'](mixed, True)] == ['2330']
 
 
+def test_legacy_source_without_ranking_defers_instead_of_using_old_candidates():
+    ns = load_app_symbols('current_stock_source_candidates')
+    state = {'_stock_source_kind': 'legacy', 'all_candidates': [('8111', '立碁', 'upload', 0)]}
+    messages = []
+    ns['st'] = SimpleNamespace(session_state=state, caption=messages.append)
+    assert ns['current_stock_source_candidates']() == []
+    assert state['_stock_source_restore_needed'] and messages
+
+
+@pytest.mark.parametrize('kind', ['legacy', 'file'])
+def test_background_legacy_restore_preserves_a_new_file_source(kind):
+    from datetime import date
+    ns = load_app_symbols('restore_stock_source')
+    ranking = pd.DataFrame({'代號': ['6668'], '名稱': ['中揚光']})
+    state = {'_stock_source_kind': kind, '_stock_source_restore_needed': True,
+             '_postclose_maintenance': {'source_restore_task': SimpleNamespace(
+                 done=lambda: True, result=lambda: (ranking, date(2026, 10, 15)))}}
+    saved, refreshed, reruns = [], [], []
+    ns.update(st=SimpleNamespace(session_state=state, rerun=lambda: reruns.append(True)),
+              _save_official_turnover_cache=lambda *a: saved.append(a),
+              current_stock_source_candidates=lambda: refreshed.append(True))
+    ns['restore_stock_source']()
+    assert not state['_stock_source_restore_needed'] and reruns
+    assert bool(saved) == bool(refreshed) == (kind == 'legacy')
+    if kind == 'legacy':
+        assert state['turnover_ranking_date'] == '2026-10-15'
+
+
 def test_display_widgets_autosave_across_hidden_tabs_and_new_devices(tmp_path):
     from streamlit.testing.v1 import AppTest
     names = {'normalize_stock_display_settings', 'get_stock_display_settings',
