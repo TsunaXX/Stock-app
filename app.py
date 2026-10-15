@@ -10797,11 +10797,16 @@ def load_model_tracking_costs():
     """Return editable Cathay rates, migrating only the former default fee."""
     with _RUNTIME_FILE_LOCK:
         config = load_config()
-        saved = config.get('model_tracking_costs')
+        shared = get_stock_display_settings().get('model_tracking_costs', {})
+        shared_values = shared.get('values', {}) if isinstance(shared, dict) else {}
+        saved = shared_values or config.get('model_tracking_costs')
         saved = dict(saved) if isinstance(saved, dict) else {}
         changed = saved.get('_cathay_fee_schedule') != CATHAY_FEE_SCHEDULE_VERSION
         if changed and (saved.get('futures_fee') is None or saved.get('futures_fee') == 50):
             saved['futures_fee'] = 10
+        if 'option_monthly_fee' not in saved and _safe_number(config.get('saved_opt_fee')) is not None:
+            saved['option_monthly_fee'] = int(_safe_number(config['saved_opt_fee']))
+            changed = True
         for key, value in CATHAY_FEE_DEFAULTS.items():
             if key not in saved:
                 saved[key] = value
@@ -10813,6 +10818,8 @@ def load_model_tracking_costs():
             config['model_tracking_costs'] = saved
             _write_json_atomic(CONFIG_FILE, config)
     costs = normalize_costs(saved)
+    minimum_fee = _safe_number(saved.get('stock_min_fee', 20))
+    costs['stock_min_fee'] = max(0, min(100000, int(minimum_fee))) if minimum_fee is not None else 20
     for key, default in CATHAY_FEE_DEFAULTS.items():
         value = _safe_number(saved.get(key))
         costs[key] = max(0, min(100000, int(value))) if value is not None else default
@@ -12680,13 +12687,63 @@ def normalize_stock_display_settings(value):
         limit_rows = int(source.get('limit_rows', 5))
     except (TypeError, ValueError):
         limit_rows = 5
-    return {
+    result = {
         **({'updated_at': str(source['updated_at'])} if source.get('updated_at') else {}),
         'limit_rows': max(1, limit_rows),
         'hide_non_stock': bool(source.get('hide_non_stock', True)),
         'allow_warrant_search': bool(source.get('allow_warrant_search', False)),
         'show_3d_hilo': bool(source.get('show_3d_hilo', False)),
     }
+    for key in ('auto_update_settings', 'model_tracking_costs'):
+        if key not in source:
+            continue
+        saved_group = source.get(key)
+        saved_group = saved_group if isinstance(saved_group, dict) else {}
+        values = saved_group.get('values')
+        values = values if isinstance(values, dict) else {}
+        if key == 'auto_update_settings':
+            normalized = {}
+            for room, setting in values.items():
+                if not isinstance(setting, dict):
+                    continue
+                try:
+                    seconds = max(1, min(300, int(setting.get('seconds', 5))))
+                except (TypeError, ValueError, OverflowError):
+                    seconds = 5
+                times = {}
+                for field, default in (('start', '09:00'), ('end', '13:30')):
+                    raw = str(setting.get(field, default))
+                    try:
+                        times[field] = datetime.strptime(raw, '%H:%M').strftime('%H:%M')
+                    except ValueError:
+                        times[field] = default
+                normalized[str(room)] = {
+                    'seconds': seconds, **times,
+                    'restricted': bool(setting.get('restricted', str(room).startswith('stock'))),
+                }
+        else:
+            normalized = normalize_costs(values)
+            try:
+                normalized['stock_min_fee'] = max(0, min(100000, int(float(values.get('stock_min_fee', 20)))))
+            except (TypeError, ValueError, OverflowError):
+                normalized['stock_min_fee'] = 20
+            for fee_key, default in CATHAY_FEE_DEFAULTS.items():
+                try:
+                    normalized[fee_key] = max(0, min(100000, int(float(values.get(fee_key, default)))))
+                except (TypeError, ValueError, OverflowError):
+                    normalized[fee_key] = default
+            normalized['_cathay_fee_schedule'] = str(
+                values.get('_cathay_fee_schedule', CATHAY_FEE_SCHEDULE_VERSION)
+            )
+        result[key] = {
+            'values': normalized,
+            **({'updated_at': str(saved_group['updated_at'])} if saved_group.get('updated_at') else {}),
+            'field_updated_at': {
+                str(name): str(timestamp)
+                for name, timestamp in (saved_group.get('field_updated_at', {}) or {}).items()
+            } if isinstance(saved_group.get('field_updated_at', {}), dict) else {},
+        }
+    return result
 
 
 def get_stock_display_settings():
@@ -12706,7 +12763,35 @@ def get_stock_display_settings():
 def merge_stock_preferences(remote, local):
     """Preferences and source order have their own versions, independent of quotes."""
     remote, local = remote or {}, local or {}
-    settings = _newer_timestamped_state(remote.get('display_settings'), local.get('display_settings'))
+    remote_settings = remote.get('display_settings') if isinstance(remote.get('display_settings'), dict) else {}
+    local_settings = local.get('display_settings') if isinstance(local.get('display_settings'), dict) else {}
+    settings = _newer_timestamped_state(remote_settings, local_settings)
+    for key in ('auto_update_settings', 'model_tracking_costs'):
+        remote_group = remote_settings.get(key) if isinstance(remote_settings.get(key), dict) else {}
+        local_group = local_settings.get(key) if isinstance(local_settings.get(key), dict) else {}
+        remote_values = remote_group.get('values', {}) if isinstance(remote_group.get('values'), dict) else {}
+        local_values = local_group.get('values', {}) if isinstance(local_group.get('values'), dict) else {}
+        remote_times = remote_group.get('field_updated_at', {}) if isinstance(remote_group.get('field_updated_at'), dict) else {}
+        local_times = local_group.get('field_updated_at', {}) if isinstance(local_group.get('field_updated_at'), dict) else {}
+        merged_values, merged_times = {}, {}
+        for item_key in set(remote_values) | set(local_values):
+            remote_item = {'updated_at': remote_times.get(item_key, remote_group.get('updated_at', '')),
+                           'value': remote_values.get(item_key)}
+            local_item = {'updated_at': local_times.get(item_key, local_group.get('updated_at', '')),
+                          'value': local_values.get(item_key)}
+            selected = _newer_timestamped_state(remote_item, local_item)
+            if 'value' in selected:
+                merged_values[item_key] = selected['value']
+                merged_times[item_key] = selected.get('updated_at', '')
+        group_time = _newer_timestamped_state(
+            {'updated_at': remote_group.get('updated_at', '')},
+            {'updated_at': local_group.get('updated_at', '')},
+        ).get('updated_at', '')
+        if merged_values:
+            settings[key] = {
+                'values': merged_values, 'updated_at': group_time,
+                'field_updated_at': merged_times,
+            }
     sources = []
     versioned_source = remote.get('stock_source_updated_at') or local.get('stock_source_updated_at')
     for payload in (remote, local):
@@ -12736,6 +12821,56 @@ def persist_stock_display_settings(field=None, widget_key=None):
         st.session_state.limit_rows = int(settings['limit_rows'])
         save_data_cache(st.session_state.stock_data, st.session_state.ignored_stocks,
                         st.session_state.all_candidates, st.session_state.saved_notes, sync_cloud=False)
+
+
+def persist_shared_display_setting(group, values, updated_keys=None):
+    """Persist a timestamped preference locally and queue its existing stock-scope sync."""
+    now = datetime.now(pytz.timezone('Asia/Taipei')).isoformat()
+    settings = normalize_stock_display_settings(get_stock_display_settings())
+    previous_group = settings.get(group, {})
+    field_times = dict(previous_group.get('field_updated_at', {})) if isinstance(previous_group, dict) else {}
+    previous_time = previous_group.get('updated_at', '') if isinstance(previous_group, dict) else ''
+    for key in values:
+        field_times.setdefault(str(key), previous_time)
+    for key in (updated_keys if updated_keys is not None else values.keys()):
+        field_times[str(key)] = now
+    settings[group] = {
+        'values': _json_safe(values), 'updated_at': now, 'field_updated_at': field_times,
+    }
+    settings['updated_at'] = now
+    settings = normalize_stock_display_settings(settings)
+    cloud_url = get_app_secret('gsheet_api_url') or ''
+    try:
+        with _RUNTIME_FILE_LOCK:
+            local_payload = _read_json_cache_file(STOCK_STRATEGY_CACHE_FILE)
+            latest_settings = normalize_stock_display_settings(local_payload.get('display_settings'))
+            merged_settings = dict(latest_settings)
+            merged_settings[group] = settings[group]
+            merged_settings['updated_at'] = now
+            settings = merge_stock_preferences(
+                {'display_settings': latest_settings}, {'display_settings': merged_settings},
+            )['display_settings']
+            local_payload['display_settings'] = settings
+            local_payload['postclose_sync_pending'] = bool(
+                cloud_url or local_payload.get('postclose_sync_pending')
+            )
+            _write_json_atomic(STOCK_STRATEGY_CACHE_FILE, local_payload, indent=2)
+    except (OSError, TypeError, ValueError) as exc:
+        st.session_state['_shared_preference_sync_status'] = 'local_only'
+        logger.warning('共用設定本機保存失敗：%s', type(exc).__name__)
+        return False
+    st.session_state['_stock_display_settings'] = settings
+    st.session_state['_cached_stock_display_settings'] = settings
+
+    if not cloud_url:
+        st.session_state['_shared_preference_sync_status'] = 'local_only'
+        return True
+    state = st.session_state.setdefault('_postclose_maintenance', {})
+    state.setdefault('pending_sync', {})['stock'] = time.monotonic()
+    state['sync_retry_at'] = 0
+    st.session_state['_shared_preference_sync_status'] = 'pending'
+    dispatch_postclose_sync()
+    return True
 
 def normalize_stock_quick_search_state(value):
     """Keep portable stock selector values and their cross-device timestamp."""
@@ -20464,14 +20599,38 @@ def intraday_auto_status_text(room, enabled):
     return '自動更新：開啟｜' + status
 
 
+def _stored_auto_time(value, fallback):
+    try:
+        return dt_time.fromisoformat(str(value)).replace(second=0, microsecond=0)
+    except (TypeError, ValueError):
+        return fallback
+
+
 def intraday_auto_settings(room):
     if f'{room}_auto_config' not in st.session_state:
-        saved = load_config().get(f'{room}_auto_seconds', 5)
+        config = load_config()
+        settings = st.session_state.get('_stock_display_settings', {})
+        group = settings.get('auto_update_settings', {}) if isinstance(settings, dict) else {}
+        values = group.get('values', {}) if isinstance(group, dict) else {}
+        shared = values.get(room, {}) if isinstance(values, dict) else {}
+        shared = shared if isinstance(shared, dict) else {}
+        saved = shared.get('seconds', config.get(f'{room}_auto_seconds', 5))
         try:
             seconds = max(1, min(300, int(saved)))
         except (TypeError, ValueError, OverflowError):
             seconds = 5
-        st.session_state[f'{room}_auto_config'] = {'seconds': seconds}
+        st.session_state[f'{room}_auto_config'] = {
+            'seconds': seconds,
+            'restricted': bool(shared.get('restricted', config.get(f'{room}_auto_restricted', False))),
+            'start': _stored_auto_time(
+                shared.get('start', config.get(f'{room}_auto_start', '09:00')),
+                dt_time(9, 0),
+            ),
+            'end': _stored_auto_time(
+                shared.get('end', config.get(f'{room}_auto_end', '13:30')),
+                dt_time(13, 30),
+            ),
+        }
     config = st.session_state[f'{room}_auto_config']
     restricted = room.startswith('stock') or config.get('restricted', False)
     return (config.get('enabled', False), config.get('seconds', 5),
@@ -20484,19 +20643,32 @@ def render_intraday_auto_controls(room):
     config = st.session_state[f'{room}_auto_config']
 
     def save_settings():
-        previous_seconds = config.get('seconds', 5)
+        previous = {field: config.get(field) for field in ('seconds', 'restricted', 'start', 'end')}
         for field in ('enabled', 'seconds', 'restricted', 'start', 'end'):
             key = f'{room}_auto_{field}'
             if key in st.session_state:
                 config[field] = st.session_state[key]
-        if config.get('seconds', 5) != previous_seconds:
+        if any(config.get(field) != previous[field] for field in previous):
             try:
                 with _RUNTIME_FILE_LOCK:
                     saved = load_config()
-                    saved[f'{room}_auto_seconds'] = int(config['seconds'])
+                    saved.update({
+                        f'{room}_auto_seconds': int(config.get('seconds', 5)),
+                        f'{room}_auto_restricted': bool(config.get('restricted', False) or room.startswith('stock')),
+                        f'{room}_auto_start': config.get('start', dt_time(9, 0)).strftime('%H:%M'),
+                        f'{room}_auto_end': config.get('end', dt_time(13, 30)).strftime('%H:%M'),
+                    })
                     _write_json_atomic(CONFIG_FILE, saved)
             except (OSError, TypeError, ValueError):
                 st.warning('更新間隔已套用，但暫時無法寫入設定檔。')
+            all_settings = get_stock_display_settings().get('auto_update_settings', {}).get('values', {})
+            all_settings[room] = {
+                'seconds': int(config.get('seconds', 5)),
+                'restricted': bool(config.get('restricted', False) or room.startswith('stock')),
+                'start': config.get('start', dt_time(9, 0)).strftime('%H:%M'),
+                'end': config.get('end', dt_time(13, 30)).strftime('%H:%M'),
+            }
+            persist_shared_display_setting('auto_update_settings', all_settings, updated_keys=[room])
         if not config.get('enabled', False) and st.session_state.get('sj_api') is not None:
             stop_intraday_background(room)
             sync_strategy_stream_scope(st.session_state.sj_api, [], room)
@@ -20517,6 +20689,7 @@ def render_intraday_auto_controls(room):
                         key=f'{room}_auto_start', on_change=save_settings)
         right.time_input('結束時間', value=config.get('end', dt_time(13, 30)),
                          key=f'{room}_auto_end', on_change=save_settings)
+    st.caption('更新間隔與時段會自動記憶；重新開啟後仍需自行啟用自動更新。')
     st.caption('僅更新此表顯示標的；登入後由伺服器背景執行，縮小視窗或切到其他瀏覽器分頁仍持續更新。登出即停止，關閉或斷線超過 2 分鐘停止。')
     return intraday_auto_settings(room)
 
@@ -21202,13 +21375,13 @@ def _model_display_value(value, column=''):
 
 
 def _model_number_text(value):
-    """Trim redundant decimal zeroes without rounding or changing saved numeric data."""
+    """Round displayed values to two decimals without changing saved numeric data."""
     if isinstance(value, (bool, np.bool_)):
         return value
     if isinstance(value, (int, float, np.integer, np.floating, Decimal)):
         if pd.isna(value):
             return ''
-        text = format(Decimal(str(value)), 'f')
+        text = format(Decimal(str(value)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP), 'f')
         return text.rstrip('0').rstrip('.') if '.' in text else text
     return value
 
@@ -21228,36 +21401,174 @@ def _model_history_overview(frame):
     return result[columns], result[columns + [column for column in result.columns if column not in columns]]
 
 
-def _model_display_frame(frame, color=False):
+def _model_column_config(frame):
+    descriptions = {
+        '全部訊號數': '目前篩選條件下建立的策略訊號總數。',
+        '有效交易數': '有完整進出場證據、可納入勝率計算的已平倉筆數。',
+        '資料不足數': '行情或成交證據不足，暫不列入績效統計的筆數。',
+        '勝率(%)': '獲利交易筆數 ÷ 有效交易數。',
+        '累積模擬損益': '有效交易的模擬淨損益合計，已扣除估算成本。',
+        '獲利因子': '獲利總額 ÷ 虧損總額絕對值。',
+        '最大回撤': '累積模擬損益由高點至後續低點的最大降幅。',
+        '訊號有效率(%)': '有效交易數占全部訊號數的比例。',
+        '資料完整率(%)': '目前篩選訊號中沒有資料缺口的比例。',
+        '方向': '策略訊號判定的多空方向。',
+        '市場': '商品所屬市場類別。',
+        '策略': '訊號採用的當沖或波段週期。',
+        '狀態': '訊號目前的追蹤狀態。',
+        '商品': '商品代碼與名稱。',
+        '代碼': '股票或期貨商品代碼。',
+        '名稱': '商品顯示名稱。',
+        '交易ID': '同一模擬交易與事件的唯一識別碼。',
+        '訊號價': '建立訊號時保存的參考行情。',
+        '進場價': '策略計畫預設的進場價位。',
+        '停損價': '策略計畫預設的停損價位。',
+        '目標價': '策略計畫預設的停利目標價位。',
+        '模擬進場價': '依行情證據推定的模擬成交進場價。',
+        '模擬出場價': '依停利、停損或收盤證據推定的模擬成交出場價。',
+        '模擬損益': '扣除模擬手續費、稅費與滑價後的損益。',
+        '毛損益': '扣除交易成本前的價差損益。',
+        '交易成本': '此筆模擬交易扣除的手續費與稅費。',
+        '平均獲利': '獲利交易的平均模擬淨損益。',
+        '平均虧損': '虧損交易的平均模擬淨損益。',
+        '每筆期望值': '平均每筆有效交易的模擬淨損益。',
+        '獲勝': '模擬淨損益大於零的有效交易筆數。',
+        '虧損': '模擬淨損益小於零的有效交易筆數。',
+        '結果(R)': '實際模擬結果相對於初始風險的倍數。',
+        '出場原因': '觸發模擬結案的條件。',
+        '交易日': '訊號所屬的交易日期。',
+        '建立時間': '訊號第一次建立的時間。',
+        '來源時間': '本筆判斷使用的最新行情時間。',
+        '計畫來源': '產生此訊號的功能頁面。',
+        '策略版本': '建立訊號時使用的策略規則版本。',
+        '市場環境': '訊號建立時保存的市場環境摘要。',
+        '指標': '用來分組比較的進場指標。',
+        '進場條件': '訊號建立時檢查的進場條件。',
+        '判定': '此訊號建立時的條件檢查結果。',
+    }
+    return {
+        column: st.column_config.Column(
+            label=str(column), help=descriptions.get(column, f'「{column}」欄位的已保存資料。')
+        )
+        for column in frame.columns
+    }
+
+
+def _model_display_frame(frame, color=True):
     result = frame.copy()
     for column in result.columns:
         result[column] = result[column].map(lambda value: _model_display_value(value, str(column)))
         if result[column].isna().any():
             result[column] = result[column].map(lambda value: '' if pd.isna(value) else str(_model_number_text(value))).astype(object)
-    styled = result.style.format(_model_number_text)
+    styled = result.style.format(_model_number_text).set_table_styles([
+        {'selector': 'th', 'props': [('color', '#93c5fd'), ('font-weight', 'bold')]},
+        {'selector': 'td', 'props': [('color', '#dbeafe')]},
+    ])
     if not color:
         return styled
 
     def tone(value, column):
+        neutral = 'color: #dbeafe'
         try:
             number_value = float(value)
-            return 'color: #ff4b4b' if number_value > 0 else ('color: #00c853' if number_value < 0 else '')
+            if column in ('模擬損益', '毛損益', '結果(R)', '累積模擬損益', '平均獲利', '平均虧損', '每筆期望值'):
+                return 'color: #ff7373' if number_value > 0 else ('color: #55d6a8' if number_value < 0 else neutral)
+            if column in ('勝率(%)', '訊號有效率(%)', '資料完整率(%)'):
+                return 'color: #5eead4'
+            if column == '最大回撤' and number_value > 0:
+                return 'color: #fbbf24'
+            return neutral
         except (TypeError, ValueError):
             text = str(value or '')
             if column == '方向':
-                return 'color: #ff4b4b' if '多' in text else ('color: #00c853' if '空' in text else '')
+                return 'color: #ff7373' if '多' in text else ('color: #55d6a8' if '空' in text else neutral)
             if column == '出場原因':
-                return 'color: #ff4b4b' if '停利' in text or '獲利' in text else ('color: #00c853' if '停損' in text or '虧損' in text else '')
-            return ''
+                return 'color: #ff7373' if '停利' in text or '獲利' in text else ('color: #55d6a8' if '停損' in text or '虧損' in text else neutral)
+            if column == '狀態':
+                if '不足' in text or '中斷' in text or '失效' in text:
+                    return 'color: #fbbf24'
+                if '持倉' in text or '等待' in text:
+                    return 'color: #67e8f9'
+                if '已平倉' in text:
+                    return 'color: #86efac'
+            if column == '判定':
+                return 'color: #86efac' if '符合' in text and '未符合' not in text else ('color: #fbbf24' if '未符合' in text else neutral)
+            return neutral
 
-    for column in ('模擬損益', '毛損益', '結果(R)', '方向', '出場原因'):
-        if column in result:
-            styled = styled.map(lambda value, key=column: tone(value, key), subset=[column])
+    for column in result.columns:
+        styled = styled.map(lambda value, key=column: tone(value, key), subset=[column])
     return styled
 
 
 def set_model_period_today(day):
     st.session_state['model_period'] = (day, day)
+
+
+def render_trading_cost_settings():
+    st.caption('此頁集中設定股票、期貨與選擇權的模擬手續費，並提供股票股數及期貨／選擇權口數的共用預設。手動輸入的價格視為成交價；滑價設定只套用有行情證據的模型模擬成交。')
+    costs = load_model_tracking_costs()
+    labels = {
+        'stock_shares': '股票共用預設股數', 'stock_discount': '股票手續費折扣（折）',
+        'stock_min_fee': '股票單邊最低手續費（元）', 'futures_contracts': '期貨／選擇權共用預設口數',
+        'futures_fee': '其他期貨單邊每口手續費（元）', 'futures_tx_fee': '臺指期 TX 單邊每口（元）',
+        'futures_mtx_fee': '小型臺指 MTX 單邊每口（元）', 'futures_tmf_fee': '微型臺指 TMF 單邊每口（元）',
+        'futures_stock_fee': '股票期貨單邊每口（元）', 'futures_small_stock_fee': '小型股票期貨單邊每口（元）',
+        'futures_etf_fee': 'ETF 期貨單邊每口（元）',
+        'option_monthly_fee': '臺指月選單邊每口（元）', 'option_friday_fee': '週五選單邊每口（元）',
+        'option_wednesday_fee': '週三選單邊每口（元）', 'slippage_ticks': '模型追蹤每次成交滑價（跳）',
+    }
+
+    def save_cost_settings():
+        current = load_model_tracking_costs()
+        saved_costs = {
+            key: st.session_state.get('model_cost_' + key, current[key])
+            for key in labels
+        }
+        if saved_costs == {key: current[key] for key in labels}:
+            return
+        saved_costs['_cathay_fee_schedule'] = CATHAY_FEE_SCHEDULE_VERSION
+        changed_keys = [key for key in labels if saved_costs[key] != current[key]]
+        try:
+            if not persist_shared_display_setting('model_tracking_costs', saved_costs, updated_keys=changed_keys):
+                st.warning('費用設定尚未保存，請稍後再試。')
+                return
+            config = load_config()
+            config['model_tracking_costs'] = saved_costs
+            with _RUNTIME_FILE_LOCK:
+                _write_json_atomic(CONFIG_FILE, config)
+        except (OSError, TypeError, ValueError) as exc:
+            logger.warning('費用設定保存失敗：%s', type(exc).__name__)
+            st.warning('費用設定無法保存，請稍後再試。')
+            return
+        if 'stock_shares' in changed_keys:
+            st.session_state['daytrade_shares'] = int(saved_costs['stock_shares'])
+            st.session_state['swing_shares'] = int(saved_costs['stock_shares'])
+        if 'futures_contracts' in changed_keys:
+            st.session_state['opt_lots'] = int(saved_costs['futures_contracts'])
+
+    columns = st.columns(3)
+    for index, (key, label) in enumerate(labels.items()):
+        with columns[index % 3]:
+            st.number_input(
+                label,
+                min_value=0.1 if key == 'stock_discount' else (1 if key in ('stock_shares', 'futures_contracts') else 0),
+                max_value=10.0 if key == 'stock_discount' else (10000000 if key in ('stock_shares', 'futures_contracts') else 100000),
+                step=0.1 if key == 'stock_discount' else (1000 if key == 'stock_shares' else 1),
+                value=float(costs[key]) if key == 'stock_discount' else int(costs[key]),
+                key='model_cost_' + key, on_change=save_cost_settings,
+            )
+    shared = get_stock_display_settings().get('model_tracking_costs', {}).get('values', {})
+    if not shared:
+        persist_shared_display_setting(
+            'model_tracking_costs', {**costs, '_cathay_fee_schedule': CATHAY_FEE_SCHEDULE_VERSION},
+        )
+    st.caption('國泰證券股票網路下單牌告優惠為 2.8 折；最低手續費與實際折扣依帳戶約定。期貨／選擇權費率先以既有國泰估算值帶入，個人費率可在此調整。')
+    st.caption('股票當沖與波段共用上方折扣及最低手續費；期貨與選擇權試算共用預設口數，並依合約種類帶入費率。每筆既有勝率紀錄仍保留建立時的成本。')
+    st.markdown('[國泰證券網路下單費率](https://www.cathaysec.com.tw/cathaysec/Products/TradeFee/TWS.aspx)｜[國泰期貨](https://www.cathayfut.com.tw/cathayfut/)')
+    if get_app_secret('gsheet_api_url') and st.session_state.get('_shared_preference_sync_status') == 'local_only':
+        st.warning('設定已儲存在本機，Google Sheet 尚未確認同步；再次修改設定時會重試。')
+    elif get_app_secret('gsheet_api_url') and st.session_state.get('_shared_preference_sync_status') == 'pending':
+        st.caption('設定已立即保存；Google Sheet 尚未回讀確認，背景同步會自動重試。')
 
 
 def render_model_tracking_room():
@@ -21269,43 +21580,17 @@ def render_model_tracking_room():
             '- 只有進出場證據完整的已平倉紀錄納入勝率；損益已估算手續費、稅費與滑價。\n'
             '- 上方看有效交易數、勝率、累積模擬損益、獲利因子與最大回撤；下方可比較策略、方向、指標並檢視每筆事件。\n'
             '- 日期、市場、策略、方向、計畫來源、版本及商品可篩選；指標分析呈現交易當時的條件，不代表單一指標造成結果。\n'
-            '- 成本可在「模擬成交與成本設定」修改，只影響新訊號；歷史紀錄保留原成交與成本。這是模擬分析，不會送出委託。'
+            '- 成本可在交易損益室的「費用設定」修改，只影響新訊號；歷史紀錄保留原成交與成本。這是模擬分析，不會送出委託。'
         )
     tracker = get_model_tracker(get_app_secret('gsheet_api_url') or '')
     tracker.last_activity = time.monotonic()
-    with st.expander('模擬成交與成本設定', expanded=False):
-        config = load_config()
-        costs = load_model_tracking_costs()
-        columns = st.columns(3)
-        labels = {
-            'stock_shares': '股票模擬股數', 'stock_discount': '股票手續費折扣（折）',
-            'stock_min_fee': '股票單邊最低手續費（元）', 'futures_contracts': '期貨模擬口數',
-            'futures_fee': '其他期貨單邊每口手續費（元）', 'futures_tx_fee': '臺指期 TX 單邊每口（元）',
-            'futures_mtx_fee': '小型臺指 MTX 單邊每口（元）', 'futures_tmf_fee': '微型臺指 TMF 單邊每口（元）',
-            'futures_stock_fee': '股票期貨單邊每口（元）', 'futures_small_stock_fee': '小型股票期貨單邊每口（元）',
-            'futures_etf_fee': 'ETF 期貨單邊每口（元）',
-            'option_monthly_fee': '臺指月選單邊每口（元）', 'option_friday_fee': '週五選單邊每口（元）',
-            'option_wednesday_fee': '週三選單邊每口（元）', 'slippage_ticks': '每次成交滑價（跳）',
-        }
-        changed = {}
-        for index, (key, label) in enumerate(labels.items()):
-            with columns[index % 3]:
-                changed[key] = st.number_input(
-                    label, min_value=0.1 if key == 'stock_discount' else (1 if key in ('stock_shares', 'futures_contracts') else 0),
-                    value=float(costs[key]) if key == 'stock_discount' else int(costs[key]), key='model_cost_' + key)
-        if changed != {key: costs[key] for key in labels}:
-            config['model_tracking_costs'] = {**changed, '_cathay_fee_schedule': CATHAY_FEE_SCHEDULE_VERSION}
-            with _RUNTIME_FILE_LOCK:
-                _write_json_atomic(CONFIG_FILE, config)
-        st.caption('費用依國泰電子下單費率估算：股票網路下單 2.8 折；臺指 TX／MTX／TMF 單邊 38／18／10 元、股票／小型股票／ETF 期貨 18／10／18 元，月選／週五選／週三選 12／12／18 元。費率可修改，設定只套用新訊號。')
-        st.caption('指數計畫使用畫面設定的微型臺指口數，每點 10 元；選擇權契約每點 50 元是合約乘數，手續費按到期別及每口費率估算。價差組合依實際口數計費，舊紀錄成本不變。')
-        st.markdown('[國泰證券網路下單費率](https://www.cathaysec.com.tw/cathaysec/Products/TradeFee/TWS.aspx)｜[國泰期貨手續費](https://eservice.cathaysec.com.tw/sign/handling_fee.html)｜股票稅費沿用交易損益室規則；停利停損先後或行情缺口未確認時不計入有效績效。')
     cols = st.columns(4)
     with cols[0]:
         now_tw = datetime.now(pytz.timezone('Asia/Taipei'))
-        report_day = max(now_tw.date(), get_futures_trading_date(now_tw).date())
+        report_day = now_tw.date()
         with st.popover('📅 日期區間'):
-            period = st.date_input('選擇起迄日期', value=(report_day - timedelta(days=30), report_day), key='model_period')
+            st.session_state.setdefault('model_period', (report_day, report_day))
+            period = st.date_input('選擇起迄日期', key='model_period')
             st.button('今天', key='model_period_today', on_click=set_model_period_today, args=(report_day,), width='stretch')
         if len(period) == 2:
             st.caption(f'{period[0]:%Y/%m/%d} ～ {period[1]:%Y/%m/%d}')
@@ -21383,13 +21668,9 @@ def render_model_tracking_room():
         if not records:
             st.info('目前沒有符合條件的紀錄。開啟股期戰略室或指數／選擇權操作計畫後，系統會依原計畫與串流行情自動追蹤。')
         else:
-            st.dataframe(_model_display_frame(pd.DataFrame([metrics])), hide_index=True, width='stretch')
-            st.markdown('##### 策略、方向與指標分析')
-            st.caption('指標分組代表進場當時有該指標證據的交易，不代表單一指標造成結果。')
-            if groups.empty:
-                st.caption('尚無有效已平倉交易，暫無分組統計。')
-            else:
-                st.dataframe(_model_display_frame(groups), hide_index=True, width='stretch')
+            metrics_frame = pd.DataFrame([metrics])
+            st.dataframe(_model_display_frame(metrics_frame), hide_index=True, width='stretch',
+                         column_config=_model_column_config(metrics_frame))
             st.markdown('##### 歷史明細')
             start_row = (page - 1) * 100
             view = frame.sort_values('建立時間', ascending=False).iloc[start_row:start_row + 100]
@@ -21399,12 +21680,22 @@ def render_model_tracking_room():
             else:
                 history = view.drop(columns=['事件', '成本設定', '指標快照', '條件快照'], errors='ignore')
                 overview, full_history = _model_history_overview(history)
-                st.dataframe(_model_display_frame(full_history if show_full_history else overview, color=True),
-                             hide_index=True, width='stretch')
+                history_frame = full_history if show_full_history else overview
+                st.dataframe(_model_display_frame(history_frame), hide_index=True, width='stretch',
+                             column_config=_model_column_config(history_frame))
                 if show_evidence:
                     evidence_columns = [column for column in ('交易ID', '策略版本', '指標快照', '條件快照', '事件') if column in view]
                     if evidence_columns:
-                        st.dataframe(_model_display_frame(view[evidence_columns]), hide_index=True, width='stretch')
+                        evidence = view[evidence_columns]
+                        st.dataframe(_model_display_frame(evidence), hide_index=True, width='stretch',
+                                     column_config=_model_column_config(evidence))
+            st.markdown('##### 策略、方向與指標分析')
+            st.caption('指標分組代表進場當時有該指標證據的交易，不代表單一指標造成結果。')
+            if groups.empty:
+                st.caption('尚無有效已平倉交易，暫無分組統計。')
+            else:
+                st.dataframe(_model_display_frame(groups), hide_index=True, width='stretch',
+                             column_config=_model_column_config(groups))
     render_model_report()
 
 
@@ -22882,6 +23173,8 @@ def dispatch_postclose_sync():
                 state['pending_sync'].pop(asset, None)
                 key = '_data_cache_sync_status' if asset == 'stock' else '_futures_cloud_save_status'
                 st.session_state[key] = 'ok'
+                if asset == 'stock':
+                    st.session_state['_shared_preference_sync_status'] = 'ok'
     if state.get('pending_sync') and not state.get('sync_task') and time.monotonic() >= state.get('sync_retry_at', 0):
         worker = get_postclose_worker()
         if worker['slot'].acquire(blocking=False):
@@ -24711,8 +25004,9 @@ if tab1.open and stock_strategy_tab.open:
                 render_stock_independent_table()
 
 with tab2:
-    model_tab, tab2_1, tab2_2, tab2_3 = st.tabs(
-        ["📊 模型勝率追蹤", "💹 當沖損益室", "📈 波段信用室", "🧾 期權交易室"],
+    trading_costs = load_model_tracking_costs()
+    model_tab, tab2_1, tab2_2, tab2_3, tab_costs = st.tabs(
+        ["📊 模型勝率追蹤", "💹 當沖損益室", "📈 波段信用室", "🧾 期權交易室", "⚙️ 費用設定"],
         default="📊 模型勝率追蹤",
         key="profit_room_active_tab", on_change="rerun",
     )
@@ -24721,16 +25015,20 @@ with tab2:
         if tab2.open and model_tab.open:
             render_model_tracking_room()
 
+    with tab_costs:
+        if tab2.open and tab_costs.open:
+            render_trading_cost_settings()
+
     with tab2_1:
-        c1, c2, c3, c4, c5 = st.columns(5)
+        c1, c2, c5 = st.columns(3)
         with c1:
             calc_price = st.number_input("基準價格", min_value=0.01, value=max(0.01, float(st.session_state.calc_base_price)), step=0.01, format="%.12g", key="input_base_price")
             if calc_price != st.session_state.calc_base_price:
                 st.session_state.calc_base_price = calc_price
                 st.session_state.calc_view_price = apply_tick_rules(calc_price)
-        with c2: shares = st.number_input("股數", min_value=1, value=1000, step=1000)
-        with c3: discount = st.number_input("手續費折扣 (折)", value=2.8, step=0.1, min_value=0.1, max_value=10.0)
-        with c4: min_fee = st.number_input("最低手續費 (元)", min_value=0, value=20, step=1)
+        with c2: shares = st.number_input("股數", min_value=1, value=trading_costs['stock_shares'], step=1000, key='daytrade_shares')
+        discount = trading_costs['stock_discount']
+        min_fee = trading_costs['stock_min_fee']
         with c5: tick_count = st.number_input("顯示檔數 (檔)", value=10, min_value=1, max_value=50, step=1)
         direction = st.radio("交易方向", ["當沖多 (先買後賣)", "當沖空 (先賣後買)"], horizontal=True)
 
@@ -24901,12 +25199,12 @@ with tab2:
             )
 
     with tab2_2:
-        c2_1, c2_2, c2_3, c2_4, c2_5 = st.columns(5)
+        c2_1, c2_2, c2_5 = st.columns(3)
         with c2_1:
             swing_calc_price = st.number_input("基準價格", min_value=0.01, value=None, step=0.5, format="%.12g", key="input_swing_base_price", placeholder="請輸入...")
-        with c2_2: swing_shares = st.number_input("股數", min_value=1, value=1000, step=1000, key="swing_shares")
-        with c2_3: swing_discount = st.number_input("手續費折扣 (折)", value=2.8, step=0.1, min_value=0.1, max_value=10.0, key="swing_discount")
-        with c2_4: swing_min_fee = st.number_input("最低手續費 (元)", min_value=0, value=20, step=1, key="swing_min_fee")
+        with c2_2: swing_shares = st.number_input("股數", min_value=1, value=trading_costs['stock_shares'], step=1000, key="swing_shares")
+        swing_discount = trading_costs['stock_discount']
+        swing_min_fee = trading_costs['stock_min_fee']
         with c2_5: swing_tick_count = st.number_input("顯示檔數 (檔)", value=10, min_value=1, max_value=50, step=1, key="swing_tick_count")
         
         def sync_swing_credit_defaults():
@@ -25365,7 +25663,7 @@ with tab2:
             st.session_state['opt_sf_search'] = None
             if 'opt_custom_margin' in st.session_state:
                 del st.session_state['opt_custom_margin']
-            st.session_state['opt_lots'] = 1
+            st.session_state['opt_lots'] = trading_costs['futures_contracts']
             st.session_state['opt_dir'] = "🔴 做多 ▲"
             st.session_state['opt_margin_level'] = "級距一 | 13.5% (一般股票)"
 
@@ -25440,11 +25738,12 @@ with tab2:
                 tax_rate = 0.00002
             else:
                 st.markdown("<div style='margin-bottom: 10px; font-size: 14px;'>合約規格：選擇權 (x50)</div>", unsafe_allow_html=True)
+                option_expiry = st.selectbox('到期別', ['月選', '週五選', '週三選'], key='opt_fee_expiry')
                 mult = 50
                 tax_rate = 0.001
 
             opt_dir = st.radio("部位方向", ["🔴 做多 ▲", "🟢 做空 ▼"], horizontal=True, key="opt_dir")
-            opt_lots = st.number_input("口數", min_value=1, value=1, step=1, key="opt_lots")
+            opt_lots = st.number_input("口數", min_value=1, value=trading_costs['futures_contracts'], step=1, key="opt_lots")
 
            # 新增：當最新成交價為空（例如剛切換到期權交易室），自動觸發獲取預設的台指期大台價格
             if st.session_state.get('opt_rt_price') is None:
@@ -25633,19 +25932,20 @@ with tab2:
             st.markdown("###### ⇆ 停損及保證金設定")
             sl_p = st.number_input("停損價 (點) - 用於風報比", min_value=0.0, value=None, format="%.12g", placeholder="輸入停損價", key="opt_sl_p")
             
-            # 手續費記憶
-            config = load_config()
-            if 'saved_opt_fee' not in st.session_state:
-                st.session_state.saved_opt_fee = config.get('saved_opt_fee', None)
-                
-            opt_fee = st.number_input("單邊手續費 (元/口)", min_value=0.0, value=st.session_state.saved_opt_fee, step=1.0, placeholder="輸入手續費 (必填)")
-            if opt_fee is not None and opt_fee != st.session_state.saved_opt_fee:
-                st.session_state.saved_opt_fee = opt_fee
-                config['saved_opt_fee'] = opt_fee
-                try:
-                    _write_json_atomic(CONFIG_FILE, config)
-                except (OSError, TypeError, ValueError):
-                    st.warning("手續費設定暫時無法儲存，請稍後再試。")
+            if opt_main_tab == '台指期':
+                fee_code = 'TX' if '大台' in opt_tx_type else ('MTX' if '小台' in opt_tx_type else 'TMF')
+                opt_fee = cathay_futures_fee(trading_costs, fee_code)
+            elif opt_main_tab == '個股期貨':
+                stock_future_code = search_stock_futures.split(' ', 1)[0] if search_stock_futures else ''
+                opt_fee = cathay_futures_fee(
+                    trading_costs, stock_future_code, product_type='股票', small='小型' in opt_sub_type,
+                )
+            else:
+                option_expiry = st.session_state.get('opt_fee_expiry', '月選')
+                opt_fee = cathay_option_fee(
+                    trading_costs, 'W' if option_expiry == '週三選' else ('F' if option_expiry == '週五選' else ''),
+                )
+            st.caption(f'單邊手續費估算：{opt_fee:,.0f} 元／口；費率可至「費用設定」調整。')
 
             actual_margin_req = 0
             margin_display_val = "尚未同步或無資料"

@@ -32,7 +32,8 @@ APPS_SCRIPT_PATH = Path(__file__).parents[1] / "google_apps_script.gs"
 
 def load_app_symbols(*names):
     """Compile selected top-level helpers so importing app.py cannot render the UI."""
-    names = set(names) | {"merge_stock_preferences", "_newer_timestamped_state", "_state_updated_at"}
+    names = set(names) | {"merge_stock_preferences", "_newer_timestamped_state", "_state_updated_at",
+                          "_stored_auto_time"}
     tree = ast.parse(APP_PATH.read_text(encoding="utf-8"))
     selected = []
     for node in tree.body:
@@ -3704,9 +3705,16 @@ def test_auto_status_marks_switch_and_hides_waiting_when_disabled():
 def test_auto_intervals_restore_separately_without_enabling_refresh():
     ns = load_app_symbols('intraday_auto_settings')
     saved = {'stock_auto_seconds':12, 'futures_auto_seconds':30}
+    state = {'_stock_display_settings': {'auto_update_settings': {'values': {
+        'stock': {'seconds':8, 'restricted':True, 'start':'09:15', 'end':'13:20'},
+        'futures': {'seconds':18, 'restricted':True, 'start':'08:45', 'end':'13:45'},
+    }}}}
     ns['load_config'] = lambda: saved
-    ns['st'] = SimpleNamespace(session_state={})
+    ns['st'] = SimpleNamespace(session_state=state)
     settings = ns['intraday_auto_settings']
+    assert settings('stock') == (False,8,dt_time(9,15),dt_time(13,20))
+    assert settings('futures') == (False,18,dt_time(8,45),dt_time(13,45))
+    state.clear()
     assert settings('stock') == (False,12,dt_time(9),dt_time(13,30))
     assert settings('futures') == (False,30,None,None)
     for invalid, expected in [('bad',5),(0,1),(999,300),(None,5)]:

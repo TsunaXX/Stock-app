@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import pandas as pd
 import numpy as np
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 import pytest
 from openpyxl import load_workbook
 from model_tracking import DEFAULT_COSTS, ModelTracker, advance, new_trade, merge_trades, performance, excel_report, normalize_costs
@@ -231,7 +231,7 @@ with outer:
     tracker.process([signal()], {'股票|2330':quote(100)})
     app = AppTest.from_string(script, default_timeout=30).run()
     assert not app.exception and app.session_state['profit'] == '模型勝率追蹤'
-    assert str(app.date_input(key='model_period').value[-1]) == '2026-10-13'
+    assert str(app.date_input(key='model_period').value[-1]) == '2026-10-12'
     assert len(app.get('download_button')) == 1
     assert any(metric.label == '全部訊號數' for metric in app.metric)
     assert any(metric.label == '資料不足數' for metric in app.metric)
@@ -255,7 +255,7 @@ def test_model_display_frame_keeps_blank_cells_arrow_compatible():
     tree = ast.parse((ROOT/'app.py').read_text(encoding='utf-8'))
     names = {'_model_display_value', '_model_display_frame', '_model_time_text', '_model_number_text', '_model_history_overview'}
     definitions = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names]
-    namespace = {'pd': pd, 'np': np, 'Decimal': Decimal, 'json': json}
+    namespace = {'pd': pd, 'np': np, 'Decimal': Decimal, 'ROUND_HALF_UP': ROUND_HALF_UP, 'json': json}
     exec(compile(ast.Module(body=definitions, type_ignores=[]), str(ROOT/'app.py'), 'exec'), namespace)
     frame = namespace['_model_display_frame'](pd.DataFrame([
         {'勝率(%)': None, '平均獲利': float('nan'), '平均虧損': '', '方向': '偏多'},
@@ -281,7 +281,7 @@ def test_model_display_frame_keeps_blank_cells_arrow_compatible():
     assert empty_table.to_pylist() == [{'勝率(%)': '', '平均獲利': '', '獲利因子': ''}]
     assert '>None<' not in empty_metrics.to_html()
     assert namespace['_model_number_text'](100.0000) == '100'
-    assert namespace['_model_number_text'](0.001200) == '0.0012'
+    assert namespace['_model_number_text'](0.001200) == '0'
     assert namespace['_model_number_text'](123456789) == '123456789'
     assert namespace['_model_number_text']('2330') == '2330'
     assert namespace['_model_number_text'](0.0) == '0'
