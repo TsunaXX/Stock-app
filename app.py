@@ -12681,6 +12681,7 @@ def normalize_stock_display_settings(value):
     except (TypeError, ValueError):
         limit_rows = 5
     return {
+        **({'updated_at': str(source['updated_at'])} if source.get('updated_at') else {}),
         'limit_rows': max(1, limit_rows),
         'hide_non_stock': bool(source.get('hide_non_stock', True)),
         'allow_warrant_search': bool(source.get('allow_warrant_search', False)),
@@ -12690,6 +12691,9 @@ def normalize_stock_display_settings(value):
 
 def get_stock_display_settings():
     """Collect only settings that should follow the stock strategy across devices."""
+    saved = st.session_state.get('_stock_display_settings')
+    if saved:
+        return normalize_stock_display_settings(saved)
     return normalize_stock_display_settings({
         'limit_rows': st.session_state.get('limit_rows', 5),
         'hide_non_stock': st.session_state.get('stock_hide_non_stock', True),
@@ -12697,6 +12701,38 @@ def get_stock_display_settings():
         'show_3d_hilo': st.session_state.get('stock_show_3d_hilo', False),
     })
 
+
+
+def merge_stock_preferences(remote, local):
+    """Preferences and source order have their own versions, independent of quotes."""
+    remote, local = remote or {}, local or {}
+    settings = _newer_timestamped_state(remote.get('display_settings'), local.get('display_settings'))
+    sources = []
+    versioned_source = remote.get('stock_source_updated_at') or local.get('stock_source_updated_at')
+    for payload in (remote, local):
+        sources.append({
+            'updated_at': payload.get('stock_source_updated_at') or ('' if versioned_source else payload.get('stock_data_updated_at', '')),
+            'kind': payload.get('stock_source_kind', 'legacy'),
+            'date': payload.get('stock_source_date', ''),
+            'candidates': payload.get('all_candidates', []),
+        } if 'all_candidates' in payload else {})
+    source = _newer_timestamped_state(*sources)
+    return {'display_settings': settings, 'all_candidates': source.get('candidates', []),
+            'stock_source_updated_at': source.get('updated_at', ''),
+            'stock_source_kind': source.get('kind', 'legacy'), 'stock_source_date': source.get('date', '')}
+
+
+def persist_stock_display_settings(field, widget_key):
+    with _RUNTIME_FILE_LOCK:
+        latest = _read_json_cache_file(STOCK_STRATEGY_CACHE_FILE)
+        settings = merge_stock_preferences(latest, {'display_settings': get_stock_display_settings()})['display_settings']
+        settings = normalize_stock_display_settings(settings)
+        settings[field] = st.session_state[widget_key]
+        settings['updated_at'] = datetime.now(pytz.timezone('Asia/Taipei')).isoformat()
+        st.session_state['_stock_display_settings'] = settings
+        st.session_state.limit_rows = int(settings['limit_rows'])
+        save_data_cache(st.session_state.stock_data, st.session_state.ignored_stocks,
+                        st.session_state.all_candidates, st.session_state.saved_notes, sync_cloud=False)
 
 def normalize_stock_quick_search_state(value):
     """Keep portable stock selector values and their cross-device timestamp."""
@@ -13480,6 +13516,10 @@ def _merge_data_cache_payload(
     merged['quick_search_state'] = _newer_timestamped_state(
         remote.get('quick_search_state'), local.get('quick_search_state'),
     )
+    merged.update(merge_stock_preferences(remote, local))
+    if clear_stock_data:
+        merged.update(all_candidates=[], stock_source_kind='none',
+                      stock_source_updated_at=datetime.now(pytz.timezone('Asia/Taipei')).isoformat())
     merged['version'] = 3
     merged['updated_at'] = datetime.now(pytz.timezone('Asia/Taipei')).isoformat()
     return _json_safe(merged)
@@ -13671,6 +13711,9 @@ def save_data_cache(
                 'stock_strategy_ranking_snapshots', {}
             ),
             'display_settings': get_stock_display_settings(),
+            'stock_source_kind': st.session_state.get('_stock_source_kind', 'legacy'),
+            'stock_source_date': st.session_state.get('_stock_source_date', ''),
+            'stock_source_updated_at': st.session_state.get('_stock_source_updated_at', ''),
             'quick_search_state': get_stock_quick_search_state(),
             'postclose_sync_pending': bool(gsheet_api_url) or not sync_cloud,
         })
@@ -13681,9 +13724,11 @@ def save_data_cache(
             local_payload['quick_search_state'] = normalize_stock_quick_search_state(
                 _newer_timestamped_state(existing.get('quick_search_state'), local_payload['quick_search_state'])
             )
+            local_payload.update(merge_stock_preferences(existing, local_payload))
             local_payload['postclose_sync_pending'] |= bool(existing.get('postclose_sync_pending'))
             _write_json_atomic(STOCK_STRATEGY_CACHE_FILE, local_payload, indent=2)
         st.session_state['_stock_quick_search_state'] = local_payload['quick_search_state']
+        st.session_state['_stock_display_settings'] = local_payload['display_settings']
 
         sync_ok = True
 
@@ -13984,11 +14029,7 @@ def load_data_cache():
     st.session_state['stock_strategy_ranking_snapshots'] = data.get(
         'strategy_ranking_snapshots', {}
     )
-    st.session_state['_cached_stock_display_settings'] = (
-        normalize_stock_display_settings(data.get('display_settings', {}))
-        if isinstance(data.get('display_settings', {}), dict)
-        else {}
-    )
+    data.update(merge_stock_preferences(remote_payload, local_payload))
     quick_search_state = normalize_stock_quick_search_state(_newer_timestamped_state(
         (remote_payload or {}).get('quick_search_state'), local_payload.get('quick_search_state'),
     ))
@@ -14004,6 +14045,7 @@ def load_data_cache():
         try:
             with _RUNTIME_FILE_LOCK:
                 latest = _read_json_cache_file(STOCK_STRATEGY_CACHE_FILE)
+                data.update(merge_stock_preferences(latest, data))
                 quick_search_state = normalize_stock_quick_search_state(_newer_timestamped_state(
                     latest.get('quick_search_state'), quick_search_state,
                 ))
@@ -14014,6 +14056,12 @@ def load_data_cache():
                 _write_json_atomic(STOCK_STRATEGY_CACHE_FILE, _json_safe(data), indent=2)
         except (OSError, TypeError, ValueError):
             pass
+
+    st.session_state['_stock_display_settings'] = data.get('display_settings', {})
+    st.session_state['_cached_stock_display_settings'] = data.get('display_settings', {})
+    for key in ('kind', 'date', 'updated_at'):
+        st.session_state['_stock_source_' + key] = data.get('stock_source_' + key, '')
+    candidates = data.get('all_candidates', [])
 
     st.session_state[
         '_stock_data_updated_at'
@@ -14820,38 +14868,29 @@ def render_stock_strategy_controls():
 
     with settings_col:
         st.markdown("#### 顯示設定")
+        settings = merge_stock_preferences(_read_json_cache_file(STOCK_STRATEGY_CACHE_FILE),
+                                           {'display_settings': get_stock_display_settings()})['display_settings']
+        settings = normalize_stock_display_settings(settings)
+        st.session_state['_stock_display_settings'] = settings
+        st.session_state.limit_rows = settings['limit_rows']
+        for field, key in (('hide_non_stock', 'stock_hide_non_stock'),
+                           ('allow_warrant_search', 'allow_warrant_search'),
+                           ('show_3d_hilo', 'stock_show_3d_hilo'), ('limit_rows', 'limit_rows_input')):
+            st.session_state[key] = settings[field]
         hide_non_stock = st.checkbox(
-            "隱藏非個股（ETF／權證／債券）", key='stock_hide_non_stock'
+            "隱藏非個股（ETF／權證／債券）", key='stock_hide_non_stock',
+            on_change=persist_stock_display_settings, args=('hide_non_stock', 'stock_hide_non_stock'),
         )
-        st.checkbox(
-            "查詢權證（含圖表快速標籤）", key="allow_warrant_search"
-        )
+        st.checkbox("查詢權證（含圖表快速標籤）", key='allow_warrant_search',
+                    on_change=persist_stock_display_settings, args=('allow_warrant_search', 'allow_warrant_search'))
         show_3d_hilo = st.checkbox(
             "近 3 日高低點（戰略備註）", key='stock_show_3d_hilo',
-            help="在戰略備註加入前天、昨天、今天的高低點。"
+            help="在戰略備註加入前天、昨天、今天的高低點。",
+            on_change=persist_stock_display_settings, args=('show_3d_hilo', 'stock_show_3d_hilo'),
         )
-        current_limit_rows = st.number_input(
-            "顯示筆數（檔案／雲端）", min_value=1, step=1,
-            value=st.session_state.limit_rows, key='limit_rows_input'
-        )
-        st.session_state.limit_rows = int(current_limit_rows)
-        if st.button("💾 儲存股票設定", width='stretch', key='save_stock_room_settings'):
-            local_saved = save_config(
-                st.session_state.get('font_size', 15), current_limit_rows,
-                st.session_state.sj_key, st.session_state.sj_secret,
-                st.session_state.remember_sj
-            )
-            cloud_saved = save_data_cache(
-                st.session_state.stock_data, st.session_state.ignored_stocks,
-                st.session_state.all_candidates, st.session_state.saved_notes,
-                replace_stock_data=True,
-            )
-            if local_saved and cloud_saved:
-                st.toast("股票設定已儲存；重啟後會還原顯示筆數與篩選設定。", icon="✅")
-            elif local_saved:
-                st.warning("設定已保留於目前服務，但 Google Sheet 尚未確認寫入。")
-            else:
-                st.error("設定暫時無法儲存，請稍後再試。")
+        st.number_input("顯示筆數（檔案／雲端）", min_value=1, step=1, key='limit_rows_input',
+                        on_change=persist_stock_display_settings, args=('limit_rows', 'limit_rows_input'))
+        st.caption('變更後自動儲存，並於背景同步 Google Sheet。')
 
     with data_col:
         st.markdown("#### 資料管理")
@@ -14898,6 +14937,8 @@ def render_stock_strategy_controls():
                 st.session_state.stock_data = pd.DataFrame()
                 st.session_state.ignored_stocks = set()
                 st.session_state.all_candidates = []
+                st.session_state['_stock_source_kind'] = 'none'
+                st.session_state['_stock_source_updated_at'] = datetime.now(pytz.timezone('Asia/Taipei')).isoformat()
                 st.session_state.search_multiselect = []
                 st.session_state.indep_search_multiselect = []
                 st.session_state.saved_notes = {}
@@ -14917,6 +14958,55 @@ def render_stock_strategy_controls():
 
     return hide_non_stock, show_3d_hilo
 
+
+
+def stock_source_candidates(frame, hide_non_stock=False):
+    """Parse one ordered source without mixing old source rows or quick queries."""
+    if not isinstance(frame, pd.DataFrame) or frame.empty:
+        return []
+    columns = {str(c).strip(): c for c in frame.columns}
+    code_col = next((c for label, c in columns.items() if '代號' in label), None)
+    name_col = next((c for label, c in columns.items() if '名稱' in label), None)
+    if code_col is None:
+        return []
+    candidates, seen = [], set()
+    for _, row in frame.iterrows():
+        match = re.search(r'(?<![0-9A-Z])\d{4,6}[A-Z]?(?![0-9A-Z])', str(row[code_col]).upper())
+        if not match:
+            continue
+        code = match.group(0)
+        if code in seen or hide_non_stock and (code.startswith('00') or len(code) > 4):
+            continue
+        seen.add(code)
+        name = str(row[name_col]) if name_col is not None and pd.notna(row[name_col]) else ''
+        candidates.append((code, name, 'upload', len(candidates)))
+    return candidates
+
+
+def current_stock_source_candidates(hide_non_stock=False):
+    """Refresh official candidates from the already-loaded ranking, never refetch it."""
+    kind = st.session_state.get('_stock_source_kind', 'legacy') or 'legacy'
+    source_date = st.session_state.get('_stock_source_date', '')
+    ranking_date = str(st.session_state.get('turnover_ranking_date', ''))
+    use_official = kind == 'official' or (
+        kind == 'legacy' and not st.session_state.get('stock_source_upload')
+        and not st.session_state.get('cloud_url_input', '').strip()
+    )
+    frame = st.session_state.get('turnover_ranking_df') if use_official else None
+    if isinstance(frame, pd.DataFrame) and not frame.empty and (not source_date or ranking_date >= source_date):
+        candidates = stock_source_candidates(frame)
+        previous = [tuple(c) for c in st.session_state.all_candidates if len(c) >= 4 and c[2] == 'upload']
+        if candidates and (candidates != previous or kind != 'official' or source_date != ranking_date):
+            searches = [c for c in st.session_state.all_candidates if len(c) >= 4 and c[2] == 'search']
+            st.session_state.all_candidates = candidates + searches
+            st.session_state['_stock_source_kind'] = 'official'
+            st.session_state['_stock_source_date'] = ranking_date
+            st.session_state['_stock_source_updated_at'] = datetime.now(pytz.timezone('Asia/Taipei')).isoformat()
+            st.session_state.prefetch_cache = {}
+            save_data_cache(st.session_state.stock_data, st.session_state.ignored_stocks,
+                            st.session_state.all_candidates, st.session_state.saved_notes, sync_cloud=False)
+    return [tuple(c) for c in st.session_state.all_candidates if len(c) >= 4 and c[2] == 'upload'
+            and (not hide_non_stock or not str(c[0]).startswith('00') and len(str(c[0])) == 4)]
 
 def build_stock_search_options(allow_warrants=None):
     """Build one shared stock selector list for the main and independent rooms."""
@@ -22578,6 +22668,7 @@ def merge_postclose_scope(remote, local, asset):
         key: _newer_timestamped_state(first.get(key), second.get(key)) for key in set(first) | set(second)
     }
     if asset == 'stock':
+        merged.update(merge_stock_preferences(remote, local))
         merged['quick_search_state'] = _newer_timestamped_state(
             remote.get('quick_search_state'), local.get('quick_search_state'),
         )
@@ -22736,9 +22827,11 @@ def restore_stock_quick_search():
                 selected = normalize_stock_quick_search_state(_newer_timestamped_state(
                     (remote or {}).get('quick_search_state'), selected,
                 ))
+                latest.update(merge_stock_preferences(remote, latest))
                 latest['quick_search_state'] = selected
                 _write_json_atomic(STOCK_STRATEGY_CACHE_FILE, latest, indent=2)
             st.session_state['_stock_quick_search_state'] = selected
+            st.session_state['_stock_display_settings'] = latest.get('display_settings', {})
             st.session_state['_stock_query_restore_pending'] = False
         except Exception as exc:
             logger.warning('Stock query restore failed: %s', type(exc).__name__)
@@ -23064,6 +23157,7 @@ if tab1.open and stock_strategy_tab.open:
             if not st.session_state.futures_list: st.session_state.futures_list = fetch_futures_list()
             targets = []
             df_up = pd.DataFrame()
+            source_kind = 'none'
             current_url = st.session_state.cloud_url_input.strip()
             if current_url:
                 if current_url not in st.session_state.url_history:
@@ -23075,6 +23169,7 @@ if tab1.open and stock_strategy_tab.open:
                     official_frame = st.session_state.get('turnover_ranking_df')
                     if not isinstance(official_frame, pd.DataFrame) or official_frame.empty:
                         raise ValueError("本次官方週轉率排行不存在，已停止分析以避免載入舊資料")
+                    source_kind = 'official'
                     df_up = official_frame.copy()
                     st.toast(
                         "已載入本次最新 TWSE／TPEx 官方週轉率排行並開始分析！",
@@ -23082,6 +23177,7 @@ if tab1.open and stock_strategy_tab.open:
                     )
 
                 elif uploaded_file:
+                    source_kind = 'file'
                     uploaded_file.seek(0)
                     fname = uploaded_file.name.lower()
                     if fname.endswith('.csv'):
@@ -23105,6 +23201,7 @@ if tab1.open and stock_strategy_tab.open:
                         df_up = pd.read_excel(uploaded_file, sheet_name=selected_sheet, dtype=str)
 
                 elif st.session_state.cloud_url_input:
+                    source_kind = 'cloud'
                     url = st.session_state.cloud_url_input
                     if "docs.google.com" in url and "/spreadsheets/" in url and "/edit" in url:
                         url = url.split("/edit")[0] + "/export?format=csv"
@@ -23115,37 +23212,22 @@ if tab1.open and stock_strategy_tab.open:
 
                 # 官方排行與舊 Goodinfo 暫存共用既有分析入口。
                 elif 'turnover_ranking_df' in st.session_state:
+                    source_kind = 'official'
                     df_up = st.session_state['turnover_ranking_df'].copy()
                     st.toast("已載入 TWSE／TPEx 官方週轉率排行並開始分析！", icon="🔄")
                 elif 'goodinfo_df' in st.session_state:
+                    source_kind = 'legacy'
                     df_up = st.session_state['goodinfo_df'].copy()
                     st.toast("已載入舊版週轉率排行暫存資料進行分析！", icon="🔄")
 
             except Exception as e: st.error(f"讀取失敗: {e}")
 
-            # 先處理上傳/資料帶入的股票 (優先權高)
-            if not df_up.empty:
-                df_up.columns = df_up.columns.astype(str).str.strip()
-                c_col = next((c for c in df_up.columns if "代號" in str(c)), None)
-                n_col = next((c for c in df_up.columns if "名稱" in str(c)), None)
-                if c_col:
-                    limit_rows = st.session_state.limit_rows
-                    count = 0
-                    for _, row in df_up.iterrows():
-                        c_raw = str(row[c_col]).replace('=', '').replace('"', '').strip()
-                        code_match = re.search(r'(?<!\d)\d{4,6}(?!\d)', c_raw)
-                        if not code_match:
-                            continue
-                        c_raw = code_match.group(0)
-                        if c_raw in st.session_state.ignored_stocks: continue
-                        if hide_non_stock:
-                            is_etf = c_raw.startswith('00')
-                            is_warrant_flag = (len(c_raw) > 4) and c_raw.isdigit()
-                            if is_etf or is_warrant_flag: continue
-                        n = str(row[n_col]) if n_col else ""
-                        if n.lower() == 'nan': n = ""
-                        targets.append((c_raw, n, 'upload', count))
-                        count += 1
+            source_candidates = stock_source_candidates(df_up)
+            targets.extend(source_candidates)
+            st.session_state['_stock_source_kind'] = source_kind
+            st.session_state['_stock_source_date'] = str(st.session_state.get('turnover_ranking_date', '')) if source_kind == 'official' else ''
+            st.session_state['_stock_source_updated_at'] = datetime.now(pytz.timezone('Asia/Taipei')).isoformat()
+            st.session_state.prefetch_cache = {}
 
             # 再處理快速查詢的股票，確保其排序在後面
             if search_selection:
@@ -23175,6 +23257,7 @@ if tab1.open and stock_strategy_tab.open:
 
             tasks_to_run = []
             for i, (code, name, source, extra) in enumerate(targets):
+                if source == 'upload' and hide_non_stock and (code.startswith('00') or len(code) > 4): continue
                 if source == 'upload' and upload_current >= upload_limit: continue
                 if code in st.session_state.ignored_stocks: continue
                 if (code, source) in seen: continue
@@ -23318,6 +23401,11 @@ if tab1.open and stock_strategy_tab.open:
                 df_check = st.session_state.stock_data
                 if '_source' in df_check.columns:
                     upload_mask = df_check['_source'] == 'upload'
+                    if hide_non_stock:
+                        eligible = df_check['代號'].astype(str).str.fullmatch(r'(?!00)\d{4}')
+                        df_check = df_check[~upload_mask | eligible]
+                        st.session_state.stock_data = df_check
+                        upload_mask = df_check['_source'] == 'upload'
                     if upload_mask.sum() > st.session_state.limit_rows:
                         keep_upload = df_check[upload_mask].head(st.session_state.limit_rows)
                         keep_other = df_check[~upload_mask]
@@ -24024,7 +24112,7 @@ if tab1.open and stock_strategy_tab.open:
                         code_map_copy, _ = load_local_stock_names()
 
                         cand_to_fetch = []
-                        for cand in st.session_state.all_candidates:
+                        for cand in current_stock_source_candidates(hide_non_stock):
                              c_code, c_name, c_source, c_extra = str(cand[0]), cand[1], cand[2], cand[3]
                              if c_source != 'upload' or c_code in st.session_state.ignored_stocks or c_code in existing_codes: continue
                              cand_to_fetch.append((c_code, c_name, c_source, c_extra))
@@ -24038,8 +24126,9 @@ if tab1.open and stock_strategy_tab.open:
 
                                 for cand in cand_to_fetch:
                                     t_code = cand[0]
-                                    if t_code in st.session_state.get('prefetch_cache', {}):
-                                        ready_results.append(st.session_state.prefetch_cache.pop(t_code))
+                                    cached = st.session_state.get('prefetch_cache', {}).pop(t_code, None)
+                                    if cached and str(cached.get('代號')) == t_code:
+                                        ready_results.append(cached)
                                     else:
                                         remaining_to_fetch.append(cand)
 
@@ -24069,7 +24158,9 @@ if tab1.open and stock_strategy_tab.open:
                                 )
 
                                 save_data_cache(st.session_state.stock_data, st.session_state.ignored_stocks, st.session_state.all_candidates, st.session_state.saved_notes)
-                                st.rerun() # 遞補完成，立刻更新畫面
+                                if ready_results:
+                                    st.rerun()  # Only rerun after a successful addition.
+                                st.warning('本次尚未取得遞補股票資料，保留現有清單，稍後可再試。')
 
 
                 st.markdown("---")

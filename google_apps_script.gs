@@ -360,6 +360,7 @@ function buildStockPayload_(payload) {
     'saved_notes', 'cached_notes', 'stock_data_updated_at',
     'market_risk_data', 'display_settings', 'strategy_ranking_snapshots',
     'stock_swing_snapshot', 'quick_search_state',
+    'stock_source_kind', 'stock_source_date', 'stock_source_updated_at',
   ].forEach(function(key) {
     if (payload[key] !== undefined) result[key] = payload[key];
   });

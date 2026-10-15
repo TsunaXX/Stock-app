@@ -32,6 +32,7 @@ APPS_SCRIPT_PATH = Path(__file__).parents[1] / "google_apps_script.gs"
 
 def load_app_symbols(*names):
     """Compile selected top-level helpers so importing app.py cannot render the UI."""
+    names = set(names) | {"merge_stock_preferences", "_newer_timestamped_state", "_state_updated_at"}
     tree = ast.parse(APP_PATH.read_text(encoding="utf-8"))
     selected = []
     for node in tree.body:
@@ -2876,6 +2877,12 @@ def test_cache_merge_preserves_remote_device_sections():
     assert {row["dedupe_key"] for row in merged["strategy_signal_log"]} == {"remote-1", "local-1"}
     assert merged["company_event_snapshot"]["updated_at"] == "2026/08/11 10:00"
     assert merged["quick_search_state"] == local["quick_search_state"]
+    remote['display_settings'] = {'limit_rows': 5, 'hide_non_stock': False, 'updated_at': '2026-10-14'}
+    local['display_settings'] = {'limit_rows': 6, 'hide_non_stock': True, 'updated_at': '2026-10-15'}
+    remote['stock_source_updated_at'], local['stock_source_updated_at'] = '2026-10-14', '2026-10-15'
+    merged = symbols['_merge_data_cache_payload'](remote, local)
+    assert merged['display_settings'] == local['display_settings']
+    assert merged['all_candidates'] == local['all_candidates']
     remote['strategy_ranking_snapshots'] = {
         'daytrade': {'updated_at': '2026-09-09T08:29:00+08:00', 'entries': [{'score': 80}]},
         'swing': {'updated_at': '2026-09-09T08:00:00+08:00', 'entries': [{'score': 60}]},
