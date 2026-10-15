@@ -20610,7 +20610,11 @@ def _stored_auto_time(value, fallback):
 def intraday_auto_settings(room):
     if f'{room}_auto_config' not in st.session_state:
         config = load_config()
-        shared = get_stock_display_settings().get('auto_update_settings', {}).get('values', {}).get(room, {})
+        settings = st.session_state.get('_stock_display_settings', {})
+        group = settings.get('auto_update_settings', {}) if isinstance(settings, dict) else {}
+        values = group.get('values', {}) if isinstance(group, dict) else {}
+        shared = values.get(room, {}) if isinstance(values, dict) else {}
+        shared = shared if isinstance(shared, dict) else {}
         saved = shared.get('seconds', config.get(f'{room}_auto_seconds', 5))
         try:
             seconds = max(1, min(300, int(saved)))
