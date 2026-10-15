@@ -148,7 +148,8 @@ st.session_state._fixture_fetch=fixture_fetch
 '''
     source = APP_PATH.read_text(encoding='utf-8')
     anchor = 'tab1, tab_fibo, tab2, tab_db, tab_company, tab3 = st.tabs(['
-    source = source.replace(anchor, "if not st.session_state.get('_source_fixture'):\n" +
+    source = source.replace(anchor, f"STOCK_STRATEGY_CACHE_FILE={str(tmp_path / 'stock.json')!r}\n" +
+                            "if not st.session_state.get('_source_fixture'):\n" +
                             ''.join('    ' + line + '\n' for line in setup.strip().splitlines()) +
                             "    st.session_state['_source_fixture']=True\n" +
                             "fetch_stock_data_raw=st.session_state._fixture_fetch\n" +

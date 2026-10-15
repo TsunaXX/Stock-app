@@ -419,6 +419,7 @@ def test_sync_does_not_clear_new_query_edit_during_write(tmp_path):
               merge_postclose_scope=lambda remote,local,asset:dict(local),
               _write_json_atomic=lambda p,d,**kw:p.write_text(json.dumps(d)))
     def post(*a,**kw):
+        newer['edit_during_write'] = newer.get('edit_during_write', 0) + 1
         path.write_text(json.dumps(newer))
         return True, None
     ns['_save_remote_scope'] = post
@@ -446,3 +447,28 @@ def test_dispatch_shares_worker_and_defers_without_blocking():
     ns['dispatch_postclose_sync']()
     assert len(submitted) == 1
     slot.release()
+
+
+def test_sync_follows_up_settings_changed_during_first_write(tmp_path):
+    import json
+    import threading
+    ns = helpers('sync_postclose_scopes')
+    path = tmp_path / 'stock.json'
+    original = {'display_settings': {'limit_rows': 5}, 'postclose_sync_pending': True}
+    newer = {'display_settings': {'limit_rows': 6}, 'postclose_sync_pending': True}
+    path.write_text(json.dumps(original))
+    writes = []
+    def post(url, scope, payload, **kwargs):
+        writes.append(payload)
+        if len(writes) == 1:
+            path.write_text(json.dumps(newer))
+        return True, None
+    ns.update(STOCK_STRATEGY_CACHE_FILE=path, GOOGLE_SCOPE_STOCK='stock_strategy',
+              _RUNTIME_FILE_LOCK=threading.RLock(), get_data_cache_sync_lock=lambda: threading.RLock(),
+              _fetch_remote_scope=lambda *a, **kw: ({}, None),
+              merge_postclose_scope=lambda remote, local, asset: dict(local),
+              _save_remote_scope=post,
+              _write_json_atomic=lambda p, d, **kw: p.write_text(json.dumps(d)))
+    assert ns['sync_postclose_scopes']('configured', ['stock']) == ['stock']
+    assert [row['display_settings']['limit_rows'] for row in writes] == [5, 6]
+    assert json.loads(path.read_text()) == {'display_settings': {'limit_rows': 6}}

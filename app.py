@@ -22705,24 +22705,29 @@ def sync_postclose_scopes(cloud_url, assets):
     for asset in assets:
         path, scope = ((STOCK_STRATEGY_CACHE_FILE, GOOGLE_SCOPE_STOCK) if asset == 'stock'
                        else (FUTURES_STATE_CACHE_FILE, GOOGLE_SCOPE_FUTURES))
-        with get_data_cache_sync_lock():
-            with _RUNTIME_FILE_LOCK:
-                with open(path, encoding='utf-8') as file:
-                    local = json.load(file)
-            remote, error = _fetch_remote_scope(cloud_url, scope, timeout=8)
-            if error:
-                continue
-            merged = merge_postclose_scope(remote, local, asset)
-            ok, _ = _save_remote_scope(cloud_url, scope, merged,
-                                      updated_at=merged.get('updated_at'), timeout=8, verify=True)
-            if ok:
+        # An edit arriving during the first write gets one immediate follow-up.
+        for _ in range(2):
+            with get_data_cache_sync_lock():
                 with _RUNTIME_FILE_LOCK:
                     with open(path, encoding='utf-8') as file:
-                        latest = json.load(file)
-                    if latest == local:
-                        merged.pop('postclose_sync_pending', None)
-                        _write_json_atomic(path, merged, indent=2)
-                        completed.append(asset)
+                        local = json.load(file)
+                remote, error = _fetch_remote_scope(cloud_url, scope, timeout=8)
+                if error:
+                    break
+                merged = merge_postclose_scope(remote, local, asset)
+                ok, _ = _save_remote_scope(cloud_url, scope, merged,
+                                          updated_at=merged.get('updated_at'), timeout=8, verify=True)
+                if ok:
+                    with _RUNTIME_FILE_LOCK:
+                        with open(path, encoding='utf-8') as file:
+                            latest = json.load(file)
+                        if latest == local:
+                            merged.pop('postclose_sync_pending', None)
+                            _write_json_atomic(path, merged, indent=2)
+                            completed.append(asset)
+                            break
+                if not ok:
+                    break
     return completed
 
 
@@ -22865,7 +22870,9 @@ def dispatch_postclose_sync():
             completed = sync_task.result()
         except Exception:
             completed = []
-        state['sync_retry_at'] = 0 if set(completed) == set(state.get('sync_versions', {})) else time.monotonic() + 900
+        newer_edits = any(state.get('pending_sync', {}).get(asset) != version
+                          for asset, version in state.get('sync_versions', {}).items())
+        state['sync_retry_at'] = 0 if newer_edits or set(completed) == set(state.get('sync_versions', {})) else time.monotonic() + 900
         for asset in completed:
             if state.get('sync_versions', {}).get(asset) == state.get('pending_sync', {}).get(asset):
                 state['pending_sync'].pop(asset, None)
@@ -23417,7 +23424,7 @@ if tab1.open and stock_strategy_tab.open:
                         keep_other = df_check[~upload_mask]
                         st.session_state.stock_data = pd.concat([keep_upload, keep_other]).sort_values(by=['_source_rank', '_order'] if '_source_rank' in df_check.columns else None)
                         st.session_state.stock_strategy_editor_revision += 1
-                        save_data_cache(st.session_state.stock_data, st.session_state.ignored_stocks, st.session_state.all_candidates, st.session_state.saved_notes)
+                        save_data_cache(st.session_state.stock_data, st.session_state.ignored_stocks, st.session_state.all_candidates, st.session_state.saved_notes, sync_cloud=False)
 
                 df_all = st.session_state.stock_data.copy()
                 if '_source' not in df_all.columns: df_all['_source'] = 'upload'
@@ -24163,7 +24170,7 @@ if tab1.open and stock_strategy_tab.open:
                                     st.session_state.stock_data, ready_results,
                                 )
 
-                                save_data_cache(st.session_state.stock_data, st.session_state.ignored_stocks, st.session_state.all_candidates, st.session_state.saved_notes)
+                                save_data_cache(st.session_state.stock_data, st.session_state.ignored_stocks, st.session_state.all_candidates, st.session_state.saved_notes, sync_cloud=False)
                                 if ready_results:
                                     st.rerun()  # Only rerun after a successful addition.
                                 st.warning('本次尚未取得遞補股票資料，保留現有清單，稍後可再試。')
