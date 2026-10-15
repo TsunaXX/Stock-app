@@ -157,6 +157,69 @@ def test_excel_real_numeric_values_filters_and_performance():
     assert sheet.freeze_panes == 'A2'
 
 
+@pytest.mark.parametrize('damage', [None, 'missing', 'changed'])
+def test_sync_accepts_apps_script_event_order_but_retries_missing_or_changed_events(tmp_path, damage):
+    if not shutil.which('node'):
+        pytest.skip('Node unavailable')
+    tracker = ModelTracker(tmp_path/'readback.sqlite', 'fake', start=False)
+    tracker.process([signal()], {'股票|2330': quote(100, 來源時間='2026-10-08T09:30:00.001+08:00')})
+    original = tracker.records()
+    remote = {'strategy_signals': {'model_schema': 1, 'model_months': [], 'model_versions': {}}}
+    tracker.remote_get = lambda scope: json.loads(json.dumps(remote.get(scope, {})))
+    program = '''
+const fs=require('fs'),vm=require('vm');
+vm.runInThisContext(fs.readFileSync('google_apps_script.gs','utf8'));
+process.stdout.write(JSON.stringify(mergeSignalPayload_({},JSON.parse(fs.readFileSync(0,'utf8')))));
+'''
+    def write(scope, data):
+        result = subprocess.run(['node', '-e', program], input=json.dumps(data),
+                                cwd=ROOT, capture_output=True, text=True, encoding='utf-8')
+        assert result.returncode == 0, result.stderr
+        remote[scope] = json.loads(result.stdout)
+        remote['strategy_signals']['model_months'] = ['202610']
+        actual = tracker.remote_get(scope)
+        if damage == 'missing':
+            actual['model_trades'][0]['事件'].pop()
+        elif damage == 'changed':
+            actual['model_trades'][0]['事件'][0]['原因'] = 'altered'
+        return actual
+    tracker.remote_save = write
+    if damage:
+        with pytest.raises(ValueError, match='交易事件回讀不一致'):
+            tracker.sync()
+        assert tracker.records() == original
+        with tracker.db() as db:
+            assert db.execute('SELECT dirty FROM trades').fetchone()[0] == 1
+        damage = None
+    tracker.sync()
+    assert tracker.records() == merge_trades(original, original)
+    with tracker.db() as db:
+        assert db.execute('SELECT dirty FROM trades').fetchone()[0] == 0
+
+
+def test_sync_preserves_events_and_new_trades_created_during_network_write(tmp_path):
+    tracker = ModelTracker(tmp_path/'concurrent-write.sqlite', 'fake', start=False)
+    tracker.process([signal()], {'股票|2330': quote(100)})
+    remote = {'strategy_signals': {'model_schema': 1, 'model_months': [], 'model_versions': {}}}
+    tracker.remote_get = lambda scope: json.loads(json.dumps(remote.get(scope, {})))
+    def write(scope, data):
+        remote[scope] = json.loads(json.dumps(data))
+        remote['strategy_signals']['model_months'] = ['202610']
+        tracker.process([], {'股票|2330': quote(111, 1)})
+        tracker.process([signal(商品鍵='2408')], {})
+        return tracker.remote_get(scope)
+    tracker.remote_save = write
+    tracker.sync()
+    records = {r['商品鍵']: r for r in tracker.records()}
+    assert records['2330']['狀態'] == '已平倉' and '2408' in records
+    with tracker.db() as db:
+        assert db.execute('SELECT COUNT(*) FROM trades WHERE dirty=1').fetchone()[0] == 2
+    tracker.remote_save = lambda scope, data: remote.update({scope: data}) or data
+    tracker.sync()
+    with tracker.db() as db:
+        assert db.execute('SELECT COUNT(*) FROM trades WHERE dirty=1').fetchone()[0] == 0
+
+
 def test_apps_script_merge_runs_under_real_javascript():
     if not shutil.which('node'):
         pytest.skip('Node unavailable')

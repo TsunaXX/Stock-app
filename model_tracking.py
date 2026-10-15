@@ -578,10 +578,13 @@ class ModelTracker:
                 if not isinstance(row,dict) or new_trade(row)['交易ID'] != row.get('交易ID') or row.get('狀態') not in ACTIVE | {'已平倉','訊號失效'}:
                     raise ValueError('Google Sheet 交易ID或狀態無效；保留待同步')
             local = self.records(month, month)
+            local_versions = {r['交易ID']: r for r in local}
             merged = merge_trades(remote, local)
             if month in pending:
                 actual = self.remote_save(scope, {'model_schema': 1, 'model_trades': merged})
-                saved = {r['交易ID']: r for r in actual.get('model_trades', [])}
+                saved_rows = actual.get('model_trades', [])
+                # Apps Script collation can order identical ISO event times differently.
+                saved = {r['交易ID']: r for r in merge_trades(saved_rows, saved_rows)}
                 if any(r['交易ID'] not in saved or merge_trades([saved[r['交易ID']]], [r])[0] != saved[r['交易ID']] for r in merged):
                     raise ValueError('交易事件回讀不一致；保留待同步並重試')
                 catalog_check = self.remote_get('strategy_signals')
@@ -589,10 +592,16 @@ class ModelTracker:
                     raise ValueError('月份索引回讀不一致；保留待同步')
                 merged = list(saved.values())
             with self.db() as db:
+                db.execute('BEGIN IMMEDIATE')
                 for row in merged:
-                    self.store(db, row, dirty=0)
-                if month in pending:
-                    db.execute('UPDATE trades SET dirty=0 WHERE month=?', (month,))
+                    current = db.execute('SELECT body FROM trades WHERE id=?', (row['交易ID'],)).fetchone()
+                    current = json.loads(current[0]) if current else None
+                    changed = current is not None and current != local_versions.get(row['交易ID'])
+                    if changed:
+                        row = merge_trades([row], [current])[0]
+                    self.store(db, row, dirty=int(changed))
+                    if month in pending and not changed:
+                        db.execute('UPDATE trades SET dirty=0 WHERE id=?', (row['交易ID'],))
             self.revision += 1
             self.month_versions[month] = versions.get(month)
         self.hydrated = True
