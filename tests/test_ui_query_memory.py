@@ -17,6 +17,8 @@ def test_restore_queries_uses_own_version_including_explicit_empty_list():
              'postclose_sync_pending': True}
     remote = {'stock_data': [{'代號':'2330'}], 'stock_data_updated_at':'2026-10-06',
               'quick_search_state': {'main':['1815 富喬'], 'updated_at':'2026-10-05'}}
+    local['display_settings'] = {'limit_rows':6, 'hide_non_stock':True, 'updated_at':'2026-10-06'}
+    remote['display_settings'] = {'limit_rows':5, 'hide_non_stock':False, 'updated_at':'2026-10-05'}
     state, writes = {}, []
     ns.update(st=SimpleNamespace(session_state=state), STOCK_STRATEGY_CACHE_FILE='stock.json',
               _RUNTIME_FILE_LOCK=threading.RLock(),
@@ -27,6 +29,8 @@ def test_restore_queries_uses_own_version_including_explicit_empty_list():
               normalize_stock_display_settings=lambda v: v, load_search_cache=lambda: ['stale'])
     assert ns['load_data_cache']()[0]['代號'].tolist() == ['2330']
     assert state['_stock_quick_search_state'] == local['quick_search_state']
+    assert state['_stock_display_settings'] == local['display_settings']
+    assert writes[-1]['display_settings'] == local['display_settings']
     assert writes[-1]['quick_search_state'] == local['quick_search_state']
     local['quick_search_state'] = {'main':[], 'independent':[], 'updated_at':'2026-10-06T11:00:00+08:00'}
     ns['load_data_cache']()
