@@ -129,7 +129,7 @@ def test_delayed_company_result_only_fills_missing_events_without_replacing_newe
 
 @pytest.mark.parametrize('include_analysis', [False, True])
 def test_futures_quote_refresh_preserves_strategy_or_checks_each_rows_prior_stop(include_analysis):
-    ns = load_app_symbols('update_futures_live_rows', '_safe_number', 'snapshot_change_rate',
+    ns = load_app_symbols('update_futures_live_rows', 'shioaji_contract_limits', '_safe_number', 'snapshot_change_rate',
                           '_stream_datetime', 'set_futures_row_values', 'parse_trade_plan_numbers')
     rows = pd.DataFrame([{'期貨代碼': code, '契約月份': '202610', '收盤價': 100,
         '開盤價': 100, '當日高': 101, '當日低': 99, '當日成交口數': 10,
@@ -144,6 +144,7 @@ def test_futures_quote_refresh_preserves_strategy_or_checks_each_rows_prior_stop
         avg_price=100.2, updated_at=pd.Timestamp.now(tz='Asia/Taipei')) for _ in contracts]
     ns['get_futures_tick_size'] = lambda *a: .5
     ns['round_futures_price'] = lambda price, *a: price
+    ns['shioaji_contract_limits'] = lambda api, contract: (110., 90.)
     def history(*a, **kw):
         assert include_analysis, 'Quote-only refresh must not request history'
         return pd.DataFrame()
@@ -155,6 +156,7 @@ def test_futures_quote_refresh_preserves_strategy_or_checks_each_rows_prior_stop
     ns['fmt_price'] = lambda value: str(value)
     updated, count = ns['update_futures_live_rows'](rows, object(), '當沖', '自動', include_analysis)
     assert count == 2 and list(updated['收盤價']) == [100.5, 100.5]
+    assert list(updated['當日漲停價']) == [110., 110.]  # Contract bounds override quote-derived 110.55.
     if include_analysis:
         assert '前次預判停損已碰觸' in updated.iloc[0]['進出場點位']
         assert '前次預判停損已碰觸' not in updated.iloc[1]['進出場點位']
@@ -642,3 +644,29 @@ def test_same_day_revenue_company_code_identity_and_partial_resync():
     assert [e['revenue']['company'] for e in merged['events']]==['台積電','富喬']
     assert merged['events'][0]['revenue']['mom']=='+11%'
     assert merged['calendar_companies']==['2330','1815']
+
+
+def test_stock_background_publishes_current_limits_without_rewriting_strategy():
+    ns = load_app_symbols('background_intraday_rows', 'set_futures_row_values')
+    rows = pd.DataFrame([{'代號': '2330', '收盤價': 100, '戰略備註': '固定備註',
+                          '_交易日漲停價': 110, '_交易日跌停價': 90,
+                          '當日漲停價': 110, '當日跌停價': 90}])
+    state = {'sj_api': object(), 'sj_logged_in': True}
+    ns['st'] = SimpleNamespace(session_state=state)
+    ns['intraday_auto_settings'] = lambda room: (True, 5, None, None)
+    ns['check_shioaji_connection'] = lambda api: True
+    ns['get_intraday_background'] = lambda: None
+    ns['intraday_auto_window_open'] = lambda *a, **kw: True
+    ns['get_app_secret'] = lambda key: ''
+    ns['get_model_tracker'] = lambda url: SimpleNamespace(submit=lambda *a: None)
+    ns['model_tracking_config'] = lambda *a: ({}, '多頭')
+    ns['model_tracking_samples'] = lambda *a: ([], {})
+    ns['begin_intraday_auto_update'] = lambda *a: True
+    ns['finish_intraday_auto_update'] = lambda *a: None
+    ns['refresh_daytrade_metrics_for_codes'] = lambda seed, *a, **kw: (
+        seed.assign(**{'收盤價': 108, '_交易日漲停價': 115, '_交易日跌停價': 95,
+                       '當日漲停價': 118, '當日跌停價': 98, '戰略備註': '不得套用'}), 1, 1)
+    result = ns['background_intraday_rows']('stock', rows)
+    assert result.iloc[0]['_交易日漲停價'] == 115 and result.iloc[0]['_交易日跌停價'] == 95
+    assert result.iloc[0]['當日漲停價'] == 118 and result.iloc[0]['當日跌停價'] == 98
+    assert result.iloc[0]['戰略備註'] == '固定備註'

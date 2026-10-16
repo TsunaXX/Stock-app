@@ -532,10 +532,21 @@ class ModelTracker:
                 self.revision += 1
 
     def remote_get(self, scope):
-        response = requests.get(self.url, params={'scope': scope, '_ts': time.time_ns()},
-                                headers={'Cache-Control': 'no-cache, no-store, max-age=0', 'Pragma': 'no-cache'},
-                                timeout=(5, 35))
-        response.raise_for_status()
+        for attempt in range(3):
+            try:
+                response = requests.get(self.url, params={'scope': scope, '_ts': time.time_ns()},
+                                        headers={'Cache-Control': 'no-cache, no-store, max-age=0', 'Pragma': 'no-cache'},
+                                        timeout=(5, 35))
+                response.raise_for_status()
+                break
+            except (requests.ConnectionError, requests.Timeout, requests.HTTPError) as exc:
+                status = exc.response.status_code if exc.response is not None else None
+                if status is not None and status not in (429, 500, 502, 503, 504):
+                    raise
+                if attempt == 2:
+                    reason = f'HTTP {status}' if status else type(exc).__name__
+                    raise RuntimeError(f'Google Sheet 暫時無法讀取（{scope}／{reason}，已嘗試 3 次）；保留待同步並自動重試') from exc
+                time.sleep(2 ** attempt)
         payload = response.json()
         if payload.get('success') is not True:
             raise ValueError(payload.get('error', 'Google Sheet 讀取失敗'))
