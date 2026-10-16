@@ -1461,7 +1461,7 @@ def test_stock_quote_refresh_uses_one_snapshot_batch_for_all_rows():
         "_safe_number", "get_tick_size", "calculate_limits", "stock_limit_context",
         "snapshot_change_rate", "price_change_amount", "stock_snapshot_limit_context",
         "fetch_stock_snapshot_map", "merge_realtime_stock_snapshots",
-        "refresh_stock_quotes_for_codes", "get_shioaji_stock_contract", "_is_shioaji_auth_error",
+        "refresh_stock_quotes_for_codes", "shioaji_contract_limits", "get_shioaji_stock_contract", "_is_shioaji_auth_error",
     )
 
     class Snapshot:
@@ -1473,7 +1473,8 @@ def test_stock_quote_refresh_uses_one_snapshot_batch_for_all_rows():
             self.sell_price = close
 
     class Contracts:
-        Stocks = {"2330": object(), "2317": object()}
+        Stocks = {"2330": SimpleNamespace(limit_up=111.5, limit_down=91.5),
+                  "2317": SimpleNamespace(limit_up=222.5, limit_down=182.5)}
 
     api = type("API", (), {})()
     api.Contracts = Contracts()
@@ -1492,6 +1493,8 @@ def test_stock_quote_refresh_uses_one_snapshot_batch_for_all_rows():
     assert count == 2
     assert len(calls) == 1
     assert refreshed["收盤價"].tolist() == [101, 202]
+    assert refreshed['_交易日漲停價'].tolist() == [111.5, 222.5]
+    assert refreshed['_交易日跌停價'].tolist() == [91.5, 182.5]
 
 
 def test_stock_price_only_refresh_preserves_every_strategy_field():
@@ -3196,6 +3199,7 @@ def test_daytrade_plan_rejects_limit_up_chase_with_low_reward_risk():
             "_daytrade_close": 160.5,
             "_daytrade_phase": "開盤區間完成",
             "當日漲停價": 162,
+            "當日跌停價": 130,
         },
         "多頭", True, {"eligible": True, "rule": "觸發"},
     )
@@ -3218,6 +3222,7 @@ def test_daytrade_plan_keeps_normal_breakout_when_space_is_sufficient():
             "_daytrade_close": 160.5,
             "_daytrade_phase": "開盤區間完成",
             "當日漲停價": 180,
+            "當日跌停價": 130,
         },
         "多頭", True, {"eligible": True, "rule": "觸發"},
     )
@@ -3246,6 +3251,49 @@ def test_daytrade_breakout_at_daily_limit_is_rejected_instead_of_moved_backwards
     )
     assert long_plan["valid"] is False and long_plan["blocking_reason"] == "已到漲停"
     assert short_plan["valid"] is False and short_plan["blocking_reason"] == "已到跌停"
+
+
+def test_stock_intraday_targets_use_today_limits_and_invalid_private_values_fall_back():
+    ns = load_app_symbols('get_taiwan_tick_size', 'round_to_tick', 'get_tick_size',
+                          'move_tick', '_as_float', '_safe_number', 'fmt_price', 'build_trade_plan',
+                          'parse_trade_plan_numbers')
+    base = {'_daytrade_vwap': 106.5, '_daytrade_or_high': 108,
+            '_daytrade_or_low': 105, '_daytrade_close': 108.5,
+            '_交易日漲停價': 110, '_交易日跌停價': 90,
+            '當日漲停價': 119, '當日跌停價': 98}  # Next-session display after 14:30.
+    long = ns['build_trade_plan'](base, '多頭', True, {'eligible': True})
+    assert '目 110' in long['summary'] and not long['valid']  # Capped RR remains below 1.3.
+    short = ns['build_trade_plan']({**base, '_daytrade_vwap': 94, '_daytrade_or_high': 95,
+                                  '_daytrade_or_low': 92, '_daytrade_close': 91.9},
+                                 '空頭', True, {'eligible': True})
+    assert '目 90' in short['summary']
+    fallback = ns['build_trade_plan']({**base, '_交易日漲停價': float('nan'),
+                                     '_交易日跌停價': None, '當日漲停價': 110, '當日跌停價': 90},
+                                    '多頭', True, {'eligible': True})
+    assert fallback == long
+    missing = ns['build_trade_plan']({k: v for k, v in base.items() if '停價' not in k},
+                                   '多頭', True, {'eligible': True})
+    assert not missing['valid'] and '尚未確認' in missing['summary']
+
+
+def test_futures_capped_targets_and_contract_limits():
+    ns = load_app_symbols('calculate_futures_strategy_levels', 'shioaji_contract_limits',
+                          '_safe_number', 'round_futures_price', 'get_futures_tick_size',
+                          'FUTURES_FIXED_TICK_SIZES', 'clamp_futures_intraday_levels', 'fmt_price')
+    row = {'期貨代碼': 'CDF', '商品類型': '股票', '收盤價': 108, '開盤價': 106,
+           '當日高': 108, '當日低': 105, '當日漲停價': 111, '當日跌停價': 90}
+    long = ns['calculate_futures_strategy_levels'](row, '當沖', '偏多')
+    assert '目 111' in long['進出場點位']
+    short = ns['calculate_futures_strategy_levels'](
+        {**row, '收盤價': 92, '當日高': 95, '當日低': 92, '當日跌停價': 89.5}, '當沖', '偏空')
+    assert '目 89.5' in short['進出場點位']
+    missing = ns['calculate_futures_strategy_levels']({**row, '當日漲停價': None}, '當沖', '偏多')
+    assert '尚未確認' in missing['進出場點位']
+    contract = SimpleNamespace(code='CDFJ6')
+    api = SimpleNamespace(contracts=SimpleNamespace(info=lambda c: SimpleNamespace(limit_up=111.5, limit_down=91.5)))
+    assert ns['shioaji_contract_limits'](api, contract) == (111.5, 91.5)
+    assert ns['shioaji_contract_limits'](object(), SimpleNamespace(limit_up=110, limit_down=90)) == (110, 90)
+    assert ns['clamp_futures_intraday_levels'](101, 80, 130, 119.7, 90.2, 1) == (101, 91, 119)
 
 
 def test_stock_and_futures_ranking_freeze_boundaries():
@@ -3340,7 +3388,7 @@ def test_intraday_auto_window_and_completion_gate():
 
 def test_stream_refresh_only_visible_stocks_preserves_daily_strategy_and_quote_age():
     ns = load_app_symbols(
-        'refresh_daytrade_metrics_for_codes', 'refresh_stock_quotes_for_codes',
+        'refresh_daytrade_metrics_for_codes', 'refresh_stock_quotes_for_codes', 'shioaji_contract_limits',
         'get_shioaji_stock_contract', '_is_shioaji_auth_error',
         'merge_realtime_stock_snapshots', 'fresh_strategy_stream_quote', '_stream_datetime',
         '_safe_number', '_stream_number', 'snapshot_change_rate', 'price_change_amount', 'get_tick_size',
@@ -3425,7 +3473,7 @@ def test_intraday_history_seed_is_background_and_reused():
 
 
 def test_futures_auto_reads_stream_only_and_waits_for_history():
-    ns = load_app_symbols('update_futures_live_rows', '_safe_number', '_stream_datetime',
+    ns = load_app_symbols('update_futures_live_rows', 'shioaji_contract_limits', '_safe_number', '_stream_datetime',
                           'snapshot_change_rate', 'fresh_strategy_stream_quote', 'set_futures_row_values', 'parse_trade_plan_numbers')
     rows = pd.DataFrame([{'期貨代碼':'CDF', '契約月份':'202610', '契約鍵':'CDF:202610',
                           '收盤價':100, '開盤價':99, '當日高':101, '當日低':98,

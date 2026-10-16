@@ -15521,6 +15521,21 @@ def stock_snapshot_limit_context(snapshot, price, change_rate=None, now_tw=None)
     return stock_limit_context(reference, current_price, now_tw=now_tw)
 
 
+def shioaji_contract_limits(api, contract):
+    """Read SDK-maintained session limits; compact 1.7 contracts need info()."""
+    if contract is None:
+        return None, None
+    try:
+        info = api.contracts.info(contract)
+    except (AttributeError, KeyError, TypeError):
+        info = contract
+    upper = _safe_number(getattr(info, 'limit_up', None))
+    lower = _safe_number(getattr(info, 'limit_down', None))
+    if upper is not None and lower is not None and 0 < lower < upper:
+        return upper, lower
+    return None, None
+
+
 FUTURES_FIXED_TICK_SIZES = {
     'TX': 1.0, 'MTX': 1.0, 'TMF': 1.0,
     'TE': 0.05, 'TF': 0.2, 'GTF': 0.05,
@@ -15569,6 +15584,8 @@ def clamp_futures_intraday_levels(entry, stop, target, limit_up, limit_down, tic
         return entry, stop, target
     if upper is not None and lower is not None and lower > upper:
         return entry, stop, target
+    upper = round_futures_price(upper, tick, ROUND_FLOOR) if upper is not None else None
+    lower = round_futures_price(lower, tick, ROUND_CEILING) if lower is not None else None
 
     def clamp(value):
         numeric = _safe_number(value)
@@ -16183,6 +16200,12 @@ def calculate_futures_strategy_levels(row, strategy_mode='當沖', direction_cho
     risk_distance = max((atr or observed_range) * (0.55 if strategy_mode == '當沖' else 1.0), tick * 2)
     limit_up = _safe_number(row.get('當日漲停價')) if strategy_mode == '當沖' else None
     limit_down = _safe_number(row.get('當日跌停價')) if strategy_mode == '當沖' else None
+    if strategy_mode == '當沖' and (
+        limit_up is None or limit_down is None or not 0 < limit_down < limit_up
+    ):
+        return {'支撐壓力': f'支 {fmt_price(support)}｜壓 {fmt_price(resistance)}',
+                '進出場點位': '等待｜當日漲跌停價尚未確認', '方向': '觀望',
+                '觸發條件': '缺少當日合法價格範圍', **guard_fields}
     if direction == '偏多':
         entry = round_future(float(resistance) + tick)
         stop = round_future(entry - risk_distance)
@@ -16201,7 +16224,7 @@ def calculate_futures_strategy_levels(row, strategy_mode='當沖', direction_cho
         risk = abs(entry - stop)
         if not valid_levels or risk <= 0 or abs(target - entry) / risk < 1.3:
             return {'支撐壓力': f'支 {fmt_price(support)}｜壓 {fmt_price(resistance)}',
-                    '進出場點位': '等待｜剩餘風報比不足', '方向': '觀望',
+                    '進出場點位': f'等待｜剩餘風報比不足｜目 {fmt_price(target)}', '方向': '觀望',
                     '觸發條件': '漲跌停範圍內剩餘風報比不足', 'VWAP': vwap, 'ATR': atr,
                     **guard_fields}
     return {
@@ -16388,9 +16411,12 @@ def update_futures_live_rows(rows, api, strategy_mode, direction_choice, include
             if price is not None and price > 0:
                 updated.at[index, '收盤價'] = price
                 updated.at[index, '開盤價'] = _safe_number(getattr(snapshot, 'open', None), updated.loc[index].get('開盤價'))
-                change = _safe_number(getattr(snapshot, 'change_price', getattr(snapshot, 'change', None)), 0) or 0
-                reference = price - change
                 live_change_rate = snapshot_change_rate(snapshot, price)
+                change = _safe_number(getattr(snapshot, 'change_price', getattr(snapshot, 'change', None)))
+                reference = price - change if change is not None else (
+                    price / (1 + live_change_rate / 100)
+                    if live_change_rate is not None and live_change_rate > -100 else None
+                )
                 updated.at[index, '漲跌幅'] = live_change_rate if live_change_rate is not None else 0
                 updated.at[index, '當日高'] = _safe_number(getattr(snapshot, 'high', None), updated.at[index, '當日高'])
                 updated.at[index, '當日低'] = _safe_number(getattr(snapshot, 'low', None), updated.at[index, '當日低'])
@@ -16398,7 +16424,11 @@ def update_futures_live_rows(rows, api, strategy_mode, direction_choice, include
                 updated.at[index, '買價'] = _safe_number(getattr(snapshot, 'buy_price', None))
                 updated.at[index, '賣價'] = _safe_number(getattr(snapshot, 'sell_price', None))
                 updated.at[index, '報價時間'] = _stream_datetime(getattr(snapshot, 'updated_at', None)).strftime('%Y/%m/%d %H:%M:%S')
-                if reference > 0:
+                limit_up, limit_down = shioaji_contract_limits(api, contract)
+                if limit_up is not None:
+                    updated.at[index, '當日漲停價'] = limit_up
+                    updated.at[index, '當日跌停價'] = limit_down
+                elif reference is not None and reference > 0:
                     tick = get_futures_tick_size(
                         updated.at[index, '期貨代碼'], reference,
                         str(updated.at[index, '商品類型']) if '商品類型' in updated.columns else '未知',
@@ -19517,11 +19547,24 @@ def build_trade_plan(row, direction, is_daytrade_mode, filter_result):
         }
 
     is_long = direction == '多頭'
+    limit_up = (_safe_number(row.get('_交易日漲停價')) or _safe_number(row.get('當日漲停價'))) if is_daytrade_mode else None
+    limit_down = (_safe_number(row.get('_交易日跌停價')) or _safe_number(row.get('當日跌停價'))) if is_daytrade_mode else None
+    if is_daytrade_mode and (
+        limit_up is None or limit_down is None or not 0 < limit_down < limit_up
+    ):
+        return {'summary': '等待｜當日漲跌停價尚未確認',
+                'detail': '缺少當日合法價格範圍，不預判點位。',
+                'valid': False, 'reward_risk': None}
 
     def _round(value):
         return round_to_tick(max(0.01, value))
 
     def _format_plan(entry, stop, target, trigger_text, current_price=None):
+        if is_daytrade_mode:
+            entry, stop, target = (
+                _round(max(limit_down or 0.01, min(value, limit_up or float('inf'))))
+                for value in (entry, stop, target)
+            )
         if is_long and not (stop < entry < target):
             return {
                 'summary': '⛔ 不追價｜可用獲利空間不足',
@@ -19606,8 +19649,6 @@ def build_trade_plan(row, direction, is_daytrade_mode, filter_result):
         current_price = _as_float(row.get('_daytrade_close'))
 
         if is_long:
-            limit_up = _as_float(row.get('_交易日漲停價', row.get('當日漲停價')))
-            limit_down = _as_float(row.get('_交易日跌停價', row.get('當日跌停價')))
             if limit_up is not None and opening_high >= limit_up:
                 return {
                     'summary': '⛔ 不追價｜已到漲停，無可用突破價',
@@ -19620,21 +19661,12 @@ def build_trade_plan(row, direction, is_daytrade_mode, filter_result):
             if stop >= entry:
                 stop = _round(move_tick(entry, -2))
             target = _round(entry + (entry - stop) * 1.5)
-            if limit_up is not None and limit_up > 0:
-                # Entry/target must not cross the current day's upper limit;
-                # leave one legal tick for a trigger above the range high.
-                entry = min(entry, _round(move_tick(limit_up, -1)))
-                target = min(target, _round(limit_up))
-            if limit_down is not None and limit_down > 0:
-                stop = max(stop, _round(limit_down))
             trigger = (
                 '突破目前開盤高點且維持 VWAP 上方（區間形成中）'
                 if opening_forming else '開盤區間高點突破後，維持 VWAP 上方'
             )
             return _format_plan(entry, stop, target, trigger, current_price)
 
-        limit_down = _as_float(row.get('_交易日跌停價', row.get('當日跌停價')))
-        limit_up = _as_float(row.get('_交易日漲停價', row.get('當日漲停價')))
         if limit_down is not None and opening_low <= limit_down:
             return {
                 'summary': '⛔ 不追價｜已到跌停，無可用跌破價',
@@ -19647,11 +19679,6 @@ def build_trade_plan(row, direction, is_daytrade_mode, filter_result):
         if stop <= entry:
             stop = _round(move_tick(entry, 2))
         target = _round(entry - (stop - entry) * 1.5)
-        if limit_down is not None and limit_down > 0:
-            entry = max(entry, _round(move_tick(limit_down, 1)))
-            target = max(target, _round(limit_down))
-        if limit_up is not None and limit_up > 0:
-            stop = min(stop, _round(limit_up))
         trigger = (
             '跌破目前開盤低點且維持 VWAP 下方（區間形成中）'
             if opening_forming else '開盤區間低點跌破後，維持 VWAP 下方'
@@ -20578,9 +20605,23 @@ def refresh_stock_quotes_for_codes(
         snapshot_map = fetch_stock_snapshot_map(
             sj_api, stock_data['代號'].astype(str).tolist(),
         )
-    return merge_realtime_stock_snapshots(
+    refreshed, count = merge_realtime_stock_snapshots(
         stock_data, snapshot_map, points_map=points_map, price_only=price_only,
     )
+    if not price_only:
+        refreshed = refreshed.astype(object)
+        for index, row in refreshed.iterrows():
+            code = str(row['代號'])
+            if code not in snapshot_map:
+                continue
+            upper, lower = shioaji_contract_limits(sj_api, get_shioaji_stock_contract(sj_api, code))
+            if upper is not None:
+                refreshed.at[index, '_交易日漲停價'] = upper
+                refreshed.at[index, '_交易日跌停價'] = lower
+                if datetime.now(pytz.timezone('Asia/Taipei')).time() < dt_time(14, 30):
+                    refreshed.at[index, '當日漲停價'] = upper
+                    refreshed.at[index, '當日跌停價'] = lower
+    return refreshed, count
 
 
 def intraday_auto_window_open(now_tw, start=None, end=None, stock=False):
@@ -20918,7 +20959,7 @@ def background_intraday_rows(room, rows, visible_codes=None, strategy_mode='當�
     for _, row in refreshed.iterrows():
         indexes = merged.index[merged[key].astype(str) == str(row[key])]
         for column, value in row.items():
-            if stock and column not in ('收盤價', '漲跌幅', '成交價價差') and not column.startswith(('_daytrade_', '_quote_')):
+            if stock and column not in ('收盤價', '漲跌幅', '成交價價差', '當日漲停價', '當日跌停價', '_交易日漲停價', '_交易日跌停價') and not column.startswith(('_daytrade_', '_quote_')):
                 continue
             for index in indexes:
                 set_futures_row_values(merged, index, {column: value})

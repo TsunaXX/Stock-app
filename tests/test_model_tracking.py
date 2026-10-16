@@ -711,6 +711,65 @@ def test_cloud_readback_does_not_reuse_cached_reads_and_keeps_pending_on_timeout
         assert db.execute('SELECT dirty FROM trades').fetchone()[0] == 1
 
 
+
+@pytest.mark.parametrize('failure', [500, 429, 'timeout'])
+def test_cloud_catalog_transient_failure_retries_with_new_nonce(tmp_path, failure):
+    import requests
+    tracker = ModelTracker(tmp_path/'retry.sqlite', 'https://example.test/exec', start=False)
+    if failure == 'timeout':
+        error = requests.ReadTimeout('temporary')
+    else:
+        response = requests.Response()
+        response.status_code = failure
+        error = requests.HTTPError('temporary', response=response)
+    data = {'model_schema': 1, 'model_months': [], 'model_versions': {}}
+    success = SimpleNamespace(raise_for_status=lambda: None,
+                              json=lambda: {'success': True, 'data': data})
+    with patch('model_tracking.requests.get', side_effect=[error, success]) as get, \
+         patch('model_tracking.time.sleep') as sleep, \
+         patch('model_tracking.time.time_ns', side_effect=[1, 2]):
+        assert tracker.remote_get('strategy_signals') == data
+    assert get.call_count == 2
+    assert [c.kwargs['params']['_ts'] for c in get.call_args_list] == [1, 2]
+    sleep.assert_called_once_with(1)
+
+
+def test_persistent_cloud_500_keeps_pending_then_verified_retry_clears_it(tmp_path):
+    import requests
+    tracker = ModelTracker(tmp_path/'pending.sqlite', 'https://example.test/exec', start=False)
+    tracker.process([signal()], {'股票|2330': quote(100)})
+    response = requests.Response()
+    response.status_code = 500
+    error = requests.HTTPError('500 https://example.test/exec?private=value', response=response)
+    with patch('model_tracking.requests.get', side_effect=error) as get, \
+         patch('model_tracking.time.sleep') as sleep, \
+         pytest.raises(RuntimeError, match='HTTP 500.*3 次') as caught:
+        tracker.sync()
+    assert get.call_count == 3 and sleep.call_count == 2
+    assert 'https://' not in str(caught.value)
+    with tracker.db() as db:
+        assert db.execute('SELECT dirty FROM trades').fetchone()[0] == 1
+    before = tracker.records()
+    tracker.remote_get = lambda scope: ({'model_schema': 1, 'model_months': ['202610'], 'model_versions': {}}
+                                       if scope == 'strategy_signals' else {'model_trades': []})
+    tracker.remote_save = lambda scope, data: data
+    tracker.sync()
+    assert tracker.records() == before and tracker.status == '已回讀驗證'
+    with tracker.db() as db:
+        assert db.execute('SELECT dirty FROM trades').fetchone()[0] == 0
+
+
+def test_nontransient_cloud_http_error_does_not_repeat(tmp_path):
+    import requests
+    tracker = ModelTracker(tmp_path/'denied.sqlite', 'https://example.test/exec', start=False)
+    response = requests.Response()
+    response.status_code = 403
+    with patch('model_tracking.requests.get', side_effect=requests.HTTPError(response=response)) as get, \
+         patch('model_tracking.time.sleep') as sleep, pytest.raises(requests.HTTPError):
+        tracker.remote_get('strategy_signals')
+    assert get.call_count == 1 and not sleep.called
+
+
 def test_cached_model_performance_handles_legacy_metric_dict():
     """A pre-upgrade metric cache must not crash the new summary cards."""
     tree = ast.parse((ROOT/'app.py').read_text(encoding='utf-8'))
