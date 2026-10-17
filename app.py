@@ -19463,7 +19463,8 @@ def calculate_daytrade_filter_result(row, direction, attention_counts=None, disp
         range_broken = bool(open_aligned and near_live_edge)
         range_score = 12 if range_broken else (6 if open_aligned else 0)
     else:
-        range_broken = close > opening_high if is_long else close < opening_low
+        # Preview one tick before the fixed range breaks; entry still requires the breakout.
+        range_broken = close >= move_tick(opening_high, -1) if is_long else close <= move_tick(opening_low, 1)
         range_score = 15 if range_broken else 0
     if volume_ratio is None:
         volume_score = 8
@@ -19516,7 +19517,9 @@ def calculate_daytrade_filter_result(row, direction, attention_counts=None, disp
     else:
         rule = (
             f'觸發：開盤動能{direction_text} VWAP＋接近{range_text}'
-            if is_opening_micro else f'觸發：{direction_text} VWAP＋{direction_text}{range_text}'
+            if is_opening_micro else (f'觸發：{direction_text} VWAP＋{direction_text}{range_text}'
+                  if (close > opening_high if is_long else close < opening_low)
+                  else f'觀察：接近{range_text}，等待突破價成交')
         )
 
     data_source = str(row.get('_daytrade_source', '—'))
@@ -19622,6 +19625,13 @@ def build_trade_plan(row, direction, is_daytrade_mode, filter_result):
                 'valid': False, 'reward_risk': round(reward_risk, 2),
                 'blocking_reason': '已偏離進場點',
             }
+        if is_daytrade_mode and price is not None:
+            executable = max(entry, price) if is_long else min(entry, price)
+            remaining_rr = abs(target - executable) / abs(executable - stop) if executable != stop else 0
+            if remaining_rr < minimum_reward_risk:
+                return {'summary': f'等待｜現價剩餘風報比不足｜停 {fmt_price(stop)}｜目 {fmt_price(target)}',
+                        'detail': f'現價剩餘風報比 {remaining_rr:.2f}，等待回測原進場點。',
+                        'valid': False, 'reward_risk': round(remaining_rr, 2), 'blocking_reason': '現價剩餘風報比不足'}
         summary = (
             f"進 {fmt_price(entry)}｜停 {fmt_price(stop)}｜目 {fmt_price(target)}｜"
             f"RR {reward_risk:.2f}"
@@ -19714,7 +19724,7 @@ def build_guarded_stock_trade_plan(row, direction, is_daytrade, result):
     plans = st.session_state.setdefault('_stock_last_intraday_plans', {})
     prior = plans.get(code, {})
     price = _safe_number(row.get('_daytrade_close'))
-    if prior.get('session') == session and price is not None:
+    if prior.get('session') == session and price is not None and not bool(row.get('_data_stale', False)):
         stop = prior['stop']
         stopped = price <= stop if prior['direction'] == '多頭' else price >= stop
         if stopped:
@@ -19722,12 +19732,22 @@ def build_guarded_stock_trade_plan(row, direction, is_daytrade, result):
     if plan.get('valid'):
         levels = parse_trade_plan_numbers(plan['summary'])
         entry = levels.get('entry')
-        if entry is not None and levels.get('stop') is not None and price is not None and (
-            (direction == '多頭' and price >= entry) or (direction == '空頭' and price <= entry)
-        ):
-            plans[code] = {'session': session, 'direction': direction, 'stop': levels['stop']}
+        if entry is not None and levels.get('stop') is not None and price is not None:
+            triggered = price >= entry if direction == '多頭' else price <= entry
+            plans[code] = {'session': session, 'direction': direction, 'stop': levels['stop'],
+                           'summary': plan['summary'], 'target': levels.get('target'), 'triggered': triggered}
     elif isinstance(row.get('_daytrade_guard_reason'), str) and row.get('_daytrade_guard_reason') and not plan['summary'].startswith('⛔'):
         plan['summary'] = '等待｜' + row['_daytrade_guard_reason']
+    if (not plan.get('valid') and prior.get('session') == session and prior.get('summary')):
+        status = '前次預判（僅追蹤，非新進場訊號）'
+        if bool(row.get('_data_stale', False)):
+            status = '前次預判（行情未確認）'
+        elif price is not None:
+            if price <= prior['stop'] if prior['direction'] == '多頭' else price >= prior['stop']:
+                status = '前次預判停損已碰觸' if prior.get('triggered') else '前次預判失效（停損價已碰觸）'
+            elif prior.get('target') is not None and (price >= prior['target'] if prior['direction'] == '多頭' else price <= prior['target']):
+                status = '前次預判目標已碰觸'
+        plan = {**plan, 'summary': status + '｜' + prior['summary'], 'tracking_only': True}
     return plan
 
 
@@ -21027,7 +21047,7 @@ def operation_model_spec(source, kind, live, direction, entry, stop, target, all
             '進場許可': bool(allowed), '跳動點': 1, '乘數': 10, '期交稅率': .00002,
             '觀察價格': _safe_number(live.get('price')), '觀察時間': str(live.get('updated', '')),
             '觸發條件': rule, '指標快照': indicators, '條件快照': {'原計畫進場許可': bool(allowed)},
-            '成本設定': costs, '市場環境': direction}
+            '成本設定': costs, '市場環境': direction, '進場品質檢查': True}
     if source == '選擇權操作計畫':
         if not option_quote or not option_quote.get('expiry'):
             return None
@@ -21201,7 +21221,7 @@ def model_tracking_samples(rows, stock, mode, direction_choice, config, seconds,
                 direction = str(row.get('_系統方向', determine_stock_direction(row, mode == '當沖', direction_choice)['direction']))
                 state = str(row.get('訊號狀態', ''))
                 rule = str(row.get('盤中觸發' if mode == '當沖' else '隔日規則', ''))
-                eligible = None not in levels.values()
+                eligible = None not in levels.values() and not bool(row.get('_預判僅追蹤', False))
             else:
                 risk = config.get('risk', {})
                 direction = determine_stock_direction(row, mode == '當沖', direction_choice)['direction']
@@ -21230,6 +21250,9 @@ def model_tracking_samples(rows, stock, mode, direction_choice, config, seconds,
                           if row.get('商品類型') == '指數' else _safe_number(row.get('乘數')))
             tax_rate = .00002 if row.get('商品類型') in ('指數', '股票', 'ETF') else None
             indicators = {k: _safe_number(row.get(k)) for k in ('VWAP', 'ATR', '量倉比')}
+        quote['進場品質許可'] = bool(eligible and None not in levels.values())
+        quote['進場品質方向'] = direction
+        quote['進場品質時間'] = quote['來源時間']
         if quote['休市'] or price is None or not signal_valid or not eligible or direction not in ('多頭','空頭','偏多','偏空') or None in levels.values():
             continue
         entry, stop, target = levels['entry'], levels['stop'], levels['target']
@@ -21244,7 +21267,7 @@ def model_tracking_samples(rows, stock, mode, direction_choice, config, seconds,
                         '條件快照':{name + '同向': (price > value if long else price < value)
                                     for name,value in indicators.items() if value is not None and name in ('VWAP','均線')},
                         '跳動點':tick, '乘數':multiplier,
-                        '期交稅率':tax_rate, '成本設定':dict(config.get('costs', DEFAULT_COSTS)),
+                        '期交稅率':tax_rate, '成本設定':dict(config.get('costs', DEFAULT_COSTS)), '進場品質檢查': True,
                         '市場環境':config.get('market_bias', '未取得')})
     return signals, quotes
 
@@ -21437,13 +21460,14 @@ def _model_history_overview(frame):
             str(code or '') + ((' ' + str(name)) if name else '')
             for code, name in zip(codes.fillna(''), names.fillna(''))
         ]
-    first = ['交易日', '商品', '計畫來源', '方向', '狀態', '模擬進場價', '模擬出場價', '模擬損益']
+    first = ['交易日', '商品', '計畫來源', '方向', '狀態', '模擬進場價', '模擬出場價', '模擬損益', '進場等待原因']
     columns = [column for column in first if column in result.columns]
     return result[columns], result[columns + [column for column in result.columns if column not in columns]]
 
 
 def _model_column_config(frame):
     descriptions = {
+        '進場等待原因': '新版當沖在模擬成交前檢查追價與扣除雙邊成本後的空間；等待不算已成交。',
         '全部訊號數': '目前篩選條件下建立的策略訊號總數。',
         '有效交易數': '有完整進出場證據、可納入勝率計算的已平倉筆數。',
         '資料不足數': '行情或成交證據不足，暫不列入績效統計的筆數。',
@@ -24092,7 +24116,7 @@ if tab1.open and stock_strategy_tab.open:
                                 axis=1,
                             )
                             daytrade_ready_count = int(daytrade_ready_mask.sum())
-                            st.caption(f"當沖盤中指標：{daytrade_ready_count} / {len(df_display)} 檔可計算；09:00–09:15 使用快照＋1 分 K，09:15 後固定開盤區間；背景準備分 K，後續以串流與快取更新。")
+                            st.caption(f"當沖盤中指標：{daytrade_ready_count} / {len(df_display)} 檔可計算；09:00–09:15 使用快照＋1 分 K，09:15 後固定開盤區間、接近一檔即預告突破價；背景準備分 K，後續以串流與快取更新。")
 
                     market_risk_data = st.session_state.risk_filter_market_data
                     attention_counts = market_risk_data.get('attention', {})
@@ -24161,6 +24185,7 @@ if tab1.open and stock_strategy_tab.open:
                         df_display.at[i, '方向依據'] = direction_info['basis']
                         df_display.at[i, '_系統方向'] = row_direction
                         df_display.at[i, '進出場預判'] = trade_plan['summary']
+                        df_display.at[i, '_預判僅追蹤'] = bool(trade_plan.get('tracking_only'))
                         signal_state = classify_signal_state(result['rule'], result['eligible'], result['score'], risk_min_score)
                         quote_time = row.get('_quote_time') or (row.get('_daytrade_data_time') if is_daytrade_mode else None)
                         required_ready = bool(result.get('data_time')) if is_daytrade_mode else result.get('extension') is not None
@@ -24251,7 +24276,7 @@ if tab1.open and stock_strategy_tab.open:
                     st_val = str(row.get('狀態', ''))
                     frame = source_frame if isinstance(source_frame, pd.DataFrame) else df_display
                     if not st_val and row.name in frame.index:
-                        st_val = str(frame.at[row.name, '狀態'])
+                        st_val = str(frame.loc[row.name].get('狀態', ''))
                     source_row = frame.loc[row.name] if row.name in frame.index else row
                     limit_state = strategy_row_limit_state(source_row)
                     risk_val = str(row.get('風險', ''))
@@ -24364,7 +24389,7 @@ if tab1.open and stock_strategy_tab.open:
                                 styles[idx] = 'color:#ff4b4b;font-weight:bold;'
                     return styles
 
-                styled_df = df_display[input_cols].style.apply(style_tab1_df, axis=1)
+                styled_df = df_display[input_cols].style.apply(style_tab1_df, axis=1, source_frame=df_display.copy())
 
                 def stock_content_width(column, minimum, maximum=520, full_content=False):
                     return _content_column_width(
@@ -24918,6 +24943,7 @@ if tab1.open and stock_strategy_tab.open:
                                 df_indep.at[i, '建議方向'] = direction_info['label']
                                 df_indep.at[i, '方向依據'] = direction_info['basis']
                                 df_indep.at[i, '進出場預判'] = trade_plan['summary']
+                                df_indep.at[i, '_預判僅追蹤'] = bool(trade_plan.get('tracking_only'))
                                 df_indep.at[i, '支撐壓力'] = build_stock_support_resistance(row, indep_is_daytrade)
                                 df_indep.at[i, '訊號狀態'] = signal_state
                                 df_indep.at[i, '信心分'] = confidence['score']
