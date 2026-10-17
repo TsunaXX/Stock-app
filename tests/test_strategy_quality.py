@@ -81,3 +81,16 @@ def test_cost_guard_rejects_nominal_profit_below_cost_without_rewriting_legacy()
     legacy = advance(new_trade({**s, '進場品質檢查': False}), quote(100))
     assert legacy['狀態'] == '模擬持倉'
     assert not entry_quality_reason(signal(進場品質檢查=True, 策略='波段'), 108)
+
+
+def test_retained_plan_cannot_enter_when_conditions_withdrawn_but_holding_still_exits():
+    waiting = new_trade(signal(進場品質檢查=True))
+    blocked = advance(waiting, quote(100, 進場品質許可=False))
+    assert blocked['狀態'] == '等待進場' and '目前條件' in blocked['進場等待原因']
+    wrong_side = advance(waiting, quote(100, 進場品質許可=True, 進場品質方向='空頭'))
+    assert wrong_side['狀態'] == '等待進場'
+    before_permission = advance(waiting, quote(100, 進場品質許可=True, 進場品質時間='2026-10-08T09:30:01+08:00'))
+    assert before_permission['狀態'] == '等待進場'
+    holding = advance(waiting, quote(100, 進場品質許可=True, 進場品質方向='多頭'))
+    assert holding['狀態'] == '模擬持倉'
+    assert advance(holding, quote(94, 1, 進場品質許可=False))['狀態'] == '已平倉'

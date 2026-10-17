@@ -21250,6 +21250,9 @@ def model_tracking_samples(rows, stock, mode, direction_choice, config, seconds,
                           if row.get('商品類型') == '指數' else _safe_number(row.get('乘數')))
             tax_rate = .00002 if row.get('商品類型') in ('指數', '股票', 'ETF') else None
             indicators = {k: _safe_number(row.get(k)) for k in ('VWAP', 'ATR', '量倉比')}
+        quote['進場品質許可'] = bool(eligible and None not in levels.values())
+        quote['進場品質方向'] = direction
+        quote['進場品質時間'] = quote['來源時間']
         if quote['休市'] or price is None or not signal_valid or not eligible or direction not in ('多頭','空頭','偏多','偏空') or None in levels.values():
             continue
         entry, stop, target = levels['entry'], levels['stop'], levels['target']

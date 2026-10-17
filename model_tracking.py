@@ -263,6 +263,14 @@ def advance(record, quote):
                 (quote.get('進場許可時間') and ts < stamp(quote['進場許可時間']))):
             row['來源時間'] = text
             return row
+        if row.get('進場品質檢查') and (
+            quote.get('進場品質許可') is False or
+            (quote.get('進場品質時間') and ts < stamp(quote['進場品質時間'])) or
+            (quote.get('進場品質方向') and quote['進場品質方向'] != row['方向'])
+        ):
+            row['來源時間'] = text
+            row['進場等待原因'] = '目前條件未放行同向進場，保留原點位追蹤'
+            return row
         fill = price + sign * slip
         if sign * (target - fill) <= 0:
             event(row, '訊號失效', text, '首個成交證據已越過目標；不得回填計畫價成交')
