@@ -56,9 +56,9 @@ def test_published_stock_levels_remain_visible_without_new_signal():
     kept = fn(row, '多頭', True, {})
     assert '進 101｜停 99｜目 104' in kept['summary'] and kept['tracking_only'] and not kept['valid']
     stopped = fn({**row, '_daytrade_close': 98}, '多頭', True, {})
-    assert '失效（停損價已碰觸）' in stopped['summary']
+    assert stopped['summary'].startswith('失效｜')
     stale = fn({**row, '_daytrade_close': 98, '_data_stale': True}, '多頭', True, {})
-    assert '行情未確認' in stale['summary'] and '已碰觸' not in stale['summary']
+    assert stale['summary'].startswith('行情待確認｜') and '已進場' not in stale['summary']
     assert fn({**row, '_daytrade_data_time': '2026/10/19 09:01:00'}, '多頭', True, {})['summary'] == '—'
 
 
@@ -94,3 +94,38 @@ def test_retained_plan_cannot_enter_when_conditions_withdrawn_but_holding_still_
     holding = advance(waiting, quote(100, 進場品質許可=True, 進場品質方向='多頭'))
     assert holding['狀態'] == '模擬持倉'
     assert advance(holding, quote(94, 1, 進場品質許可=False))['狀態'] == '已平倉'
+
+
+def test_entry_labels_are_compact_and_do_not_grant_tracking_permission():
+    ns = load_app_symbols('build_guarded_stock_trade_plan', 'parse_trade_plan_numbers', '_safe_number')
+    ns['st'] = SimpleNamespace(session_state={})
+    ns['fmt_price'] = str
+    current = {'valid': True, 'summary': '進 101｜停 99｜目 104'}
+    ns['build_trade_plan'] = lambda *args: current.copy()
+    fn = ns['build_guarded_stock_trade_plan']
+    row = {'代號': '2330', '_daytrade_data_time': '2026/10/19 09:01:00', '_daytrade_close': 101}
+    assert fn(row, '多頭', True, {})['summary'] == '已進場｜進 101｜停 99｜目 104'
+    current['valid'] = False
+    kept = fn({**row, '_daytrade_close': 100}, '多頭', True, {})
+    assert kept['summary'] == '已進場·追蹤｜進 101｜停 99｜目 104'
+    assert kept['tracking_only'] and not kept['valid']
+    assert fn({**row, '_daytrade_close': 98}, '多頭', True, {})['summary'].startswith('停損｜')
+    assert fn({**row, '_daytrade_close': 104}, '多頭', True, {})['summary'].startswith('達標｜')
+    current['valid'] = True
+    assert '已進場' not in fn({**row, '代號': '1815', '_data_stale': True}, '多頭', True, {})['summary']
+    assert '已進場' in fn({**row, '代號': '1815', '_daytrade_close': 99}, '空頭', True, {})['summary']
+
+
+def test_signal_notification_names_do_not_change_event_identity():
+    ns = load_app_symbols('notify_signal_state_changes')
+    messages = []
+    ns['st'] = SimpleNamespace(session_state={}, toast=lambda message, **kw: messages.append(message))
+    fn = ns['notify_signal_state_changes']
+    fn('stocks', {'2330': '等待'}, True, {'2330': '台積電（2330）'})
+    fn('stocks', {'2330': '✅ 已觸發'}, True, {'2330': '台積電（2330）'})
+    assert messages == ['訊號狀態更新：台積電（2330） ✅ 已觸發']
+    fn('stocks', {'2330': '✅ 已觸發'}, True, {'2330': '台積公司（2330）'})
+    assert len(messages) == 1
+    fn('futures', {'TXF 202610': '等待'}, True)
+    fn('futures', {'TXF 202610': '✅ 已觸發'}, True, {'TXF 202610': '臺股期貨（TXF 202610）'})
+    assert '臺股期貨' in messages[-1]
