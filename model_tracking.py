@@ -7,14 +7,16 @@ import queue
 import sqlite3
 import threading
 import time
+from contextlib import closing
 from datetime import datetime
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_HALF_UP, ROUND_CEILING, ROUND_FLOOR
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
 
-VERSION = 'V1.0'
+VERSION = 'V1.1'
+PROTECTION_POLICY = 'balanced-1R-v1'
 TZ = ZoneInfo('Asia/Taipei')
 ACTIVE = {'等待進場', '模擬持倉', '監控中斷', '資料不足'}
 DEFAULT_COSTS = {'stock_shares': 1000, 'stock_discount': 2.8, 'stock_min_fee': 20,
@@ -118,6 +120,7 @@ def merge_trades(remote, local):
                     row[key] = first[key]
             events = {e['事件ID']: e for item in (old, incoming) for e in item.get('事件', []) if e.get('事件ID')}
             row['事件'] = sorted(events.values(), key=lambda e: e['時間'])
+            restore_profit_protection(row)
         merged[row['交易ID']] = row
     return list(merged.values())
 
@@ -126,10 +129,11 @@ def event(record, state, ts, reason=''):
     record['狀態'] = state
     record['來源時間'] = ts
     record['異常原因'] = reason
-    evidence = '|'.join([record['交易ID'], state, ts, reason])
+    protection = {key: record[key] for key in ('保利價', '保利淨額', '保利最大浮盈', '初始風險') if key in record} if reason.startswith('保利') else {}
+    evidence = '|'.join([record['交易ID'], state, ts, reason]) + (json.dumps(protection, sort_keys=True) if protection else '')
     eid = hashlib.sha256(evidence.encode()).hexdigest()
     if not any(e.get('事件ID') == eid for e in record.setdefault('事件', [])):
-        record['事件'].append({'事件ID': eid, '時間': ts, '狀態': state, '原因': reason})
+        record['事件'].append({'事件ID': eid, '時間': ts, '狀態': state, '原因': reason, **protection})
 
 
 def new_trade(signal):
@@ -152,6 +156,8 @@ def new_trade(signal):
     row = {**signal, '交易ID': trade_id(signal), '紀錄類型': '自動', '資料缺口': False,
            'MFE(R)': 0.0, 'MAE(R)': 0.0, '事件': []}
     row['成本設定'] = normalize_costs(row.get('成本設定'))
+    if row.get('保利規則') == PROTECTION_POLICY:
+        row['保利狀態'] = '待進場'
     row['建立時間'] = row['來源時間']
     event(row, '等待進場', row['來源時間'])
     return row
@@ -189,6 +195,119 @@ def entry_quality_reason(row, price):
     return ''
 
 
+def trade_pnl(row, exit_price, fills=None):
+    """One cost definition for simulated exits and the cost-covering protection floor."""
+    costs, legs = row['成本設定'], row.get('選擇權腿')
+    qty = costs['stock_shares'] if row['市場'] == '股票' else costs['futures_contracts']
+    multiplier, entry = row['乘數'], row['模擬進場價']
+    sign = 1 if row['方向'] in ('多頭', '偏多') else -1
+    gross = sign * (exit_price - entry) * multiplier * qty
+    if row['市場'] == '股票':
+        fee = sum(max(costs['stock_min_fee'], math.floor(p * qty * .001425 * costs['stock_discount'] / 10)) for p in (entry, exit_price))
+        tax = math.floor((exit_price if sign > 0 else entry) * qty * (.0015 if row['策略'] == '當沖' else .003))
+    elif legs:
+        if fills is None:
+            return None
+        gross = sum(leg['買賣'] * (fills[leg['代碼']] - row['進場權利金'][leg['代碼']]) for leg in legs) * multiplier * qty
+        fee = costs['futures_fee'] * qty * 2 * len(legs)
+        tax = sum(int((Decimal(str(p)) * Decimal(str(multiplier)) * qty * Decimal('.001')).quantize(Decimal('1'), rounding=ROUND_HALF_UP))
+                  for values in (row['進場權利金'], fills) for p in values.values())
+    else:
+        rate = number(row.get('期交稅率'))
+        if rate is None:
+            return None
+        fee = costs['futures_fee'] * qty * 2
+        tax = sum(round(p * multiplier * qty * rate) for p in (entry, exit_price))
+    return {'毛損益': round(gross, 2), '交易成本': round(fee + tax, 2), '模擬損益': round(gross - fee - tax, 2)}
+
+
+def protection_tick(row, price):
+    if row['市場'] == '股票':
+        return next((step for ceiling, step in ((10, .01), (50, .05), (100, .1), (500, .5), (1000, 1)) if price < ceiling), 5)
+    return row['跳動點']
+
+
+def restore_profit_protection(row):
+    """The existing cloud event union also carries monotonic protection across devices."""
+    if row.get('保利規則') != PROTECTION_POLICY or row.get('狀態') not in ACTIVE:
+        return
+    for item in row.get('事件', []):
+        if item.get('時間', '') > row.get('來源時間', ''):
+            continue
+        for key in ('保利價', '保利淨額', '保利最大浮盈'):
+            value = number(item.get(key))
+            if value is not None:
+                old = number(row.get(key))
+                row[key] = value if old is None else (min(old, value) if key == '保利價' and row['方向'] in ('空頭', '偏空') else max(old, value))
+        if '初始風險' in item:
+            row.setdefault('初始風險', item['初始風險'])
+        if item.get('保利價') is not None or item.get('保利淨額') is not None:
+            row.setdefault('保利啟動時間', item['時間'])
+            row['保利更新時間'] = max(row.get('保利更新時間', ''), item['時間'])
+    if row.get('保利價') is not None or row.get('保利淨額') is not None:
+        row['保利狀態'] = '保利中'
+    if row.get('初始風險', 0) > 0:
+        row['保利最大浮盈(R)'] = round(row.get('保利最大浮盈', 0) / row['初始風險'], 4)
+
+
+def update_profit_protection(row, price, text, pnl=None):
+    """Only observed post-entry prices can raise protection; initial risk never changes."""
+    if row.get('保利規則') != PROTECTION_POLICY or row.get('資料缺口'):
+        return
+    legs = row.get('選擇權腿')
+    sign = 1 if row['方向'] in ('多頭', '偏多') else -1
+    entry, risk = row['模擬進場價'], row['初始風險']
+    if legs:
+        if pnl is None:
+            row['保利狀態'] = '權利金待確認'
+            return
+        peak = max(row.get('保利最大浮盈', 0), pnl['模擬損益'])
+        row['保利最大浮盈'] = peak
+        row['保利最大浮盈(R)'] = round(peak / risk, 4)
+        if peak < risk:
+            return
+        candidate = max(0, peak - risk)
+        old = row.get('保利淨額')
+        row['保利淨額'] = max(old or 0, round(candidate, 2))
+        changed = old != row['保利淨額']
+    else:
+        peak = max(row.get('保利最大浮盈', 0), sign * (price - entry))
+        if peak == row.get('保利最大浮盈') and row.get('保利價') is not None:
+            return
+        row['保利最大浮盈'] = peak
+        row['保利最大浮盈(R)'] = round(peak / risk, 4)
+        if peak < risk:
+            return
+        slip = row['跳動點'] * row['成本設定']['slippage_ticks']
+        # Solve the exact existing fee/tax definition, including adverse exit slippage.
+        lo, hi = 0., peak
+        for _ in range(40):
+            distance = (lo + hi) / 2
+            result = trade_pnl(row, entry + sign * (distance - slip))
+            if result is None:
+                row['保利狀態'] = '成本待確認'
+                return
+            if result['模擬損益'] >= 0:
+                hi = distance
+            else:
+                lo = distance
+        candidate = entry + sign * max(hi, peak - risk)
+        step = Decimal(str(protection_tick(row, candidate)))
+        candidate = float((Decimal(str(candidate)) / step).to_integral_value(rounding=ROUND_CEILING if sign > 0 else ROUND_FLOOR) * step)
+        # A cost floor beyond the observed market is not an executable protection level.
+        if sign * (price - candidate) <= 0:
+            row['保利狀態'] = '成本待確認'
+            return
+        old = row.get('保利價')
+        row['保利價'] = candidate if old is None else (max(old, candidate) if sign > 0 else min(old, candidate))
+        changed = old != row['保利價']
+    row['保利狀態'] = '保利中'
+    if changed:
+        row.setdefault('保利啟動時間', text)
+        row['保利更新時間'] = text
+        event(row, '模擬持倉', text, '保利啟動' if old is None else '保利移動')
+
+
 def advance(record, quote):
     """Only ordered observed prices establish fills. Gaps never count as verified wins."""
     row = json.loads(json.dumps(record, ensure_ascii=False))
@@ -198,6 +317,7 @@ def advance(record, quote):
     price = number(quote.get('價格'))
     if ts is None or (prior is not None and ts < prior):
         return row
+    restore_profit_protection(row)
     if row.get('到期時間') and ts >= stamp(row['到期時間']):
         row['到期未確認'] = row.get('模擬進場價') is not None
         row['資料缺口'] = bool(row['到期未確認'] or row.get('資料缺口'))
@@ -292,6 +412,12 @@ def advance(record, quote):
             row['觸發進場點位'] = price
             fill = sum(leg['買賣'] * fills[leg['代碼']] for leg in option_legs)
         row['模擬進場價'], row['進場時間'], row['最新價'] = fill, text, price
+        if row.get('保利規則') == PROTECTION_POLICY:
+            qty = row['成本設定']['stock_shares'] if row['市場'] == '股票' else row['成本設定']['futures_contracts']
+            risk = ((fill if len(option_legs) == 1 else row['限定風險寬度'] + fill) * multiplier * qty
+                    if option_legs else abs(fill - stop))
+            row.update({'初始風險': risk, '初始風險單位': '元' if option_legs else '點',
+                        '保利狀態': '未啟動', '保利最大浮盈': 0., '保利最大浮盈(R)': 0.})
         event(row, '模擬持倉', text)
         return row  # The entry sample cannot also prove a later exit.
     fill = row['模擬進場價']
@@ -310,45 +436,44 @@ def advance(record, quote):
         row['資料缺口'] = True
         event(row, '監控中斷', text, '同一根 K 同時觸及停利停損，先後順序未確認')
         return row
+    exit_fills = option_fills(row, quote, False) if option_legs else None
+    exit_price = (sum(leg['買賣'] * exit_fills[leg['代碼']] for leg in option_legs)
+                  if exit_fills is not None else price - sign * slip)
+    pnl = trade_pnl(row, exit_price, exit_fills)
+    if row.get('保利規則') == PROTECTION_POLICY and option_legs and exit_fills is None:
+        row['資料缺口'] = True
+        event(row, '資料不足', text, '保利追蹤缺少同時段的各腿權利金成交證據')
+        return row
+    protected = False
+    if row.get('保利規則') == PROTECTION_POLICY:
+        if option_legs:
+            floor = number(row.get('保利淨額'))
+            protected = floor is not None and pnl is not None and pnl['模擬損益'] <= floor
+        else:
+            floor = number(row.get('保利價'))
+            protected = floor is not None and sign * (price - floor) <= 0
     cutoff = ts.time()
     reached_close = (cutoff.hour == 13 and cutoff.minute >= (30 if row['市場'] == '股票' else 45)) or (row['市場'] == '期貨' and cutoff.hour == 5)
     close_session = quote.get('收盤確認', False) and reached_close and row['策略'] == '當沖'
-    if stopped or targeted or close_session:
-        exit_price = price - sign * slip
-        costs = row['成本設定']
-        qty = costs['stock_shares'] if row['市場'] == '股票' else costs['futures_contracts']
-        gross = sign * (exit_price - fill) * multiplier * qty
-        if row['市場'] == '股票':
-            fee = sum(max(costs['stock_min_fee'], math.floor(p * qty * .001425 * costs['stock_discount'] / 10))
-                      for p in (fill, exit_price))
-            sell = exit_price if long else fill
-            tax = math.floor(sell * qty * (.0015 if row['策略'] == '當沖' else .003))
-        elif option_legs:
-            fills = option_fills(row, quote, False)
-            if fills is None:
+    if stopped or targeted or protected or close_session:
+        if option_legs:
+            if exit_fills is None:
                 row['資料缺口'] = True
                 event(row, '資料不足', text, '觸及出場但缺少同時段的各腿權利金成交證據')
                 return row
-            exit_price = sum(leg['買賣'] * fills[leg['代碼']] for leg in option_legs)
-            gross = sum(leg['買賣'] * (fills[leg['代碼']] - row['進場權利金'][leg['代碼']])
-                        for leg in option_legs) * multiplier * qty
-            fee = costs['futures_fee'] * qty * 2 * len(option_legs)
-            tax = sum(int((Decimal(str(p)) * Decimal(str(multiplier)) * qty * Decimal('.001')).quantize(Decimal('1'), rounding=ROUND_HALF_UP))
-                      for values in (row['進場權利金'], fills) for p in values.values())
-            row['出場權利金'] = fills
-        else:
-            fee = costs['futures_fee'] * qty * 2
-            rate = row.get('期交稅率')
-            if rate is None:
-                event(row, '資料不足', text, '此商品未確認期交稅率')
-                row['資料缺口'] = True
-                return row
-            tax = sum(round(p * multiplier * qty * rate) for p in (fill, exit_price))
-        row.update({'模擬出場價': exit_price, '結案時間': text, '毛損益': round(gross, 2),
-                    '交易成本': round(fee + tax, 2), '模擬損益': round(gross - fee - tax, 2),
+            row['出場權利金'] = exit_fills
+        if pnl is None:
+            event(row, '資料不足', text, '此商品未確認期交稅率')
+            row['資料缺口'] = True
+            return row
+        if protected:
+            row['保利狀態'] = '保利出場'
+        row.update({**pnl, '模擬出場價': exit_price, '結案時間': text,
                     '結果(R)': round(sign * (price - trigger_fill) / risk, 4) if option_legs else round(sign * (exit_price - fill) / risk, 4),
-                    '出場原因': '停損' if stopped else ('停利' if targeted else '收盤')})
+                    '出場原因': '保利' if protected else ('停損' if stopped else ('停利' if targeted else '收盤'))})
         event(row, '已平倉', text)
+    elif row.get('保利規則') == PROTECTION_POLICY:
+        update_profit_protection(row, price, text, pnl)
     return row
 
 
@@ -449,6 +574,7 @@ class ModelTracker:
             db.execute('CREATE TABLE IF NOT EXISTS trades (id TEXT PRIMARY KEY, month TEXT, slot TEXT, state TEXT, body TEXT, dirty INTEGER)')
             db.execute('CREATE INDEX IF NOT EXISTS trades_month ON trades(month)')
             db.execute('CREATE INDEX IF NOT EXISTS trades_state ON trades(state,slot)')
+            db.execute('CREATE INDEX IF NOT EXISTS trades_slot ON trades(slot)')
             for raw in db.execute("SELECT body FROM trades WHERE state IN ('等待進場','模擬持倉')").fetchall():
                 row = json.loads(raw[0])
                 previous_time = row['來源時間']
@@ -487,6 +613,21 @@ class ModelTracker:
         with self.db() as db:
             rows = db.execute("SELECT body FROM trades WHERE month=? AND state IN ('等待進場','模擬持倉','監控中斷','資料不足')", (month,)).fetchall()
         return [row for raw in rows if (row := json.loads(raw[0])).get('計畫來源') == source and row.get('交易日') == day]
+
+    def protection_plans(self, market, keys, mode, day, source=None):
+        """Bounded current-plan reads by indexed instrument, without loading performance history."""
+        result = {}
+        with closing(self.db()) as db:
+            for key in keys:
+                prefix = f'{key}|{market}|{mode}|'
+                raw = db.execute("""SELECT body FROM trades WHERE slot>=? AND slot<?
+                    AND json_extract(body, '$.保利規則')=? AND json_extract(body, '$.計畫來源') IS ?
+                    AND ((?='波段' AND state IN ('等待進場','模擬持倉','監控中斷','資料不足')) OR json_extract(body, '$.交易日')=?)
+                    ORDER BY (state IN ('模擬持倉','監控中斷','資料不足') AND json_extract(body, '$.模擬進場價') IS NOT NULL) DESC,
+                    rowid DESC LIMIT 1""", (prefix, prefix + '\uffff', PROTECTION_POLICY, source, mode, day)).fetchone()
+                if raw:
+                    result[str(key)] = json.loads(raw[0])
+        return result
 
     def store(self, db, row, dirty=1):
         db.execute('INSERT INTO trades VALUES (?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET state=excluded.state,body=excluded.body,dirty=MAX(trades.dirty,excluded.dirty)',

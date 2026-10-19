@@ -44,7 +44,7 @@ from market_automation import (
     macro_results, merge_company_sections, merge_macro_results, vwap_guard,
 )
 
-from model_tracking import ModelTracker, DEFAULT_COSTS, VERSION as MODEL_VERSION, performance, excel_report, normalize_costs, option_fills, option_tick, advance as advance_model_trade
+from model_tracking import ModelTracker, DEFAULT_COSTS, VERSION as MODEL_VERSION, PROTECTION_POLICY, performance, excel_report, normalize_costs, option_fills, option_tick, advance as advance_model_trade
 
 logger = logging.getLogger(__name__)
 
@@ -7821,7 +7821,7 @@ def render_operation_plan(seed_data, option_page=False):
             f"#### 🎯 進出依據 <span style='font-size:15px;color:{position_color};font-weight:700'>　{position_recommendation}</span>",
             unsafe_allow_html=True,
         )
-        st.caption("以日線費波支撐／壓力與 15 分 K 確認，作為順勢進場、停損與目標依據。")
+        st.caption("以日線費波支撐／壓力與 15 分 K 確認；保＝達1R後移動保利，保留1R回撤，最低保護成本。")
         st.info(f"**進場確認：** {plan['trigger']}")
         position_count = st.selectbox(
             "預計進場口數",
@@ -7845,6 +7845,7 @@ def render_operation_plan(seed_data, option_page=False):
                 {'EMA5': short_wave.get('ema_fast'), '量比': short_wave.get('volume_ratio')}, short_wave['trigger'],
             ))
         record_operation_models('指數操作計畫', model_specs, api, st.session_state.get('index_scenario_seconds_saved', 5))
+        render_operation_protection('指數操作計畫', model_specs)
         execution_direction = trade_state.get('execution_direction') or plan.get('direction')
         execution_color = (
             '#ff4b4b' if execution_direction == '偏多'
@@ -8189,6 +8190,7 @@ def render_operation_plan(seed_data, option_page=False):
                     "- **模型估值差**：理論價減保守買進價。負值常反映買賣價差，不代表這筆交易的期望報酬。\n"
                     "- **單買門檻**：一般單買需目標越過損益兩平、目標情境為正、報酬風險比至少 1.25。\n"
                     "- **放寬試單**：機率／價差較不理想但仍符合最低條件時，只顯示小部位試單；不代表一般單買通過。\n"
+                    "- **保利**：實際建倉最大風險金額為 1R；淨浮盈達 1R 啟動，淨額保護下限跟隨最大浮盈保留 1R 回撤，最低為 0 元。\n"
                     "- 夜盤以最新期貨代替現貨，期現價差可能造成估算誤差。"
                 )
 
@@ -8360,6 +8362,7 @@ def render_operation_plan(seed_data, option_page=False):
                 else:
                     st.info("即時權利金或淨收權利金不足，暫時無法繪製可驗證的損益曲線。")
         record_operation_models('選擇權操作計畫', option_model_specs, api, st.session_state.get('option_auto_seconds_saved', 5))
+        render_operation_protection('選擇權操作計畫', option_model_specs)
 
 
 
@@ -20998,7 +21001,7 @@ def get_model_rules_version(stock):
                  build_trade_plan, calculate_entry_confidence) if stock else (
                      calculate_futures_strategy_levels, enrich_futures_strategy_rows, calculate_entry_confidence)
     functions += (model_tracking_samples,)
-    return MODEL_VERSION + '-' + data_version([inspect.getsource(f) for f in functions])[:10]
+    return MODEL_VERSION + '-' + data_version([PROTECTION_POLICY, *[inspect.getsource(f) for f in functions]])[:10]
 
 
 def model_market_open(row, now_value=None):
@@ -21022,13 +21025,47 @@ def get_model_tracker(url=''):
     return ModelTracker('model_tracking.sqlite3', url, market_open=model_market_open)
 
 
+def model_protection_text(row):
+    status = row.get('保利狀態', '未啟動')
+    if row.get('資料缺口') or row.get('狀態') in ('資料不足', '監控中斷'):
+        status = '資料待確認'
+    value = row.get('保利淨額') if row.get('選擇權腿') else row.get('保利價')
+    unit = '淨額$' if row.get('選擇權腿') else ''
+    return f"保 {unit}{fmt_price(value) if value is not None else '—'}·{status}"
+
+
+def apply_model_protection(rows, stock, mode):
+    """Project the same persisted simulator state; the UI never advances a second position."""
+    if rows.empty or not st.session_state.get('sj_logged_in', False):
+        return
+    key_column, plan_column = ('代號', '進出場預判') if stock else ('契約鍵', '進出場點位')
+    day = datetime.now(pytz.timezone('Asia/Taipei'))
+    if not stock:
+        day = get_futures_trading_date(day)
+    tracker = get_model_tracker(get_app_secret('gsheet_api_url') or '')
+    plans = tracker.protection_plans('股票' if stock else '期貨', rows[key_column].astype(str),
+                                     '當沖' if mode == '當沖' else '波段', day.date().isoformat())
+    for index, row in rows.iterrows():
+        record = plans.get(str(row[key_column]))
+        if record and record.get('模擬進場價') is not None:
+            side = '多' if record['方向'] in ('多頭', '偏多') else '空'
+            status = record.get('出場原因') or ('待確認' if record.get('資料缺口') else '已進場')
+            protection = fmt_price(record['保利價']) if record.get('保利價') is not None else '—'
+            rows.at[index, plan_column] = (
+                f"{side}·{status}｜進 {fmt_price(record['進場價'])}｜停 {fmt_price(record['停損價'])}｜"
+                f"保 {protection}｜目 {fmt_price(record['目標價'])}"
+            )
+        elif plan_column in rows and None not in parse_trade_plan_numbers(row.get(plan_column)).values():
+            rows.at[index, plan_column] = str(row[plan_column]).replace('｜目 ', '｜保 —｜目 ', 1)
+
+
 @st.cache_resource(max_entries=4)
 def get_operation_model_version(source):
     functions = (calculate_index_trade_plan, evaluate_trade_entry_state, calculate_short_wave_plan,
                  operation_model_spec, operation_model_samples)
     if source == '選擇權操作計畫':
         functions += (recommend_txo_strategy, evaluate_txo_directional_quality, option_fills, option_tick, advance_model_trade)
-    return MODEL_VERSION + '-plan-' + data_version([source, *[inspect.getsource(f) for f in functions]])[:10]
+    return MODEL_VERSION + '-plan-' + data_version([source, PROTECTION_POLICY, *[inspect.getsource(f) for f in functions]])[:10]
 
 
 def operation_model_spec(source, kind, live, direction, entry, stop, target, allowed,
@@ -21053,7 +21090,7 @@ def operation_model_spec(source, kind, live, direction, entry, stop, target, all
             '進場許可': bool(allowed), '跳動點': 1, '乘數': 10, '期交稅率': .00002,
             '觀察價格': _safe_number(live.get('price')), '觀察時間': str(live.get('updated', '')),
             '觸發條件': rule, '指標快照': indicators, '條件快照': {'原計畫進場許可': bool(allowed)},
-            '成本設定': costs, '市場環境': direction, '進場品質檢查': True}
+            '成本設定': costs, '市場環境': direction, '進場品質檢查': True, '保利規則': PROTECTION_POLICY}
     if source == '選擇權操作計畫':
         if not option_quote or not option_quote.get('expiry'):
             return None
@@ -21157,6 +21194,7 @@ def record_operation_models(source, specs, api, seconds):
         if previous:
             specs[index]['策略版本'] = previous['策略版本']
             specs[index]['成本設定'] = previous['成本設定']
+            specs[index]['保利規則'] = previous.get('保利規則')
     current_keys = {spec['商品鍵'] for spec in specs}
     specs += [{**row, '新訊號': False, '進場許可': False} for row in active
               if row['商品鍵'] not in current_keys]
@@ -21171,6 +21209,17 @@ def record_operation_models(source, specs, api, seconds):
                     stream = quote['串流識別'].rsplit(':', 1)[0] if spec.get('選擇權腿') else quote['串流識別']
                     cursors[spec['商品鍵']] = {'stream': stream, 'sequence': quote['序號'],
                                             'time': quote['來源時間'], 'allowed': spec['進場許可'], 'direction': spec['方向']}
+def render_operation_protection(source, specs):
+    if not st.session_state.get('sj_logged_in', False):
+        return
+    specs = [spec for spec in specs if spec]
+    tracker = get_model_tracker(get_app_secret('gsheet_api_url') or '')
+    day = get_futures_trading_date(datetime.now(pytz.timezone('Asia/Taipei'))).date().isoformat()
+    plans = tracker.protection_plans('期貨', [spec['商品鍵'] for spec in specs], '當沖', day, source)
+    if specs and not plans:
+        st.caption('保 —｜均衡保利：達 1R 啟動、保留 1R 回撤，最低保護成本。')
+    for key, row in plans.items():
+        st.caption(f"{row['名稱']}｜{row.get('計畫類型', '')}｜{model_protection_text(row)}")
 
 
 def model_tracking_samples(rows, stock, mode, direction_choice, config, seconds, api=None):
@@ -21273,7 +21322,7 @@ def model_tracking_samples(rows, stock, mode, direction_choice, config, seconds,
                         '條件快照':{name + '同向': (price > value if long else price < value)
                                     for name,value in indicators.items() if value is not None and name in ('VWAP','均線')},
                         '跳動點':tick, '乘數':multiplier,
-                        '期交稅率':tax_rate, '成本設定':dict(config.get('costs', DEFAULT_COSTS)), '進場品質檢查': True,
+                        '期交稅率':tax_rate, '成本設定':dict(config.get('costs', DEFAULT_COSTS)), '進場品質檢查': True, '保利規則': PROTECTION_POLICY,
                         '市場環境':config.get('market_bias', '未取得')})
     return signals, quotes
 
@@ -21384,13 +21433,13 @@ def model_version_display_labels(records):
         for market, discovered in versions.items():
             labels = registry.setdefault(market, {})
             pending = sorted(((first_seen, raw) for raw, first_seen in discovered.items() if raw not in labels))
-            if not labels and pending:
+            if not labels and pending and pending[0][1].startswith('V1.0'):
                 _, raw = pending.pop(0)
                 labels[raw] = f'V1.0-{market}-20261001'
                 changed = True
             for first_seen, raw in pending:
                 date_code = first_seen if first_seen > '20261001' else '20261001'
-                base = f'V1.0-{market}-{date_code}'
+                base = f"{'V1.1' if raw.startswith('V1.1') else 'V1.0'}-{market}-{date_code}" + ('-保利' if raw.startswith('V1.1') else '')
                 used = set(labels.values())
                 label, suffix = base, 1
                 while label in used:
@@ -21466,13 +21515,21 @@ def _model_history_overview(frame):
             str(code or '') + ((' ' + str(name)) if name else '')
             for code, name in zip(codes.fillna(''), names.fillna(''))
         ]
-    first = ['交易日', '商品', '計畫來源', '方向', '狀態', '模擬進場價', '模擬出場價', '模擬損益', '進場等待原因']
+    first = ['交易日', '商品', '計畫來源', '方向', '狀態', '模擬進場價', '模擬出場價', '保利價', '保利淨額', '保利狀態', '出場原因', '模擬損益', '策略版本', '進場等待原因']
     columns = [column for column in first if column in result.columns]
     return result[columns], result[columns + [column for column in result.columns if column not in columns]]
 
 
 def _model_column_config(frame):
     descriptions = {
+        '保利價': '股期／指數達 1R 後的移動保護價；含雙邊費用與出場滑價，只往獲利方向移動。',
+        '保利淨額': '選擇權以實際各腿權利金計算的淨損益保護下限（元），不是指數點位。',
+        '保利狀態': '未啟動、保利中、保利出場或資料待確認。',
+        '初始風險': '進場時固定的 1R；股期／指數為點位距離，選擇權為實際建倉最大風險金額。',
+        '初始風險單位': '股期／指數使用點位；選擇權使用實際建倉最大風險金額（元）。',
+        '保利最大浮盈(R)': '保利規則使用的最大浮盈倍數；選擇權以各腿扣除費用後的淨浮盈計算。',
+        'MFE(R)': '原有標的點位最大浮盈倍數；選擇權的現金保利倍數另見保利最大浮盈(R)。',
+        '保利規則': '均衡移動：達 1R 啟動，保留 1R 回撤空間，最低保護成本。',
         '進場等待原因': '新版當沖在模擬成交前檢查追價與扣除雙邊成本後的空間；等待不算已成交。',
         '全部訊號數': '目前篩選條件下建立的策略訊號總數。',
         '有效交易數': '有完整進出場證據、可納入勝率計算的已平倉筆數。',
@@ -21554,7 +21611,7 @@ def _model_display_frame(frame, color=True):
             if column == '方向':
                 return 'color: #ff7373' if '多' in text else ('color: #55d6a8' if '空' in text else neutral)
             if column == '出場原因':
-                return 'color: #ff7373' if '停利' in text or '獲利' in text else ('color: #55d6a8' if '停損' in text or '虧損' in text else neutral)
+                return 'color: #ff7373' if '停利' in text or '獲利' in text or '保利' in text else ('color: #55d6a8' if '停損' in text or '虧損' in text else neutral)
             if column == '狀態':
                 if '不足' in text or '中斷' in text or '失效' in text:
                     return 'color: #fbbf24'
@@ -21652,6 +21709,7 @@ def render_model_tracking_room():
             '- 上方看有效交易數、勝率、累積模擬損益、獲利因子與最大回撤；下方可比較策略、方向、指標並檢視每筆事件。\n'
             '- 日期、市場、策略、方向、計畫來源、版本及商品可篩選；指標分析呈現交易當時的條件，不代表單一指標造成結果。\n'
             '- 成本可在交易損益室的「費用設定」修改，只影響新訊號；歷史紀錄保留原成交與成本。這是模擬分析，不會送出委託。'
+            '\n- V1.1 均衡保利：達 1R 啟動、保留 1R 回撤，最低保護成本；選擇權以實際權利金淨損益追蹤。跳空仍按觀察成交價模擬，不保證保價成交。'
         )
     tracker = get_model_tracker(get_app_secret('gsheet_api_url') or '')
     tracker.last_activity = time.monotonic()
@@ -22512,6 +22570,7 @@ def render_futures_strategy_room():
             futures_display_columns = futures_basic_columns
 
         record_model_table('futures', display_rows, False, strategy_mode, direction_choice)
+        apply_model_protection(display_rows, False, strategy_mode)
 
         def style_futures_row(row, source_frame=None):
             styles = [''] * len(row)
@@ -22609,7 +22668,7 @@ def render_futures_strategy_room():
                 '未平倉量': st.column_config.NumberColumn(format='%d', width=content_width('未平倉量', 56, 100), disabled=True),
                 '方向': st.column_config.TextColumn(width=content_width('方向', 48, 86), disabled=True),
                 '支撐壓力': st.column_config.TextColumn(width=content_width('支撐壓力', 80), disabled=True),
-                '進出場點位': st.column_config.TextColumn(width=content_width('進出場點位', 96, 720, True), disabled=True, help='進＝條件成立後觀察價；停＝失效點；目＝第一目標。已進場＝預判觸發，非實際成交。'),
+                '進出場點位': st.column_config.TextColumn(width=content_width('進出場點位', 96, 720, True), disabled=True, help='進＝條件成立後觀察價；停＝失效點；目＝第一目標。已進場＝預判觸發，非實際成交。保＝達1R後移動保利，最低保護成本。'),
                 '觸發條件': st.column_config.TextColumn(width=content_width('觸發條件', 72), disabled=True, help='條件成立後才評估進場；未成立時不以預判價直接下單。'),
                 '當日漲停價': st.column_config.NumberColumn(format='%.12g', width=content_width('當日漲停價', 54, 96), disabled=True, help='依期交所漲跌資料反推參考價後估算；實際限制以期交所與券商下單畫面為準。'),
                 '當日跌停價': st.column_config.NumberColumn(format='%.12g', width=content_width('當日跌停價', 54, 96), disabled=True, help='依期交所漲跌資料反推參考價後估算；實際限制以期交所與券商下單畫面為準。'),
@@ -22795,6 +22854,7 @@ def render_futures_strategy_room():
         if night_scope:
             st.caption('夜盤自動更新：僅顯示夜盤契約；關閉後還原原本分析標的。')
         record_model_table('futures_independent', independent_rows, False, strategy_mode, direction_choice)
+        apply_model_protection(independent_rows, False, strategy_mode)
         if not independent_rows.empty:
             if enhanced_layer:
                 independent_source_columns = (
@@ -24250,6 +24310,7 @@ if tab1.open and stock_strategy_tab.open:
                 else:
                     input_cols = stock_strategy_display_columns(False, False, False)
                 record_model_table('stock', df_display, True, strategy_mode, st.session_state.get('risk_filter_direction', '系統自動'))
+                apply_model_protection(df_display, True, strategy_mode)
                 for col in input_cols:
                     if col not in df_display.columns: df_display[col] = None
 
@@ -24429,13 +24490,13 @@ if tab1.open and stock_strategy_tab.open:
                             "開盤區間": st.column_config.TextColumn(width=stock_content_width('開盤區間', 80, 150), disabled=True, help="09:00–09:15 顯示形成中的即時低點－高點；09:15 後固定為完整開盤區間。"),
                             "量能": st.column_config.TextColumn(width=stock_content_width('量能', 52, 96), disabled=True, help="目前累積量相對最近交易日同時段平均量。"),
                             "盤中觸發": st.column_config.TextColumn(width=stock_content_width('盤中觸發', 72), disabled=True, help="僅在盤中條件同時成立時提供觀察提示，不是自動買賣指令。"),
-                            "進出場預判": st.column_config.TextColumn(width=stock_content_width('進出場預判', 86, 720, True), disabled=True, help="通過條件後，以開盤區間與 VWAP 推估進場、策略失效離場與第一目標；僅供觀察與回測；已進場＝預判觸發，非實際成交。"),
+                            "進出場預判": st.column_config.TextColumn(width=stock_content_width('進出場預判', 86, 720, True), disabled=True, help="通過條件後，以開盤區間與 VWAP 推估進場、策略失效離場與第一目標；僅供觀察與回測；已進場＝預判觸發，非實際成交。保＝達1R後移動保利，最低保護成本。"),
                         })
                     else:
                         risk_column_config.update({
                             "乖離": st.column_config.TextColumn(width=stock_content_width('乖離', 52, 96), disabled=True, help="收盤價相對 20 日線的 ATR 距離；數值越大越不宜追價或追空。"),
                             "隔日規則": st.column_config.TextColumn(width=stock_content_width('隔日規則', 72), disabled=True, help="僅在隔日條件成真時才列入評估，不是自動買賣指令。"),
-                            "進出場預判": st.column_config.TextColumn(width=stock_content_width('進出場預判', 86, 720, True), disabled=True, help="通過條件後，以昨高／昨低與 ATR 推估進場、策略失效離場與第一目標；僅供觀察與回測；已進場＝預判觸發，非實際成交。"),
+                            "進出場預判": st.column_config.TextColumn(width=stock_content_width('進出場預判', 86, 720, True), disabled=True, help="通過條件後，以昨高／昨低與 ATR 推估進場、策略失效離場與第一目標；僅供觀察與回測；已進場＝預判觸發，非實際成交。保＝達1R後移動保利，最低保護成本。"),
                         })
 
                 stock_table_signature = abs(hash((
@@ -24983,6 +25044,7 @@ if tab1.open and stock_strategy_tab.open:
                             if col not in df_indep.columns: df_indep[col] = None
 
                         record_model_table('stock_independent', df_indep, True, indep_strategy_mode, indep_direction)
+                        apply_model_protection(df_indep, True, indep_strategy_mode)
                         cols_to_fmt = ["當日漲停價", "當日跌停價", "成交價價差", "5日線價差"]
                         for c in cols_to_fmt:
                             if c in df_indep.columns: df_indep[c] = df_indep[c].apply(fmt_price)
