@@ -380,7 +380,7 @@ def test_daily_refresh_only_downloads_recent_days_and_preserves_bounded_complete
     shared, lock, api = {'temperature':{}}, threading.RLock(), object()
     end = pd.Timestamp.now(tz='Asia/Taipei').tz_localize(None).normalize()
     old = pd.DataFrame({'Close':[100.]*180},index=pd.date_range(end=end,periods=180))
-    shared['temperature'][('TWF=F',180,True,id(api))] = {'df':old,'source':'cached','saved_at':0,'attrs':{}}
+    shared['temperature'][('TWF=F',180,True,id(api))] = {'df':old,'source':'cached','saved_at':time.monotonic()-181,'attrs':{}}
     recent = pd.DataFrame({'Close':[200.]*7},index=pd.date_range(end=end,periods=7))
     recent.attrs['market_temperature_reference_close'] = 190.
     calls = []
