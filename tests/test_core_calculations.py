@@ -17,6 +17,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import urljoin
 
+from model_tracking import PROTECTION_POLICY
+
 import numpy as np
 import pandas as pd
 import pytz
@@ -44,6 +46,7 @@ def load_app_symbols(*names):
             if targets.intersection(names):
                 selected.append(node)
     namespace = {
+        "PROTECTION_POLICY": PROTECTION_POLICY,
         "calendar": calendar,
         "html": html,
         "io": io,
