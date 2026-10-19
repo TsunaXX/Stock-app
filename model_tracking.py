@@ -431,7 +431,8 @@ def advance(record, quote):
     targeted = price >= target if long else price <= target
     # OHLC extrema never establish the order of stop and target.
     high, low = number(quote.get('最高')), number(quote.get('最低'))
-    ambiguous = high is not None and low is not None and high >= max(stop, target) and low <= min(stop, target)
+    observed_stop = (number(row.get('保利價')) or stop) if row.get('保利規則') == PROTECTION_POLICY and not option_legs else stop
+    ambiguous = high is not None and low is not None and high >= max(observed_stop, target) and low <= min(observed_stop, target)
     if ambiguous:
         row['資料缺口'] = True
         event(row, '監控中斷', text, '同一根 K 同時觸及停利停損，先後順序未確認')

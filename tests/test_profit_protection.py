@@ -33,6 +33,8 @@ def test_stock_arms_at_one_r_trails_without_loosening_and_exits_at_observed_pric
     assert trade_pnl(armed, floor - .5)['模擬損益'] >= 0
     higher = advance(armed, quote(110, 3))
     assert higher['保利價'] == 104.5 and higher['初始風險'] == 5.5
+    uncertain = advance(higher, quote(108, 4, 最高=135, 最低=100))
+    assert uncertain['資料缺口'] and uncertain['狀態'] == '監控中斷'
     assert advance(higher, quote(108, 4))['保利價'] == 104.5
     closed = advance(higher, quote(103, 4))
     assert closed['出場原因'] == '保利' and closed['保利狀態'] == '保利出場'
