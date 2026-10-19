@@ -199,10 +199,11 @@ def test_background_history_shares_successes_and_retries_partial_failures_withou
     ns['calculate_market_temperature'] = lambda data:{'score':50}
     calls, failed = [], [False]
     api = object()
-    frame = pd.DataFrame({'Close':[100.]})
+    frame = pd.DataFrame({'Close':[100.]}, index=[pd.Timestamp.now(tz='Asia/Taipei').tz_localize(None).normalize()])
     seed = [('加權','^TWII',frame,'last-good',{}),('期貨','TWF=F',frame,'last-good',{})]
     def fetch(code, **kwargs):
-        assert kwargs == {'api':api, 'logged_in':True}
+        assert kwargs['api'] is api and kwargs['logged_in'] is True
+        assert kwargs.get('lookback_days',180) == (180 if len(calls) < 2 else 7)
         calls.append(code)
         return (pd.DataFrame() if failed[0] and code == 'TWF=F' else frame.copy()),'official'
     ns['fetch_market_temperature_data'] = fetch
@@ -347,3 +348,48 @@ def test_synchronous_fallback_also_keeps_valid_snapshot_on_failure():
         assert session['_index_operation_fallback']['trade_state']['can_enter']
     finally:
         worker.close()
+
+
+@pytest.mark.parametrize('close_time',['2026-10-19T13:45:00+08:00','2026-10-20T05:00:00+08:00'])
+def test_closing_evidence_gets_original_freshness_grace_without_ui_entry_permission(close_time):
+    ns, worker, session, state, seed, price, connected, market, builds, records, subscriptions = harness()
+    from datetime import datetime
+    clock = [pd.Timestamp(close_time)-pd.Timedelta(seconds=1)]
+    class Clock(datetime):
+        @classmethod
+        def now(cls,tz=None):
+            value = clock[0].to_pydatetime()
+            return value.astimezone(tz) if tz else value.replace(tzinfo=None)
+    opened = load_app_symbols('model_market_open')
+    opened['is_market_closed_func'] = lambda day:day.weekday() >= 5
+    ns['datetime'], ns['model_market_open'] = Clock, opened['model_market_open']
+    try:
+        ns['index_operation_snapshot'](seed,.02)
+        wait_result(worker,'index_plan',lambda result:result['rows'].get('plan'))
+        clock[0] = pd.Timestamp(close_time)+pd.Timedelta(seconds=5)
+        assert worker.jobs['index_plan']['ready']()
+        assert not ns['index_operation_snapshot']([], .02)['trade_state']['can_enter']
+        clock[0] = pd.Timestamp(close_time)+pd.Timedelta(seconds=31)
+        assert not worker.jobs['index_plan']['ready']()
+    finally:
+        worker.close()
+
+
+def test_daily_refresh_only_downloads_recent_days_and_preserves_bounded_complete_history():
+    ns = load_app_symbols('refresh_index_background_history')
+    shared, lock, api = {'temperature':{}}, threading.RLock(), object()
+    end = pd.Timestamp.now(tz='Asia/Taipei').tz_localize(None).normalize()
+    old = pd.DataFrame({'Close':[100.]*180},index=pd.date_range(end=end,periods=180))
+    shared['temperature'][('TWF=F',180,True,id(api))] = {'df':old,'source':'cached','saved_at':time.monotonic()-181,'attrs':{}}
+    recent = pd.DataFrame({'Close':[200.]*7},index=pd.date_range(end=end,periods=7))
+    recent.attrs['market_temperature_reference_close'] = 190.
+    calls = []
+    def fetch(code,**kwargs):
+        calls.append(kwargs['lookback_days'])
+        return recent.copy(),'official'
+    ns.update(get_shared_market_data_cache=lambda:(shared,lock),fetch_market_temperature_data=fetch,
+              calculate_market_temperature=lambda data:{'score':50.})
+    result = ns['refresh_index_background_history'](api,[('期貨','TWF=F',old,'cached',{})])[0][2]
+    assert calls == [7] and len(result) == 180 and not result.index.has_duplicates
+    assert result['Close'].iloc[0] == 100. and result['Close'].iloc[-1] == 200.
+    assert result.attrs['market_temperature_reference_close'] == 190.

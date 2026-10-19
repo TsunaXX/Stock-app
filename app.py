@@ -7734,10 +7734,19 @@ def refresh_index_background_history(api, seed_data):
         if cached and time.monotonic() - cached['saved_at'] <= 180:
             data, source = cached['df'].copy(deep=True), cached['source']
         else:
-            data, source = fetch_market_temperature_data(code, api=api, logged_in=True)
+            recent = {}
+            if cached and not cached['df'].empty:
+                days = (datetime.now(pytz.timezone('Asia/Taipei')).date() - pd.Timestamp(cached['df'].index[-1]).date()).days
+                recent['lookback_days'] = min(180, max(7, days + 2))
+            data, source = fetch_market_temperature_data(code, api=api, logged_in=True, **recent)
             if data.empty:
                 # Keep both sources' last successful histories; failed retries use the queue backoff.
                 raise RuntimeError('index history unavailable')
+            if cached and not cached['df'].empty:
+                attrs = {**cached.get('attrs', {}), **data.attrs}
+                data = pd.concat([cached['df'], data])
+                data = data.loc[~data.index.duplicated(keep='last')].sort_index().tail(180)
+                data.attrs.update(attrs)
             with lock:
                 shared['temperature'][key] = {'df': data.copy(deep=True), 'source': source,
                     'attrs': dict(data.attrs), 'saved_at': time.monotonic()}
@@ -7823,8 +7832,10 @@ def index_operation_snapshot(seed_data, seconds):
     def ready():
         with stream['lock']:
             connected = not (stream.get('connection_down') or stream.get('auth_error'))
+        now_tw = datetime.now(pytz.timezone('Asia/Taipei'))
+        market = {'市場': '期貨', '交易時段': '日盤+夜盤'}
         return connected and (not state.get('initialized') or
-            model_market_open({'市場': '期貨', '交易時段': '日盤+夜盤'}))
+            model_market_open(market, now_tw) or model_market_open(market, now_tw - timedelta(seconds=30)))
     if worker is None:  # AppTest has no connected server session.
         previous = st.session_state.get('_index_operation_fallback', {})
         try:
@@ -7856,7 +7867,8 @@ def index_operation_snapshot(seed_data, seconds):
     live = snapshot.get('live_snapshot')
     source = parse_strategy_data_time(live.get('updated')) if live else None
     age = (datetime.now(pytz.timezone('Asia/Taipei')).replace(tzinfo=None) - source.to_pydatetime()).total_seconds() if source is not None else None
-    if snapshot.get('plan') and (pending or not ready() or result['outside'] or result['error'] or age is None or not 0 <= age <= 30):
+    if snapshot.get('plan') and (pending or not model_market_open({'市場': '期貨', '交易時段': '日盤+夜盤'})
+            or not ready() or result['outside'] or result['error'] or age is None or not 0 <= age <= 30):
         snapshot['trade_state'].update(can_enter=False, permission='等待最新串流', color='#ffc107',
                                       reason='行情尚未更新；保留原點位，等待最新串流後再判斷進場。')
         if snapshot.get('short_wave'):
