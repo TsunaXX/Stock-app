@@ -21611,7 +21611,9 @@ def _model_display_frame(frame, color=True):
             if column == '方向':
                 return 'color: #ff7373' if '多' in text else ('color: #55d6a8' if '空' in text else neutral)
             if column == '出場原因':
-                return 'color: #ff7373' if '停利' in text or '獲利' in text or '保利' in text else ('color: #55d6a8' if '停損' in text or '虧損' in text else neutral)
+                if '保利' in text:
+                    return 'color: #67e8f9'
+                return 'color: #ff7373' if '停利' in text or '獲利' in text else ('color: #55d6a8' if '停損' in text or '虧損' in text else neutral)
             if column == '狀態':
                 if '不足' in text or '中斷' in text or '失效' in text:
                     return 'color: #fbbf24'
