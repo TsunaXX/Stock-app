@@ -422,6 +422,7 @@ def intraday_auto_interval(room, enabled, seconds):
     st.session_state['timer_seconds'] = seconds
     return seconds
 render_postclose_maintenance = lambda: None
+refresh_index_background_history = lambda api, seed: seed
 get_model_tracker = lambda *a: SimpleNamespace(protection_plans=lambda *a, **kw: {})
 def record_operation_models(source, specs, api, seconds, **kw):
     st.session_state['model_plan_source'] = source

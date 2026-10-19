@@ -331,3 +331,19 @@ def test_failed_slow_source_preserves_snapshot_but_keeps_observing_existing_posi
     finally:
         worker.close()
         jobs.pool.shutdown(wait=True)
+
+
+def test_synchronous_fallback_also_keeps_valid_snapshot_on_failure():
+    ns, worker, session, state, seed, price, connected, market, builds, records, subscriptions = harness()
+    ns['get_intraday_background'] = lambda:None
+    try:
+        first = ns['index_operation_snapshot'](seed,5)
+        assert first['plan'] and first['trade_state']['can_enter']
+        def fail(*args,**kwargs): raise ConnectionError('minute cache temporarily unavailable')
+        ns['get_cached_futures_intraday_state'] = fail
+        result = ns['index_operation_snapshot'](seed,5)
+        assert result['live_price'] == first['live_price'] and result['plan'] == first['plan']
+        assert result['error'] and not result['trade_state']['can_enter']
+        assert session['_index_operation_fallback']['trade_state']['can_enter']
+    finally:
+        worker.close()

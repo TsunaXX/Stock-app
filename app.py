@@ -7826,7 +7826,18 @@ def index_operation_snapshot(seed_data, seconds):
         return connected and (not state.get('initialized') or
             model_market_open({'市場': '期貨', '交易時段': '日盤+夜盤'}))
     if worker is None:  # AppTest has no connected server session.
-        snapshot, _ = update({})
+        previous = st.session_state.get('_index_operation_fallback', {})
+        try:
+            snapshot, _ = update(previous)
+        except Exception as exc:
+            snapshot = {**previous, 'error': type(exc).__name__, 'fresh': False,
+                'trade_state': {**previous.get('trade_state', {}), 'can_enter': False,
+                    'permission': '等待最新串流', 'color': '#ffc107',
+                    'reason': '行情尚未更新；保留原點位，等待最新串流後再判斷進場。'}}
+            if previous.get('short_wave'):
+                snapshot['short_wave'] = {**previous['short_wave'], 'momentum_ready': False}
+            return snapshot
+        st.session_state['_index_operation_fallback'] = snapshot
         return snapshot
     with stream['lock']:
         stream.setdefault('intraday_background_workers', weakref.WeakSet()).add(worker)
