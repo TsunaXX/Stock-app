@@ -16166,9 +16166,7 @@ def _list_shioaji_futures_contracts(api):
         contracts.extend(list(api.contracts.list(security_type) or []))
     except Exception as exc:
         if _is_shioaji_auth_error(exc):
-            invalidator = globals().get('invalidate_shioaji_connection')
-            if callable(invalidator):
-                invalidator(exc)
+            remember_shioaji_auth_error(api, exc)
             return []
     if not contracts:
         try:
@@ -16179,9 +16177,7 @@ def _list_shioaji_futures_contracts(api):
                     continue
         except Exception as exc:
             if _is_shioaji_auth_error(exc):
-                invalidator = globals().get('invalidate_shioaji_connection')
-                if callable(invalidator):
-                    invalidator(exc)
+                remember_shioaji_auth_error(api, exc)
             return []
     unique = {}
     for contract in contracts:

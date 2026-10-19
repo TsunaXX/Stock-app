@@ -243,7 +243,8 @@ def test_background_model_specs_and_recorder_are_identical_to_foreground(tmp_pat
 
 
 def test_worker_fetch_errors_and_empty_minutes_do_not_touch_session_state():
-    ns = load_app_symbols('fetch_shioaji_data','get_futures_intraday_state')
+    ns = load_app_symbols('fetch_shioaji_data','get_futures_intraday_state',
+                          '_list_shioaji_futures_contracts','remember_shioaji_auth_error','_is_shioaji_auth_error')
     ns['st'] = SimpleNamespace()
     ns['get_taiex_contract'] = lambda api:SimpleNamespace(code='IX0001')
     ns['time'] = SimpleNamespace(sleep=lambda seconds:None)
@@ -254,6 +255,16 @@ def test_worker_fetch_errors_and_empty_minutes_do_not_touch_session_state():
     assert ns['fetch_shioaji_data'](api,'^TWII',lookback_days=1,background=True).empty
     ns['get_cached_index_minutes'] = lambda *a:pd.DataFrame(columns=['Open','High','Low','Close'])
     assert not ns['get_futures_intraday_state'](api,'偏多',logged_in=True)['available']
+    ns['sj'] = None
+    stream = {'lock':threading.RLock()}
+    ns['_stream_state'] = lambda api:stream
+    def auth(*args): raise RuntimeError('Not authenticated')
+    def forbidden(*args): raise AssertionError('background cannot invalidate UI login')
+    ns['invalidate_shioaji_connection'] = forbidden
+    api.contracts = SimpleNamespace(list=auth)
+    assert ns['_list_shioaji_futures_contracts'](api) == []
+    assert stream['connection_down'] and stream['auth_error'] == 'RuntimeError'
+
 
 
 def test_shared_contract_ownership_survives_one_session_leaving():
