@@ -4070,7 +4070,7 @@ def render_company_event_snapshot(snapshot):
 # ==========================================
 # 永豐 API (Shioaji) 擷取核心
 # ==========================================
-def fetch_shioaji_data(api, code, interval='1d', lookback_days=10):
+def fetch_shioaji_data(api, code, interval='1d', lookback_days=10, background=False):
     try:
         # ==========================================
         # 1. 暴力破解版：強迫取得「近月合約」物件
@@ -4193,7 +4193,8 @@ def fetch_shioaji_data(api, code, interval='1d', lookback_days=10):
         
         # 4. 依照官方文件轉換成 DataFrame 格式
         if not kbars_dict:
-            st.session_state['sj_last_error'] = f"contract={getattr(contract, 'code', contract)} 期間內查無K棒（API回傳0筆，非例外錯誤）"
+            if not background:
+                st.session_state['sj_last_error'] = f"contract={getattr(contract, 'code', contract)} 期間內查無K棒（API回傳0筆，非例外錯誤）"
             return pd.DataFrame()
             
         df = pd.DataFrame(kbars_dict)
@@ -4297,7 +4298,8 @@ def fetch_shioaji_data(api, code, interval='1d', lookback_days=10):
         return df
     except Exception as e:
         print(f"Shioaji fetch error for {code}: {e}")
-        st.session_state['sj_last_error'] = f"{type(e).__name__}: {e}"
+        if not background:
+            st.session_state['sj_last_error'] = f"{type(e).__name__}: {e}"
         return pd.DataFrame()
 
 
@@ -4354,7 +4356,7 @@ def round_to_tick(price):
 # ==========================================
 # 臺灣市場溫度計
 # ==========================================
-def merge_market_temperature_snapshot(df, api, code, stream_only=False):
+def merge_market_temperature_snapshot(df, api, code, stream_only=False, subscribe=True):
     """Merge the current Shioaji snapshot into a daily series.
 
     Futures snapshots after 15:00 are assigned to the following trading date,
@@ -4376,12 +4378,16 @@ def merge_market_temperature_snapshot(df, api, code, stream_only=False):
                 return df
             trading_date = pd.Timestamp(now_tw.date())
         elif is_future:
-            contract = api.Contracts.Futures.TXF.TXFR1
+            contract = (get_near_futures_contract(api, 'TXF') if not subscribe
+                        else api.Contracts.Futures.TXF.TXFR1)
+            if contract is None:
+                return df
             trading_date = get_futures_trading_date(now_tw)
         else:
             return df
 
-        snapshots = get_stream_quotes(api, [contract], snapshot_fallback=not stream_only)
+        kwargs = {'subscribe': False} if not subscribe else {}
+        snapshots = get_stream_quotes(api, [contract], snapshot_fallback=not stream_only, **kwargs)
         if not snapshots:
             return df
 
@@ -4446,21 +4452,26 @@ def merge_market_temperature_snapshot(df, api, code, stream_only=False):
         return df
 
 
-def fetch_market_temperature_data(code, lookback_days=180):
+def fetch_market_temperature_data(code, lookback_days=180, *, api=None, logged_in=None):
     """Fetch a daily OHLCV series for the thermometer, preferring Shioaji."""
     source = ""
     df = pd.DataFrame()
-    api = st.session_state.get('sj_api')
+    background = logged_in is not None
+    if not background:
+        api = st.session_state.get('sj_api')
+        logged_in = st.session_state.get('sj_logged_in', False)
 
-    if st.session_state.get('sj_logged_in', False) and api is not None:
-        df = fetch_shioaji_data(api, code, interval='1d', lookback_days=lookback_days)
+    if logged_in and api is not None:
+        kwargs = {'background': True} if background else {}
+        df = fetch_shioaji_data(api, code, interval='1d', lookback_days=lookback_days, **kwargs)
         if code == '^TWII':
             twse_df = fetch_twse_taiex_daily_history(lookback_days=lookback_days)
             if not twse_df.empty:
                 df = merge_taiex_history_with_shioaji(twse_df, df)
                 source = "證交所官方歷史日K + 永豐 Shioaji 即時串流"
         if not df.empty:
-            df = merge_market_temperature_snapshot(df, api, code)
+            df = (merge_market_temperature_snapshot(df, api, code, stream_only=True, subscribe=False) if background
+                  else merge_market_temperature_snapshot(df, api, code))
             if not source:
                 source = "永豐 Shioaji 全盤資料"
 
@@ -4474,7 +4485,7 @@ def fetch_market_temperature_data(code, lookback_days=180):
 
     # 僅未登入永豐時，才允許加權指數以 Yahoo 作為歷史資料備援。登入後
     # 必須維持單一券商資料源，避免快照與歷史 K 棒混用而產生錯誤漲跌。
-    if df.empty and code == '^TWII' and not st.session_state.get('sj_logged_in', False):
+    if df.empty and code == '^TWII' and not logged_in:
         try:
             df = yf.Ticker('^TWII').history(period='6mo', interval='1d')
             if isinstance(df.columns, pd.MultiIndex):
@@ -4664,7 +4675,7 @@ def get_cached_index_minutes(api, interval):
     }).dropna(subset=['Open', 'High', 'Low', 'Close'])
 
 
-def get_futures_intraday_state(api, direction):
+def get_futures_intraday_state(api, direction, logged_in=None):
     """Return 15-minute confirmation, VWAP and active-session opening range."""
     empty_state = {
         'available': False, 'confirmation_text': "尚未取得 15 分 K；進場前請確認價格在費波區止跌／受壓。",
@@ -4672,7 +4683,7 @@ def get_futures_intraday_state(api, direction):
         'bullish_break': False, 'bearish_break': False,
         'vwap': None, 'opening_high': None, 'opening_low': None, 'latest': None,
     }
-    if api is None or not st.session_state.get('sj_logged_in', False):
+    if api is None or not (st.session_state.get('sj_logged_in', False) if logged_in is None else logged_in):
         return empty_state
     try:
         intraday = get_cached_index_minutes(api, '15min')
@@ -4733,7 +4744,7 @@ def get_futures_intraday_state(api, direction):
         return empty_state
 
 
-def get_cached_futures_intraday_state(api, direction, max_age_seconds=8):
+def get_cached_futures_intraday_state(api, direction, max_age_seconds=8, logged_in=None):
     """Throttle the slower 15-minute K request; the streamed price remains live."""
     shared, cache_lock = get_shared_market_data_cache()
     cache = shared['intraday']
@@ -4743,7 +4754,8 @@ def get_cached_futures_intraday_state(api, direction, max_age_seconds=8):
     now = time.monotonic()
     if cached and now - cached['saved_at'] <= max_age_seconds:
         return dict(cached['value'])
-    value = get_futures_intraday_state(api, direction)
+    value = (get_futures_intraday_state(api, direction) if logged_in is None
+             else get_futures_intraday_state(api, direction, logged_in=logged_in))
     with cache_lock:
         cache.clear()
         cache[cache_key] = {'saved_at': now, 'value': dict(value)}
@@ -4929,6 +4941,14 @@ def _is_shioaji_auth_error(exc):
     )
 
 
+def remember_shioaji_auth_error(api, exc):
+    """Worker reports transport failure; only the UI clears login/session state."""
+    state = _stream_state(api)
+    with state['lock']:
+        state['auth_error'] = type(exc).__name__
+        state['connection_down'] = True
+
+
 def get_shioaji_stock_contract(api, code):
     """Contract lookup also detects expired authentication inside background jobs."""
     if api is None:
@@ -4983,9 +5003,8 @@ def get_near_futures_contract(api, product='TMF'):
             if contract is not None:
                 return contract
     except Exception as exc:
-        invalidator = globals().get('invalidate_shioaji_connection')
-        if _is_shioaji_auth_error(exc) and callable(invalidator):
-            invalidator(exc)
+        if _is_shioaji_auth_error(exc):
+            remember_shioaji_auth_error(api, exc)
         return None
 
     # 舊版 SDK／尚未完成延遲載入的契約檔備援。
@@ -4995,9 +5014,8 @@ def get_near_futures_contract(api, product='TMF'):
         candidates = [c for c in api.Contracts.Futures.TXF if c.code[-2:] not in ('R1', 'R2') and '/' not in c.code]
         return min(candidates, key=lambda c: getattr(c, 'delivery_date', '999999'))
     except Exception as exc:
-        invalidator = globals().get('invalidate_shioaji_connection')
-        if _is_shioaji_auth_error(exc) and callable(invalidator):
-            invalidator(exc)
+        if _is_shioaji_auth_error(exc):
+            remember_shioaji_auth_error(api, exc)
         return None
 
 
@@ -7598,7 +7616,7 @@ def get_taifex_txo_spread_quote(plan, expiry_choice, preferred_width=100):
     }
 
 
-def get_stable_index_trade_plan(index_df, index_result, futures_df, futures_result):
+def get_stable_index_trade_plan(index_df, index_result, futures_df, futures_result, cache=None):
     """Rebuild daily levels only when the complete daily source version changes."""
     _, cutoff = _post_close_target_date()
     closed = []
@@ -7606,13 +7624,14 @@ def get_stable_index_trade_plan(index_df, index_result, futures_df, futures_resu
         closed.append(data.loc[pd.DatetimeIndex(data.index).date <= cutoff].copy() if not data.empty else data)
     signature = tuple((str(data.index[-1]), data_version(data.tail(90).to_dict()))
                       if not data.empty else None for data in closed)
-    cached = st.session_state.get('_index_daily_plan', {})
+    cache = st.session_state if cache is None else cache
+    cached = cache.get('_index_daily_plan', {})
     if cached.get('signature') == signature and cached.get('plan'):
         return dict(cached['plan'])
     plan = calculate_index_trade_plan(closed[0], calculate_market_temperature(closed[0]),
                                       closed[1], calculate_market_temperature(closed[1]))
     if plan:
-        st.session_state['_index_daily_plan'] = {'signature': signature, 'plan': dict(plan)}
+        cache['_index_daily_plan'] = {'signature': signature, 'plan': dict(plan)}
     return plan or cached.get('plan')
 
 
@@ -7629,17 +7648,12 @@ def render_index_scenario_tracking(plan):
     return quote
 
 
-def render_operation_plan(seed_data, option_page=False):
-    """Refresh every analysis on the active page from stream/minute caches only."""
-    api = st.session_state.get('sj_api')
-    option_model_specs = []
-    if api is not None:
-        contracts = [get_near_futures_contract(api, product) for product in ('TMF', 'TXF')]
-        contracts.append(get_taiex_contract(api))
-        sync_strategy_stream_scope(api, [c for c in contracts if c is not None], 'index')
+def calculate_operation_snapshot(seed_data, api, entry_profile, state, background=False):
+    """Same published calculations, with explicit state and no rendering/session access."""
     thermometer_data = []
     for label, code, data, source, result in seed_data:
-        live_data = merge_market_temperature_snapshot(data, api, code, stream_only=True)
+        live_data = merge_market_temperature_snapshot(data, api, code, stream_only=True,
+                    **({'subscribe': False} if background else {}))
         if live_data is not data:
             source = f'{source}＋即時串流'
             result = calculate_market_temperature(live_data)
@@ -7648,18 +7662,234 @@ def render_operation_plan(seed_data, option_page=False):
     futures_item = next((item for item in thermometer_data if item[1] == 'TWF=F'), None)
     plan = get_stable_index_trade_plan(
         index_item[2] if index_item else pd.DataFrame(), index_item[4] if index_item else None,
-        futures_item[2] if futures_item else pd.DataFrame(), futures_item[4] if futures_item else None,
+        futures_item[2] if futures_item else pd.DataFrame(), futures_item[4] if futures_item else None, cache=state,
     )
     if plan is None:
-        record_operation_models('選擇權操作計畫' if option_page else '指數操作計畫', [], api,
-                                st.session_state.get('option_auto_seconds_saved' if option_page else 'index_scenario_seconds_saved', 5))
+        return {'plan': None, 'thermometer_data': thermometer_data}
+    live_snapshot = get_live_futures_snapshot(api, 'TMF', stream_only=True)
+    fresh = bool(live_snapshot)
+    if live_snapshot:
+        state['quote'] = live_snapshot
+    live_snapshot = state.get('quote')
+    live_price = live_snapshot['price'] if live_snapshot else plan['latest']
+    live_change = live_snapshot['change'] if live_snapshot else float((futures_item[4] or {}).get('change', 0))
+    intraday_state = get_cached_futures_intraday_state(
+        api, plan['direction'], max_age_seconds=0, **({'logged_in': True} if background else {}),
+    )
+    previous_temperature = None
+    if futures_item is not None and len(futures_item[2]) > 20:
+        previous_temperature = calculate_market_temperature(futures_item[2].iloc[:-1].copy())
+    temperature_delta = (
+        float(futures_item[4]['score']) - float(previous_temperature['score'])
+        if futures_item and futures_item[4] and previous_temperature else 0.0
+    )
+    trade_state = evaluate_trade_entry_state(
+        plan, live_price, live_change, intraday_state, temperature_delta, entry_profile,
+    )
+    if not fresh:
+        trade_state = {**trade_state, 'can_enter': False, 'permission': '等待最新串流',
+                       'reason': '行情尚未更新；保留原點位，等待最新串流後再判斷進場。', 'color': '#ffc107'}
+    short_wave_direction, short_direction_note = resolve_short_wave_direction(
+        plan, trade_state, intraday_state,
+    )
+    short_wave = get_cached_short_wave_plan(api, short_wave_direction, max_age_seconds=0)
+    if short_wave and not fresh:
+        short_wave = {**short_wave, 'momentum_ready': False}
+    return {'plan': plan, 'thermometer_data': thermometer_data,
+            'index_item': index_item, 'futures_item': futures_item,
+            'live_snapshot': live_snapshot, 'live_price': live_price, 'live_change': live_change,
+            'intraday_state': intraday_state, 'trade_state': trade_state,
+            'short_wave_direction': short_wave_direction, 'short_direction_note': short_direction_note,
+            'short_wave': short_wave, 'fresh': fresh}
+
+
+def index_operation_model_specs(snapshot, quantity, profile, cost_settings=None, version=None):
+    plan, live = snapshot.get('plan'), snapshot.get('live_snapshot')
+    if not plan:
+        return []
+    trade, intraday, wave = snapshot['trade_state'], snapshot['intraday_state'], snapshot['short_wave']
+    specs = [operation_model_spec(
+        '指數操作計畫', '日線／15分K', live,
+        trade.get('execution_direction') or plan.get('direction'),
+        trade['entry_level'], trade['invalidation'], trade['target'], trade['can_enter'], quantity, profile,
+        {'VWAP': intraday.get('vwap'), 'ATR': plan.get('atr')}, plan['trigger'],
+        cost_settings=cost_settings, version=version)]
+    if wave:
+        specs.append(operation_model_spec(
+            '指數操作計畫', '短波5分K', live, snapshot['short_wave_direction'],
+            wave['entry'], wave['stop'], wave['target'], wave['momentum_ready'], quantity, profile,
+            {'EMA5': wave.get('ema_fast'), '量比': wave.get('volume_ratio')}, wave['trigger'],
+            cost_settings=cost_settings, version=version))
+    return specs
+
+
+def refresh_index_background_history(api, seed_data):
+    """Slow daily refresh uses the existing shared bounded pool, never the table timer."""
+    shared, lock = get_shared_market_data_cache()
+    result = []
+    for label, code, seed, source, _ in seed_data:
+        key = (code, 180, True, id(api))
+        with lock:
+            cached = shared['temperature'].get(key)
+        if cached and time.monotonic() - cached['saved_at'] <= 180:
+            data, source = cached['df'].copy(deep=True), cached['source']
+        else:
+            data, source = fetch_market_temperature_data(code, api=api, logged_in=True)
+            if data.empty:
+                # Keep both sources' last successful histories; failed retries use the queue backoff.
+                raise RuntimeError('index history unavailable')
+            with lock:
+                shared['temperature'][key] = {'df': data.copy(deep=True), 'source': source,
+                    'attrs': dict(data.attrs), 'saved_at': time.monotonic()}
+        result.append((label, code, data, source, calculate_market_temperature(data)))
+    return result
+
+
+def index_operation_snapshot(seed_data, seconds):
+    """First visit owns one server job; returning reads its latest complete snapshot."""
+    api = st.session_state.get('sj_api')
+    if api is not None and _stream_state(api).get('auth_error'):
+        check_shioaji_connection(api)
+        st.rerun()
+    profile = st.session_state.get('trade_plan_entry_profile', st.session_state.get('_index_entry_profile', '積極（提早確認）'))
+    quantity = st.session_state.get('trade_plan_position_count', st.session_state.get('_index_position_count', 1))
+    st.session_state['_index_entry_profile'], st.session_state['_index_position_count'] = profile, quantity
+    if 'trade_plan_entry_profile' not in st.session_state:
+        st.session_state['trade_plan_entry_profile'] = profile
+    if 'trade_plan_position_count' not in st.session_state:
+        st.session_state['trade_plan_position_count'] = quantity
+    seed_data = seed_data or st.session_state.get('_index_operation_seed', [])
+    if not seed_data:
+        seed_data = [(label, code, pd.DataFrame(), '', None) for label, code in
+                     [('加權股價指數', '^TWII'), ('臺股期貨', 'TWF=F')]]
+    if api is None or not st.session_state.get('sj_logged_in', False):
+        return calculate_operation_snapshot(seed_data, None, profile,
+            st.session_state.setdefault('_index_operation_state', {}))
+    costs, version = load_model_tracking_costs(), get_operation_model_version('指數操作計畫')
+    tracker = get_model_tracker(get_app_secret('gsheet_api_url') or '')
+    worker = get_intraday_background()
+    signature = data_version([id(api), seconds, profile, quantity, costs, version,
+                              st.session_state.get('_index_refresh_generation', 0)])
+    scope = f'index_{id(worker)}_{signature[:10]}'
+    state = {}
+    cursors = st.session_state.setdefault('_index_operation_cursors', {})
+    history_jobs = get_public_maintenance_jobs()
+    def load_history():
+        if worker is not None:
+            with worker.lock:
+                current = worker.jobs.get('index_plan')
+                if worker.closed or not current or current['signature'] != signature:
+                    raise RuntimeError('index session ended')
+        with stream['lock']:
+            if stream.get('connection_down') or stream.get('auth_error'):
+                raise RuntimeError('index transport disconnected')
+        try:
+            result = refresh_index_background_history(api, seed_data)
+        except Exception as exc:
+            with stream['lock']:
+                stream['index_history_error'] = type(exc).__name__
+            raise
+        with stream['lock']:
+            stream.pop('index_history_error', None)
+        return result
+    def update(previous):
+        nonlocal seed_data
+        contracts = [get_near_futures_contract(api, product) for product in ('TMF', 'TXF')]
+        contracts.append(get_taiex_contract(api))
+        sync_strategy_stream_scope(api, [c for c in contracts if c is not None], scope)
+        refreshed = history_jobs.poll(('index_history', id(api)),
+            load_history, interval=30)
+        if refreshed:
+            seed_data = refreshed
+        with stream['lock']:
+            history_error = stream.get('index_history_error')
+        if history_error:
+            # A failed daily refresh cannot publish a newly calculated plan from old history.
+            specs = [{**spec, '新訊號': False, '進場許可': False}
+                     for spec in previous.get('model_specs', []) if spec]
+            record_operation_models('指數操作計畫', specs, api, seconds, tracker=tracker, cursors=cursors)
+            raise RuntimeError('index history refresh failed')
+        snapshot = calculate_operation_snapshot(seed_data, api, profile, state, background=True)
+        state['initialized'] = bool(snapshot.get('plan'))
+        if not snapshot.get('plan'):
+            if previous.get('plan'):
+                raise RuntimeError('index plan unavailable')
+            return snapshot, 0
+        specs = index_operation_model_specs(snapshot, quantity, profile, costs, version)
+        record_operation_models('指數操作計畫', specs, api, seconds, tracker=tracker, cursors=cursors)
+        snapshot['model_specs'] = specs
+        return snapshot, int(snapshot['fresh'])
+    stream = _stream_state(api)
+    def ready():
+        with stream['lock']:
+            connected = not (stream.get('connection_down') or stream.get('auth_error'))
+        return connected and (not state.get('initialized') or
+            model_market_open({'市場': '期貨', '交易時段': '日盤+夜盤'}))
+    if worker is None:  # AppTest has no connected server session.
+        previous = st.session_state.get('_index_operation_fallback', {})
+        try:
+            snapshot, _ = update(previous)
+        except Exception as exc:
+            snapshot = {**previous, 'error': type(exc).__name__, 'fresh': False,
+                'trade_state': {**previous.get('trade_state', {}), 'can_enter': False,
+                    'permission': '等待最新串流', 'color': '#ffc107',
+                    'reason': '行情尚未更新；保留原點位，等待最新串流後再判斷進場。'}}
+            if previous.get('short_wave'):
+                snapshot['short_wave'] = {**previous['short_wave'], 'momentum_ready': False}
+            return snapshot
+        st.session_state['_index_operation_fallback'] = snapshot
+        return snapshot
+    with stream['lock']:
+        stream.setdefault('intraday_background_workers', weakref.WeakSet()).add(worker)
+    previous = worker.result('index_plan')
+    worker.configure('index_plan', signature, previous['rows'] if previous else {}, seconds, update, ready,
+                     lambda: sync_strategy_stream_scope(api, [], scope), low_priority=True)
+    result = worker.result('index_plan')
+    pending = result is None
+    result = result or previous
+    if not result:
+        return {'plan': None}
+    snapshot = result['rows']
+    if snapshot.get('thermometer_data'):
+        st.session_state['_index_operation_seed'] = snapshot['thermometer_data']
+    snapshot.update({key: result[key] for key in ('checked_at', 'updated_at', 'outside', 'error', 'duration')})
+    live = snapshot.get('live_snapshot')
+    source = parse_strategy_data_time(live.get('updated')) if live else None
+    age = (datetime.now(pytz.timezone('Asia/Taipei')).replace(tzinfo=None) - source.to_pydatetime()).total_seconds() if source is not None else None
+    if snapshot.get('plan') and (pending or not ready() or result['outside'] or result['error'] or age is None or not 0 <= age <= 30):
+        snapshot['trade_state'].update(can_enter=False, permission='等待最新串流', color='#ffc107',
+                                      reason='行情尚未更新；保留原點位，等待最新串流後再判斷進場。')
+        if snapshot.get('short_wave'):
+            snapshot['short_wave']['momentum_ready'] = False
+    return snapshot
+
+
+def render_operation_plan(seed_data, option_page=False, seconds=5, snapshot=None):
+    """Render the latest snapshot; only the option page keeps its existing foreground flow."""
+    api = st.session_state.get('sj_api')
+    option_model_specs = []
+    entry_profile = st.session_state.get('trade_plan_entry_profile', '積極（提早確認）')
+    if option_page:
+        if api is not None:
+            contracts = [get_near_futures_contract(api, product) for product in ('TMF', 'TXF')]
+            contracts.append(get_taiex_contract(api))
+            sync_strategy_stream_scope(api, [c for c in contracts if c is not None], 'index')
+        snapshot = calculate_operation_snapshot(seed_data, api, entry_profile,
+                    st.session_state.setdefault('_index_operation_state', {}))
+    elif snapshot is None:
+        snapshot = index_operation_snapshot(seed_data, seconds)
+    plan = snapshot.get('plan')
+    if plan is None:
+        if option_page:
+            record_operation_models('選擇權操作計畫', [], api, seconds)
         st.info('⏳ 正在載入加權與期貨日 K；資料足夠後會直接顯示操作計畫。')
-        if time.monotonic() - st.session_state.get('_index_trade_plan_auto_retry', 0) >= 180:
+        if option_page and time.monotonic() - st.session_state.get('_index_trade_plan_auto_retry', 0) >= 180:
             st.session_state['_index_trade_plan_auto_retry'] = time.monotonic()
             clear_index_market_data_cache()
             st.rerun()
         return
-    st.session_state.pop('_index_trade_plan_auto_retry', None)
+    if option_page:
+        st.session_state.pop('_index_trade_plan_auto_retry', None)
     entry_profile = st.session_state.get('trade_plan_entry_profile', '積極（提早確認）')
     if not option_page:
         profile_col, refresh_col = st.columns([6, 1])
@@ -7672,32 +7902,16 @@ def render_operation_plan(seed_data, option_page=False):
                 help="積極模式會擴大費波觀察區，並允許即時價站穩／跌破 VWAP 後提早小部位進場；過熱與反向急漲跌保護仍保留。",
             )
         with refresh_col:
-            st.button("↻ 即時更新", key="refresh_trade_plan_live", width='stretch')
-    live_snapshot = render_index_scenario_tracking(plan)
-    live_price = live_snapshot['price'] if live_snapshot else plan['latest']
-    live_change = live_snapshot['change'] if live_snapshot else float((futures_item[4] or {}).get('change', 0))
-    intraday_state = get_cached_futures_intraday_state(
-        st.session_state.get('sj_api'), plan['direction'], max_age_seconds=0,
-    )
-    previous_temperature = None
-    if futures_item is not None and len(futures_item[2]) > 20:
-        previous_temperature = calculate_market_temperature(futures_item[2].iloc[:-1].copy())
-    temperature_delta = (
-        float(futures_item[4]['score']) - float(previous_temperature['score'])
-        if futures_item and futures_item[4] and previous_temperature else 0.0
-    )
-    trade_state = evaluate_trade_entry_state(
-        plan, live_price, live_change, intraday_state, temperature_delta, entry_profile,
-    )
-    if not st.session_state.get('_index_scenario_live', {}).get('fresh'):
-        trade_state = {**trade_state, 'can_enter': False, 'permission': '等待最新串流',
-                       'reason': '行情尚未更新；保留原點位，等待最新串流後再判斷進場。', 'color': '#ffc107'}
-    short_wave_direction, short_direction_note = resolve_short_wave_direction(
-        plan, trade_state, intraday_state,
-    )
-    short_wave = get_cached_short_wave_plan(st.session_state.get('sj_api'), short_wave_direction, max_age_seconds=0)
-    if short_wave and not st.session_state.get('_index_scenario_live', {}).get('fresh'):
-        short_wave = {**short_wave, 'momentum_ready': False}
+            if st.button("↻ 即時更新", key="refresh_trade_plan_live", width='stretch'):
+                st.session_state['_index_refresh_generation'] = st.session_state.get('_index_refresh_generation', 0) + 1
+                st.rerun()
+    index_item, futures_item = snapshot['index_item'], snapshot['futures_item']
+    live_snapshot, live_price, live_change = (snapshot[key] for key in ('live_snapshot', 'live_price', 'live_change'))
+    intraday_state, trade_state = snapshot['intraday_state'], snapshot['trade_state']
+    short_wave_direction, short_direction_note, short_wave = (snapshot[key] for key in
+        ('short_wave_direction', 'short_direction_note', 'short_wave'))
+    if live_snapshot:
+        st.caption('來源時間：' + _stream_datetime(live_snapshot['updated']).strftime('%Y/%m/%d %H:%M:%S'))
     if not option_page:
         confirmation_text = intraday_state['confirmation_text']
         display_direction, direction_color = {
@@ -7830,21 +8044,7 @@ def render_operation_plan(seed_data, option_page=False):
             key="trade_plan_position_count",
             help="此設定會連動更新進出依據與短波當沖的停損金額及預估收益。",
         )
-        model_specs = [operation_model_spec(
-            '指數操作計畫', '日線／15分K', live_snapshot,
-            trade_state.get('execution_direction') or plan.get('direction'),
-            trade_state['entry_level'], trade_state['invalidation'], trade_state['target'],
-            trade_state['can_enter'], position_count, entry_profile,
-            {'VWAP': intraday_state.get('vwap'), 'ATR': plan.get('atr')}, plan['trigger'],
-        )]
-        if short_wave:
-            model_specs.append(operation_model_spec(
-                '指數操作計畫', '短波5分K', live_snapshot, short_wave_direction,
-                short_wave['entry'], short_wave['stop'], short_wave['target'],
-                short_wave['momentum_ready'], position_count, entry_profile,
-                {'EMA5': short_wave.get('ema_fast'), '量比': short_wave.get('volume_ratio')}, short_wave['trigger'],
-            ))
-        record_operation_models('指數操作計畫', model_specs, api, st.session_state.get('index_scenario_seconds_saved', 5))
+        model_specs = snapshot.get('model_specs', [])
         render_operation_protection('指數操作計畫', model_specs)
         execution_direction = trade_state.get('execution_direction') or plan.get('direction')
         execution_color = (
@@ -15993,9 +16193,7 @@ def _list_shioaji_futures_contracts(api):
         contracts.extend(list(api.contracts.list(security_type) or []))
     except Exception as exc:
         if _is_shioaji_auth_error(exc):
-            invalidator = globals().get('invalidate_shioaji_connection')
-            if callable(invalidator):
-                invalidator(exc)
+            remember_shioaji_auth_error(api, exc)
             return []
     if not contracts:
         try:
@@ -16006,9 +16204,7 @@ def _list_shioaji_futures_contracts(api):
                     continue
         except Exception as exc:
             if _is_shioaji_auth_error(exc):
-                invalidator = globals().get('invalidate_shioaji_connection')
-                if callable(invalidator):
-                    invalidator(exc)
+                remember_shioaji_auth_error(api, exc)
             return []
     unique = {}
     for contract in contracts:
@@ -16049,9 +16245,7 @@ def resolve_shioaji_futures_contract(api, root, contract_month):
             candidates.extend(list(found or []))
         except Exception as exc:
             if _is_shioaji_auth_error(exc):
-                invalidator = globals().get('invalidate_shioaji_connection')
-                if callable(invalidator):
-                    invalidator(exc)
+                remember_shioaji_auth_error(api, exc)
                 return None
             continue
 
@@ -16062,9 +16256,7 @@ def resolve_shioaji_futures_contract(api, root, contract_month):
                 candidates.extend(list(getattr(api.Contracts.Futures, query_root)))
             except Exception as exc:
                 if _is_shioaji_auth_error(exc):
-                    invalidator = globals().get('invalidate_shioaji_connection')
-                    if callable(invalidator):
-                        invalidator(exc)
+                    remember_shioaji_auth_error(api, exc)
                     return None
                 continue
     if not candidates:
@@ -20852,7 +21044,9 @@ def get_intraday_background():
     if runtime.is_active_session(session_id) is not True:
         return None
     worker = st.session_state.get('_intraday_background')
-    if worker is None or worker.closed:
+    if worker is None or worker.closed or not isinstance(worker, IntradayBackground):
+        if worker is not None:
+            worker.close()
         worker = IntradayBackground(lambda: runtime.is_active_session(session_id))
         st.session_state['_intraday_background'] = worker
     return worker
@@ -21069,7 +21263,8 @@ def get_operation_model_version(source):
 
 
 def operation_model_spec(source, kind, live, direction, entry, stop, target, allowed,
-                         quantity, profile, indicators, rule, option_quote=None, spread=False):
+                         quantity, profile, indicators, rule, option_quote=None, spread=False,
+                         cost_settings=None, version=None):
     """Freeze published levels and actual contract identities, never theoretical option fills."""
     levels = [_safe_number(value) for value in (entry, stop, target)]
     entry, stop, target = levels
@@ -21077,7 +21272,7 @@ def operation_model_spec(source, kind, live, direction, entry, stop, target, all
             or min(levels) <= 0
             or not (stop < entry < target if direction == '偏多' else target < entry < stop)):
         return None
-    cost_settings = load_model_tracking_costs()
+    cost_settings = load_model_tracking_costs() if cost_settings is None else cost_settings
     costs = normalize_costs(cost_settings)
     costs['futures_contracts'] = int(quantity)
     underlying = str(live['contract_code'])
@@ -21085,7 +21280,7 @@ def operation_model_spec(source, kind, live, direction, entry, stop, target, all
     spec = {'市場': '期貨', '商品鍵': underlying + '|' + kind, '代碼': underlying,
             '名稱': '微台 ' + kind, '交易時段': '日盤+夜盤', '策略': '當沖',
             '計畫來源': source, '計畫類型': kind, '觸發商品': underlying,
-            '策略版本': get_operation_model_version(source) + '-' + data_version([kind, profile, costs])[:10],
+            '策略版本': (version or get_operation_model_version(source)) + '-' + data_version([kind, profile, costs])[:10],
             '方向': direction, '進場價': levels[0], '停損價': levels[1], '目標價': levels[2],
             '進場許可': bool(allowed), '跳動點': 1, '乘數': 10, '期交稅率': .00002,
             '觀察價格': _safe_number(live.get('price')), '觀察時間': str(live.get('updated', '')),
@@ -21180,10 +21375,10 @@ def operation_model_samples(specs, api, seconds, now_value=None, after=None):
     return signals, quotes
 
 
-def record_operation_models(source, specs, api, seconds):
-    if api is None or not st.session_state.get('sj_logged_in', False):
+def record_operation_models(source, specs, api, seconds, tracker=None, cursors=None):
+    if api is None or (tracker is None and not st.session_state.get('sj_logged_in', False)):
         return
-    tracker = get_model_tracker(get_app_secret('gsheet_api_url') or '')
+    tracker = get_model_tracker(get_app_secret('gsheet_api_url') or '') if tracker is None else tracker
     day = get_futures_trading_date(datetime.now(pytz.timezone('Asia/Taipei'))).date().isoformat()
     specs = [dict(spec) for spec in specs if spec]
     active = tracker.active_plans(source, day)
@@ -21198,7 +21393,7 @@ def record_operation_models(source, specs, api, seconds):
     current_keys = {spec['商品鍵'] for spec in specs}
     specs += [{**row, '新訊號': False, '進場許可': False} for row in active
               if row['商品鍵'] not in current_keys]
-    cursors = st.session_state.setdefault('_operation_model_cursors', {})
+    cursors = st.session_state.setdefault('_operation_model_cursors', {}) if cursors is None else cursors
     signals, quotes = operation_model_samples(specs, api, seconds, after=cursors)
     if signals or quotes:
         if tracker.submit(signals, quotes):
@@ -26315,7 +26510,8 @@ with tab_fibo:
     thermometer_data = []
     # Streamlit tabs 仍會執行隱藏分頁程式；只在實際開啟需要的分頁時下載兩組溫度資料。
     if tab_fibo.open and (
-        tab_trade_plan.open or tab_option_plan.open or tab_fibo_thermometer.open
+        tab_option_plan.open or tab_fibo_thermometer.open or
+        (tab_trade_plan.open and not st.session_state.get('sj_logged_in', False))
     ):
         for label, code in thermometer_specs:
             temp_df, source = get_cached_market_temperature_data(code)
@@ -26324,7 +26520,7 @@ with tab_fibo:
 
     active_plan = tab_fibo.open and (tab_trade_plan.open or tab_option_plan.open)
     if st.session_state.get('sj_api') is not None:
-        if not active_plan:
+        if not (tab_fibo.open and tab_option_plan.open):
             sync_strategy_stream_scope(st.session_state.sj_api, [], 'index')
         if not (tab_fibo.open and tab_option_plan.open):
             sync_strategy_stream_scope(st.session_state.sj_api, [], 'options')
@@ -26344,14 +26540,19 @@ with tab_fibo:
             seed_date = _post_close_target_date()[1]
             @st.fragment(run_every=interval)
             def render_active_operation_plan():
-                if _post_close_target_date()[1] != seed_date:
+                if option_page and _post_close_target_date()[1] != seed_date:
                     st.rerun()
+                snapshot = None if option_page else index_operation_snapshot(thermometer_data, seconds)
                 checked_at = datetime.now(pytz.timezone('Asia/Taipei')).strftime('%Y/%m/%d %H:%M:%S')
+                if snapshot is not None:
+                    checked_at = _stream_datetime(snapshot['updated_at']).strftime('%Y/%m/%d %H:%M:%S') if snapshot.get('updated_at') else '等待資料'
                 st.caption(
                     f'⏰ 全頁自動更新：每 {seconds} 秒｜分析與即時點位同步更新｜自動更新時間：{checked_at}'
                     if interval else '⏰ 自動追蹤：等待 Shioaji 登入；保留最近完整資料。'
                 )
-                render_operation_plan(thermometer_data, option_page)
+                if snapshot and (snapshot.get('outside') or snapshot.get('error') or not snapshot.get('fresh', True)):
+                    st.caption('等待最新串流或更新時段；保留最近完整分析與來源時間。')
+                render_operation_plan(thermometer_data, option_page, seconds, snapshot)
             render_active_operation_plan()
 
     with tab_fibo_thermometer:
