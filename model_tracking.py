@@ -120,7 +120,7 @@ def merge_trades(remote, local):
                     row[key] = first[key]
             events = {e['事件ID']: e for item in (old, incoming) for e in item.get('事件', []) if e.get('事件ID')}
             row['事件'] = sorted(events.values(), key=lambda e: e['時間'])
-            restore_profit_protection(row)
+        restore_profit_protection(row)
         merged[row['交易ID']] = row
     return list(merged.values())
 

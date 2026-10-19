@@ -87,8 +87,6 @@ def test_armed_floor_survives_cloud_event_union_and_restart_without_retroactive_
         assert result.returncode == 0, result.stderr
         # The deployed generic event union needs no new Apps Script schema.
         merged = merge_trades([], json.loads(result.stdout))[0]
-        from model_tracking import restore_profit_protection
-        restore_profit_protection(merged)
         assert merged['保利價'] == raised['保利價']
     tracker = ModelTracker(tmp_path / 'restart.sqlite', start=False)
     with tracker.db() as db:
