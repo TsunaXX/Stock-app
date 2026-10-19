@@ -7783,7 +7783,15 @@ def index_operation_snapshot(seed_data, seconds):
         with stream['lock']:
             if stream.get('connection_down') or stream.get('auth_error'):
                 raise RuntimeError('index transport disconnected')
-        return refresh_index_background_history(api, seed_data)
+        try:
+            result = refresh_index_background_history(api, seed_data)
+        except Exception as exc:
+            with stream['lock']:
+                stream['index_history_error'] = type(exc).__name__
+            raise
+        with stream['lock']:
+            stream.pop('index_history_error', None)
+        return result
     def update(previous):
         nonlocal seed_data
         contracts = [get_near_futures_contract(api, product) for product in ('TMF', 'TXF')]
@@ -7793,6 +7801,14 @@ def index_operation_snapshot(seed_data, seconds):
             load_history, interval=30)
         if refreshed:
             seed_data = refreshed
+        with stream['lock']:
+            history_error = stream.get('index_history_error')
+        if history_error:
+            # A failed daily refresh cannot publish a newly calculated plan from old history.
+            specs = [{**spec, '新訊號': False, '進場許可': False}
+                     for spec in previous.get('model_specs', []) if spec]
+            record_operation_models('指數操作計畫', specs, api, seconds, tracker=tracker, cursors=cursors)
+            raise RuntimeError('index history refresh failed')
         snapshot = calculate_operation_snapshot(seed_data, api, profile, state, background=True)
         state['initialized'] = bool(snapshot.get('plan'))
         if not snapshot.get('plan'):

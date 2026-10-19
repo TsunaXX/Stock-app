@@ -261,7 +261,7 @@ python -m pytest -q
 - 第一階段只讓指數操作計畫首次開啟後常駐；同一 session 沿用 IntradayBackground，一個 index_plan 工作，切離主／子分頁不取消，不執行隱藏 UI。未開啟頁面不建工作，選擇權與股期頁沿用原生命週期。
 - 行情仍使用同一 API 的串流；TMF、TXF 與加權採 session／設定版本各自的 scope，背景日 K 疊合共用已訂閱的 TXF 近月，不額外訂閱相同標的的連續契約。離線超過原兩分鐘寬限期或登出後釋放本工作持有的訂閱；其他 scope 使用中的商品保留。已送出的有限歷史請求可完成，不再排新工作。
 - calculate_operation_snapshot 輸入 API、靈敏度及獨立計算狀態，輸出最新完整快照。render_operation_plan 只繪製指數快照，選擇權仍前景計算。回到分頁不重新下載日 K 或重跑模型；口數、靈敏度、秒數變更只重設該工作，成交游標不重設。
-- 日 K 使用原 temperature 共用快取與 180 秒有效期，慢來源放入既有 BackgroundJobs，最多每三十秒檢查一次；成功資料共用，失敗保留前次完整組合。5／15 分 K 使用既有分 K 快取及串流更新，不增加 snapshots／ticks 輪詢；形成中的 K 棒變動仍按使用者設定秒數判斷。
+- 日 K 使用原 temperature 共用快取與 180 秒有效期，慢來源放入既有 BackgroundJobs，最多每三十秒檢查一次；成功資料共用，失敗保留前次完整組合，暫停新訊號但持續以既有成交證據監控原持倉。5／15 分 K 使用既有分 K 快取及串流更新，不增加 snapshots／ticks 輪詢；形成中的 K 棒變動仍按使用者設定秒數判斷。
 - 背景不讀寫 session_state 或 UI。模型轉接明確傳入成本、版本、Tracker、游標，仍使用同一 operation_model_samples 與非阻塞 submit；原凍結價位、許可時間、有序成交、保利與損益公式不變，不增加 Sheets 結構。
 - IntradayBackground 支援 DataFrame 與字典快照；安全複本、失敗保留最後完整結果。指數工作排序在原股期工作之後，更新耗時的四倍超過設定間隔時自動退避；只保存一份結果。畫面更新時間採背景成功版本時間，來源時間仍為券商時間；行情過期或暫停時禁止新進場，不把檢查時間冒充來源時間。
 - 本機瀏覽器與可重現效能測試、驗收界線見 [INDEX_BACKGROUND_SNAPSHOTS.md](INDEX_BACKGROUND_SNAPSHOTS.md)。

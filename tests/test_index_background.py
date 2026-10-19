@@ -305,3 +305,29 @@ def test_background_daily_overlay_reads_owned_near_contract_without_extra_subscr
     result = ns['merge_market_temperature_snapshot'](frame,object(),'TWF=F',stream_only=True,subscribe=False)
     assert result['Close'].iloc[-1] == 20100.
     assert calls == [('TXFJ6',{'snapshot_fallback':False,'subscribe':False})]
+
+
+def test_failed_slow_source_preserves_snapshot_but_keeps_observing_existing_positions():
+    ns, worker, session, state, seed, price, connected, market, builds, records, subscriptions = harness()
+    jobs, failing = BackgroundJobs(), [False]
+    ns['get_public_maintenance_jobs'] = lambda:SimpleNamespace(poll=lambda key,loader,**kw:jobs.poll(key,loader,interval=0))
+    def refresh(api,seed):
+        if failing[0]: raise ConnectionError('daily source unavailable')
+        return seed
+    ns['refresh_index_background_history'] = refresh
+    try:
+        ns['index_operation_snapshot'](seed,.02)
+        good = wait_result(worker,'index_plan',lambda r:r['rows'].get('plan'))
+        live = ns['get_live_futures_snapshot']
+        ns['get_live_futures_snapshot'] = lambda *a, **kw:good['rows']['live_snapshot']
+        failing[0] = True
+        failed = wait_result(worker,'index_plan',lambda r:r.get('error'))
+        assert failed['rows']['live_price'] == good['rows']['live_price'] and failed['updated_at'] == good['updated_at']
+        assert records[-1][1] and all(not spec['進場許可'] and not spec['新訊號'] for spec in records[-1][1])
+        failing[0] = False
+        ns['get_live_futures_snapshot'] = live
+        price[0] = 20200.
+        assert wait_result(worker,'index_plan',lambda r:r['rows'].get('live_price') == 20200. and not r['error'])
+    finally:
+        worker.close()
+        jobs.pool.shutdown(wait=True)
