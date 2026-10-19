@@ -19736,9 +19736,11 @@ def build_guarded_stock_trade_plan(row, direction, is_daytrade, result):
         entry = levels.get('entry')
         if entry is not None and levels.get('stop') is not None and price is not None:
             triggered = not bool(row.get('_data_stale', False)) and (price >= entry if direction == '多頭' else price <= entry)
+            if prior.get('session') == session and prior.get('direction') == direction and prior.get('summary') == plan['summary']:
+                triggered = triggered or bool(prior.get('triggered'))
             plans[code] = {'session': session, 'direction': direction, 'stop': levels['stop'],
                            'summary': plan['summary'], 'target': levels.get('target'), 'triggered': triggered}
-            if triggered:
+            if triggered and not bool(row.get('_data_stale', False)):
                 plan['summary'] = '已進場｜' + plan['summary']
     elif isinstance(row.get('_daytrade_guard_reason'), str) and row.get('_daytrade_guard_reason') and not plan['summary'].startswith('⛔'):
         plan['summary'] = '等待｜' + row['_daytrade_guard_reason']

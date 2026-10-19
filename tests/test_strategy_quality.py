@@ -105,6 +105,7 @@ def test_entry_labels_are_compact_and_do_not_grant_tracking_permission():
     fn = ns['build_guarded_stock_trade_plan']
     row = {'代號': '2330', '_daytrade_data_time': '2026/10/19 09:01:00', '_daytrade_close': 101}
     assert fn(row, '多頭', True, {})['summary'] == '已進場｜進 101｜停 99｜目 104'
+    assert fn({**row, '_daytrade_close': 100}, '多頭', True, {})['summary'].startswith('已進場｜')
     current['valid'] = False
     kept = fn({**row, '_daytrade_close': 100}, '多頭', True, {})
     assert kept['summary'] == '已進場·追蹤｜進 101｜停 99｜目 104'
