@@ -7817,7 +7817,9 @@ def index_operation_snapshot(seed_data, seconds):
     previous = worker.result('index_plan')
     worker.configure('index_plan', signature, previous['rows'] if previous else {}, seconds, update, ready,
                      lambda: sync_strategy_stream_scope(api, [], scope), low_priority=True)
-    result = worker.result('index_plan') or previous
+    result = worker.result('index_plan')
+    pending = result is None
+    result = result or previous
     if not result:
         return {'plan': None}
     snapshot = result['rows']
@@ -7827,7 +7829,7 @@ def index_operation_snapshot(seed_data, seconds):
     live = snapshot.get('live_snapshot')
     source = parse_strategy_data_time(live.get('updated')) if live else None
     age = (datetime.now(pytz.timezone('Asia/Taipei')).replace(tzinfo=None) - source.to_pydatetime()).total_seconds() if source is not None else None
-    if snapshot.get('plan') and (not ready() or result['outside'] or result['error'] or age is None or not 0 <= age <= 30):
+    if snapshot.get('plan') and (pending or not ready() or result['outside'] or result['error'] or age is None or not 0 <= age <= 30):
         snapshot['trade_state'].update(can_enter=False, permission='等待最新串流', color='#ffc107',
                                       reason='行情尚未更新；保留原點位，等待最新串流後再判斷進場。')
         if snapshot.get('short_wave'):

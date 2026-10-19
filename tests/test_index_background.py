@@ -126,12 +126,20 @@ def test_disconnected_market_closed_and_expired_quote_keep_last_levels_without_p
 
 def test_setting_changes_reuse_cursors_and_release_only_the_old_scope():
     ns, worker, session, state, seed, *_, subscriptions = harness()
+    finish = threading.Event()
     try:
         ns['index_operation_snapshot'](seed, .02)
         wait_result(worker, 'index_plan')
         old_cursor = session['_index_operation_cursors']
+        calculate = ns['calculate_operation_snapshot']
+        def blocked(*args, **kwargs):
+            assert finish.wait(2)
+            return calculate(*args, **kwargs)
+        ns['calculate_operation_snapshot'] = blocked
         session['trade_plan_entry_profile'] = '穩健（完整確認）'
-        ns['index_operation_snapshot']([], .03)
+        pending = ns['index_operation_snapshot']([], .03)
+        assert not pending['trade_state']['can_enter']
+        finish.set()
         assert wait_result(worker, 'index_plan', lambda r:r['rows'].get('plan'))
         assert session['_index_operation_cursors'] is old_cursor and old_cursor['kept']
         assert len([codes for codes in subscriptions.values() if codes]) == 1
@@ -142,6 +150,7 @@ def test_setting_changes_reuse_cursors_and_release_only_the_old_scope():
         assert worker.jobs['index_plan'] is current
         assert session['trade_plan_entry_profile'] == '穩健（完整確認）'
     finally:
+        finish.set()
         worker.close()
 
 
