@@ -385,13 +385,15 @@ class ScenarioFixtureDatetime(datetime):
         fixed = pytz.timezone('Asia/Taipei').localize(cls(2026, 10, 6, 10))
         return fixed.astimezone(tz) if tz else fixed.replace(tzinfo=None)
 datetime = ScenarioFixtureDatetime
+st.session_state['sj_logged_in'] = True
+st.session_state.setdefault('sj_api', object())
 st.session_state.setdefault('main_workspace_active_tab', '📈 指數操盤室')
 st.session_state['index_workspace_active_tab'] = st.session_state.get('_test_page', '📅 選擇權操作計畫')
 fixture = pd.DataFrame({'Open':[20000.]*90,'High':[20500.]*90,'Low':[19500.]*90,
                         'Close':[20100.]*90,'Volume':[1000.]*90},
                        index=pd.date_range('2026-07-05',periods=90,freq='D'))
 get_cached_market_temperature_data = lambda *a, **kw: (fixture.copy(),'測試快取')
-get_stable_index_trade_plan = lambda *a: {'market_label':'測試市場','alignment_note':'完整日 K',
+get_stable_index_trade_plan = lambda *a, **kw: {'market_label':'測試市場','alignment_note':'完整日 K',
     'direction':'偏多','action':'多方觀察','action_color':'#ff4b4b','latest':20100.,
     'swing_low':19500.,'swing_high':20500.,'support':20000.,'resistance':20500.,'entry_level':20000.,
     'invalidation':19900.,'target':20500.,'zone_points':20.,'trigger':'測試條件','atr':100.,
@@ -420,7 +422,8 @@ def intraday_auto_interval(room, enabled, seconds):
     st.session_state['timer_seconds'] = seconds
     return seconds
 render_postclose_maintenance = lambda: None
-def record_operation_models(source, specs, api, seconds):
+get_model_tracker = lambda *a: SimpleNamespace(protection_plans=lambda *a, **kw: {})
+def record_operation_models(source, specs, api, seconds, **kw):
     st.session_state['model_plan_source'] = source
     st.session_state['model_plan_count'] = len([spec for spec in specs if spec])
 '''

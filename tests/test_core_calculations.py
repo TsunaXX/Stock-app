@@ -2242,7 +2242,7 @@ def test_expired_shioaji_session_is_invalidated_without_crashing_futures_room():
         "SHIOAJI_FUTURES_ROOT_ALIASES", "FUTURES_MONTH_CODE",
         "shioaji_futures_root_candidates", "expected_shioaji_futures_code",
         "_is_shioaji_auth_error", "_contract_delivery_month", "_is_actual_futures_contract",
-        "_list_shioaji_futures_contracts", "resolve_shioaji_futures_contract",
+        "_list_shioaji_futures_contracts", "resolve_shioaji_futures_contract", "remember_shioaji_auth_error",
     )
 
     class AuthError(Exception):
@@ -2255,10 +2255,10 @@ def test_expired_shioaji_session_is_invalidated_without_crashing_futures_room():
     class API:
         contracts = ExpiredContracts()
 
-    invalidated = []
-    symbols["invalidate_shioaji_connection"] = lambda exc: invalidated.append(str(exc))
+    state = {"lock": threading.RLock()}
+    symbols["_stream_state"] = lambda api: state
     assert symbols["resolve_shioaji_futures_contract"](API(), "TMF", "202609") is None
-    assert invalidated == ["Not authenticated"]
+    assert state["connection_down"] and state["auth_error"] == "AuthError"
     assert symbols["_is_shioaji_auth_error"](TimeoutError("temporary timeout")) is False
 
 
@@ -2305,7 +2305,7 @@ def test_index_operation_plan_waits_and_retries_without_missing_data_warning():
     assert "entry_rr_color" in source
     assert "short_rr_color" in source
     assert 'seed_date = _post_close_target_date()[1]' in source
-    assert 'if _post_close_target_date()[1] != seed_date:' in source
+    assert 'if option_page and _post_close_target_date()[1] != seed_date:' in source
 
 
 def test_phone_charts_keep_payoff_levels_outside_the_plot_canvas():

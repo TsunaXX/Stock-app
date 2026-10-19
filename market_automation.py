@@ -1,6 +1,7 @@
 """Local signal guards and bounded public-data maintenance; no broker polling."""
 
 import hashlib
+import copy
 import json
 import math
 import threading
@@ -24,7 +25,7 @@ class IntradayBackground:
         self.thread = threading.Thread(target=self._run, name='intraday-background', daemon=True)
         self.thread.start()
 
-    def configure(self, room, signature, rows, seconds, update, ready, release):
+    def configure(self, room, signature, rows, seconds, update, ready, release, low_priority=False):
         with self.lock:
             prior = self.jobs.get(room)
             if prior and prior['signature'] == signature:
@@ -33,16 +34,16 @@ class IntradayBackground:
                 prior['cancelled'] = True
                 if not prior['running']:
                     self._release(prior)
-            self.jobs[room] = {'signature': signature, 'rows': rows.copy(deep=True),
+            self.jobs[room] = {'signature': signature, 'rows': copy.deepcopy(rows),
                                'seconds': seconds, 'update': update, 'ready': ready,
                                'release': release, 'next': 0, 'result': None,
-                               'running': False, 'cancelled': False}
+                               'running': False, 'cancelled': False, 'low_priority': low_priority}
         self.wake.set()
 
     def result(self, room):
         with self.lock:
             value = self.jobs.get(room, {}).get('result')
-            return {**value, 'rows': value['rows'].copy(deep=True)} if value else None
+            return {**value, 'rows': copy.deepcopy(value['rows'])} if value else None
 
     def remove(self, room):
         with self.lock:
@@ -82,7 +83,7 @@ class IntradayBackground:
                     self.close()
                     break
             with self.lock:
-                jobs = list(self.jobs.values())
+                jobs = sorted(self.jobs.values(), key=lambda job: job['low_priority'])
             for job in jobs:
                 with self.lock:
                     if self.closed or job['cancelled'] or time.monotonic() < job['next']:
@@ -93,7 +94,7 @@ class IntradayBackground:
                 try:
                     outside = not job['ready']()
                     if not outside:
-                        rows, count = job['update'](rows.copy(deep=True))
+                        rows, count = job['update'](copy.deepcopy(rows))
                 except Exception as exc:
                     error = type(exc).__name__
                 checked = datetime.now().astimezone().isoformat()
@@ -103,14 +104,18 @@ class IntradayBackground:
                         self._release(job)
                         continue
                     prior = job['result'] or {}
-                    changed = count and data_version(rows.to_dict('records')) != prior.get('version')
+                    version = data_version(rows.to_dict('records') if isinstance(rows, pd.DataFrame) else rows)
+                    changed = count and version != prior.get('version')
                     job['result'] = {'rows': rows, 'count': count, 'error': error,
                                      'outside': outside, 'checked_at': checked,
                                      'updated_at': checked if changed and not error else prior.get('updated_at'),
-                                     'version': data_version(rows.to_dict('records')),
+                                     'version': version,
                                      'duration': time.monotonic() - started}
                     job['rows'] = rows
-                    job['next'] = time.monotonic() + (max(1, job['seconds']) if outside else job['seconds'])
+                    delay = max(1, job['seconds']) if outside else job['seconds']
+                    if job['low_priority']:
+                        delay = max(delay, job['result']['duration'] * 4)
+                    job['next'] = time.monotonic() + delay
             self.wake.wait(0.25)
             self.wake.clear()
 
