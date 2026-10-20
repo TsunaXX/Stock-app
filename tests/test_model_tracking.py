@@ -5,6 +5,7 @@ import json
 import shutil
 import subprocess
 import threading
+import time
 from pathlib import Path
 from unittest.mock import patch
 from types import SimpleNamespace
@@ -218,6 +219,87 @@ def test_sync_preserves_events_and_new_trades_created_during_network_write(tmp_p
     tracker.sync()
     with tracker.db() as db:
         assert db.execute('SELECT COUNT(*) FROM trades WHERE dirty=1').fetchone()[0] == 0
+
+
+@pytest.mark.parametrize('fail_first', [False, True])
+def test_slow_cloud_does_not_block_ordered_local_evidence_or_retry(tmp_path, fail_first):
+    entered, release = threading.Event(), threading.Event()
+    remote = {'strategy_signals': {'model_schema': 1, 'model_months': [], 'model_versions': {}}}
+    calls = []
+    tracker = ModelTracker(tmp_path/'slow-cloud.sqlite', 'fake', sync_seconds=.05, start=False)
+
+    def read(scope):
+        calls.append(scope)
+        if len(calls) == 1:
+            entered.set()
+            assert release.wait(10)
+            if fail_first:
+                raise ConnectionError('offline')
+        return json.loads(json.dumps(remote.get(scope, {})))
+
+    def write(scope, data):
+        remote[scope] = json.loads(json.dumps(data))
+        remote['strategy_signals']['model_months'] = ['202610']
+        return read(scope)
+
+    def wait_for(predicate):
+        deadline = time.monotonic() + 5
+        while not predicate() and time.monotonic() < deadline:
+            time.sleep(.01)
+        assert predicate()
+
+    tracker.remote_get, tracker.remote_save = read, write
+    tracker.thread = threading.Thread(target=tracker.run, daemon=True)
+    tracker.sync_thread = threading.Thread(target=tracker.run_sync, daemon=True)
+    tracker.thread.start()
+    tracker.sync_thread.start()
+    try:
+        assert entered.wait(2)
+        # More than the queue capacity while the first cloud request is still blocked.
+        for batch in range(6):
+            for sequence in range(batch*100+1, batch*100+101):
+                assert tracker.submit([signal()], {'股票|2330': quote(100, 序號=sequence)})
+            wait_for(lambda: tracker.records() and tracker.records()[0].get('最後序號') == (batch+1)*100)
+        assert tracker.submit([], {'股票|2330': quote(111, 1, 序號=601)})
+        wait_for(lambda: tracker.records()[0]['狀態'] == '已平倉')
+        rows = tracker.records()
+        assert len(rows) == 1 and not rows[0]['資料缺口'] and not tracker.overloaded
+        assert performance(rows)[0]['有效交易數'] == 1
+        assert not tracker.synced_at
+        with tracker.db() as db:
+            assert db.execute('SELECT dirty FROM trades').fetchone()[0] == 1
+        release.set()
+        wait_for(lambda: bool(tracker.synced_at))
+        assert len(calls) >= (5 if fail_first else 4)
+        assert remote['strategy_signals:202610']['model_trades'] == tracker.records()
+        with tracker.db() as db:
+            assert db.execute('SELECT dirty FROM trades').fetchone()[0] == 0
+    finally:
+        release.set()
+        tracker.close()
+    assert not tracker.thread.is_alive() and not tracker.sync_thread.is_alive()
+
+
+def test_real_queue_overflow_recovers_warning_but_keeps_gap(tmp_path):
+    import queue
+    tracker = ModelTracker(tmp_path/'overflow.sqlite', start=False)
+    tracker.process([signal()], {'股票|2330': quote(100)})
+    tracker.queue = queue.Queue(maxsize=2)
+    assert tracker.submit([], {'股票|2330': quote(100, 1)})
+    assert tracker.submit([], {'股票|2330': quote(100, 2)})
+    assert not tracker.submit([], {'股票|2330': quote(111, 3)})
+    assert '佇列已滿' in tracker.error
+    tracker.thread = threading.Thread(target=tracker.run, daemon=True)
+    tracker.thread.start()
+    try:
+        deadline = time.monotonic() + 3
+        while tracker.error and time.monotonic() < deadline:
+            time.sleep(.01)
+        assert not tracker.error and not tracker.overloaded
+        assert tracker.records()[0]['資料缺口']
+        assert performance(tracker.records())[0]['有效交易數'] == 0
+    finally:
+        tracker.close()
 
 
 def test_apps_script_merge_runs_under_real_javascript():

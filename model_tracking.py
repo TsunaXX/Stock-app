@@ -561,6 +561,7 @@ class ModelTracker:
         self.error = ''
         self.revision = 0
         self.closed = False
+        self.stop = threading.Event()
         self.overloaded = False
         self.last_activity = time.monotonic()
         self.last_gap_check = 0
@@ -570,7 +571,7 @@ class ModelTracker:
         self.last_sync = 0
         self.month_versions = {}
         self.hydrated = not bool(url)
-        with self.db() as db:
+        with closing(self.db()) as db, db:
             db.execute('PRAGMA journal_mode=WAL')
             db.execute('CREATE TABLE IF NOT EXISTS trades (id TEXT PRIMARY KEY, month TEXT, slot TEXT, state TEXT, body TEXT, dirty INTEGER)')
             db.execute('CREATE INDEX IF NOT EXISTS trades_month ON trades(month)')
@@ -584,9 +585,13 @@ class ModelTracker:
                 row['來源時間'] = previous_time
                 self.store(db, row)
         self.thread = None
+        self.sync_thread = None
         if start:
             self.thread = threading.Thread(target=self.run, name='model-tracker', daemon=True)
             self.thread.start()
+            if self.url:
+                self.sync_thread = threading.Thread(target=self.run_sync, name='model-sync', daemon=True)
+                self.sync_thread.start()
 
     def db(self):
         return sqlite3.connect(self.path, timeout=5)
@@ -604,14 +609,14 @@ class ModelTracker:
             return False
 
     def records(self, start=None, end=None):
-        with self.db() as db:
+        with closing(self.db()) as db, db:
             rows = db.execute('SELECT body FROM trades WHERE month >= ? AND month <= ? ORDER BY month,id',
                               (start or '000000', end or '999999')).fetchall()
         return [json.loads(r[0]) for r in rows]
 
     def active_plans(self, source, day):
         month = day[:7].replace('-', '')
-        with self.db() as db:
+        with closing(self.db()) as db, db:
             rows = db.execute("SELECT body FROM trades WHERE month=? AND state IN ('等待進場','模擬持倉','監控中斷','資料不足')", (month,)).fetchall()
         return [row for raw in rows if (row := json.loads(raw[0])).get('計畫來源') == source and row.get('交易日') == day]
 
@@ -660,13 +665,14 @@ class ModelTracker:
             self.primary_streams[key] = primary
             selected[key] = chosen[1] if chosen else quote
         quotes = selected
-        with self.db() as db:
+        with closing(self.db()) as db, db:
             if self.overloaded:
                 for raw in db.execute("SELECT body FROM trades WHERE state IN ('等待進場','模擬持倉','監控中斷','資料不足')").fetchall():
                     row = json.loads(raw[0])
                     row['資料缺口'] = True
                     event(row, '監控中斷', datetime.now(TZ).isoformat(), '記錄佇列滿載，成交證據未確認')
                     self.store(db, row)
+                    self.revision += 1
                 self.overloaded = False
             for signal in signals:
                 row = new_trade(signal)
@@ -707,7 +713,7 @@ class ModelTracker:
 
     def mark_gaps(self):
         now = time.monotonic()
-        with self.db() as db:
+        with closing(self.db()) as db, db:
             for raw in db.execute("SELECT body FROM trades WHERE state IN ('等待進場','模擬持倉')").fetchall():
                 row = json.loads(raw[0])
                 if row['策略'] == '波段' and not self.market_open(row):
@@ -762,7 +768,7 @@ class ModelTracker:
         catalog = self.remote_get('strategy_signals')
         if catalog.get('model_schema') != 1:
             raise ValueError('Apps Script 尚未部署策略追蹤原子合併 V1.0；資料保留待同步')
-        with self.db() as db:
+        with closing(self.db()) as db, db:
             pending = [r[0] for r in db.execute('SELECT DISTINCT month FROM trades WHERE dirty=1')]
         versions = catalog.get('model_versions', {})
         if not isinstance(versions, dict) or not isinstance(catalog.get('model_months', []), list) or any(not isinstance(m,str) or len(m) != 6 or not m.isdigit() or not 1 <= int(m[4:]) <= 12 for m in catalog.get('model_months', [])):
@@ -791,7 +797,7 @@ class ModelTracker:
                 if month not in catalog_check.get('model_months', []):
                     raise ValueError('月份索引回讀不一致；保留待同步')
                 merged = list(saved.values())
-            with self.db() as db:
+            with closing(self.db()) as db, db:
                 db.execute('BEGIN IMMEDIATE')
                 for row in merged:
                     current = db.execute('SELECT body FROM trades WHERE id=?', (row['交易ID'],)).fetchone()
@@ -812,16 +818,9 @@ class ModelTracker:
         while not self.closed:
             try:
                 signals, quotes = self.queue.get(timeout=.25)
-                if not self.hydrated and self.url:
-                    # Preserve samples while storage is unavailable; their original timestamps remain evidence.
-                    if time.monotonic() - self.last_sync >= self.sync_seconds:
-                        self.last_sync = time.monotonic()
-                        try:
-                            self.sync()
-                        except Exception as exc:
-                            self.error, self.status = str(exc), '待同步／本機保留'
-                    self.hydrated = True  # Cloud merge still deduplicates restored signals by stable ID.
                 self.process(signals, quotes)
+                if self.error == '記錄佇列已滿；保留資料缺口，不阻塞行情' and self.queue.empty():
+                    self.error = ''
             except queue.Empty:
                 pass
             except Exception as exc:
@@ -832,14 +831,23 @@ class ModelTracker:
                     self.mark_gaps()
                 except Exception as exc:
                     self.error = '資料缺口記錄待重試：' + type(exc).__name__
-            if self.url and time.monotonic() - self.last_activity < 120 and time.monotonic() - self.last_sync >= self.sync_seconds:
+
+    def run_sync(self):
+        # Slow HTTP/retries must never stop the ordered local evidence writer.
+        while not self.stop.is_set():
+            if time.monotonic() - self.last_activity < 120 and time.monotonic() - self.last_sync >= self.sync_seconds:
                 self.last_sync = time.monotonic()
                 try:
                     self.sync()
                 except Exception as exc:
                     self.error, self.status = str(exc), '待同步／本機保留'
+                finally:
+                    self.last_sync = time.monotonic()
+            self.stop.wait(.25)
 
     def close(self):
         self.closed = True
-        if self.thread:
-            self.thread.join(timeout=1)
+        self.stop.set()
+        for thread in (self.thread, self.sync_thread):
+            if thread:
+                thread.join(timeout=1)
