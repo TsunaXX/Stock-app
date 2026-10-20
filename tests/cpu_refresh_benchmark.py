@@ -82,6 +82,12 @@ def main(ref):
         'clamp_futures_intraday_levels', '_safe_number', 'fmt_price')
     # Calendar classification is deterministic; this benchmark never fetches holidays.
     ns['is_market_closed_func'] = lambda d: d.weekday() >= 5
+    class Clock(ns['datetime']):
+        @classmethod
+        def now(cls, tz=None):
+            value = pd.Timestamp('2026-10-20T16:00:00+08:00').to_pydatetime()
+            return value.astimezone(tz) if tz else value.replace(tzinfo=None)
+    ns['datetime'] = Clock
     old_futures = baseline_function(ref, 'app.py', 'calculate_futures_strategy_levels', ns)
     index = pd.date_range(end='2026-10-20 16:00', periods=86400, freq='min')
     minutes = index.hour * 60 + index.minute

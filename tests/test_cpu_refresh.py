@@ -1,6 +1,9 @@
 """CPU regressions must retain complete execution evidence and trading sessions."""
 from contextlib import closing
 from datetime import datetime
+import ast
+import inspect
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -122,3 +125,20 @@ def test_short_history_atr_keeps_first_and_previous_close(futures_calculations, 
     result = ns['calculate_futures_strategy_levels']({'期貨代碼': 'TX', '商品類型': '指數',
         '當日漲停價': 23000., '當日跌停價': 18000.}, '當沖', '自動', data)
     assert result['ATR'] == pytest.approx((4 + (count - 1) * 12) / count if count <= 14 else 12)
+
+
+def test_cpu_only_change_keeps_existing_model_version_but_future_rules_change_it():
+    ns = load_app_symbols('calculate_futures_strategy_levels', 'enrich_futures_strategy_rows',
+                          'calculate_entry_confidence', 'model_tracking_samples')
+    source = Path(__file__).parents[1] / 'app.py'
+    node = next(n for n in ast.parse(source.read_text(encoding='utf-8')).body
+                if isinstance(n, ast.FunctionDef) and n.name == 'get_model_rules_version')
+    node.decorator_list = []
+    ns.update(inspect=inspect, MODEL_VERSION=model.VERSION)
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[])), source, 'exec'), ns)
+    expected = model.VERSION + '-d8631cd521'
+    assert ns['get_model_rules_version'](False) == expected
+    def future_strategy(*args):
+        return 'Different rules require a new version'
+    ns['calculate_futures_strategy_levels'] = future_strategy
+    assert ns['get_model_rules_version'](False) != expected

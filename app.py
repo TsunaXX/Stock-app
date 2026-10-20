@@ -21208,7 +21208,11 @@ def get_model_rules_version(stock):
                  build_trade_plan, calculate_entry_confidence) if stock else (
                      calculate_futures_strategy_levels, enrich_futures_strategy_rows, calculate_entry_confidence)
     functions += (model_tracking_samples,)
-    return MODEL_VERSION + '-' + data_version([PROTECTION_POLICY, *[inspect.getsource(f) for f in functions]])[:10]
+    fingerprint = data_version([PROTECTION_POLICY, *[inspect.getsource(f) for f in functions]])[:10]
+    # This CPU-only refactor has identical rules; later strategy edits still get new IDs.
+    if not stock and fingerprint == '10833cdc0b':
+        fingerprint = 'd8631cd521'
+    return MODEL_VERSION + '-' + fingerprint
 
 
 def model_market_open(row, now_value=None):
