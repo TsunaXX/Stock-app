@@ -297,6 +297,38 @@ def test_index_intraday_resample_reuses_history_and_never_downloads_on_timer():
     assert len(result) == 4 and result['Volume'].sum() == 2000
 
 
+def test_compact_near_future_supplies_both_index_minute_plans():
+    from datetime import datetime
+    ns = load_app_symbols('SHIOAJI_FUTURES_ROOT_ALIASES', 'FUTURES_MONTH_CODE',
+                          'shioaji_futures_root_candidates', 'expected_shioaji_futures_code',
+                          '_is_shioaji_auth_error', '_contract_delivery_month', '_is_actual_futures_contract',
+                          'resolve_shioaji_futures_contract', 'get_near_futures_contract',
+                          'get_cached_index_minutes', 'calculate_short_wave_plan', 'get_futures_intraday_state')
+    compact = SimpleNamespace(code='TXFJ6', security_type='FUT', exchange='TAIFEX')
+    api = SimpleNamespace(contracts=SimpleNamespace(futures=lambda root, **kw:[compact]))
+    ns['get_near_month_futures_settlement'] = lambda:datetime(2026,10,21)
+    ns['ensure_market_stream_subscription'] = lambda *a:True
+    history = bars([20000+i for i in range(100)])
+    calls = []
+    def cached_history(api, contract, asset, wait):
+        assert contract is compact and asset == 'futures' and not wait
+        calls.append(contract.code)
+        return history
+    ns['get_strategy_intraday_history'] = cached_history
+    assert ns['get_near_futures_contract'](api,'TXF') is compact
+    wave = ns['calculate_short_wave_plan'](api,'偏多')
+    assert wave and wave['entry'] < wave['target'] and wave['stop'] < wave['entry']
+    assert ns['get_futures_intraday_state'](api,'偏多',logged_in=True)['available']
+    assert calls == ['TXFJ6','TXFJ6']
+    for invalid in (SimpleNamespace(code='TXFR1'), SimpleNamespace(code='TXFK6'),
+                    SimpleNamespace(code='CDFJ6'), SimpleNamespace(code='TXFJ6',delivery_month='202611')):
+        api.contracts.futures = lambda *a, **kw:[invalid]
+        assert ns['resolve_shioaji_futures_contract'](api,'TXF','202610') is None
+    mini = SimpleNamespace(code='MXFJ6')
+    api.contracts.futures = lambda *a, **kw:[mini]
+    assert ns['resolve_shioaji_futures_contract'](api,'MTX','202610') is mini
+
+
 def test_index_tracking_fragment_ui_keeps_daily_plan_when_live_price_changes():
     from streamlit.testing.v1 import AppTest
     tree = ast.parse((Path(__file__).parents[1] / 'app.py').read_text(encoding='utf-8'))
