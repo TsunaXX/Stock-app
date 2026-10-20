@@ -99,7 +99,9 @@ def merge_trades(remote, local):
         old = merged.get(row['交易ID'])
         if old:
             incoming = row
-            newer = str(incoming.get('來源時間', '')) > str(old.get('來源時間', ''))
+            same_stream = incoming.get('串流識別') == old.get('串流識別')
+            newer = (str(incoming.get('來源時間', '')), (number(incoming.get('最後序號')) or 0) if same_stream else 0, len(incoming.get('事件', []))) > (
+                str(old.get('來源時間', '')), (number(old.get('最後序號')) or 0) if same_stream else 0, len(old.get('事件', [])))
             terminal = incoming.get('狀態') == '已平倉'
             old_terminal = old.get('狀態') == '已平倉'
             if terminal and old_terminal:
@@ -570,6 +572,7 @@ class ModelTracker:
         self.source_quotes = {}
         self.last_sync = 0
         self.month_versions = {}
+        self.sync_positions = {}
         self.hydrated = not bool(url)
         with closing(self.db()) as db, db:
             db.execute('PRAGMA journal_mode=WAL')
@@ -726,10 +729,13 @@ class ModelTracker:
                 self.store(db,row)
                 self.revision += 1
 
-    def remote_get(self, scope):
+    def remote_get(self, scope, trade_ids=None):
         for attempt in range(3):
             try:
-                response = requests.get(self.url, params={'scope': scope, '_ts': time.time_ns()},
+                params = {'scope': scope, '_ts': time.time_ns()}
+                if trade_ids is not None:
+                    params['trade_ids'] = ','.join(trade_ids)
+                response = requests.get(self.url, params=params,
                                         headers={'Cache-Control': 'no-cache, no-store, max-age=0', 'Pragma': 'no-cache'},
                                         timeout=(5, 35))
                 response.raise_for_status()
@@ -750,16 +756,23 @@ class ModelTracker:
             raise ValueError('Google Sheet 儲存格式不符，保留待同步')
         return data
 
-    def remote_save(self, scope, data):
+    def remote_save(self, scope, data, delta=False):
         response = requests.post(self.url, json={'scope': scope, 'data': json.dumps(data, ensure_ascii=False),
                                                 'updated_at': datetime.now(TZ).isoformat()}, timeout=(5, 35))
         response.raise_for_status()
         payload = response.json()
         if payload.get('success') is not True:
             raise ValueError(payload.get('error', 'Google Sheet 寫入失敗'))
-        actual = self.remote_get(scope)
+        actual = self.remote_get(scope, [r['交易ID'] for r in data['model_trades']]) if delta else self.remote_get(scope)
         if actual.get('model_schema') != 1:
             raise ValueError('Apps Script 尚未部署策略追蹤原子合併 V1.0；資料保留待同步')
+        if delta:
+            version = str(payload.get('model_version', ''))
+            previous = str(payload.get('model_previous_version', ''))
+            read_version = str(actual.get('model_version', ''))
+            if not version.isdigit() or not read_version.isdigit() or int(read_version) < int(version) or (previous and not previous.isdigit()):
+                raise ValueError('交易同步版本回讀無效；保留待同步')
+            actual['_committed_version'], actual['_previous_version'] = version, previous
         return actual
 
     def sync(self):
@@ -773,6 +786,8 @@ class ModelTracker:
         versions = catalog.get('model_versions', {})
         if not isinstance(versions, dict) or not isinstance(catalog.get('model_months', []), list) or any(not isinstance(m,str) or len(m) != 6 or not m.isdigit() or not 1 <= int(m[4:]) <= 12 for m in catalog.get('model_months', [])):
             raise ValueError('Google Sheet 月份索引無效；保留待同步')
+        if catalog.get('model_sync') == 2:
+            return self.sync_delta(catalog, pending)
         months = sorted(set(pending + [m for m in catalog.get('model_months', [])
                                       if not self.hydrated or versions.get(m) != self.month_versions.get(m)]))
         for month in months:
@@ -814,6 +829,63 @@ class ModelTracker:
         self.synced_at = datetime.now(TZ).strftime('%Y/%m/%d %H:%M:%S')
         self.status, self.error = '已回讀驗證', ''
 
+    def merge_synced_rows(self, rows, sent=None):
+        sent = sent or {}
+        with closing(self.db()) as db, db:
+            db.execute('BEGIN IMMEDIATE')
+            for row in rows:
+                if not isinstance(row, dict) or new_trade(row)['交易ID'] != row.get('交易ID') or row.get('狀態') not in ACTIVE | {'已平倉','訊號失效'}:
+                    raise ValueError('Google Sheet 交易ID或狀態無效；保留待同步')
+                raw = db.execute('SELECT body FROM trades WHERE id=?', (row['交易ID'],)).fetchone()
+                current = json.loads(raw[0]) if raw else None
+                merged = merge_trades([row], [current] if current else [])[0]
+                self.store(db, merged, dirty=0)
+                if current == sent.get(row['交易ID']) and merged == row:
+                    db.execute('UPDATE trades SET dirty=0 WHERE id=?', (row['交易ID'],))
+        self.revision += 1
+
+    def sync_delta(self, catalog, pending):
+        versions = catalog.get('model_versions', {})
+        for month in sorted(set(pending + catalog.get('model_months', []))):
+            scope = 'strategy_signals:' + month
+            if not self.hydrated or versions.get(month) != self.month_versions.get(month):
+                remote = self.remote_get(scope)
+                if not isinstance(remote.get('model_trades', []), list):
+                    raise ValueError('Google Sheet 交易紀錄格式無效')
+                self.merge_synced_rows(remote.get('model_trades', []))
+                self.month_versions[month] = remote.get('model_version') or versions.get(month)
+            with closing(self.db()) as db, db:
+                # Rotate across dirty rows so frequently changing positions cannot starve later trades.
+                rows = db.execute('SELECT rowid,body FROM trades WHERE month=? AND dirty=1 ORDER BY (rowid<=?),rowid LIMIT 20',
+                                  (month, self.sync_positions.get(month, 0))).fetchall()
+            batch, size = [], 0
+            for rowid, body in rows:
+                length = len(body.encode('utf-8'))
+                if batch and size + length > 256_000:
+                    break
+                batch.append((rowid, json.loads(body)))
+                size += length
+            if not batch:
+                continue
+            sent = {row['交易ID']: row for _, row in batch}
+            actual = self.remote_save(scope, {'model_schema': 1, 'model_trades': list(sent.values())}, delta=True)
+            saved = actual.get('model_trades', [])
+            if not isinstance(saved, list):
+                raise ValueError('Google Sheet 交易紀錄格式無效；保留待同步')
+            saved = {r['交易ID']: r for r in merge_trades(saved, saved)}
+            if any(key not in saved or merge_trades([saved[key]], [row])[0] != saved[key] for key, row in sent.items()):
+                raise ValueError('交易事件回讀不一致；保留待同步並重試')
+            self.merge_synced_rows(list(saved.values()), sent)
+            # A concurrent device may have written between our read and POST; fetch it next cycle.
+            if actual['_previous_version'] == (self.month_versions.get(month) or ''):
+                self.month_versions[month] = actual['_committed_version']
+            self.sync_positions[month] = batch[-1][0]
+        self.hydrated = True
+        self.synced_at = datetime.now(TZ).strftime('%Y/%m/%d %H:%M:%S')
+        with closing(self.db()) as db, db:
+            remaining = db.execute('SELECT COUNT(*) FROM trades WHERE dirty=1').fetchone()[0]
+        self.status, self.error = (f'已回讀驗證；尚有 {remaining} 筆待同步' if remaining else '已回讀驗證'), ''
+
     def run(self):
         while not self.closed:
             try:
@@ -835,10 +907,13 @@ class ModelTracker:
     def run_sync(self):
         # Slow HTTP/retries must never stop the ordered local evidence writer.
         while not self.stop.is_set():
-            if time.monotonic() - self.last_activity < 120 and time.monotonic() - self.last_sync >= self.sync_seconds:
+            if time.monotonic() - self.last_sync >= self.sync_seconds:
                 self.last_sync = time.monotonic()
                 try:
-                    self.sync()
+                    with closing(self.db()) as db, db:
+                        pending = db.execute('SELECT 1 FROM trades WHERE dirty=1 LIMIT 1').fetchone()
+                    if pending or time.monotonic() - self.last_activity < 120:
+                        self.sync()
                 except Exception as exc:
                     self.error, self.status = str(exc), '待同步／本機保留'
                 finally:
