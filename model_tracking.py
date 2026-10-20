@@ -7,7 +7,7 @@ import queue
 import sqlite3
 import threading
 import time
-from contextlib import closing
+from contextlib import closing, contextmanager
 from datetime import datetime
 from decimal import Decimal, ROUND_HALF_UP, ROUND_CEILING, ROUND_FLOOR
 from zoneinfo import ZoneInfo
@@ -552,6 +552,11 @@ def excel_report(records):
     return output.getvalue()
 
 
+def database_busy(exc):
+    return (isinstance(exc, sqlite3.OperationalError)
+            and (getattr(exc, 'sqlite_errorcode', 0) & 255) in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED))
+
+
 class ModelTracker:
     """One bounded writer per app process; SQLite outbox survives restart, monthly cloud scopes merge."""
     def __init__(self, path, url='', sync_seconds=30, start=True, market_open=None):
@@ -574,8 +579,10 @@ class ModelTracker:
         self.month_versions = {}
         self.sync_positions = {}
         self.hydrated = not bool(url)
-        with closing(self.db()) as db, db:
+        self.write_lock = threading.RLock()
+        with closing(self.db()) as db:
             db.execute('PRAGMA journal_mode=WAL')
+        with self.write_db() as db:
             db.execute('CREATE TABLE IF NOT EXISTS trades (id TEXT PRIMARY KEY, month TEXT, slot TEXT, state TEXT, body TEXT, dirty INTEGER)')
             db.execute('CREATE INDEX IF NOT EXISTS trades_month ON trades(month)')
             db.execute('CREATE INDEX IF NOT EXISTS trades_state ON trades(state,slot)')
@@ -598,6 +605,13 @@ class ModelTracker:
 
     def db(self):
         return sqlite3.connect(self.path, timeout=5)
+
+    @contextmanager
+    def write_db(self):
+        # Only short local transactions share this lock; HTTP and UI reads never hold it.
+        with self.write_lock, closing(self.db()) as db, db:
+            db.execute('BEGIN IMMEDIATE')
+            yield db
 
     def submit(self, signals, quotes):
         self.last_activity = time.monotonic()
@@ -668,7 +682,7 @@ class ModelTracker:
             self.primary_streams[key] = primary
             selected[key] = chosen[1] if chosen else quote
         quotes = selected
-        with closing(self.db()) as db, db:
+        with self.write_db() as db:
             if self.overloaded:
                 for raw in db.execute("SELECT body FROM trades WHERE state IN ('等待進場','模擬持倉','監控中斷','資料不足')").fetchall():
                     row = json.loads(raw[0])
@@ -721,7 +735,7 @@ class ModelTracker:
 
     def mark_gaps(self):
         now = time.monotonic()
-        with closing(self.db()) as db, db:
+        with self.write_db() as db:
             for raw in db.execute("SELECT body FROM trades WHERE state IN ('等待進場','模擬持倉')").fetchall():
                 row = json.loads(raw[0])
                 if row['策略'] == '波段' and not self.market_open(row):
@@ -817,18 +831,7 @@ class ModelTracker:
                 if month not in catalog_check.get('model_months', []):
                     raise ValueError('月份索引回讀不一致；保留待同步')
                 merged = list(saved.values())
-            with closing(self.db()) as db, db:
-                db.execute('BEGIN IMMEDIATE')
-                for row in merged:
-                    current = db.execute('SELECT body FROM trades WHERE id=?', (row['交易ID'],)).fetchone()
-                    current = json.loads(current[0]) if current else None
-                    changed = current is not None and current != local_versions.get(row['交易ID'])
-                    if changed:
-                        row = merge_trades([row], [current])[0]
-                    self.store(db, row, dirty=int(changed))
-                    if month in pending and not changed:
-                        db.execute('UPDATE trades SET dirty=0 WHERE id=?', (row['交易ID'],))
-            self.revision += 1
+            self.merge_synced_rows(merged, local_versions if month in pending else {})
             self.month_versions[month] = versions.get(month)
         self.hydrated = True
         self.synced_at = datetime.now(TZ).strftime('%Y/%m/%d %H:%M:%S')
@@ -836,18 +839,19 @@ class ModelTracker:
 
     def merge_synced_rows(self, rows, sent=None):
         sent = sent or {}
-        with closing(self.db()) as db, db:
-            db.execute('BEGIN IMMEDIATE')
-            for row in rows:
-                if not isinstance(row, dict) or new_trade(row)['交易ID'] != row.get('交易ID') or row.get('狀態') not in ACTIVE | {'已平倉','訊號失效'}:
-                    raise ValueError('Google Sheet 交易ID或狀態無效；保留待同步')
-                raw = db.execute('SELECT body FROM trades WHERE id=?', (row['交易ID'],)).fetchone()
-                current = json.loads(raw[0]) if raw else None
-                merged = merge_trades([row], [current] if current else [])[0]
-                self.store(db, merged, dirty=0)
-                if current == sent.get(row['交易ID']) and merged == row:
-                    db.execute('UPDATE trades SET dirty=0 WHERE id=?', (row['交易ID'],))
-        self.revision += 1
+        for row in rows:
+            if not isinstance(row, dict) or new_trade(row)['交易ID'] != row.get('交易ID') or row.get('狀態') not in ACTIVE | {'已平倉','訊號失效'}:
+                raise ValueError('Google Sheet 交易ID或狀態無效；保留待同步')
+        for offset in range(0, len(rows), 20):
+            with self.write_db() as db:
+                for row in rows[offset:offset + 20]:
+                    raw = db.execute('SELECT body FROM trades WHERE id=?', (row['交易ID'],)).fetchone()
+                    current = json.loads(raw[0]) if raw else None
+                    merged = merge_trades([row], [current] if current else [])[0]
+                    self.store(db, merged, dirty=0)
+                    if current == sent.get(row['交易ID']) and merged == row:
+                        db.execute('UPDATE trades SET dirty=0 WHERE id=?', (row['交易ID'],))
+            self.revision += 1
 
     def sync_delta(self, catalog, pending):
         versions = catalog.get('model_versions', {})
@@ -892,15 +896,24 @@ class ModelTracker:
         self.status, self.error = (f'已回讀驗證；尚有 {remaining} 筆待同步' if remaining else '已回讀驗證'), ''
 
     def run(self):
+        pending = None
+        busy_message = '本機資料庫忙碌；保留原批次並自動重試'
         while not self.closed:
             try:
-                signals, quotes = self.queue.get(timeout=.25)
-                self.process(signals, quotes)
-                if self.error == '記錄佇列已滿；保留資料缺口，不阻塞行情' and self.queue.empty():
+                if pending is None:
+                    pending = self.queue.get(timeout=.25)
+                self.process(*pending)
+                pending = None
+                if self.error == busy_message or (self.error == '記錄佇列已滿；保留資料缺口，不阻塞行情' and self.queue.empty()):
                     self.error = ''
             except queue.Empty:
                 pass
             except Exception as exc:
+                if database_busy(exc):
+                    self.error = busy_message
+                    self.stop.wait(.25)
+                    continue
+                pending = None
                 self.error = '本機記錄失敗：' + type(exc).__name__
             if time.monotonic() - self.last_gap_check >= 5:
                 self.last_gap_check = time.monotonic()
@@ -920,7 +933,8 @@ class ModelTracker:
                     if pending or time.monotonic() - self.last_activity < 120:
                         self.sync()
                 except Exception as exc:
-                    self.error, self.status = str(exc), '待同步／本機保留'
+                    self.error = '本機資料庫忙碌；保留待同步並自動重試' if database_busy(exc) else str(exc)
+                    self.status = '待同步／本機保留'
                 finally:
                     self.last_sync = time.monotonic()
             self.stop.wait(.25)
