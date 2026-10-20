@@ -204,6 +204,8 @@ def test_snapshot_readiness_tracks_both_modes_and_visible_contract_month():
     rows = pd.DataFrame([{'期貨代碼': 'TX', '契約月份': '202610'}])
     snapshot = {'complete': True, 'target_date': '2026-10-02', 'scope': ['TX:202610']}
     check = ns['postclose_snapshot_ready']
+    assert not check({'daytrade': snapshot, 'swing': snapshot}, rows, 'futures', date(2026, 10, 2))
+    snapshot.update(contract_keys=True, entries=[{'code': 'TX:202610'}])
     assert check({'daytrade': snapshot, 'swing': snapshot}, rows, 'futures', date(2026, 10, 2))
     assert not check({'daytrade': snapshot}, rows, 'futures', date(2026, 10, 2))
     rows['契約月份'] = '202611'
@@ -308,10 +310,13 @@ def test_tpex_eps_supports_official_english_company_code():
 
 
 def test_saved_futures_scope_keeps_contract_month_and_ignores_removed_rows():
-    ns = helpers('postclose_futures_seed_rows')
-    saved = {'universe': [{'期貨代碼': 'TX', '契約鍵': 'TX:202610'},
-                          {'期貨代碼': 'TX', '契約鍵': 'TX:202611'},
-                          {'期貨代碼': 'TMF', '契約鍵': 'TMF:202610'}],
+    from test_futures_ranking_identity import contract_helpers
+    ns = contract_helpers('postclose_futures_seed_rows')
+    select = ns['select_futures_ranking_contracts']
+    ns['select_futures_ranking_contracts'] = lambda rows: select(rows, '2026-10-19T10:00:00+08:00')
+    saved = {'universe': [{'期貨代碼': 'TX', '契約鍵': 'TX:202610', '契約月份': '202610'},
+                          {'期貨代碼': 'TX', '契約鍵': 'TX:202611', '契約月份': '202611'},
+                          {'期貨代碼': 'TMF', '契約鍵': 'TMF:202610', '契約月份': '202610'}],
              'strategy_ranking_snapshots': {'daytrade': {'scope': ['TX:202610', 'TMF:202610']}},
              'ignored': ['TMF:202610']}
     assert ns['postclose_futures_seed_rows'](saved)['契約鍵'].tolist() == ['TX:202610']
