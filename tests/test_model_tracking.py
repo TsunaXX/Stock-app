@@ -317,6 +317,12 @@ data=mergeSignalPayload_(data, {model_trades:[a]});
 assert.equal(data.model_trades.length,2);
 assert.equal(data.model_trades[0]['狀態'],'已平倉');
 assert.equal(data.model_trades[0]['事件'].length,2);
+const holding={...a,'狀態':'模擬持倉','最後序號':1,'事件':[...a['事件'],{'事件ID':'3','時間':'09:00'}]};
+const nextTick={...holding,'最後序號':2};
+assert.equal(mergeModelTrades_([a],[holding])[0]['狀態'],'模擬持倉');
+assert.equal(mergeModelTrades_([holding],[a])[0]['狀態'],'模擬持倉');
+assert.equal(mergeModelTrades_([nextTick],[holding])[0]['最後序號'],2);
+assert.equal(mergeModelTrades_([holding],[nextTick])[0]['最後序號'],2);
 assert(!mergeModelTrades_([closed],[{...closed,'成本設定':{slip:1,fee:50}}])[0]['資料缺口']);
 assert.equal(data.strategy_signal_log[0].dedupe_key,'manual');
 assert.equal(normalizeScope_('strategy_signals:202610'),'strategy_signals:202610');
@@ -510,13 +516,13 @@ def test_apps_script_full_read_write_lock_and_partial_commit_recovery():
     program=r"""
 const fs=require('fs'),vm=require('vm'),assert=require('assert');
 const rows=[['scope','part','data','updated_at']];
-let held=false,fail=false;const reads=[];
+let held=false,fail=false;const reads=[],deletions=[];
 const sheet={getLastRow:()=>rows.length,
   getRange:(start,col,count,width)=>({
     getDisplayValues:()=>{reads.push({start,col,count,width});return Array.from({length:count},(_,i)=>Array.from({length:width},(_,j)=>String((rows[start+i-1]||[])[col+j-1]||'')));},
     setNumberFormat(){return this;},
     setValues(values){assert(held); for(let i=0;i<values.length;i++) {rows[start+i-1]=values[i]; if(fail && values[i][0].includes(':')) {fail=false; throw Error('partial write');}} return this;}
-  }),deleteRow:(r)=>rows.splice(r-1,1),clearContents:()=>rows.splice(0)};
+  }),deleteRows:(r,n)=>{assert(held);deletions.push(n);rows.splice(r-1,n);},clearContents:()=>rows.splice(0)};
 global.SpreadsheetApp={getActiveSpreadsheet:()=>({getSheetByName:()=>sheet}),flush:()=>{}};
 global.LockService={getScriptLock:()=>({waitLock:()=>{assert(!held);held=true;},releaseLock:()=>held=false})};
 global.ContentService={MimeType:{JSON:'json'},createTextOutput:(body)=>({setMimeType:()=>JSON.parse(body)})};
@@ -524,7 +530,9 @@ vm.runInThisContext(fs.readFileSync('google_apps_script.gs','utf8'));
 function post(scope,data){return doPost({postData:{contents:JSON.stringify({scope,data,updated_at:new Date().toISOString()})}});}
 const a={'交易ID':'a'.repeat(64),'交易日':'2026-10-08','市場':'股票','商品鍵':'2330','策略':'當沖','策略版本':'V1.0','方向':'多頭','進場價':100,'停損價':95,'目標價':110,'建立時間':'2026-10-08T09:00:00+08:00','來源時間':'2026-10-08T09:00:00+08:00','狀態':'等待進場','事件':[]};
 assert(post('strategy_signals',{strategy_signal_log:[{dedupe_key:'manual'}]}).success);
-assert(post('strategy_signals:202610',{model_trades:[a]}).success);
+const firstCommit=post('strategy_signals:202610',{model_trades:[a]});
+assert(firstCommit.success && /^\d+$/.test(firstCommit.model_version));
+assert.equal(firstCommit.model_previous_version,'');
 const stale={model_trades:[{...a,'交易ID':'b'.repeat(64)}]};
 assert(post('strategy_signals:202610',stale).success);
 let read=doGet({parameter:{scope:'strategy_signals:202610'}});
@@ -533,6 +541,14 @@ reads.length=0;
 let catalog=doGet({parameter:{scope:'strategy_signals'}}).data;
 assert(reads.filter(r=>r.start>1 && r.col<=3 && r.col+r.width>3).every(r=>r.count===1)); // Catalog read must not load other scopes' JSON.
 assert(catalog.model_months.includes('202610') && catalog.strategy_signal_log[0].dedupe_key==='manual');
+assert.equal(catalog.model_sync,2);
+assert.equal(JSON.parse(rows.find(r=>r[0]==='strategy_signals')[2]).model_sync,undefined);
+let selected=doGet({parameter:{scope:'strategy_signals:202610',trade_ids:a['交易ID']}}).data;
+assert.equal(selected.model_trades.length,1);
+assert.equal(selected.model_trades[0]['交易ID'],a['交易ID']);
+assert(/^\d+$/.test(selected.model_version));
+assert(!doGet({parameter:{scope:'strategy_signals:202610',trade_ids:'invalid'}}).success);
+assert(!doGet({parameter:{scope:'strategy_signals:202610',trade_ids:Array(21).fill(a['交易ID']).join(',')}}).success);
 fail=true;
 assert(!post('strategy_signals:202610',{model_trades:[{...a,'交易ID':'c'.repeat(64),'指標快照':{text:'x'.repeat(60000)}}]}).success);
 read=doGet({parameter:{scope:'strategy_signals:202610'}});
@@ -541,6 +557,12 @@ assert(post('strategy_signals:202610',{model_trades:[{...a,'交易ID':'c'.repeat
 assert.equal(doGet({parameter:{scope:'strategy_signals:202610'}}).data.model_trades.length,3);
 assert(!post('strategy_signals:202609',{model_trades:[a]}).success);
 assert(!post('strategy_signals:202610',{model_trades:[{...a,'交易ID':'__proto__'}]}).success);
+const big={...a,'交易ID':'d'.repeat(64),'指標快照':{text:'x'.repeat(44000*93)}};
+assert(post('strategy_signals:202610',{model_trades:[big]}).success);
+deletions.length=0;
+assert(post('strategy_signals:202610',{model_trades:[a]}).success);
+assert(deletions.some(n=>n>=93) && deletions.length<=3); // Whole generation, not 93 remote delete calls.
+assert.equal(doGet({parameter:{scope:'strategy_signals:202610'}}).data.model_trades.length,4);
 assert(!held);
 """
     result=subprocess.run(['node','-e',program],cwd=ROOT,capture_output=True,text=True)

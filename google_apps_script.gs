@@ -125,7 +125,18 @@ function doGet(e) {
     const rows = getScopeRowMap_(sheet);
 
     if (requested) {
-      return jsonResponse_(readScopeData_(sheet, requested, rows[requested]));
+      const item = readScopeData_(sheet, requested, rows[requested]);
+      const ids = e && e.parameter && e.parameter.trade_ids;
+      if (ids !== undefined) {
+        const keys = String(ids).split(',');
+        if (!/^strategy_signals:\d{6}$/.test(requested) || keys.length > 20 || keys.some(function(k) {return !/^[a-f0-9]{64}$/.test(k);})) {
+          throw new Error('交易回讀 ID 無效或超過 20 筆');
+        }
+        item.data = Object.assign({}, item.data || {}, {model_schema: 1,
+          model_trades: ((item.data || {}).model_trades || []).filter(function(r) {return keys.indexOf(r['交易ID']) >= 0;})});
+      }
+      if (/^strategy_signals:\d{6}$/.test(requested) && item.data) item.data.model_version = item.version || '';
+      return jsonResponse_(item);
     }
 
     const scopes = {};
@@ -144,7 +155,7 @@ function doGet(e) {
 
 function readScopeData_(sheet, scope, row) {
   if (!row || !row.parts || !row.parts.length) {
-    return {success: true, scope: scope, data: scope === 'strategy_signals' ? {model_schema: 1, model_months: [], model_versions: {}} : null, updated_at: ''};
+    return {success: true, scope: scope, data: scope === 'strategy_signals' ? {model_schema: 1, model_sync: 2, model_months: [], model_versions: {}} : null, updated_at: ''};
   }
   const generations = {};
   row.parts.forEach(function(part) {
@@ -169,7 +180,8 @@ function readScopeData_(sheet, scope, row) {
   return {
     success: true,
     scope: scope,
-    data: scope === 'strategy_signals' ? Object.assign({model_schema: 1, model_months: [], model_versions: {}}, parseJsonSafe_(serialized)) : parseJsonSafe_(serialized),
+    data: scope === 'strategy_signals' ? Object.assign({model_months: [], model_versions: {}}, parseJsonSafe_(serialized), {model_schema: 1, model_sync: 2}) : parseJsonSafe_(serialized),
+    version: String(complete[0]),
     updated_at: String(generations[complete[0]][0].updated_at || row.updated_at || ''),
   };
 }
@@ -193,13 +205,16 @@ function doPost(e) {
         return jsonResponse_({success: false, error: 'data 必須是有效 JSON 物件'});
       }
       const updatedAt = String(body.updated_at || new Date().toISOString());
-      const row = saveScopeData_(scope, data, updatedAt);
+      const commit = {};
+      const row = saveScopeData_(scope, data, updatedAt, commit);
       SpreadsheetApp.flush();
       return jsonResponse_({
         success: true,
         scope: scope,
         updated_at: updatedAt,
         row: row,
+        model_version: commit.version,
+        model_previous_version: commit.previous_version,
       });
     }
 
@@ -223,7 +238,18 @@ function doPost(e) {
 }
 
 
-function saveScopeData_(scope, data, updatedAt) {
+function deleteScopeRows_(sheet, rows) {
+  const ordered = rows.slice().sort(function(a,b) {return b-a;});
+  for (let i = 0; i < ordered.length;) {
+    const last = ordered[i];
+    let first = last;
+    while (++i < ordered.length && ordered[i] === first - 1) first = ordered[i];
+    sheet.deleteRows(first, last - first + 1);
+  }
+}
+
+
+function saveScopeData_(scope, data, updatedAt, commit) {
   if (/^strategy_signals:\d{6}$/.test(scope)) {
     if (!Array.isArray(data.model_trades) || data.model_trades.some(function(r) {
       return !r || !/^[a-f0-9]{64}$/.test(r['交易ID'] || '') || typeof r['商品鍵'] !== 'string' || !r['商品鍵'] ||
@@ -240,9 +266,11 @@ function saveScopeData_(scope, data, updatedAt) {
   const rows = getScopeRowMap_(sheet);
   const existing = rows[scope] || null;
   if (scope === 'strategy_signals' || /^strategy_signals:\d{6}$/.test(scope)) {
-    const prior = readScopeData_(sheet, scope, existing).data || {};
-    data = mergeSignalPayload_(prior, data);
+    const prior = readScopeData_(sheet, scope, existing);
+    if (commit) commit.previous_version = prior.version || '';
+    data = mergeSignalPayload_(prior.data || {}, data);
   }
+  if (scope === 'strategy_signals') delete data.model_sync; // Capabilities belong to the deployed code, not persisted data.
   const chunks = splitJsonChunks_(JSON.stringify(data));
   const existingRow = existing && existing.rows.length ? existing.rows[0] : 0;
   const incomingUpdatedAt = String(updatedAt || new Date().toISOString());
@@ -269,7 +297,7 @@ function saveScopeData_(scope, data, updatedAt) {
 
   const signalScope = scope === 'strategy_signals' || /^strategy_signals:\d{6}$/.test(scope);
   if (!signalScope && existing && existing.rows.length) {
-    existing.rows.sort(function(a, b) { return b - a; }).forEach(function(row) { sheet.deleteRow(row); });
+    deleteScopeRows_(sheet, existing.rows);
   }
   const row = Math.max(sheet.getLastRow() + 1, 2);
   const generation = Math.max(Date.now() * 1000, existing ? existing.parts.reduce(function(n,p) {return Math.max(n, p.generation + 1);}, 0) : 0);
@@ -278,10 +306,11 @@ function saveScopeData_(scope, data, updatedAt) {
   });
   sheet.getRange(row, 1, values.length, HEADER.length).setNumberFormat('@').setValues(values);
   SpreadsheetApp.flush();
+  if (commit) commit.version = String(generation);
   // Preserve the last complete generation until the new one has been written in full.
   if (signalScope && existing && existing.rows.length) {
     try {
-      existing.rows.sort(function(a,b) {return b-a;}).forEach(function(oldRow) {sheet.deleteRow(oldRow);});
+      deleteScopeRows_(sheet, existing.rows);
     } catch (_) {} // A leftover generation is harmless; reads select the newest complete one.
   }
   if (/^strategy_signals:\d{6}$/.test(scope)) {
@@ -377,7 +406,11 @@ function mergeModelTrades_(remote, incoming) {
     const old = merged[key];
     let row = Object.assign({}, item);
     if (old) {
-      const newer = String(item['來源時間'] || '') > String(old['來源時間'] || '');
+      const newTime = String(item['來源時間'] || ''), oldTime = String(old['來源時間'] || '');
+      const sameStream = item['串流識別'] === old['串流識別'];
+      const newSeq = sameStream ? Number(item['最後序號']) || 0 : 0, oldSeq = sameStream ? Number(old['最後序號']) || 0 : 0;
+      const newer = newTime > oldTime || (newTime === oldTime && (newSeq > oldSeq ||
+        (newSeq === oldSeq && (item['事件'] || []).length > (old['事件'] || []).length)));
       const terminal = item['狀態'] === '已平倉';
       const oldTerminal = old['狀態'] === '已平倉';
       let chosen = ((newer && !oldTerminal) || (terminal && !oldTerminal)) ? item : old;
