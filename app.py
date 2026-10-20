@@ -8228,7 +8228,7 @@ def render_operation_plan(seed_data, option_page=False, seconds=5, snapshot=None
                 "短波可先於日線進場許可觸發，但只適合小部位快進快出。"
             )
         elif short_wave_direction:
-            st.info("即時條件已通過，但尚未取得足夠的 5 分 K，暫不提供短波點位。")
+            st.info("5 分 K 資料尚未就緒，暫不提供短波點位；目前僅有觀察方向，不代表進場條件已通過。")
         else:
             st.info("尚未形成可辨識的盤中方向；短波暫不啟用，避免在區間中段雙向追價。")
 
@@ -16274,10 +16274,15 @@ def resolve_shioaji_futures_contract(api, root, contract_month):
     if not candidates:
         candidates = _list_shioaji_futures_contracts(api)
 
+    # Compact 1.7 contracts omit delivery_month; verify the actual code as in official-row mapping.
+    expected_code = expected_shioaji_futures_code(root, target_month)
     matched = [
         contract for contract in candidates
         if _is_actual_futures_contract(contract)
-        and _contract_delivery_month(contract) == target_month
+        and (_contract_delivery_month(contract) == target_month or (
+            not _contract_delivery_month(contract)
+            and str(getattr(contract, 'code', '') or '').upper() == expected_code
+        ))
         and (
             str(getattr(contract, 'root', '') or '').upper() in roots
             or any(str(getattr(contract, 'code', '') or '').upper().startswith(item) for item in roots)
