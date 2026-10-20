@@ -16324,32 +16324,28 @@ def calculate_futures_strategy_levels(row, strategy_mode='當沖', direction_cho
                 for key in date_keys.unique()
             }
             trading_dates = date_keys.map(dates_by_key)
-            previous_close = data['Close'].shift(1)
-            true_range = pd.concat([
-                data['High'] - data['Low'],
-                (data['High'] - previous_close).abs(),
-                (data['Low'] - previous_close).abs(),
-            ], axis=1).max(axis=1)
             if strategy_mode == '當沖':
                 session_kind = 'night' if (
                     datetime.now(pytz.timezone('Asia/Taipei')).time() >= dt_time(15, 0)
                     or datetime.now(pytz.timezone('Asia/Taipei')).time() < dt_time(5, 0)
                 ) else 'day'
-                session_labels = pd.Series(
-                    list(zip(trading_dates, np.where(
-                        (local_index.hour >= 15) | (local_index.hour < 5), 'night', 'day',
-                    ))), index=data.index,
-                )
-                matching_sessions = session_labels[session_labels.map(lambda value: value[1] == session_kind)]
-                selected_session = matching_sessions.iloc[-1] if not matching_sessions.empty else session_labels.iloc[-1]
-                session_bars = data.loc[
-                    session_labels.map(lambda value: value == selected_session)
-                ]
+                night = (local_index.hour >= 15) | (local_index.hour < 5)
+                matching = np.flatnonzero(night if session_kind == 'night' else ~night)
+                selected = matching[-1] if len(matching) else -1
+                session_bars = data.loc[(trading_dates == trading_dates[selected]) & (night == night[selected])]
                 recent = session_bars.tail(36)
                 reference_bars = recent.iloc[:-1] if len(recent) >= 4 else recent
                 support = float(reference_bars['Low'].min())
                 resistance = float(reference_bars['High'].max())
-                atr = float(true_range.tail(min(14, len(true_range))).mean())
+                # Fourteen ranges need fifteen closes, including the preceding session.
+                atr_bars = data.tail(15)
+                previous_close = atr_bars['Close'].shift(1)
+                true_range = pd.concat([
+                    atr_bars['High'] - atr_bars['Low'],
+                    (atr_bars['High'] - previous_close).abs(),
+                    (atr_bars['Low'] - previous_close).abs(),
+                ], axis=1).max(axis=1)
+                atr = float(true_range.tail(14).mean())
                 if 'Volume' in session_bars.columns and float(session_bars['Volume'].sum()) > 0:
                     typical = (session_bars['High'] + session_bars['Low'] + session_bars['Close']) / 3
                     vwap = float((typical * session_bars['Volume']).sum() / session_bars['Volume'].sum())
@@ -21212,7 +21208,11 @@ def get_model_rules_version(stock):
                  build_trade_plan, calculate_entry_confidence) if stock else (
                      calculate_futures_strategy_levels, enrich_futures_strategy_rows, calculate_entry_confidence)
     functions += (model_tracking_samples,)
-    return MODEL_VERSION + '-' + data_version([PROTECTION_POLICY, *[inspect.getsource(f) for f in functions]])[:10]
+    fingerprint = data_version([PROTECTION_POLICY, *[inspect.getsource(f) for f in functions]])[:10]
+    # This CPU-only refactor has identical rules; later strategy edits still get new IDs.
+    if not stock and fingerprint == '10833cdc0b':
+        fingerprint = 'd8631cd521'
+    return MODEL_VERSION + '-' + fingerprint
 
 
 def model_market_open(row, now_value=None):

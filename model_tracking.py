@@ -703,7 +703,12 @@ class ModelTracker:
                 updated = row
                 evidence = quote.get('成交證據', [])
                 quote = dict(quote)
-                quote['銜接確認'] = any(stamp(t.get('來源時間')) == stamp(row.get('來源時間')) and t.get('價格') == row.get('最新價',row.get('訊號價')) for t in evidence)
+                prior_time, prior_price = row.get('來源時間'), row.get('最新價', row.get('訊號價'))
+                # Stream timestamps normally match verbatim; parse only cross-format bridges.
+                quote['銜接確認'] = any(t.get('來源時間') == prior_time and t.get('價格') == prior_price for t in evidence)
+                if not quote['銜接確認']:
+                    prior_stamp = stamp(prior_time)
+                    quote['銜接確認'] = any(t.get('價格') == prior_price and stamp(t.get('來源時間')) == prior_stamp for t in evidence)
                 for tick in evidence:
                     if str(tick.get('來源時間', '')) < str(updated['來源時間']):
                         continue
