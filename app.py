@@ -11189,6 +11189,9 @@ def _newer_timestamped_state(first, second):
     if not second:
         return dict(first)
     if first.get('target_date') and first.get('target_date') == second.get('target_date'):
+        # Legacy futures entries cannot identify which delivery month was scored.
+        if bool(first.get('contract_keys')) != bool(second.get('contract_keys')):
+            return dict(first if first.get('contract_keys') else second)
         # An older client saving later must not replace the migrated daytrade formula.
         if first.get('weights') and not second.get('weights'):
             return dict(first)
@@ -18978,6 +18981,27 @@ def _score_futures_post_close(row, strategy_mode, market_context, row_scales):
     return combined
 
 
+def select_futures_ranking_contracts(rows, now_value=None):
+    """Near month only; add the next month for the upcoming settlement session."""
+    current = pd.Timestamp(now_value or datetime.now(pytz.timezone('Asia/Taipei')))
+    current = current.tz_localize('Asia/Taipei') if current.tzinfo is None else current.tz_convert('Asia/Taipei')
+    active, _ = filter_active_futures_rows(rows, current.to_pydatetime())
+    if active.empty or '月份順位' not in active:
+        return active
+    next_open = adjust_to_next_market_day(current.date() + timedelta(days=1))
+    settlement_roots = set()
+    for _, row in active[active['月份順位'] == 0].iterrows():
+        expiry = _normalize_futures_taipei_datetime(row.get('契約最後交易日'))
+        if expiry is None and (row.get('商品類型') in FUTURES_STANDARD_SETTLEMENT_TYPES
+                              or row.get('期貨代碼') in FUTURES_STANDARD_SETTLEMENT_ROOTS):
+            expiry = futures_expiry_date(row.get('契約月份'))
+        expiry_day = pd.Timestamp(expiry).date() if expiry is not None else None
+        if expiry_day in (next_open, current.date()):
+            settlement_roots.add(row['期貨代碼'])
+    return active[(active['月份順位'] == 0) | (
+        (active['月份順位'] == 1) & active['期貨代碼'].isin(settlement_roots))].drop_duplicates('契約鍵')
+
+
 def build_strategy_ranking_entries(
     rows, strategy_mode, now_value=None, limit=None, market_context=None, asset_type=None,
 ):
@@ -18992,7 +19016,16 @@ def build_strategy_ranking_entries(
         'open_interest': max((_ranking_number(value, 0) or 0 for value in rows.get('未平倉量', [])), default=1),
     }
     entries = []
+    seen = set()
     for _, row in rows.iterrows():
+        code = str(row.get('代號', row.get('期貨代碼', ''))).strip()
+        name = str(row.get('名稱', '')).strip() or code
+        if asset_type == 'futures':
+            month = str(row.get('契約月份', '')).strip()
+            code = str(row.get('契約鍵', '')).strip() or (f'{code}:{month}' if month else code)
+            if code in seen:
+                continue
+            seen.add(code)
         score_result = (
             _score_futures_post_close(row, strategy_mode, market_context, row_scales)
             if asset_type == 'futures' else
@@ -19000,8 +19033,6 @@ def build_strategy_ranking_entries(
         )
         if score_result is None:
             continue
-        code = str(row.get('代號', row.get('期貨代碼', ''))).strip()
-        name = str(row.get('名稱', '')).strip() or code
         entries.append({'code': code, 'name': name, **score_result})
     entries.sort(key=lambda item: (-item['score'], item['code']))
     return entries if limit is None else entries[:max(1, int(limit))]
@@ -19068,6 +19099,10 @@ def refresh_strategy_ranking_snapshots(rows, asset_type, analysis=False):
         return False
     if rows is None or rows.empty:
         return False
+    if asset_type == 'futures' and '契約鍵' in rows:
+        rows = select_futures_ranking_contracts(rows, current)
+        if rows.empty:
+            return False
     state_key = f'{asset_type}_strategy_ranking_snapshots'
     previous = dict(st.session_state.get(state_key, {}))
     update_times = [_state_updated_at(item) for item in previous.values()]
@@ -19099,6 +19134,7 @@ def refresh_strategy_ranking_snapshots(rows, asset_type, analysis=False):
                 'errors': list(context.get('errors', [])),
                 'using_last_success': bool(context.get('using_last_success')),
                 'complete': True,
+                **({'contract_keys': True} if asset_type == 'futures' else {}),
                 **({'weights': strategy_ranking_weights(asset_type, mode)}
                    if asset_type == 'stock' and key == 'daytrade' else {}),
                 'entries': entries,
@@ -19121,34 +19157,47 @@ def refresh_stock_swing_snapshot(analysis=False):
     )
 
 
-def render_strategy_ranking(rows, strategy_mode, room_label, allow_refresh=True):
+def render_strategy_ranking(rows, strategy_mode, room_label, allow_refresh=True, ranking_universe=None):
     """Render the independent post-close ranking immediately below its table."""
     current, target_date = _post_close_target_date()
     if rows is None or rows.empty:
         return
     asset_type = 'futures' if room_label.startswith('期貨') else 'stock'
+    if asset_type == 'futures':
+        pool = ranking_universe if isinstance(ranking_universe, pd.DataFrame) else rows
+        pool = pool[pool['期貨代碼'].isin(rows['期貨代碼'])]
+        rows = select_futures_ranking_contracts(pool, current)
+        rows = rows[~rows['契約鍵'].isin(st.session_state.get('futures_strategy_ignored', []))]
     snapshot_key = 'daytrade' if strategy_mode == '當沖' else 'swing'
     state_key = f'{asset_type}_strategy_ranking_snapshots'
     # Rendering never waits for official APIs. The maintenance fragment owns
     # background refresh, independently of the intraday quote toggle.
     visible = rows.copy(deep=True)
-    if asset_type == 'stock':
-        tables = st.session_state.setdefault('_postclose_stock_tables', {})
-        tables[room_label] = visible
-        visible = pd.concat(tables.values()).drop_duplicates('代號')
+    tables = st.session_state.setdefault(f'_postclose_{asset_type}_tables', {})
+    tables[room_label] = visible
+    visible = pd.concat(tables.values()).drop_duplicates('契約鍵' if asset_type == 'futures' else '代號')
     st.session_state[f'_postclose_visible_{asset_type}'] = visible
     waiting = st.session_state.get(f'_{asset_type}_{snapshot_key}_ranking_waiting',
                                    st.session_state.get(f'_{asset_type}_ranking_waiting', []))
     if waiting:
         st.caption('盤後資料待補齊，保留原排名：' + '、'.join(waiting[:4]))
+    if asset_type == 'futures':
+        st.caption('期貨排名僅比較近月；下個開盤日為結算日則加入次月，結算日保留至到期換月。')
     snapshot = st.session_state.get(state_key, {}).get(snapshot_key, {})
     if asset_type == 'stock' and snapshot_key == 'daytrade' and snapshot.get('weights') != strategy_ranking_weights('stock', '當沖'):
         snapshot = {}  # Never label a legacy 55/35/10 score as the new 60/40 ranking.
     if snapshot.get('target_date'):
         target_date = date.fromisoformat(snapshot['target_date'])
-    code_column = '期貨代碼' if asset_type == 'futures' else '代號'
+    code_column = '契約鍵' if asset_type == 'futures' else '代號'
     codes = set(rows[code_column].astype(str))
-    entries = [entry for entry in snapshot.get('entries', []) if entry['code'] in codes]
+    entries = []
+    seen = set()
+    for entry in snapshot.get('entries', []):
+        if entry['code'] in codes and entry['code'] not in seen:
+            entries.append(entry)
+            seen.add(entry['code'])
+    if asset_type == 'futures' and snapshot.get('entries') and not snapshot.get('contract_keys'):
+        st.caption('舊期貨排名未記錄契約月份；保留原快照，等待完整盤後資料補齊，不套用其他月份評分。')
     missing_codes = codes - {entry['code'] for entry in entries}
     if missing_codes:
         st.caption('盤前排名待補：' + '、'.join(sorted(missing_codes)) + '；等待補齊同日盤後資料，既有評分保持不變。')
@@ -19187,10 +19236,11 @@ def render_strategy_ranking(rows, strategy_mode, room_label, allow_refresh=True)
     colored = []
     explanation_rows = []
     for rank, entry in enumerate(entries, 1):
+        display_code = entry['code'].replace(':', ' ') if asset_type == 'futures' else entry['code']
         color = '#ff6b6b' if entry['direction'] == '多' else '#35d07f'
         colored.append(
             f"<span class='ranking-result' style='color:{color}'>"
-            f"{html.escape(entry['name'])}({html.escape(entry['code'])})"
+            f"{html.escape(entry['name'])}({html.escape(display_code)})"
             f"({entry['score']}·{entry['direction']})</span>"
         )
         reason_html = "<span style='color:#64748b;padding:0 2px'>｜</span>".join(
@@ -19198,7 +19248,7 @@ def render_strategy_ranking(rows, strategy_mode, room_label, allow_refresh=True)
             for component in str(entry['reason']).split('｜') if component.strip()
         )
         identity_html = format_ranking_entry_identity(
-            rank, entry['name'], entry['code'], entry['direction'],
+            rank, entry['name'], display_code, entry['direction'],
         )
         explanation_rows.append(
             f"<div class='ranking-explanation'><div class='ranking-identity'>{identity_html} "
@@ -22948,7 +22998,8 @@ def render_futures_strategy_room():
                 persist_futures_room_state()
                 st.rerun()
 
-            render_strategy_ranking(display_rows, strategy_mode, '期貨', allow_refresh=not futures_auto_enabled)
+            render_strategy_ranking(display_rows, strategy_mode, '期貨', allow_refresh=not futures_auto_enabled,
+                                    ranking_universe=universe)
 
         if enhanced_layer and not display_rows.empty:
             signal_states = {
@@ -23092,6 +23143,7 @@ def render_futures_strategy_room():
             )
             render_strategy_ranking(
                 independent_rows, strategy_mode, '期貨獨立計算',
+                ranking_universe=universe,
             )
 
     render_futures_independent_table()
@@ -23127,6 +23179,8 @@ def postclose_snapshot_ready(snapshots, rows, asset, target, risk=None, modes=('
         snapshots.get(mode, {}).get('complete')
         and snapshots[mode].get('target_date') == target.isoformat()
         and snapshots[mode].get('scope') == scope
+        and (asset != 'futures' or (snapshots[mode].get('contract_keys')
+             and set(scope).issubset({entry.get('code') for entry in snapshots[mode].get('entries', [])})))
         and (asset != 'stock' or mode != 'daytrade'
              or snapshots[mode].get('weights') == strategy_ranking_weights('stock', '當沖'))
         and (asset != 'stock' or risk is None
@@ -23158,14 +23212,14 @@ def postclose_futures_seed_rows(saved):
     snapshots = saved.get('strategy_ranking_snapshots', {})
     scope = set(snapshots.get('daytrade', {}).get('scope', []))
     codes = {entry['code'] for entry in snapshots.get('daytrade', {}).get('entries', [])}
-    if scope:
-        rows = rows[rows['契約鍵'].astype(str).isin(scope)]
-    elif codes:
-        rows = rows[rows['期貨代碼'].astype(str).isin(codes)]
+    if scope or codes:
+        roots = {key.split(':')[0] for key in scope or codes}
+        rows = rows[rows['期貨代碼'].astype(str).isin(roots)]
     else:
         keys = set(saved.get('manual', []))
         keys.update(rows['契約鍵'].astype(str).head(5))
         rows = rows[rows['契約鍵'].astype(str).isin(keys)]
+    rows = select_futures_ranking_contracts(rows)
     return rows[~rows['契約鍵'].astype(str).isin(saved.get('ignored', []))].copy()
 
 
@@ -23246,6 +23300,7 @@ def build_postclose_job(row_sets, target, need_turnover, need_risk, previous_ris
                 )
                 keys = set(visible['契約鍵'].astype(str))
                 rows = official[official['契約鍵'].astype(str).isin(keys)].copy()
+                rows = rows.drop_duplicates('契約鍵')
                 if set(rows['契約鍵'].astype(str)) != keys:
                     raise ValueError('部分期貨契約尚無同日行情')
             snapshots = {}
@@ -23282,6 +23337,7 @@ def build_postclose_job(row_sets, target, need_turnover, need_risk, previous_ris
                     'target_date': target.isoformat(), 'source_date': target_text,
                     'source_dates': context['source_dates'], 'errors': [],
                     'complete': True, 'scope': postclose_scope(visible, asset),
+                    **({'contract_keys': True} if asset == 'futures' else {}),
                     'risk_version': postclose_risk_version(risk) if asset == 'stock' else '',
                     'entries': entries, 'using_last_success': False,
                     **({'weights': weights} if asset == 'stock' and key == 'daytrade' else {}),
@@ -23745,6 +23801,7 @@ tab1, tab_fibo, tab2, tab_db, tab_company, tab3 = st.tabs([
 
 with tab1:
     st.session_state.pop('_postclose_stock_tables', None)
+    st.session_state.pop('_postclose_futures_tables', None)
     # Only timers registered during this full app run belong to visible tables.
     for room in ('stock', 'stock_independent', 'futures', 'futures_independent'):
         st.session_state.pop(f'{room}_auto_timer_seconds', None)
