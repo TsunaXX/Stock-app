@@ -458,8 +458,10 @@ def advance(record, quote):
         row['串流識別'] = stream
     seq = quote.get('序號')
     old_seq = row.get('串流序號', {}).get(stream) if stream else row.get('最後序號')
-    if stream == old_stream and seq is not None and old_seq is not None and seq <= old_seq and quote.get('有效'):
-        return row  # Replayed same-time ticks must never rewind the evidence cursor.
+    if stream == old_stream and seq is not None and old_seq is not None and seq <= old_seq:
+        if quote.get('有效'):
+            return row
+        seq = None  # Record the invalid source without rewinding the last observed evidence cursor.
     if seq is not None and old_seq is not None and seq > old_seq + 1:
         row['資料缺口'] = True
         event(row, '監控中斷', text, '成交證據佇列缺漏，不能確認停利停損先後',

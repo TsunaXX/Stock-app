@@ -21,6 +21,14 @@ def test_same_timestamp_replay_cannot_rewind_sequence_or_create_false_gap():
     assert advance(row, quote(102, 2, 序號=5, 串流識別='api:0'))['資料缺口']
 
 
+def test_invalid_replayed_tick_keeps_real_gap_but_cannot_rewind_sequence():
+    row = advance(new_trade(signal()), quote(100, 序號=2, 串流識別='api:0'))
+    invalid = advance(row, quote(99, 1, 序號=1, 串流識別='api:0', 有效=False))
+    assert invalid['資料缺口'] and invalid['最後序號'] == 2
+    recovered = advance(invalid, quote(101, 2, 序號=3, 串流識別='api:0'))
+    assert recovered['資料缺口'] and not any(e.get('缺漏證據') for e in recovered['事件'])
+
+
 def test_source_metadata_does_not_change_legacy_identity_or_results():
     stock = signal()
     row = new_trade(stock)
