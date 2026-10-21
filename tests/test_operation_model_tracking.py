@@ -192,6 +192,8 @@ def test_no_extra_broker_query_subscription_or_timer_and_gate_timestamp():
     plan = spec(ns)
     assert sample(ns, [plan], 0) == ([], {'期貨|TMFJ6|日線／15分K': {
         '有效':False,'成交證據':[], '交易日':'2026-10-12','更新秒數':5,
+        '策略':plan['策略'],'策略版本':plan['策略版本'],'計畫來源':plan['計畫來源'],'計畫類型':plan['計畫類型'],'成本設定':plan['成本設定'],
+        '指標快照':plan['指標快照'],'條件快照':plan['條件快照'],
         '來源時間':NOW.isoformat(), '休市':False, '進場許可':True,'許可方向':'偏多','進場許可時間':None,'收盤確認':False,'暖機等待':False}})
     assert set(state['model_tick_buffers']) == {'TMFJ6'}
     tick(state,'TMFJ6',20000.,0)

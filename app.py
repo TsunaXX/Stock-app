@@ -44,7 +44,7 @@ from market_automation import (
     macro_results, merge_company_sections, merge_macro_results, vwap_guard,
 )
 
-from model_tracking import ModelTracker, DEFAULT_COSTS, VERSION as MODEL_VERSION, PROTECTION_POLICY, performance, excel_report, normalize_costs, option_fills, option_tick, advance as advance_model_trade
+from model_tracking import ModelTracker, DEFAULT_COSTS, VERSION as MODEL_VERSION, PROTECTION_POLICY, performance, plan_performance, excel_report, normalize_costs, option_fills, option_tick, advance as advance_model_trade
 
 logger = logging.getLogger(__name__)
 
@@ -21432,6 +21432,8 @@ def operation_model_samples(specs, api, seconds, now_value=None, after=None):
                 and 0 <= (datetime.fromisoformat(last['來源時間']) - datetime.fromisoformat(premium['來源時間'])).total_seconds() <= 2
                 for leg in spec['選擇權腿'])
         quote = {**last, '有效': valid, '成交證據': evidence, '交易日': day, '更新秒數': seconds,
+                 '策略': spec['策略'], '策略版本': spec['策略版本'], '計畫來源': spec['計畫來源'], '計畫類型': spec['計畫類型'], '成本設定': spec['成本設定'],
+                 '指標快照': spec['指標快照'], '條件快照': spec['條件快照'],
                  '來源時間': last.get('來源時間', source_time), '休市': not model_market_open(spec, now),
                  '進場許可': spec['進場許可'], '許可方向': spec['方向'], '進場許可時間': last.get('來源時間'), '收盤確認': valid and (
                      dt_time(13, 45) <= source.time() < dt_time(15) or dt_time(5) <= source.time() < dt_time(8, 45))}
@@ -21571,6 +21573,11 @@ def model_tracking_samples(rows, stock, mode, direction_choice, config, seconds,
         quote['進場品質許可'] = bool(eligible and None not in levels.values())
         quote['進場品質方向'] = direction
         quote['進場品質時間'] = quote['來源時間']
+        quote.update({'策略版本': config.get('rules_version', MODEL_VERSION), '計畫來源': '股期戰略室',
+                      '計畫類型': ('股票' if stock else '期貨') + mode, '成本設定': dict(config.get('costs', DEFAULT_COSTS)),
+                      '指標快照': indicators, '市場環境': config.get('market_bias', '未取得'), '觸發條件': rule,
+                      '條件快照': {name + '同向': (price > value if direction in ('多頭', '偏多') else price < value)
+                                   for name, value in indicators.items() if price is not None and value is not None and name in ('VWAP', '均線')}})
         if quote['休市'] or price is None or not signal_valid or not eligible or direction not in ('多頭','空頭','偏多','偏空') or None in levels.values():
             continue
         entry, stop, target = levels['entry'], levels['stop'], levels['target']
@@ -21703,7 +21710,8 @@ def model_version_display_labels(records):
                 changed = True
             for first_seen, raw in pending:
                 date_code = first_seen if first_seen > '20261001' else '20261001'
-                base = f"{'V1.1' if raw.startswith('V1.1') else 'V1.0'}-{market}-{date_code}" + ('-保利' if raw.startswith('V1.1') else '')
+                generation = 'V1.2' if raw.startswith('V1.2') else ('V1.1' if raw.startswith('V1.1') else 'V1.0')
+                base = f'{generation}-{market}-{date_code}' + ('-保利' if generation != 'V1.0' else '')
                 used = set(labels.values())
                 label, suffix = base, 1
                 while label in used:
@@ -21733,7 +21741,7 @@ def _model_time_text(value):
 def _model_display_value(value, column=''):
     if value is None:
         return None
-    if column in {'觀察時間', '來源時間', '建立時間', '進場時間', '結案時間'} and value is not None and str(value).strip():
+    if column in {'觀察時間', '來源時間', '建立時間', '進場時間', '結案時間', '最後進場等待時間', '訊號失效時間', '進場觸發時間', '起始時間', '結束時間'} and value is not None and str(value).strip():
         return _model_time_text(value)
     if column == '事件' and isinstance(value, (list, tuple)):
         lines = []
@@ -21779,7 +21787,7 @@ def _model_history_overview(frame):
             str(code or '') + ((' ' + str(name)) if name else '')
             for code, name in zip(codes.fillna(''), names.fillna(''))
         ]
-    first = ['交易日', '商品', '計畫來源', '方向', '狀態', '模擬進場價', '模擬出場價', '保利價', '保利淨額', '保利狀態', '出場原因', '模擬損益', '策略版本', '進場等待原因']
+    first = ['交易日', '商品', '計畫來源', '計畫類型', '方向', '狀態', '進場次數', '模擬進場價', '模擬出場價', '保利價', '保利淨額', '保利狀態', '出場原因', '模擬損益', '策略版本', '最後進場等待原因', '訊號失效原因', '未進場分類', '事件數']
     columns = [column for column in first if column in result.columns]
     return result[columns], result[columns + [column for column in result.columns if column not in columns]]
 
@@ -21795,6 +21803,20 @@ def _model_column_config(frame):
         'MFE(R)': '原有標的點位最大浮盈倍數；選擇權的現金保利倍數另見保利最大浮盈(R)。',
         '保利規則': '均衡移動：達 1R 啟動，保留 1R 回撤空間，最低保護成本。',
         '進場等待原因': '新版當沖在模擬成交前檢查追價與扣除雙邊成本後的空間；等待不算已成交。',
+        '最後進場等待原因': '最後一次未能進場的原因；進場或失效後仍保留。',
+        '訊號失效原因': '訊號終止或超過有效時間的原因，不覆蓋原等待原因。',
+        '未進場分類': '進場前最後的等待分類；行情不完整與策略未放行分開記錄。',
+        '資料缺口原因': '已確認中斷與缺漏的原因，不能藉重新同步清除。',
+        '事件數': '事件發生次數；重複診斷區間的次數也納入，完整內容可匯出。',
+        '計畫類型': '股票／期貨當沖或波段、日線／15分K、短波5分K、選擇權組合。',
+        '原始計畫ID': '同一來源、類型、策略版本及契約組合的計畫識別。',
+        '交易執行ID': '每一次進場的識別；以原始計畫及前一筆執行形成跨裝置一致的鏈。',
+        '進場次數': '同一原始計畫的第幾次進場，雲端會驗證前一筆及次數。',
+        '同步確認': 'V1.2 執行須經共用儲存層確認後才納入正式績效。',
+        '平均R值': '沿用紀錄的結果(R)平均；選擇權是標的點位觸發R，非權利金報酬倍數。',
+        '保利出場比例(%)': '有效已結案交易中，出場原因為保利的比例。',
+        '計畫觸發率(%)': '至少一次已進場的計畫數／原始計畫數。',
+        '計畫有效率(%)': '至少一筆有效結案交易的計畫數／已觸發計畫數；在途另列，缺父紀錄時留空。',
         '全部訊號數': '目前篩選條件下建立的策略訊號總數。',
         '有效交易數': '有完整進出場證據、可納入勝率計算的已平倉筆數。',
         '資料不足數': '行情或成交證據不足，暫不列入績效統計的筆數。',
@@ -21990,16 +22012,19 @@ def render_model_tracking_room():
             st.button('今天', key='model_period_today', on_click=set_model_period_today, args=(report_day,), width='stretch')
         if len(period) == 2:
             st.caption(f'{period[0]:%Y/%m/%d} ～ {period[1]:%Y/%m/%d}')
-    with cols[1]:
-        market = st.selectbox('市場', ['全部', '股票', '期貨', '選擇權'], key='model_market')
-    with cols[2]:
-        mode = st.selectbox('策略', ['全部', '當沖', '波段'], key='model_mode')
-    with cols[3]:
-        direction = st.selectbox('多空方向', ['全部', '多', '空'], key='model_direction')
     if len(period) != 2:
         return
-    plan_source = st.selectbox('計畫來源', ['全部', '股期戰略室', '指數操作計畫', '選擇權操作計畫'], key='model_plan_source')
-    records = tracker.records(period[0].strftime('%Y%m'), period[1].strftime('%Y%m'))
+    tracker.request_history(period[0], period[1])
+    records = tracker.records(period[0].strftime('%Y%m'), period[1].strftime('%Y%m'), details=False)
+    records = [{**row, '市場': '選擇權' if row.get('選擇權腿') else row['市場']} for row in records
+               if period[0].isoformat() <= row['交易日'] <= period[1].isoformat()]
+    with cols[1]:
+        sources = ['全部', '股期戰略室', '指數操作計畫', '選擇權操作計畫']
+        if any(row.get('計畫來源') == '未確認' for row in records):
+            sources.append('未確認')
+        if st.session_state.get('model_plan_source', '全部') not in sources:
+            st.session_state['model_plan_source'] = '全部'
+        plan_source = st.selectbox('計畫來源', sources, key='model_plan_source')
     version_labels = model_version_display_labels(records)
 
     def display_records(source_records, labels=None):
@@ -22015,27 +22040,43 @@ def render_model_tracking_room():
             result.append(displayed)
         return result
 
-    records = display_records(records)
-    versions = ['全部'] + sorted({r.get('策略版本', MODEL_VERSION) for r in records})
-    version_col, code_col = st.columns(2)
+    scope_records = [row for row in records if plan_source == '全部' or row.get('計畫來源') == plan_source]
+    version_tokens = {_model_market_version_key(row) + '|' + str(row.get('策略版本', MODEL_VERSION)) for row in scope_records}
+    versions = ['全部'] + sorted(version_tokens)
     if st.session_state.get('model_version', '全部') not in versions:
         st.session_state['model_version'] = '全部'
-    with version_col:
-        version = st.selectbox('策略版本', versions, key='model_version')
-    with code_col:
+    with cols[2]:
+        version = st.selectbox('策略版本', versions, key='model_version',
+                               format_func=lambda token: version_labels.get(tuple(token.split('|', 1)), token) if token != '全部' else token)
+    scope_records = [row for row in scope_records if version == '全部' or _model_market_version_key(row) + '|' + str(row.get('策略版本', MODEL_VERSION)) == version]
+    with cols[3]:
         product_options = sorted({
             f"{str(row.get('代碼') or row.get('商品鍵') or '').strip()}｜{str(row.get('名稱') or '').strip()}"
-            for row in records if row.get('代碼') or row.get('商品鍵')
+            for row in scope_records if row.get('代碼') or row.get('商品鍵')
         })
         current_product = str(st.session_state.get('model_code', '') or '')
         if current_product and current_product not in product_options:
-            product_options.append(current_product)
+            st.session_state['model_code'] = ''
         code = st.selectbox('商品代碼或名稱', [''] + product_options, key='model_code',
-                            format_func=lambda value: value or '全部商品', accept_new_options=True,
+                            format_func=lambda value: value or '全部商品',
                             placeholder='輸入代碼或名稱搜尋') or ''
+    scope_records = [row for row in scope_records if not code or code == f"{str(row.get('代碼') or row.get('商品鍵') or '').strip()}｜{str(row.get('名稱') or '').strip()}"]
+    lower = st.columns(3)
+    for column, label, key, field in zip(lower, ('市場', '策略', '多空方向'), ('model_market', 'model_mode', 'model_direction'), ('市場', '策略', '方向')):
+        options = sorted({('多' if row[field] in ('多頭', '偏多') else '空') if field == '方向' else row[field] for row in scope_records})
+        if st.session_state.get(key, '全部') not in ['全部'] + options:
+            st.session_state[key] = '全部'
+        with column:
+            chosen = st.selectbox(label, ['全部'] + options, key=key)
+        scope_records = [row for row in scope_records if chosen == '全部' or (chosen in row[field] if field == '方向' else row[field] == chosen)]
+    market, mode, direction = (st.session_state[key] for key in ('model_market', 'model_mode', 'model_direction'))
+    filter_scope = (period, plan_source, version, code, market, mode, direction)
+    if st.session_state.get('_model_filter_scope') != filter_scope:
+        st.session_state['model_page'] = 1
+        st.session_state['_model_filter_scope'] = filter_scope
     show_evidence = st.toggle('顯示指標與事件證據', key='model_evidence')
     show_full_history = st.toggle('顯示完整明細欄位', key='model_full_history', value=False)
-    page = st.number_input('明細頁碼', min_value=1, value=1, step=1, key='model_page')
+    page = st.number_input('明細頁碼', min_value=1, step=1, key='model_page')
 
     @st.fragment(run_every=30)
     def render_model_report():
@@ -22043,22 +22084,28 @@ def render_model_tracking_room():
         if tracker.error:
             st.warning(tracker.error)
         tracker.last_activity = time.monotonic()
-        current_records = tracker.records(period[0].strftime('%Y%m'), period[1].strftime('%Y%m'))
+        current_records = tracker.records(period[0].strftime('%Y%m'), period[1].strftime('%Y%m'), details=False)
         current_labels = model_version_display_labels(current_records)
-        current_records = display_records(current_records, current_labels)
+        current_records = [{**row, '市場': '選擇權' if row.get('選擇權腿') else row['市場']} for row in current_records]
         query = ''.join(str(code).replace('｜', '').split()).casefold()
         records = [row for row in current_records if period[0].isoformat() <= row['交易日'] <= period[1].isoformat()
                    and (market == '全部' or row['市場'] == market) and (mode == '全部' or row['策略'] == mode)
                    and (direction == '全部' or direction in row['方向'])
-                   and (version == '全部' or row['策略版本'] == version)
+                   and (version == '全部' or _model_market_version_key(row) + '|' + str(row['策略版本']) == version)
                    and (plan_source == '全部' or row.get('計畫來源', '股期戰略室') == plan_source)
                    and (not query or query in ''.join(str(row.get(key, '') or '') for key in ('代碼', '名稱', '商品鍵')).replace(' ', '').casefold())]
         metrics, groups, frame = cached_model_performance(json.dumps(records, ensure_ascii=False), str((period, market, mode, direction, version, code, plan_source)))
+        st.markdown('##### 交易績效（每次進場獨立計算）')
         for col, key in zip(st.columns(3), ('全部訊號數', '有效交易數', '資料不足數')):
             col.metric(key, str(metrics[key]))
         for col, key in zip(st.columns(4), ('勝率(%)', '累積模擬損益', '獲利因子', '最大回撤')):
             col.metric(key, '未確認' if metrics[key] is None else f'{metrics[key]:,.2f}'.rstrip('0').rstrip('.'))
-        st.download_button('⬇️ 匯出 Excel', lambda: excel_report(records),
+        export_ids = [row['交易ID'] for row in records]
+        export_ready = tracker.events_ready(export_ids)
+        if not export_ready and st.button('準備完整 Excel', key='model_prepare_excel'):
+            tracker.events_ready(export_ids, request=True)
+            st.info('正在背景讀取封存事件，完成後即可匯出。')
+        st.download_button('⬇️ 匯出 Excel', lambda: excel_report(tracker.details(export_ids)), disabled=not export_ready,
                            file_name='模型勝率追蹤.xlsx', mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
                            on_click='ignore', key='model_excel')
         if not records:
@@ -22075,16 +22122,35 @@ def render_model_tracking_room():
                 st.info('此頁沒有紀錄，請選擇較前面的頁碼。')
             else:
                 history = view.drop(columns=['事件', '成本設定', '指標快照', '條件快照'], errors='ignore')
+                history = pd.DataFrame(display_records(history.to_dict('records'), current_labels))
                 overview, full_history = _model_history_overview(history)
                 history_frame = full_history if show_full_history else overview
                 st.dataframe(_model_display_frame(history_frame), hide_index=True, width='stretch',
                              column_config=_model_column_config(history_frame))
                 if show_evidence:
-                    evidence_columns = [column for column in ('交易ID', '策略版本', '指標快照', '條件快照', '事件') if column in view]
+                    evidence_columns = [column for column in ('交易ID', '策略版本', '指標快照', '條件快照', '事件數') if column in view]
                     if evidence_columns:
                         evidence = view[evidence_columns]
                         st.dataframe(_model_display_frame(evidence), hide_index=True, width='stretch',
                                      column_config=_model_column_config(evidence))
+                    event_rows = tracker.events(view['交易ID'])
+                    if not tracker.events_ready(view['交易ID']):
+                        st.info('完整事件正在背景載入；行情更新不受影響。')
+                    st.caption(f"本頁事件發生 {int(view.get('事件數', pd.Series(dtype=float)).sum())} 次（重複診斷可能合併為區間）；畫面最多顯示 500 列，Excel 保留完整內容。")
+                    if event_rows:
+                        st.dataframe(_model_display_frame(pd.DataFrame(event_rows[:500])), hide_index=True, width='stretch')
+            st.markdown('##### 原始計畫績效')
+            plan_history = tracker.plan_records([row['原始計畫ID'] for row in records if row.get('原始計畫ID')], period[1])
+            plan_metrics, plan_rows = plan_performance(plan_history)
+            st.caption('以目前篩選觸及的原始計畫歸組，合計至所選結束日的各次執行；缺少父紀錄時等待舊月份載入。舊制不推測共同計畫。平均R沿用保存的結果(R)，選擇權為標的觸發R，與金額保利R不同。')
+            for column, (label, value) in zip(st.columns(len(plan_metrics)), plan_metrics.items()):
+                column.metric(label, '未確認' if value is None else f'{value:,.2f}'.rstrip('0').rstrip('.'))
+            if not plan_rows.empty:
+                st.dataframe(_model_display_frame(plan_rows), hide_index=True, width='stretch')
+                reasons = plan_rows.loc[~plan_rows['已觸發'], ['未進場分類', '訊號失效原因']]
+                if not reasons.empty:
+                    st.caption('尚未進場計畫的原因分布')
+                    st.dataframe(_model_display_frame(reasons.groupby(['未進場分類', '訊號失效原因'], dropna=False).size().reset_index(name='計畫數')), hide_index=True, width='stretch')
             st.markdown('##### 策略、方向與指標分析')
             st.caption('指標分組代表進場當時有該指標證據的交易，不代表單一指標造成結果。')
             if groups.empty:
