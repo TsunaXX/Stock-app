@@ -375,12 +375,16 @@ function archiveModelEvents_(scope) {
     const events = r['事件'], text = JSON.stringify(events), sha = modelDigest_(text);
     if (archived[r['交易ID']] && archived[r['交易ID']].sha !== sha) throw new Error('既有原始事件封存不一致');
     archived[r['交易ID']] = {交易ID: r['交易ID'], sha: sha, events_json: text};
+    const diagnostic = function(e) {
+      const reason = String(e['原因'] || '');
+      return !reason.startsWith('保利') && (['監控中斷','資料不足','等待進場'].indexOf(e['狀態']) >= 0 || reason.startsWith('恢復追蹤') || reason === '串流成交證據已就緒');
+    };
     const diagnostics = Object.create(null);
     events.forEach(function(e) {
-      if (['監控中斷','資料不足','等待進場'].indexOf(e['狀態']) >= 0 && !String(e['原因'] || '').startsWith('保利')) diagnostics[e['狀態'] + '|' + (e['原因'] || '')] = e['事件ID'];
+      if (diagnostic(e)) diagnostics[e['狀態'] + '|' + (e['原因'] || '')] = e['事件ID'];
     });
     const kept = events.filter(function(e) {
-      return ['監控中斷','資料不足','等待進場'].indexOf(e['狀態']) < 0 || String(e['原因'] || '').startsWith('保利') || diagnostics[e['狀態'] + '|' + (e['原因'] || '')] === e['事件ID'];
+      return !diagnostic(e) || diagnostics[e['狀態'] + '|' + (e['原因'] || '')] === e['事件ID'];
     });
     const count = function(values) {return values.reduce(function(n,e) {return n + (e['次數'] || 1);}, 0);};
     r['事件封存'] = {scope: archiveScope, sha: sha, 事件數: count(events), 保留事件數: count(kept)};

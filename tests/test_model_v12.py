@@ -238,6 +238,7 @@ def test_archive_roundtrip_partial_write_and_stale_writer_keep_all_evidence(tmp_
     row = new_trade(signal())
     row['資料缺口'] = True
     row['事件'] += [{'事件ID':str(i), '時間':row['來源時間'], '狀態':'監控中斷', '原因':'連線中斷', '證據':'證'*200} for i in range(300)]
+    row['事件'] += [{'事件ID':'recover'+str(i), '時間':row['來源時間'], '狀態':'模擬持倉', '原因':'恢復追蹤；缺口仍保留並排除有效績效'} for i in range(300)]
     row['事件'] += [{'事件ID':'entry', '時間':row['來源時間'], '狀態':'模擬持倉', '原因':'已進場'},
                     {'事件ID':'protect', '時間':row['來源時間'], '狀態':'模擬持倉', '原因':'保利更新', '保利價':101}]
     program = '''const assert=require('node:assert/strict'),crypto=require('node:crypto');
@@ -303,7 +304,8 @@ console.log(JSON.stringify({compact,archive}));
         fresh.details([row['交易ID']])
     fresh.remote_get = lambda scope: data['archive']
     fresh.load_event_archive('strategy_events:202610')
-    assert fresh.events_ready([row['交易ID']]) and len(fresh.events([row['交易ID']], limit=500)) == len(row['事件'])
+    assert fresh.events_ready([row['交易ID']]) and len(fresh.events([row['交易ID']], limit=500)) == 500
+    assert len(fresh.details([row['交易ID']])[0]['事件']) == len(row['事件'])
 
 
 def test_cross_device_reentry_identity_and_pending_ack_retry(tmp_path):
