@@ -125,7 +125,21 @@ function doGet(e) {
     const rows = getScopeRowMap_(sheet);
 
     if (requested) {
-      const item = readScopeData_(sheet, requested, rows[requested]);
+      let item = readScopeData_(sheet, requested, rows[requested]);
+      if (requested === 'strategy_signals') {
+        const data = item.data || {};
+        const months = data.model_months || [];
+        const active = Object.assign({}, data.model_active_months || {});
+        let changed = false;
+        months.forEach(function(month) {
+          if (Object.prototype.hasOwnProperty.call(active, month)) return;
+          const stored = readScopeData_(sheet, 'strategy_signals:' + month, rows['strategy_signals:' + month]);
+          active[month] = ((stored.data || {}).model_trades || []).some(function(r) {return ['等待進場','模擬持倉','監控中斷','資料不足'].indexOf(r['狀態']) >= 0;});
+          changed = true;
+        });
+        if (changed) saveScopeData_('strategy_signals', {model_active_months: active}, new Date().toISOString());
+        item.data = Object.assign({}, data, {model_reentry: 1, model_history: 1, model_events: 1, model_active_months: active});
+      }
       const ids = e && e.parameter && e.parameter.trade_ids;
       if (ids !== undefined) {
         const keys = String(ids).split(',');
@@ -193,6 +207,11 @@ function doPost(e) {
     lock.waitLock(30000);
     const body = parseRequestBody_(e);
     const scope = normalizeScope_(body.scope);
+    if (body.action === 'archive_model_events') {
+      if (!/^strategy_signals:\d{6}$/.test(scope)) throw new Error('封存月份無效');
+      return jsonResponse_(archiveModelEvents_(scope));
+    }
+    if (/^strategy_events:/.test(scope)) throw new Error('原始事件僅可經封存流程寫入');
 
     if (scope) {
       if (body.data === undefined || body.data === null) {
@@ -249,7 +268,7 @@ function deleteScopeRows_(sheet, rows) {
 }
 
 
-function saveScopeData_(scope, data, updatedAt, commit) {
+function saveScopeData_(scope, data, updatedAt, commit, internalArchive) {
   if (/^strategy_signals:\d{6}$/.test(scope)) {
     if (!Array.isArray(data.model_trades) || data.model_trades.some(function(r) {
       return !r || !/^[a-f0-9]{64}$/.test(r['交易ID'] || '') || typeof r['商品鍵'] !== 'string' || !r['商品鍵'] ||
@@ -268,7 +287,18 @@ function saveScopeData_(scope, data, updatedAt, commit) {
   if (scope === 'strategy_signals' || /^strategy_signals:\d{6}$/.test(scope)) {
     const prior = readScopeData_(sheet, scope, existing);
     if (commit) commit.previous_version = prior.version || '';
+    const incomingTrades = data.model_trades || [];
+    if (/^strategy_signals:\d{6}$/.test(scope) && !internalArchive) {
+      const indexed = Object.create(null);
+      ((prior.data || {}).model_trades || []).forEach(function(r) {indexed[r['交易ID']] = r;});
+      incomingTrades.forEach(function(r) {
+        const previous = indexed[r['交易ID']];
+        if (stableModelJson_(previous && previous['事件封存'] || null) !== stableModelJson_(r['事件封存'] || null)) throw new Error('事件封存版本已變更，請重新同步；保留待同步資料');
+      });
+    }
+    if (internalArchive) prior.data.model_trades = data.model_trades;
     data = mergeSignalPayload_(prior.data || {}, data);
+    if (/^strategy_signals:\d{6}$/.test(scope)) validateModelExecutions_(data.model_trades, incomingTrades);
   }
   if (scope === 'strategy_signals') delete data.model_sync; // Capabilities belong to the deployed code, not persisted data.
   const chunks = splitJsonChunks_(JSON.stringify(data));
@@ -295,7 +325,7 @@ function saveScopeData_(scope, data, updatedAt, commit) {
     }
   }
 
-  const signalScope = scope === 'strategy_signals' || /^strategy_signals:\d{6}$/.test(scope);
+  const signalScope = scope === 'strategy_signals' || /^strategy_(signals|events):\d{6}$/.test(scope);
   if (!signalScope && existing && existing.rows.length) {
     deleteScopeRows_(sheet, existing.rows);
   }
@@ -317,9 +347,58 @@ function saveScopeData_(scope, data, updatedAt, commit) {
     const month = scope.split(':')[1];
     const versions = {};
     versions[month] = String(generation);
-    saveScopeData_('strategy_signals', {model_schema: 1, model_months: [month], model_versions: versions}, incomingUpdatedAt);
+    const active = {};
+    active[month] = data.model_trades.some(function(r) {return ['等待進場','模擬持倉','監控中斷','資料不足'].indexOf(r['狀態']) >= 0;});
+    saveScopeData_('strategy_signals', {model_schema: 1, model_months: [month], model_versions: versions, model_active_months: active}, incomingUpdatedAt);
   }
   return row;
+}
+
+
+function archiveModelEvents_(scope) {
+  const sheet = getStoreSheet_(), index = getScopeRowMap_(sheet);
+  const stored = readScopeData_(sheet, scope, index[scope]);
+  const rows = (stored.data || {}).model_trades;
+  if (!Array.isArray(rows)) throw new Error('封存來源不存在');
+  const archiveScope = scope.replace('strategy_signals:', 'strategy_events:');
+  let prior;
+  try { prior = readScopeData_(sheet, archiveScope, index[archiveScope]); }
+  catch (error) {
+    if (rows.some(function(r) {return r['事件封存'];})) throw error;
+    prior = {data: null}; // A failed first archive has no linked consumers; the full source is still intact.
+  }
+  const archived = Object.create(null);
+  ((prior.data || {}).records || []).forEach(function(r) {archived[r['交易ID']] = r;});
+  let changed = 0;
+  rows.forEach(function(r) {
+    if (r['識別版本'] === 2 || r['事件封存'] || (r['事件'] || []).length < 128) return;
+    const events = r['事件'], text = JSON.stringify(events), sha = modelDigest_(text);
+    if (archived[r['交易ID']] && archived[r['交易ID']].sha !== sha) throw new Error('既有原始事件封存不一致');
+    archived[r['交易ID']] = {交易ID: r['交易ID'], sha: sha, events_json: text};
+    const diagnostic = function(e) {
+      const reason = String(e['原因'] || '');
+      return !reason.startsWith('保利') && (['監控中斷','資料不足','等待進場'].indexOf(e['狀態']) >= 0 || reason.startsWith('恢復追蹤') || reason === '串流成交證據已就緒');
+    };
+    const diagnostics = Object.create(null);
+    events.forEach(function(e) {
+      if (diagnostic(e)) diagnostics[e['狀態'] + '|' + (e['原因'] || '')] = e['事件ID'];
+    });
+    const kept = events.filter(function(e) {
+      return !diagnostic(e) || diagnostics[e['狀態'] + '|' + (e['原因'] || '')] === e['事件ID'];
+    });
+    const count = function(values) {return values.reduce(function(n,e) {return n + (e['次數'] || 1);}, 0);};
+    r['事件封存'] = {scope: archiveScope, sha: sha, 事件數: count(events), 保留事件數: count(kept)};
+    r['事件格式'] = 2; r['事件數'] = count(events); r['事件'] = kept;
+    changed++;
+  });
+  if (changed) {
+    saveScopeData_(archiveScope, {model_event_archive: 1, records: Object.keys(archived).sort().map(function(k) {return archived[k];})}, new Date().toISOString());
+    const check = readScopeData_(sheet, archiveScope, getScopeRowMap_(sheet)[archiveScope]);
+    const actual = (check.data || {}).records || [];
+    if (actual.length !== Object.keys(archived).length || actual.some(function(r) {return !archived[r['交易ID']] || modelDigest_(r.events_json) !== archived[r['交易ID']].sha;})) throw new Error('原始事件封存回讀失敗，保留原主紀錄');
+    saveScopeData_(scope, stored.data, new Date().toISOString(), {}, true);
+  }
+  return {success: true, archived_trades: changed, archive_scope: archiveScope};
 }
 
 
@@ -397,6 +476,66 @@ function buildStockPayload_(payload) {
 }
 
 
+function stableModelJson_(value) {
+  if (Array.isArray(value)) return '[' + value.map(stableModelJson_).join(',') + ']';
+  if (value && typeof value === 'object') return '{' + Object.keys(value).sort().map(function(k) {return JSON.stringify(k) + ':' + stableModelJson_(value[k]);}).join(',') + '}';
+  return JSON.stringify(value);
+}
+
+function modelDigest_(text) {
+  return Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, text, Utilities.Charset.UTF_8).map(function(n) {return ('0' + ((n + 256) % 256).toString(16)).slice(-2);}).join('');
+}
+
+function modelTime_(value) {
+  const text = String(value || '');
+  return Date.parse(/(Z|[+-]\d{2}:\d{2})$/.test(text) ? text : text + '+08:00');
+}
+
+function validateModelExecutions_(merged, incoming) {
+  const indexed = Object.create(null);
+  merged.forEach(function(row) {indexed[row['交易ID']] = row;});
+  incoming.forEach(function(row) {
+    if (row['識別版本'] !== 2 && !String(row['策略版本']).startsWith('V1.2')) return;
+    const fields = {};
+    ['市場','商品鍵','策略','策略版本','方向','到期時間'].forEach(function(k) {fields[k] = row[k] || '';});
+    fields['計畫來源'] = row['計畫來源']; fields['計畫類型'] = row['計畫類型'];
+    fields['交易日'] = row['策略'] === '當沖' ? row['交易日'] : '';
+    fields['選擇權腿'] = (row['選擇權腿'] || []).slice().sort(function(a,b) {return String(a['代碼']).localeCompare(String(b['代碼'])) || a['買賣']-b['買賣'];});
+    const plan = modelDigest_('plan-v2|' + stableModelJson_(fields));
+    const parentId = row['前次執行ID'] || '';
+    const id = modelDigest_('execution-v2|' + plan + '|' + parentId);
+    if (row['識別版本'] !== 2 || row['原始計畫ID'] !== plan || row['交易ID'] !== id || row['交易執行ID'] !== id ||
+        ['股期戰略室','指數操作計畫','選擇權操作計畫'].indexOf(row['計畫來源']) < 0 || !row['計畫類型']) throw new Error('V1.2 計畫或執行 ID 無效');
+    if (!parentId && row['進場次數'] !== 1) throw new Error('首次進場次數無效');
+    if (parentId) {
+      let parent = indexed[parentId];
+      const cleared = row['重入解除證據'] || {};
+      if (!parent && /^\d{6}$/.test(String(row['前次執行月份'] || ''))) {
+        const sheet = getStoreSheet_(), scope = 'strategy_signals:' + row['前次執行月份'];
+        const stored = readScopeData_(sheet, scope, getScopeRowMap_(sheet)[scope]);
+        parent = ((stored.data || {}).model_trades || []).find(function(r) {return r['交易ID'] === parentId;});
+      }
+      const closeTime = parent && modelTime_(parent['結案時間']);
+      const entryTime = modelTime_(row['進場時間']), clearTime = modelTime_(cleared['來源時間']);
+      if (!parent || parent['原始計畫ID'] !== plan || parent['狀態'] !== '已平倉' || parent['資料缺口'] ||
+          row['進場次數'] !== parent['進場次數'] + 1 || !isFinite(closeTime) || !isFinite(entryTime) || !isFinite(clearTime) ||
+          entryTime <= closeTime || clearTime <= closeTime || clearTime > entryTime ||
+          (row['策略'] === '當沖' && parent['交易日'] !== row['交易日']) ||
+          (row['到期時間'] && entryTime >= modelTime_(row['到期時間']))) throw new Error('二次進場缺少已確認前筆或新許可／解除證據');
+      const proof = row['成交證據識別'] || {};
+      if (proof['來源時間'] !== row['進場時間'] || !isFinite(proof['價格']) || proof['價格'] <= 0) throw new Error('二次進場成交證據不符');
+      if (row['選擇權腿']) {
+        row['選擇權腿'].forEach(function(leg) {
+          const premium = (proof['權利金證據'] || {})[leg['代碼']] || {};
+          const elapsed = entryTime - modelTime_(premium['來源時間']);
+          if (!isFinite(elapsed) || elapsed < 0 || elapsed > 2000 || !(premium['價格'] > 0) || !row['進場權利金'] || !(row['進場權利金'][leg['代碼']] > 0)) throw new Error('選擇權重新進場各腿證據不足');
+        });
+      }
+    }
+    indexed[id]['同步確認'] = true;
+  });
+}
+
 // doPost holds ScriptLock across read/merge/write, including the month catalog.
 function mergeModelTrades_(remote, incoming) {
   const merged = Object.create(null);
@@ -435,14 +574,38 @@ function mergeModelTrades_(remote, incoming) {
       ['建立時間', '指標快照', '成本設定', '訊號價', '市場環境', '觸發條件', '條件快照'].forEach(function(k) {
         if (first[k] !== undefined) row[k] = first[k];
       });
+      if (row['識別版本'] === 2) ['進場價','停損價','目標價'].forEach(function(k) {row[k] = first[k];});
+      ['最後進場等待原因','最後進場等待時間','訊號失效原因','訊號失效時間','未進場分類'].forEach(function(k) {
+        if (!row[k] && (item[k] || old[k])) row[k] = item[k] || old[k];
+      });
+      const causes = Array.from(new Set([].concat(old['資料缺口原因'] || [], item['資料缺口原因'] || [])));
+      if (causes.length) row['資料缺口原因'] = causes;
       const events = {};
       [].concat(old['事件'] || [], item['事件'] || []).forEach(function(e) {
-        if (e && e['事件ID']) events[e['事件ID']] = e;
+        if (!e || !e['事件ID']) return;
+        const previous = events[e['事件ID']];
+        if (!previous || String(e['結束時間'] || e['時間']) > String(previous['結束時間'] || previous['時間']) ||
+            (String(e['結束時間'] || e['時間']) === String(previous['結束時間'] || previous['時間']) && (e['次數'] || 1) >= (previous['次數'] || 1))) events[e['事件ID']] = e;
       });
       row['事件'] = Object.keys(events).map(function(k) {return events[k];}).sort(function(a,b) {
         return String(a['時間']).localeCompare(String(b['時間']));
       });
+      const archive = row['事件封存'] || {};
+      row['事件數'] = (archive['事件數'] || 0) - (archive['保留事件數'] || 0) + row['事件'].reduce(function(n,e) {return n + (e['次數'] || 1);}, 0);
+      if (row['識別版本'] === 2) {
+        row['同步確認'] = Boolean(old['同步確認'] || item['同步確認']);
+        ['重入解除','重入來源時間','重入最後序號','重入串流識別','重入等待原因'].forEach(function(k) {
+          const candidates = [old,item].filter(function(r) {return r[k] !== undefined;});
+          if (candidates.length) row[k] = candidates.sort(function(a,b) {return String(b['重入來源時間'] || '').localeCompare(String(a['重入來源時間'] || ''));})[0][k];
+        });
+      }
     }
+    if (!row['計畫來源']) {
+      const kind = row['計畫類型'] || '', keyText = String(row['商品鍵'] || '');
+      row['計畫來源'] = row['選擇權腿'] ? '選擇權操作計畫' : (['日線／15分K','短波5分K'].indexOf(kind) >= 0 || /\|(日線／15分K|短波5分K)$/.test(keyText)) ? '指數操作計畫' :
+        (['股票','期貨'].indexOf(row['市場']) >= 0 && !row['觸發商品']) ? '股期戰略室' : '未確認';
+    }
+    if (!row['計畫類型']) row['計畫類型'] = row['計畫來源'] === '股期戰略室' ? String(row['市場'] || '') + String(row['策略'] || '') : row['計畫來源'] === '指數操作計畫' ? String(row['商品鍵']).split('|').pop() : '未確認';
     merged[key] = row;
   });
   return Object.keys(merged).sort().map(function(k) {return merged[k];});
@@ -452,6 +615,7 @@ function mergeSignalPayload_(prior, incoming) {
   const result = Object.assign({}, prior, incoming, {model_schema: 1});
   result.model_months = Array.from(new Set([].concat(prior.model_months || [], incoming.model_months || []))).sort();
   result.model_versions = Object.assign({}, prior.model_versions || {});
+  result.model_active_months = Object.assign({}, prior.model_active_months || {}, incoming.model_active_months || {});
   Object.keys(incoming.model_versions || {}).forEach(function(k) {
     if (String(incoming.model_versions[k]) > String(result.model_versions[k] || '')) result.model_versions[k] = incoming.model_versions[k];
   });
@@ -473,7 +637,7 @@ function mergeSignalPayload_(prior, incoming) {
 
 function normalizeScope_(value) {
   const scope = String(value || '').trim();
-  return SCOPES.indexOf(scope) >= 0 || /^strategy_signals:\d{6}$/.test(scope) ? scope : '';
+  return SCOPES.indexOf(scope) >= 0 || /^strategy_(signals|events):\d{6}$/.test(scope) ? scope : '';
 }
 
 

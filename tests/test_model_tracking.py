@@ -337,7 +337,7 @@ console.log('Apps Script merge verified');
 def test_new_home_tab_lazy_ui_and_excel(tmp_path):
     from streamlit.testing.v1 import AppTest
     source = (ROOT/'app.py').read_text(encoding='utf-8')
-    functions = {'render_model_tracking_room','cached_model_performance','model_performance_state',
+    functions = {'render_model_tracking_room','cached_model_performance','model_performance_state', '_model_column_config',
                  '_model_market_version_key','_model_version_first_date','model_version_display_labels',
                  '_model_time_text','_model_display_value','_model_display_frame',
                   '_model_number_text','_model_history_overview','set_model_period_today'}
@@ -346,9 +346,9 @@ def test_new_home_tab_lazy_ui_and_excel(tmp_path):
     script = '''
 import streamlit as st
 import pandas as pd, numpy as np, json, pytz, threading, time
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from datetime import date,datetime,timedelta
-from model_tracking import ModelTracker,DEFAULT_COSTS,VERSION as MODEL_VERSION,performance,excel_report,normalize_costs
+from model_tracking import ModelTracker,DEFAULT_COSTS,VERSION as MODEL_VERSION,performance,plan_performance,excel_report,normalize_costs
 class ModelFixtureDatetime(datetime):
     @classmethod
     def now(cls, tz=None):
@@ -379,7 +379,11 @@ with outer:
         if outer.open and first.open:
             render_model_tracking_room()
 '''
-    tracker.process([signal()], {'股票|2330':quote(100)})
+    tracker.process([
+        signal(交易日='2026-10-12', 來源時間='2026-10-12T10:00:00+08:00'),
+        signal(交易日='2026-10-12', 來源時間='2026-10-12T10:00:00+08:00', 市場='期貨', 商品鍵='TMF|短波5分K', 代碼='TMF', 名稱='微台', 計畫來源='指數操作計畫', 計畫類型='短波5分K'),
+        signal(交易日='2026-10-12', 來源時間='2026-10-12T10:00:00+08:00', 市場='期貨', 商品鍵='TXOC@TMF', 代碼='TXOC', 名稱='單買BC', 計畫來源='選擇權操作計畫', 計畫類型='單買BC', 選擇權腿=[{'代碼':'TXOC','買賣':1}], 乘數=50, 到期時間='2026-10-28T13:30:00+08:00'),
+    ], {})
     app = AppTest.from_string(script, default_timeout=30).run()
     assert not app.exception and app.session_state['profit'] == '模型勝率追蹤'
     assert str(app.date_input(key='model_period').value[-1]) == '2026-10-12'
@@ -391,12 +395,18 @@ with outer:
     assert '2330｜台積電' in app.selectbox(key='model_code').options
     app.selectbox(key='model_plan_source').select('選擇權操作計畫').run()
     assert not app.exception
+    assert app.selectbox(key='model_code').options == ['全部商品', 'TXOC｜單買BC']
+    assert app.selectbox(key='model_market').options == ['全部', '選擇權']
     app.selectbox(key='model_market').select('選擇權').run()
     assert not app.exception
     assert not any('舊版手動紀錄' in e.label for e in app.expander)
     assert not any(e.key == 'show_legacy_model_records' for e in app.checkbox)
-    app.selectbox(key='model_code').select('2330｜台積電').run()
+    app.selectbox(key='model_code').select('TXOC｜單買BC').run()
     assert not app.exception
+    app.selectbox(key='model_plan_source').select('指數操作計畫').run()
+    assert not app.exception and app.selectbox(key='model_code').value == ''
+    assert app.selectbox(key='model_code').options == ['全部商品', 'TMF｜微台']
+    assert app.selectbox(key='model_market').value == '全部'
     tracker.close()
 
 
