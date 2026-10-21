@@ -127,7 +127,7 @@ def test_short_history_atr_keeps_first_and_previous_close(futures_calculations, 
     assert result['ATR'] == pytest.approx((4 + (count - 1) * 12) / count if count <= 14 else 12)
 
 
-def test_cpu_only_change_keeps_existing_model_version_but_future_rules_change_it():
+def test_cpu_alias_is_exact_and_later_rules_get_new_versions():
     ns = load_app_symbols('calculate_futures_strategy_levels', 'enrich_futures_strategy_rows',
                           'calculate_entry_confidence', 'model_tracking_samples')
     source = Path(__file__).parents[1] / 'app.py'
@@ -136,9 +136,14 @@ def test_cpu_only_change_keeps_existing_model_version_but_future_rules_change_it
     node.decorator_list = []
     ns.update(inspect=inspect, MODEL_VERSION=model.VERSION)
     exec(compile(ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[])), source, 'exec'), ns)
-    expected = model.VERSION + '-d8631cd521'
+    fingerprint = ns['data_version']([model.PROTECTION_POLICY, *[inspect.getsource(ns[name]) for name in (
+        'calculate_futures_strategy_levels', 'enrich_futures_strategy_rows',
+        'calculate_entry_confidence', 'model_tracking_samples')]])[:10]
+    expected = model.VERSION + '-' + ('d8631cd521' if fingerprint == '10833cdc0b' else fingerprint)
     assert ns['get_model_rules_version'](False) == expected
     def future_strategy(*args):
         return 'Different rules require a new version'
     ns['calculate_futures_strategy_levels'] = future_strategy
     assert ns['get_model_rules_version'](False) != expected
+    ns['data_version'] = lambda data: '10833cdc0b'
+    assert ns['get_model_rules_version'](False) == model.VERSION + '-d8631cd521'

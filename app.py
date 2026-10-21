@@ -21530,6 +21530,7 @@ def model_tracking_samples(rows, stock, mode, direction_choice, config, seconds,
         else:
             quote['有效'] = valid = False  # A warm-up snapshot is not ordered trade evidence.
         signal_valid = valid or (not ticks and age is not None and 0 <= age <= 30 and not bool(row.get('_data_stale', False)))
+        quote['暖機等待'] = not ticks and signal_valid
         quote['成交證據'] = ticks
         quotes[market + '|' + key] = quote
         if stock:
