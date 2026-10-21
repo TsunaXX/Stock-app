@@ -90,6 +90,32 @@ def trade_id(signal):
     return hashlib.sha256('|'.join(map(str, fields)).encode()).hexdigest()
 
 
+def plan_labels(row):
+    source = row.get('計畫來源')
+    kind = row.get('計畫類型')
+    if not source:
+        if row.get('選擇權腿'):
+            source = '選擇權操作計畫'
+        elif kind in ('日線／15分K', '短波5分K') or str(row.get('商品鍵', '')).endswith(('|日線／15分K', '|短波5分K')):
+            source = '指數操作計畫'
+        elif row.get('市場') in ('股票', '期貨') and not row.get('觸發商品'):
+            source = '股期戰略室'
+        else:
+            source = '未確認'
+    if not kind:
+        kind = (str(row.get('市場', '')) + str(row.get('策略', '')) if source == '股期戰略室'
+                else str(row.get('商品鍵', '')).rsplit('|', 1)[-1] if source == '指數操作計畫' else '未確認')
+    return {'計畫來源': source, '計畫類型': kind}
+
+
+def waiting(record, ts, category, reason):
+    changed = record.get('最後進場等待原因') != reason or record.get('未進場分類') != category
+    record.update({'來源時間': ts, '進場等待原因': reason, '最後進場等待原因': reason,
+                   '最後進場等待時間': ts, '未進場分類': category})
+    if changed:
+        event(record, record['狀態'], ts, reason)
+
+
 def merge_trades(remote, local):
     merged = {}
     for row in list(remote or []) + list(local or []):
@@ -122,6 +148,7 @@ def merge_trades(remote, local):
                     row[key] = first[key]
             events = {e['事件ID']: e for item in (old, incoming) for e in item.get('事件', []) if e.get('事件ID')}
             row['事件'] = sorted(events.values(), key=lambda e: e['時間'])
+        row.update(plan_labels(row))
         restore_profit_protection(row)
         merged[row['交易ID']] = row
     return list(merged.values())
@@ -131,6 +158,14 @@ def event(record, state, ts, reason=''):
     record['狀態'] = state
     record['來源時間'] = ts
     record['異常原因'] = reason
+    if state == '訊號失效':
+        record.update({'訊號失效原因': reason, '訊號失效時間': ts})
+        if record.get('模擬進場價') is None:
+            record['未進場分類'] = '超過有效時間' if '結束' in reason or '到期' in reason else '訊號失效'
+    if record.get('資料缺口') and reason and state in ('監控中斷', '資料不足'):
+        causes = record.setdefault('資料缺口原因', [])
+        if reason not in causes:
+            causes.append(reason)
     protection = {key: record[key] for key in ('保利價', '保利淨額', '保利最大浮盈', '初始風險') if key in record} if reason.startswith('保利') else {}
     evidence = '|'.join([record['交易ID'], state, ts, reason]) + (json.dumps(protection, sort_keys=True) if protection else '')
     eid = hashlib.sha256(evidence.encode()).hexdigest()
@@ -157,6 +192,7 @@ def new_trade(signal):
         raise ValueError('選擇權腿、乘數或到期時間無效')
     row = {**signal, '交易ID': trade_id(signal), '紀錄類型': '自動', '資料缺口': False,
            'MFE(R)': 0.0, 'MAE(R)': 0.0, '事件': []}
+    row.update(plan_labels(row))
     row['成本設定'] = normalize_costs(row.get('成本設定'))
     if row.get('保利規則') == PROTECTION_POLICY:
         row['保利狀態'] = '待進場'
@@ -338,6 +374,8 @@ def advance(record, quote):
         row['串流識別'] = stream
     seq = quote.get('序號')
     old_seq = row.get('串流序號', {}).get(stream) if stream else row.get('最後序號')
+    if stream == old_stream and seq is not None and old_seq is not None and seq <= old_seq and quote.get('有效'):
+        return row  # Replayed same-time ticks must never rewind the evidence cursor.
     if seq is not None and old_seq is not None and seq > old_seq + 1:
         row['資料缺口'] = True
         event(row, '監控中斷', text, '成交證據佇列缺漏，不能確認停利停損先後')
@@ -378,20 +416,19 @@ def advance(record, quote):
             event(row, '訊號失效', text, '未進場前已越過停損或交易日已結束')
             return row
         if sign * (price - entry) < 0:
-            row['來源時間'] = text
+            waiting(row, text, '未觸價', '尚未觸及原進場價')
             return row
         if (not quote.get('進場許可', True) or
                 (quote.get('許可方向') and quote['許可方向'] != row['方向']) or
                 (quote.get('進場許可時間') and ts < stamp(quote['進場許可時間']))):
-            row['來源時間'] = text
+            waiting(row, text, '策略未放行', '原策略尚未發布有效同向進場許可')
             return row
         if row.get('進場品質檢查') and (
             quote.get('進場品質許可') is False or
             (quote.get('進場品質時間') and ts < stamp(quote['進場品質時間'])) or
             (quote.get('進場品質方向') and quote['進場品質方向'] != row['方向'])
         ):
-            row['來源時間'] = text
-            row['進場等待原因'] = '目前條件未放行同向進場，保留原點位追蹤'
+            waiting(row, text, '策略未放行', '目前條件未放行同向進場，保留原點位追蹤')
             return row
         fill = price + sign * slip
         if sign * (target - fill) <= 0:
@@ -400,10 +437,8 @@ def advance(record, quote):
         quality_reason = entry_quality_reason(row, price)
         if quality_reason:
             # Keep the original levels and wait; do not relabel an old loss or move the target.
-            row['來源時間'] = text
-            row['進場等待原因'] = quality_reason
+            waiting(row, text, '品質檢查不符', quality_reason)
             return row
-        row.pop('進場等待原因', None)
         if option_legs:
             fills = option_fills(row, quote, True)
             if fills is None:
@@ -645,10 +680,11 @@ class ModelTracker:
             for key in keys:
                 prefix = f'{key}|{market}|{mode}|'
                 raw = db.execute("""SELECT body FROM trades WHERE slot>=? AND slot<?
-                    AND json_extract(body, '$.保利規則')=? AND json_extract(body, '$.計畫來源') IS ?
+                    AND json_extract(body, '$.保利規則')=?
+                    AND (json_extract(body, '$.計畫來源')=? OR (?='股期戰略室' AND json_extract(body, '$.計畫來源') IS NULL))
                     AND ((?='波段' AND state IN ('等待進場','模擬持倉','監控中斷','資料不足')) OR json_extract(body, '$.交易日')=?)
                     ORDER BY (state IN ('模擬持倉','監控中斷','資料不足') AND json_extract(body, '$.模擬進場價') IS NOT NULL) DESC,
-                    rowid DESC LIMIT 1""", (prefix, prefix + '\uffff', PROTECTION_POLICY, source, mode, day)).fetchone()
+                    rowid DESC LIMIT 1""", (prefix, prefix + '\uffff', PROTECTION_POLICY, source or '股期戰略室', source or '股期戰略室', mode, day)).fetchone()
                 if raw:
                     result[str(key)] = json.loads(raw[0])
         return result

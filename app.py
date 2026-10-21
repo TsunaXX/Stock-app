@@ -21578,6 +21578,7 @@ def model_tracking_samples(rows, stock, mode, direction_choice, config, seconds,
         if not (stop < entry < target if long else target < entry < stop):
             continue
         signals.append({'交易日': day.isoformat(), '市場':market, '商品鍵':key, '代碼':key,
+                        '計畫來源': '股期戰略室', '計畫類型': ('股票' if stock else '期貨') + mode,
                         '名稱':str(row.get('名稱', key)), '交易時段':str(row.get('交易時段','日盤+夜盤')), '策略':mode, '策略版本':config.get('rules_version', MODEL_VERSION),
                         '方向':direction, '訊號價':price, '來源時間':quote['來源時間'] if valid else source.isoformat(),
                         '進場價':entry, '停損價':stop, '目標價':target, '觸發條件':rule,
