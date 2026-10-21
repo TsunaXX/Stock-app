@@ -85,7 +85,7 @@ def test_armed_floor_survives_cloud_event_union_and_restart_without_retroactive_
     if shutil.which('node'):
         program = Path('google_apps_script.gs').read_text(encoding='utf-8')
         program += '\nconsole.log(JSON.stringify(mergeModelTrades_(' + json.dumps([raised], ensure_ascii=False) + ',' + json.dumps([stale_device], ensure_ascii=False) + ')));'
-        result = subprocess.run(['node', '-e', program], capture_output=True, text=True, encoding='utf-8')
+        result = subprocess.run(['node'], input=program, capture_output=True, text=True, encoding='utf-8')
         assert result.returncode == 0, result.stderr
         # The deployed generic event union needs no new Apps Script schema.
         merged = merge_trades([], json.loads(result.stdout))[0]
