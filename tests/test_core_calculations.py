@@ -3516,6 +3516,8 @@ def test_manual_intraday_button_updates_table_without_full_page_rerun(tmp_path):
             native_intervals.append(message.auto_rerun.interval)
         return original_enqueue(ctx, message)
     source = APP_PATH.read_text(encoding='utf-8')
+    source = source.replace('STOCK_STRATEGY_CACHE_FILE = "stock_strategy_cache.json"',
+                            'STOCK_STRATEGY_CACHE_FILE = ' + repr(str(tmp_path / 'auto-stock-cache.json')))
     # Inject only market inputs; exercise the real fragment, button and editor.
     setup = """
 st.session_state.stock_data = pd.DataFrame([{

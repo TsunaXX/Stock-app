@@ -16670,14 +16670,14 @@ def update_futures_live_rows(rows, api, strategy_mode, direction_choice, include
             if prior_stop is not None and price is not None and same_session:
                 stopped = price <= prior_stop if row.get('_last_intraday_direction') == '偏多' else price >= prior_stop
                 if stopped:
-                    analysis['進出場點位'] = f'⛔ 停損 {fmt_price(prior_stop)}｜' + analysis['進出場點位']
+                    analysis['進出場點位'] = f'⛔ 失效 {fmt_price(prior_stop)}｜' + analysis['進出場點位']
             levels = parse_trade_plan_numbers(analysis.get('進出場點位'))
             if price is not None and levels['entry'] is not None and levels['stop'] is not None and (
                 (analysis.get('方向') == '偏多' and price >= levels['entry'])
                 or (analysis.get('方向') == '偏空' and price <= levels['entry'])
             ):
                 if snapshot is not None and fresh_strategy_stream_quote(snapshot):
-                    analysis['進出場點位'] = '已進場｜' + analysis['進出場點位']
+                    analysis['進出場點位'] = '觸價｜' + analysis['進出場點位']
                 analysis.update({'_last_intraday_stop': levels['stop'], '_last_intraday_direction': analysis['方向'],
                                  '_last_intraday_session': analysis.get('_daytrade_guard_session')})
         if include_analysis and live_vwap is not None and live_vwap > 0 and strategy_mode == '當沖':
@@ -19988,7 +19988,7 @@ def build_guarded_stock_trade_plan(row, direction, is_daytrade, result):
         stop = prior['stop']
         stopped = price <= stop if prior['direction'] == '多頭' else price >= stop
         if stopped:
-            plan = {**plan, 'summary': f'⛔ 停損 {fmt_price(stop)}｜' + plan['summary']}
+            plan = {**plan, 'summary': f'⛔ 失效 {fmt_price(stop)}｜' + plan['summary']}
     if plan.get('valid'):
         levels = parse_trade_plan_numbers(plan['summary'])
         entry = levels.get('entry')
@@ -19999,18 +19999,18 @@ def build_guarded_stock_trade_plan(row, direction, is_daytrade, result):
             plans[code] = {'session': session, 'direction': direction, 'stop': levels['stop'],
                            'summary': plan['summary'], 'target': levels.get('target'), 'triggered': triggered}
             if triggered and not bool(row.get('_data_stale', False)):
-                plan['summary'] = '已進場｜' + plan['summary']
+                plan['summary'] = '觸價｜' + plan['summary']
     elif isinstance(row.get('_daytrade_guard_reason'), str) and row.get('_daytrade_guard_reason') and not plan['summary'].startswith('⛔'):
         plan['summary'] = '等待｜' + row['_daytrade_guard_reason']
     if (not plan.get('valid') and prior.get('session') == session and prior.get('summary')):
-        status = '已進場·追蹤' if prior.get('triggered') else '待進·追蹤'
+        status = '觸價·追蹤' if prior.get('triggered') else '待進·追蹤'
         if bool(row.get('_data_stale', False)):
             status = '行情待確認'
         elif price is not None:
             if price <= prior['stop'] if prior['direction'] == '多頭' else price >= prior['stop']:
-                status = '停損' if prior.get('triggered') else '失效'
+                status = '失效'
             elif prior.get('target') is not None and (price >= prior['target'] if prior['direction'] == '多頭' else price <= prior['target']):
-                status = '達標'
+                status = '目標觸價'
         plan = {**plan, 'summary': status + '｜' + prior['summary'], 'tracking_only': True}
     return plan
 
@@ -21499,7 +21499,7 @@ def model_tracking_samples(rows, stock, mode, direction_choice, config, seconds,
         valid = age is not None and 0 <= age <= 30 and not bool(row.get('_data_stale', False))
         price = _safe_number(row.get('收盤價'))
         day = now.date() if stock else get_futures_trading_date(now).date()
-        quote = {'價格': price, '交易日': day.isoformat(), '更新秒數': seconds,
+        quote = {'價格': price, '交易日': day.isoformat(), '策略': mode, '更新秒數': seconds,
                  '有效': valid, '休市': not model_market_open({'市場':market,'交易時段':row.get('交易時段','日盤+夜盤')}),
                  '休市銜接': mode == '波段', '來源時間': source.isoformat() if valid else now.isoformat(),
                  '收盤確認': valid and ((stock and source.time() >= dt_time(13, 30)) or
@@ -21530,6 +21530,7 @@ def model_tracking_samples(rows, stock, mode, direction_choice, config, seconds,
         else:
             quote['有效'] = valid = False  # A warm-up snapshot is not ordered trade evidence.
         signal_valid = valid or (not ticks and age is not None and 0 <= age <= 30 and not bool(row.get('_data_stale', False)))
+        quote['暖機等待'] = not ticks and signal_valid
         quote['成交證據'] = ticks
         quotes[market + '|' + key] = quote
         if stock:
@@ -21965,6 +21966,7 @@ def render_trading_cost_settings():
 
 def render_model_tracking_room():
     st.caption('依股期進出場預判、指數操作計畫與選擇權操作計畫自動記錄；不讀取帳戶交易。只有成交證據完整的已平倉模擬交易會計入勝率。')
+    st.caption('觸價僅代表報價到達預判價；已進場／停損以模型成交證據為準。未通過進場檢查的訊號仍列為等待或失效，原因見「進場等待原因」。')
     with st.expander('📘 模型勝率追蹤使用說明', expanded=False):
         st.markdown(
             '開啟股期戰略室或指數／選擇權操作計畫並登入 Shioaji 後，系統會依畫面原有串流自動記錄，不需另外啟動追蹤。\n\n'
@@ -22932,7 +22934,7 @@ def render_futures_strategy_room():
                 '未平倉量': st.column_config.NumberColumn(format='%d', width=content_width('未平倉量', 56, 100), disabled=True),
                 '方向': st.column_config.TextColumn(width=content_width('方向', 48, 86), disabled=True),
                 '支撐壓力': st.column_config.TextColumn(width=content_width('支撐壓力', 80), disabled=True),
-                '進出場點位': st.column_config.TextColumn(width=content_width('進出場點位', 96, 720, True), disabled=True, help='進＝條件成立後觀察價；停＝失效點；目＝第一目標。已進場＝預判觸發，非實際成交。保＝達1R後移動保利，最低保護成本。'),
+                '進出場點位': st.column_config.TextColumn(width=content_width('進出場點位', 96, 720, True), disabled=True, help='進＝條件成立後觀察價；停＝失效點；目＝第一目標。觸價＝報價達預判點位；已進場／停損＝模型成交證據確認，非券商成交。保＝達1R後移動保利，最低保護成本。'),
                 '觸發條件': st.column_config.TextColumn(width=content_width('觸發條件', 72), disabled=True, help='條件成立後才評估進場；未成立時不以預判價直接下單。'),
                 '當日漲停價': st.column_config.NumberColumn(format='%.12g', width=content_width('當日漲停價', 54, 96), disabled=True, help='依期交所漲跌資料反推參考價後估算；實際限制以期交所與券商下單畫面為準。'),
                 '當日跌停價': st.column_config.NumberColumn(format='%.12g', width=content_width('當日跌停價', 54, 96), disabled=True, help='依期交所漲跌資料反推參考價後估算；實際限制以期交所與券商下單畫面為準。'),
@@ -23445,8 +23447,7 @@ def supplement_frozen_stock_rankings(current, state):
     # An explicit after-close analysis may already have frozen today's complete data.
     if saved_targets == {current.date().isoformat()} and current.time() >= dt_time(13, 30):
         target = current.date()
-    if saved_targets and saved_targets != {target.isoformat()} and not migrating:
-        return  # Only the formula migration may rebuild a stale daytrade date.
+    rebuilding = migrating or daytrade.get('target_date') != target.isoformat()
     scope = postclose_scope(rows, 'stock')
     signature = (target.isoformat(), tuple(scope), data_version(snapshots))
     job = state.get('supplement')
@@ -23494,7 +23495,7 @@ def supplement_frozen_stock_rankings(current, state):
         if mode == 'swing' and snapshot.get('target_date') not in (None, target.isoformat()):
             continue  # A retained swing snapshot has its own date/freeze rule.
         codes = {entry['code'] for entry in snapshot.get('entries', [])}
-        if mode == 'daytrade' and snapshot.get('weights') != strategy_ranking_weights('stock', '當沖'):
+        if mode == 'daytrade' and rebuilding:
             codes = set()
         if set(scope) - codes:
             missing.update(set(scope) - codes)
@@ -24761,13 +24762,13 @@ if tab1.open and stock_strategy_tab.open:
                             "開盤區間": st.column_config.TextColumn(width=stock_content_width('開盤區間', 80, 150), disabled=True, help="09:00–09:15 顯示形成中的即時低點－高點；09:15 後固定為完整開盤區間。"),
                             "量能": st.column_config.TextColumn(width=stock_content_width('量能', 52, 96), disabled=True, help="目前累積量相對最近交易日同時段平均量。"),
                             "盤中觸發": st.column_config.TextColumn(width=stock_content_width('盤中觸發', 72), disabled=True, help="僅在盤中條件同時成立時提供觀察提示，不是自動買賣指令。"),
-                            "進出場預判": st.column_config.TextColumn(width=stock_content_width('進出場預判', 86, 720, True), disabled=True, help="通過條件後，以開盤區間與 VWAP 推估進場、策略失效離場與第一目標；僅供觀察與回測；已進場＝預判觸發，非實際成交。保＝達1R後移動保利，最低保護成本。"),
+                            "進出場預判": st.column_config.TextColumn(width=stock_content_width('進出場預判', 86, 720, True), disabled=True, help="通過條件後，以開盤區間與 VWAP 推估進場、策略失效離場與第一目標；僅供觀察與回測；觸價＝報價達預判點位；已進場／停損＝模型成交證據確認，非券商成交。保＝達1R後移動保利，最低保護成本。"),
                         })
                     else:
                         risk_column_config.update({
                             "乖離": st.column_config.TextColumn(width=stock_content_width('乖離', 52, 96), disabled=True, help="收盤價相對 20 日線的 ATR 距離；數值越大越不宜追價或追空。"),
                             "隔日規則": st.column_config.TextColumn(width=stock_content_width('隔日規則', 72), disabled=True, help="僅在隔日條件成真時才列入評估，不是自動買賣指令。"),
-                            "進出場預判": st.column_config.TextColumn(width=stock_content_width('進出場預判', 86, 720, True), disabled=True, help="通過條件後，以昨高／昨低與 ATR 推估進場、策略失效離場與第一目標；僅供觀察與回測；已進場＝預判觸發，非實際成交。保＝達1R後移動保利，最低保護成本。"),
+                            "進出場預判": st.column_config.TextColumn(width=stock_content_width('進出場預判', 86, 720, True), disabled=True, help="通過條件後，以昨高／昨低與 ATR 推估進場、策略失效離場與第一目標；僅供觀察與回測；觸價＝報價達預判點位；已進場／停損＝模型成交證據確認，非券商成交。保＝達1R後移動保利，最低保護成本。"),
                         })
 
                 stock_table_signature = abs(hash((

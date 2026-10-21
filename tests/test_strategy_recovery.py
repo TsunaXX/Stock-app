@@ -112,13 +112,33 @@ def test_displayed_3624_prediction_is_recorded_without_confidence_or_account_tra
 def test_prediction_without_ticks_is_listed_but_not_counted_as_a_win(tmp_path):
     ns = real_stock_adapter()
     rows, config = stock_rows_with_evidence(ns, 1)
-    ns['_stream_state'](None)['model_tick_buffers'].clear()
+    state = ns['_stream_state'](None)
+    state['model_tick_buffers'].clear()
+    rows['進出場預判'] = '進 100.5｜停 95｜目 110'
+    rows['_系統方向'] = '多頭'
+    now = datetime.now(pytz.timezone('Asia/Taipei'))
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now.astimezone(tz) if tz else now.replace(tzinfo=None)
+    ns['datetime'] = Clock
     signals, quotes = ns['model_tracking_samples'](rows, True, '當沖', '多', config, 5, object())
     assert len(signals) == 1 and not quotes['股票|2330']['有效']
     tracker = ModelTracker(tmp_path/'waiting.sqlite', start=False)
     tracker.process(signals, quotes)
     assert tracker.records()[0]['狀態'] == '資料不足'
+    assert not tracker.records()[0]['資料缺口']
     assert performance(tracker.records())[0]['有效交易數'] == 0
+    state['model_tick_buffers']['2330'] = deque(maxlen=4096)
+    for i, price in enumerate((100.5, 110.5)):
+        now += timedelta(seconds=1)
+        rows.loc[0, ['收盤價', '_quote_time']] = [price, now.isoformat()]
+        state['model_tick_buffers']['2330'].append({
+            '來源時間': now.isoformat(), '價格': price, '序號': i + 1, '串流識別': 'test:0', '有效': True})
+        signals, quotes = ns['model_tracking_samples'](rows, True, '當沖', '多', config, 5, object())
+        tracker.process(signals, quotes)
+    assert len(tracker.records()) == 1 and tracker.records()[0]['狀態'] == '已平倉'
+    assert performance(tracker.records())[0]['有效交易數'] == 1
 
 
 def test_model_only_background_follows_published_plan_without_market_polling():
