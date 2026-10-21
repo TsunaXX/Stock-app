@@ -158,15 +158,15 @@ def test_futures_quote_refresh_preserves_strategy_or_checks_each_rows_prior_stop
     assert count == 2 and list(updated['收盤價']) == [100.5, 100.5]
     assert list(updated['當日漲停價']) == [110., 110.]  # Contract bounds override quote-derived 110.55.
     if include_analysis:
-        assert '⛔ 停損' in updated.iloc[0]['進出場點位']
-        assert '⛔ 停損' not in updated.iloc[1]['進出場點位']
+        assert '⛔ 失效' in updated.iloc[0]['進出場點位']
+        assert '⛔ 失效' not in updated.iloc[1]['進出場點位']
         ns['calculate_futures_strategy_levels'] = lambda *args: {
             '方向': '偏多', '進出場點位': '進 100｜停 99｜目 103',
             '_daytrade_guard_session': 'night',
         }
         ns['fresh_strategy_stream_quote'] = lambda snapshot: True
         entered, _ = ns['update_futures_live_rows'](rows, object(), '當沖', '自動', True)
-        assert entered.iloc[1]['進出場點位'] == '已進場｜進 100｜停 99｜目 103'
+        assert entered.iloc[1]['進出場點位'] == '觸價｜進 100｜停 99｜目 103'
         ns['fresh_strategy_stream_quote'] = lambda snapshot: False
         stale, _ = ns['update_futures_live_rows'](rows, object(), '當沖', '自動', True)
         assert '已進場' not in stale.iloc[1]['進出場點位']
@@ -249,9 +249,9 @@ def test_stock_guard_keeps_direction_and_stop_notice_even_while_waiting():
     ns['st'].session_state['_stock_last_intraday_plans'] = {
         '2330': {'session': '2026/10/05', 'stop': 99.5, 'direction': '多頭'}}
     result = ns['build_guarded_stock_trade_plan'](row, '多頭', True, {'eligible': False})
-    assert '⛔ 停損' in result['summary']
+    assert '⛔ 失效' in result['summary']
     row['_daytrade_data_time'] = '2026/10/06 10:00:00'
-    assert '⛔ 停損' not in ns['build_guarded_stock_trade_plan'](row, '多頭', True, {})['summary']
+    assert '⛔ 失效' not in ns['build_guarded_stock_trade_plan'](row, '多頭', True, {})['summary']
 
 
 def test_option_timer_tracks_at_most_three_candidates_and_two_legs_without_queries():

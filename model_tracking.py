@@ -575,6 +575,7 @@ class ModelTracker:
         self.leases = {}
         self.primary_streams = {}
         self.source_quotes = {}
+        self.entry_permissions = {}
         self.last_sync = 0
         self.month_versions = {}
         self.sync_positions = {}
@@ -707,6 +708,8 @@ class ModelTracker:
                 quote = quotes.get(row['市場'] + '|' + row['商品鍵'])
                 if quote is None or (quote.get('休市') and not quote.get('收盤確認')) or row['狀態'] not in ACTIVE:
                     continue
+                if quote.get('策略') and quote['策略'] != row['策略'] and row.get('模擬進場價') is None:
+                    continue
                 if (quote.get('暖機等待') and row.get('最後序號') is None and row.get('模擬進場價') is None
                         and (not row.get('到期時間') or stamp(quote['來源時間']) < stamp(row['到期時間']))):
                     if row['狀態'] != '資料不足':
@@ -723,15 +726,35 @@ class ModelTracker:
                 if not quote['銜接確認']:
                     prior_stamp = stamp(prior_time)
                     quote['銜接確認'] = any(t.get('價格') == prior_price and stamp(t.get('來源時間')) == prior_stamp for t in evidence)
+                permission = self.entry_permissions.get((row['市場'] + '|' + row['商品鍵'], row['策略']), {})
+                permission_time = stamp(permission.get('進場品質時間'))
+                current_time = stamp(quote.get('進場品質時間'))
+                continuous = (permission.get('有效') and permission.get('交易日') == quote.get('交易日')
+                              and permission.get('串流識別') == quote.get('串流識別')
+                              and permission_time is not None and current_time is not None
+                              and 0 <= (current_time - permission_time).total_seconds() <= max(30, float(quote.get('更新秒數', 5)) * 3))
                 for tick in evidence:
                     if str(tick.get('來源時間', '')) < str(updated['來源時間']):
                         continue
-                    updated = advance(updated, {**quote, **tick})
+                    sample = {**quote, **tick}
+                    # A new decision applies from its publication time, never to earlier observed fills.
+                    tick_time = stamp(tick.get('來源時間')) if continuous and updated.get('模擬進場價') is None else None
+                    if tick_time is not None and permission_time <= tick_time < current_time:
+                        sample.update({field: permission[field] for field in ('進場品質許可', '進場品質方向', '進場品質時間')})
+                    updated = advance(updated, sample)
                 if not evidence or not quote.get('有效'):
                     updated = advance(updated, quote)
                 if updated != row:
                     self.store(db, updated)
                     self.revision += 1
+        for key, quote in quotes.items():
+            if quote.get('策略') and quote.get('進場品質時間'):
+                identity = (key, quote['策略'])
+                previous_time = stamp(self.entry_permissions.get(identity, {}).get('進場品質時間'))
+                current_time = stamp(quote['進場品質時間'])
+                if current_time is not None and (previous_time is None or current_time >= previous_time):
+                    self.entry_permissions[identity] = {
+                        field: quote.get(field) for field in ('進場品質許可', '進場品質方向', '進場品質時間', '有效', '交易日', '串流識別')}
 
     def mark_gaps(self):
         now = time.monotonic()

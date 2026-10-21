@@ -112,11 +112,14 @@ def test_postclose_stock_fetch_requests_exact_historical_date_and_rejects_wrong_
         ns['fetch_postclose_stock_row']('2330', '台積電', '20261005')
 
 
-def test_legacy_formula_with_stale_date_migrates_daytrade_only_and_keeps_swing_frozen():
+@pytest.mark.parametrize('current_formula', [False, True])
+def test_stale_date_rebuilds_daytrade_only_and_keeps_swing_frozen(current_formula):
     ns = load_app_symbols('supplement_frozen_stock_rankings', 'postclose_scope', 'strategy_ranking_weights')
     now = pd.Timestamp('2026-10-06 10:00')
     old = {mode: {'target_date': '2026-10-02', 'entries': [{'code': '1815', 'score': 80}]}
            for mode in ('daytrade', 'swing')}
+    if current_formula:
+        old['daytrade']['weights'] = ns['strategy_ranking_weights']('stock', '當沖')
     rows = pd.DataFrame([{'代號': '1815'}, {'代號': '2330'}])
     state = State(stock_strategy_ranking_snapshots=old, _postclose_visible_stock=rows,
                   stock_data=rows, ignored_stocks=[], all_candidates=[], saved_notes={})
@@ -161,3 +164,52 @@ def test_cloud_supplements_merge_same_day_additions_without_rolling_back_scores(
     old['updated_at'] = '2026-10-06T12:00:00+08:00'
     assert ns['_newer_timestamped_state'](old, new)['entries'] == new['entries']
     assert ns['_newer_timestamped_state'](new, old)['entries'] == new['entries']
+
+
+@pytest.mark.parametrize('ready', [False, True])
+def test_six_visible_stocks_rebuild_stale_three_stock_snapshot_from_one_closed_date(ready):
+    ns = load_app_symbols('supplement_frozen_stock_rankings', 'postclose_scope', 'strategy_ranking_weights',
+                          'build_postclose_job', 'run_postclose_job', '_ranking_market_date', '_ranking_number',
+                          '_as_float', 'postclose_risk_version')
+    from market_automation import data_version
+    ns['data_version'] = data_version
+    now = pd.Timestamp('2026-10-21T10:00:00+08:00')
+    codes = ['5498', '1815', '4939', '8039', '6207', '6834']
+    old = {'target_date': '2026-10-16', 'weights': ns['strategy_ranking_weights']('stock', '當沖'),
+           'entries': [{'code': code, 'score': 50} for code in ['1815', '4939', '6834']]}
+    rows = pd.DataFrame([{'代號': code, '_strategy_close': 100, '_strategy_change_rate': 0,
+                         '_ma5': 99, '_strategy_data_as_of': '2026/10/20', '收盤價': 999,
+                         '_daytrade_vwap': 998} for code in codes])
+    state = State(stock_strategy_ranking_snapshots={'daytrade': old}, _postclose_visible_stock=rows,
+                  stock_data=rows, ignored_stocks=[], all_candidates=[], saved_notes={},
+                  risk_filter_market_data={'updated': '2026/10/20', 'errors': []})
+    ns.update(st=SimpleNamespace(session_state=state, rerun=lambda: None),
+              is_market_closed_func=lambda _: False, _post_close_target_date=lambda *a: (now, date(2026, 10, 20)),
+              save_data_cache=lambda *a, **kw: None, get_app_secret=lambda _: '')
+    fetched, scored = [], []
+    def context(day, **kwargs):
+        fetched.append((day, kwargs['strategy_mode']))
+        if not ready:
+            raise ConnectionError('official source unavailable')
+        return {'source_dates': {'上櫃法人': day}}
+    def score(data, *a, **kw):
+        scored.append(set(data['代號']))
+        assert set(data['收盤價']) == {100} and '_daytrade_vwap' not in data
+        return [{'code': code, 'score': 90} for code in data['代號']]
+    ns.update(fetch_post_close_stock_ranking_context=context, ranking_context_issues=lambda *a: [],
+              build_strategy_ranking_entries=score)
+    def submit(fn, *args):
+        result = fn(*args)
+        return SimpleNamespace(done=lambda: True, result=lambda: result)
+    ns['get_postclose_worker'] = lambda: {'slot': threading.BoundedSemaphore(1), 'executor': SimpleNamespace(submit=submit)}
+    maintenance = {}
+    ns['supplement_frozen_stock_rankings'](now, maintenance)
+    ns['supplement_frozen_stock_rankings'](now, maintenance)
+    assert fetched == [('20261020', '當沖')]
+    snapshot = state['stock_strategy_ranking_snapshots']['daytrade']
+    if ready:
+        assert scored == [set(codes)]
+        assert {item['code'] for item in snapshot['entries']} == set(codes)
+        assert snapshot['target_date'] == '2026-10-20' and len(snapshot['entries']) == 6
+    else:
+        assert not scored and snapshot is old and state['_stock_daytrade_ranking_waiting']
