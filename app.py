@@ -3257,21 +3257,66 @@ def selected_company_calendar_snapshot(snapshot):
         ]} for section in ('earnings', 'taiwan_revenue', 'us_revenue', 'financials', 'disclosures', 'dividends')
     }}
 
-    reported = {(company_calendar_key(e), str(e.get('revenue', {}).get('revenue_month', '')))
-                for e in filtered['taiwan_revenue']['events'] if isinstance(e.get('revenue'), dict)}
-    def duplicate_revenue_report(event):
-        title = str(event.get('title', ''))
-        if re.search(r'更正|修正|延後|延期|變更|誤植|子公司|代.*公告', title):
-            return False
-        match = re.search(r'(?<!\d)(\d{3,4})年\s*(\d{1,2})月(?:份)?(?:合併)?營收報告', title)
-        if not match:
-            return False
-        year, month = map(int, match.groups())
-        year = year - 1911 if year >= 1911 else year
-        return (company_calendar_key(event), f'{year:03d}{month:02d}') in reported
-    filtered['disclosures']['events'] = [e for e in filtered['disclosures']['events']
-                                        if not duplicate_revenue_report(e)]
+    filtered['disclosures']['events'] = []
+    filtered['dividends']['events'] = []
     return filtered
+
+
+def company_display_snapshot(snapshot):
+    """Keep stored history, but display only the current ordered tracking list."""
+    if 'tickers' not in snapshot:
+        return snapshot
+    order, inputs, labels = {}, [], []
+    for item in str(snapshot.get('tickers', '')).split(','):
+        if item.strip():
+            inputs.append(item.strip().upper())
+            resolved = resolve_earnings_ticker(item)
+            labels.append(resolved['display_name'].upper())
+            for candidate in resolved['candidates']:
+                key = str(candidate).upper().removesuffix('.TW').removesuffix('.TWO')
+                order.setdefault(key, len(order))
+    displayed = dict(snapshot)
+    for section in ('earnings', 'taiwan_revenue', 'us_revenue', 'financials', 'disclosures', 'dividends'):
+        original = snapshot.get(section, {})
+        displayed[section] = {**original, 'events': sorted(
+            (event for event in original.get('events', []) if company_calendar_key(event) in order),
+            key=lambda event: order[company_calendar_key(event)])}
+        for field in ('resolved', 'missing'):
+            if field in original:
+                displayed[section][field] = [value for value in original[field]
+                                            if str(value).split('→', 1)[0].strip().upper() in inputs
+                                            or any(str(value).upper().startswith(label + '（') for label in labels)]
+    displayed['events'] = [e for section in ('earnings', 'taiwan_revenue', 'us_revenue', 'financials', 'disclosures', 'dividends')
+                           for e in displayed[section]['events']]
+    return displayed
+
+
+def save_company_tracking_input():
+    snapshot = {**st.session_state.company_event_snapshot,
+                'tickers': st.session_state.company_data_tickers,
+                'updated_at': datetime.now(pytz.timezone('Asia/Taipei')).isoformat()}
+    visible = {company_calendar_key(e) for e in company_display_snapshot(snapshot)['events']}
+    snapshot['calendar_companies'] = [key for key in snapshot.get('calendar_companies', []) if key in visible]
+    st.session_state.company_event_snapshot = snapshot
+    st.session_state.pop('company_calendar_selection', None)
+    if not save_company_event_snapshot(snapshot):
+        st.session_state['_company_auto_pending_save'] = snapshot
+        st.session_state['_company_sync_notice'] = '公司清單已保留本機；雲端保存待重試。'
+    else:
+        st.session_state.pop('_company_auto_pending_save', None)
+
+
+def move_company_tracking_input(offset):
+    items = list(dict.fromkeys(item.strip() for item in st.session_state.company_data_tickers.split(',') if item.strip()))
+    selected = st.session_state.get('company_order_item')
+    if selected not in items:
+        return
+    index = items.index(selected)
+    destination = index + offset
+    if 0 <= destination < len(items):
+        items[index], items[destination] = items[destination], items[index]
+        st.session_state.company_data_tickers = ', '.join(items)
+        save_company_tracking_input()
 
 
 def parse_calendar_event_date(value):
@@ -3629,9 +3674,12 @@ def sync_company_background_snapshot(url, snapshot):
         if error:
             return False
         current = normalize_company_event_snapshot(remote) if isinstance(remote, dict) else snapshot
-        if current.get('tickers') != snapshot.get('tickers'):
-            return False
         current_stamp, snapshot_stamp = _cache_payload_timestamp(current), _cache_payload_timestamp(snapshot)
+        if current.get('tickers') != snapshot.get('tickers'):
+            if snapshot_stamp is None or (current_stamp is not None and current_stamp >= snapshot_stamp):
+                return False
+            current = {**current, 'tickers': snapshot.get('tickers', ''),
+                       'calendar_companies': snapshot.get('calendar_companies', [])}
         merged = merge_company_sections(current, {k: snapshot[k] for k in (
             'earnings', 'taiwan_revenue', 'us_revenue', 'financials', 'disclosures', 'dividends')},
             prefer_existing=current_stamp is not None and (snapshot_stamp is None or current_stamp > snapshot_stamp))
@@ -27634,7 +27682,7 @@ with tab3:
 
     company_snapshot = normalize_company_event_snapshot(st.session_state.company_event_snapshot)
     st.session_state.company_event_snapshot = company_snapshot
-    company_snapshot = selected_company_calendar_snapshot(company_snapshot)
+    company_snapshot = selected_company_calendar_snapshot(company_display_snapshot(company_snapshot))
     earnings_events = list(company_snapshot.get("earnings", {}).get("events", []))
     legacy_market_by_name = {}
     for resolved_text in company_snapshot.get("earnings", {}).get("resolved", []):
@@ -27667,8 +27715,7 @@ with tab3:
         taiwan_revenue_events = list(company_snapshot.get("taiwan_revenue", {}).get("events", []))
         network_events.extend(taiwan_earnings_events)
         network_events.extend(taiwan_revenue_events)
-        network_events.extend(e for section in ('disclosures', 'dividends')
-                              for e in company_snapshot.get(section, {}).get('events', []))
+        network_events.extend(e for e in company_snapshot.get('financials', {}).get('events', []) if e.get('date'))
         visible_company_events = [
             event for event in taiwan_earnings_events + taiwan_revenue_events
             if str(event.get('date', '')).startswith(f'{sel_year}-{sel_month:02d}-')
@@ -28033,9 +28080,9 @@ with tab_company:
 
     company_ticker_input = st.text_input(
         "追蹤公司或代碼（用逗號分隔，例如 2408, 台積電, META, Google, Tesla）",
-        value=(st.session_state.company_event_snapshot.get("tickers")
-               or st.session_state.calendar_preferences.get("tickers", "2330.TW")),
+        value=st.session_state.company_event_snapshot.get("tickers", st.session_state.calendar_preferences.get("tickers", "2330.TW")),
         key="company_data_tickers",
+        on_change=save_company_tracking_input,
     )
     preview_inputs = [item.strip() for item in company_ticker_input.split(",") if item.strip()]
     if preview_inputs:
@@ -28043,6 +28090,16 @@ with tab_company:
         st.caption("辨識結果：" + "； ".join(
             f"{item['input']} → {item['display_name']}（{item['candidates'][0]}）" for item in resolved_preview
         ))
+        st.caption('公司清單與順序會自動儲存；移除後按 Enter 套用。')
+        order_cols = st.columns([3, 1, 1], vertical_alignment='bottom')
+        with order_cols[0]:
+            if st.session_state.get('company_order_item') not in preview_inputs:
+                st.session_state['company_order_item'] = preview_inputs[0]
+            st.selectbox('調整公司顯示順序', list(dict.fromkeys(preview_inputs)), key='company_order_item')
+        with order_cols[1]:
+            st.button('↑ 上移', on_click=move_company_tracking_input, args=(-1,), key='company_order_up')
+        with order_cols[2]:
+            st.button('↓ 下移', on_click=move_company_tracking_input, args=(1,), key='company_order_down')
 
     sync_col, status_col = st.columns([0.9, 2.1], vertical_alignment="center")
     with sync_col:
@@ -28130,10 +28187,10 @@ with tab_company:
     .revenue-metric-delta { display: inline-block; margin-top: 0.18rem; font-size: 0.72rem; font-weight: 750; background: rgba(128,128,128,.16); border-radius: .6rem; padding: .08rem .34rem; }
     </style>
     """, unsafe_allow_html=True)
-    snapshot = st.session_state.company_event_snapshot
+    snapshot = company_display_snapshot(st.session_state.company_event_snapshot)
     st.markdown("<div class='company-step'><span class='company-step-number'>2</span>選擇加入股市行事曆的公司</div>", unsafe_allow_html=True)
     st.caption("只會加入勾選並儲存的公司；未勾選公司的查詢結果仍保留在本頁。")
-    company_options = sorted({company_calendar_key(e) for e in snapshot.get('events', [])})
+    company_options = list(dict.fromkeys(company_calendar_key(e) for e in snapshot.get('events', [])))
     if 'company_calendar_selection' in st.session_state:
         previous_selection = st.session_state['company_calendar_selection']
         migrated_selection = normalize_company_event_snapshot({**snapshot, 'calendar_companies':previous_selection})['calendar_companies']
@@ -28150,7 +28207,7 @@ with tab_company:
         save_calendar_companies = st.button('🏢 儲存行事曆公司', key='save_calendar_companies', width='content')
     st.caption(f"目前選擇 {len(chosen_companies)} 家，共有 {len(company_options)} 家可選。")
     if save_calendar_companies:
-        snapshot = {**snapshot, 'calendar_companies': chosen_companies,
+        snapshot = {**st.session_state.company_event_snapshot, 'calendar_companies': chosen_companies,
                     'updated_at': datetime.now(pytz.timezone('Asia/Taipei')).strftime('%Y/%m/%d %H:%M:%S')}
         st.session_state.company_event_snapshot = snapshot
         saved = save_company_event_snapshot(snapshot)
@@ -28158,6 +28215,7 @@ with tab_company:
             st.warning('已套用；雲端同步失敗，請重試儲存。')
         else:
             st.success('已儲存行事曆公司。')
+    snapshot = company_display_snapshot(st.session_state.company_event_snapshot)
     revenue_events = list(snapshot.get('taiwan_revenue', {}).get('events', []))
     correctable_revenue_events = [
         event for event in revenue_events
@@ -28198,7 +28256,7 @@ with tab_company:
                     for key, value in correction_values.items()
                     if isinstance(value, date)
                 }
-                corrected_snapshot = apply_revenue_announcement_date_overrides(snapshot, corrections)
+                corrected_snapshot = apply_revenue_announcement_date_overrides(st.session_state.company_event_snapshot, corrections)
                 corrected_snapshot['updated_at'] = datetime.now(
                     pytz.timezone('Asia/Taipei')
                 ).strftime('%Y/%m/%d %H:%M:%S')
@@ -28221,7 +28279,7 @@ with tab_company:
     summary_cols[1].metric("台股月營收", len(snapshot.get("taiwan_revenue", {}).get("events", [])))
     summary_cols[2].metric("美股營收", len(snapshot.get("us_revenue", {}).get("events", [])))
     st.markdown("<div class='company-step'><span class='company-step-number'>3</span>查看同步結果</div>", unsafe_allow_html=True)
-    render_company_event_snapshot(snapshot)
+    render_company_event_snapshot(company_display_snapshot(snapshot))
 
 
 if tab1.open:

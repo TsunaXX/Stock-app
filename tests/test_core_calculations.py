@@ -3946,7 +3946,7 @@ def test_fibonacci_without_usable_login_never_fetches_or_draws_old_quotes():
     assert len(messages) == 9 and all('尚未登入永豐 API' in m for m in messages)
 
 
-def test_calendar_hides_only_matching_monthly_revenue_report_disclosures():
+def test_calendar_hides_company_disclosures_but_preserves_stored_history():
     ns = load_app_symbols('company_calendar_key', 'selected_company_calendar_snapshot')
     reports = [{'ticker':'2330', 'title':'台積電｜台積公司2026年9月營收報告'},
                {'ticker':'1815', 'title':'富喬｜115年9月營收報告'}]
@@ -3959,7 +3959,7 @@ def test_calendar_hides_only_matching_monthly_revenue_report_disclosures():
                 'taiwan_revenue':{'events':[{'ticker':code,'revenue':{'revenue_month':'11509'}} for code in ('2330','1815')]},
                 'disclosures':{'events':reports+retained}}
     filtered = ns['selected_company_calendar_snapshot'](snapshot)
-    assert filtered['disclosures']['events'] == retained
+    assert filtered['disclosures']['events'] == []
     assert len(snapshot['disclosures']['events']) == 7
     snapshot['taiwan_revenue']['events'] = []
-    assert ns['selected_company_calendar_snapshot'](snapshot)['disclosures']['events'] == reports+retained
+    assert ns['selected_company_calendar_snapshot'](snapshot)['disclosures']['events'] == []
