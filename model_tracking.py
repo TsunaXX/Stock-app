@@ -498,6 +498,8 @@ def advance(record, quote):
     option_legs = row.get('選擇權腿')
     slip = 0 if option_legs else tick * row['成本設定']['slippage_ticks']
     if row['狀態'] == '等待進場':
+        # Cross-device continuity compares the price and time of the same observed tick.
+        row['最新價'] = price
         invalid = price <= stop if long else price >= stop
         if invalid or (row.get('策略') == '當沖' and str(row.get('交易日')) != str(quote.get('交易日'))):
             event(row, '訊號失效', text, '未進場前已越過停損或交易日已結束')
@@ -1181,6 +1183,8 @@ class ModelTracker:
                     self.revision += 1
 
     def mark_gaps(self):
+        if not self.queue.empty():
+            return  # Drain already observed evidence before declaring the producer inactive.
         now = time.monotonic()
         with self.write_db() as db:
             for raw in db.execute("SELECT body FROM trades WHERE state IN ('等待進場','模擬持倉')").fetchall():
