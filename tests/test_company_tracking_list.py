@@ -1,6 +1,7 @@
 """Tracking edits control visibility without deleting retained company history."""
 import ast
 import json
+import threading
 from pathlib import Path
 from textwrap import dedent
 
@@ -78,3 +79,25 @@ def save_company_event_snapshot(snapshot):
     assert not app.exception and app.session_state.saved_snapshots[-1]['tickers'] == ''
     app.run()
     assert app.text_input(key='company_data_tickers').value == ''
+
+
+def test_failed_selection_save_retries_without_restoring_removed_company():
+    ns = load_app_symbols('sync_company_background_snapshot', 'empty_company_event_snapshot',
+                          'normalize_company_event_snapshot', 'apply_revenue_announcement_date_overrides',
+                          '_cache_payload_timestamp')
+    remote = {'tickers':'2330,2408', 'calendar_companies':['2330','2408'],
+              'updated_at':'2026-10-22T10:00:00+08:00',
+              'taiwan_revenue':{'events':[{'ticker':'2408','date':'2026-10-10','title':'月營收'}]}}
+    pending = ns['normalize_company_event_snapshot']({**remote, 'tickers':'2330', 'calendar_companies':['2330'],
+                                                    'updated_at':'2026-10-22T11:00:00+08:00'})
+    ns['GOOGLE_SCOPE_COMPANY'] = 'company_events'
+    ns['get_data_cache_sync_lock'] = threading.RLock
+    ns['_fetch_remote_scope'] = lambda *a, **kw: (remote, None)
+    writes = []
+    ns['_save_remote_scope'] = lambda url, scope, data, **kw: (writes.append(data) or (True, None))
+    assert ns['sync_company_background_snapshot']('fake', pending)
+    assert writes[0]['tickers'] == '2330' and writes[0]['calendar_companies'] == ['2330']
+    assert writes[0]['taiwan_revenue']['events'] == remote['taiwan_revenue']['events']
+    remote['updated_at'] = '2026-10-22T12:00:00+08:00'
+    assert not ns['sync_company_background_snapshot']('fake', pending)
+    assert len(writes) == 1
