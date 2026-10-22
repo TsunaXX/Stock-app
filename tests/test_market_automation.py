@@ -232,7 +232,7 @@ def test_extra_company_scopes_survive_normalization_and_calendar_only_selection(
     assert len(normalized['events']) == 3
     assert normalized['taiwan_revenue']['events'] == []
     selected = ns['selected_company_calendar_snapshot'](normalized)
-    assert len(selected['disclosures']['events']) == 1
+    assert selected['disclosures']['events'] == []
     assert selected['financials']['events'][0]['date'] == ''
 
 
