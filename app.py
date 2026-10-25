@@ -3306,14 +3306,30 @@ def save_company_tracking_input():
         st.session_state.pop('_company_auto_pending_save', None)
 
 
+def company_order_market_items(items, market='全部'):
+    """依市場篩選排序選項，保留其他市場追蹤公司與既有順序。"""
+    if market not in ('台股', '美股'):
+        return list(items)
+    filtered = []
+    for item in items:
+        candidates = resolve_earnings_ticker(item).get('candidates', ())
+        ticker = str(candidates[0]).upper() if candidates else ''
+        is_taiwan = bool(re.fullmatch(r'\d{4,6}\.(?:TW|TWO)', ticker))
+        if (market == '台股') == is_taiwan:
+            filtered.append(item)
+    return filtered
+
+
 def move_company_tracking_input(offset):
     items = list(dict.fromkeys(item.strip() for item in st.session_state.company_data_tickers.split(',') if item.strip()))
+    market_items = company_order_market_items(items, st.session_state.get('company_order_market', '全部'))
     selected = st.session_state.get('company_order_item')
-    if selected not in items:
+    if selected not in market_items:
         return
     index = items.index(selected)
-    destination = index + offset
-    if 0 <= destination < len(items):
+    market_index = market_items.index(selected) + offset
+    if 0 <= market_index < len(market_items):
+        destination = items.index(market_items[market_index])
         items[index], items[destination] = items[destination], items[index]
         st.session_state.company_data_tickers = ', '.join(items)
         save_company_tracking_input()
@@ -28091,15 +28107,20 @@ with tab_company:
             f"{item['input']} → {item['display_name']}（{item['candidates'][0]}）" for item in resolved_preview
         ))
         st.caption('公司清單與順序會自動儲存；移除後按 Enter 套用。')
-        order_cols = st.columns([3, 2], vertical_alignment='bottom')
-        with order_cols[0]:
-            if st.session_state.get('company_order_item') not in preview_inputs:
-                st.session_state['company_order_item'] = preview_inputs[0]
-            st.selectbox('調整公司顯示順序', list(dict.fromkeys(preview_inputs)), key='company_order_item')
-        with order_cols[1]:
-            with st.container(horizontal=True, gap='small'):
-                st.button('上移', icon='⬆️', on_click=move_company_tracking_input, args=(-1,), key='company_order_up')
-                st.button('下移', icon='⬇️', on_click=move_company_tracking_input, args=(1,), key='company_order_down')
+        st.radio('排序市場', ('全部', '台股', '美股'), horizontal=True, key='company_order_market')
+        order_items = company_order_market_items(list(dict.fromkeys(preview_inputs)), st.session_state.company_order_market)
+        if order_items:
+            order_cols = st.columns([3, 2], vertical_alignment='bottom')
+            with order_cols[0]:
+                if st.session_state.get('company_order_item') not in order_items:
+                    st.session_state['company_order_item'] = order_items[0]
+                st.selectbox('調整公司顯示順序', order_items, key='company_order_item')
+            with order_cols[1]:
+                with st.container(horizontal=True, gap='small'):
+                    st.button('上移', icon='⬆️', on_click=move_company_tracking_input, args=(-1,), key='company_order_up')
+                    st.button('下移', icon='⬇️', on_click=move_company_tracking_input, args=(1,), key='company_order_down')
+        else:
+            st.caption('此市場目前沒有追蹤公司。')
 
     sync_col, status_col = st.columns([0.9, 2.1], vertical_alignment="center")
     with sync_col:

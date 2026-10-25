@@ -49,7 +49,7 @@ def test_company_calendar_excludes_equipment_and_building_even_when_selected():
 def test_actual_input_and_order_controls_persist_removal_and_empty_list():
     from streamlit.testing.v1 import AppTest
     source = Path('app.py').read_text(encoding='utf8')
-    names = {'company_calendar_key','company_display_snapshot','save_company_tracking_input','move_company_tracking_input'}
+    names = {'company_calendar_key','company_display_snapshot','save_company_tracking_input','move_company_tracking_input','company_order_market_items'}
     functions = '\n'.join(ast.unparse(n) for n in ast.parse(source).body if isinstance(n, ast.FunctionDef) and n.name in names)
     controls = dedent(source[source.index('    company_ticker_input = st.text_input('):source.index('    sync_col, status_col = st.columns(')])
     _, snapshot = fixtures()
@@ -101,3 +101,59 @@ def test_failed_selection_save_retries_without_restoring_removed_company():
     remote['updated_at'] = '2026-10-22T12:00:00+08:00'
     assert not ns['sync_company_background_snapshot']('fake', pending)
     assert len(writes) == 1
+
+
+def test_company_order_market_items_classify_by_resolved_ticker():
+    ns = load_app_symbols('company_order_market_items', 'resolve_earnings_ticker', 'EARNINGS_TICKER_ALIASES')
+    ns['load_local_stock_names'] = lambda: ({'2330': '台積電', '2408': '南亞科'}, {'台積電': '2330'})
+    items = ['META', '台積電', 'MU', '2408.TWO', '2330', 'TSLA']
+    classify = ns['company_order_market_items']
+    assert classify(items, '台股') == ['台積電', '2408.TWO', '2330']
+    assert classify(items, '美股') == ['META', 'MU', 'TSLA']
+    assert classify(items, '全部') == items
+
+
+def test_order_buttons_swap_only_same_market_and_preserve_other_positions():
+    from streamlit.testing.v1 import AppTest
+    source = Path('app.py').read_text(encoding='utf8')
+    names = {'company_calendar_key', 'company_display_snapshot', 'save_company_tracking_input',
+             'move_company_tracking_input', 'company_order_market_items'}
+    functions = '\n'.join(ast.unparse(n) for n in ast.parse(source).body
+                          if isinstance(n, ast.FunctionDef) and n.name in names)
+    controls = dedent(source[source.index('    company_ticker_input = st.text_input('):
+                             source.index('    sync_col, status_col = st.columns(')])
+    _, snapshot = fixtures()
+    snapshot['tickers'] = '2330, META, 2408, MU'
+    setup = """import streamlit as st
+import re
+from datetime import datetime
+import pytz
+def resolve_earnings_ticker(value):
+    ticker = value.strip()
+    return {'input': ticker, 'display_name': ticker,
+            'candidates': (ticker + '.TW' if ticker.isdigit() else ticker,)}
+st.session_state.setdefault('calendar_preferences', {})
+st.session_state.setdefault('saved_snapshots', [])
+def save_company_event_snapshot(snapshot):
+    st.session_state.saved_snapshots.append(snapshot)
+    return True
+"""
+    script = setup + '\nst.session_state.setdefault("company_event_snapshot", ' + repr(snapshot) + ')\n' + functions + '\n' + controls
+    app = AppTest.from_string(script).run()
+    app.radio(key='company_order_market').set_value('台股').run()
+    assert not app.exception
+    assert app.selectbox(key='company_order_item').options == ['2330', '2408']
+    app.selectbox(key='company_order_item').select('2408').run()
+    app.button(key='company_order_up').click().run()
+    assert not app.exception
+    assert app.session_state.company_event_snapshot['tickers'] == '2408, META, 2330, MU'
+    app.radio(key='company_order_market').set_value('美股').run()
+    assert not app.exception
+    assert app.selectbox(key='company_order_item').options == ['META', 'MU']
+    app.selectbox(key='company_order_item').select('MU').run()
+    app.button(key='company_order_up').click().run()
+    assert not app.exception
+    assert app.session_state.company_event_snapshot['tickers'] == '2408, MU, 2330, META'
+    app.radio(key='company_order_market').set_value('全部').run()
+    assert not app.exception
+    assert app.selectbox(key='company_order_item').options == ['2408', 'MU', '2330', 'META']
