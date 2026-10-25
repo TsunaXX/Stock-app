@@ -28110,15 +28110,15 @@ with tab_company:
         st.radio('排序市場', ('全部', '台股', '美股'), horizontal=True, key='company_order_market')
         order_items = company_order_market_items(list(dict.fromkeys(preview_inputs)), st.session_state.company_order_market)
         if order_items:
-            order_cols = st.columns([3, 1, 1], vertical_alignment='bottom')
+            order_cols = st.columns([3, 2], vertical_alignment='bottom')
             with order_cols[0]:
                 if st.session_state.get('company_order_item') not in order_items:
                     st.session_state['company_order_item'] = order_items[0]
                 st.selectbox('調整公司顯示順序', order_items, key='company_order_item')
             with order_cols[1]:
-                st.button('↑ 上移', on_click=move_company_tracking_input, args=(-1,), key='company_order_up')
-            with order_cols[2]:
-                st.button('↓ 下移', on_click=move_company_tracking_input, args=(1,), key='company_order_down')
+                with st.container(horizontal=True, gap='small'):
+                    st.button('上移', icon='⬆️', on_click=move_company_tracking_input, args=(-1,), key='company_order_up')
+                    st.button('下移', icon='⬇️', on_click=move_company_tracking_input, args=(1,), key='company_order_down')
         else:
             st.caption('此市場目前沒有追蹤公司。')
 
