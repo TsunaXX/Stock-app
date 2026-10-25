@@ -28091,15 +28091,15 @@ with tab_company:
             f"{item['input']} → {item['display_name']}（{item['candidates'][0]}）" for item in resolved_preview
         ))
         st.caption('公司清單與順序會自動儲存；移除後按 Enter 套用。')
-        order_cols = st.columns([3, 1, 1], vertical_alignment='bottom')
+        order_cols = st.columns([3, 2], vertical_alignment='bottom')
         with order_cols[0]:
             if st.session_state.get('company_order_item') not in preview_inputs:
                 st.session_state['company_order_item'] = preview_inputs[0]
             st.selectbox('調整公司顯示順序', list(dict.fromkeys(preview_inputs)), key='company_order_item')
         with order_cols[1]:
-            st.button('↑ 上移', on_click=move_company_tracking_input, args=(-1,), key='company_order_up')
-        with order_cols[2]:
-            st.button('↓ 下移', on_click=move_company_tracking_input, args=(1,), key='company_order_down')
+            with st.container(horizontal=True, gap='small'):
+                st.button('上移', icon='⬆️', on_click=move_company_tracking_input, args=(-1,), key='company_order_up')
+                st.button('下移', icon='⬇️', on_click=move_company_tracking_input, args=(1,), key='company_order_down')
 
     sync_col, status_col = st.columns([0.9, 2.1], vertical_alignment="center")
     with sync_col:
