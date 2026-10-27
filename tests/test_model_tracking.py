@@ -384,6 +384,10 @@ with outer:
         signal(交易日='2026-10-12', 來源時間='2026-10-12T10:00:00+08:00', 市場='期貨', 商品鍵='TMF|短波5分K', 代碼='TMF', 名稱='微台', 計畫來源='指數操作計畫', 計畫類型='短波5分K'),
         signal(交易日='2026-10-12', 來源時間='2026-10-12T10:00:00+08:00', 市場='期貨', 商品鍵='TXOC@TMF', 代碼='TXOC', 名稱='單買BC', 計畫來源='選擇權操作計畫', 計畫類型='單買BC', 選擇權腿=[{'代碼':'TXOC','買賣':1}], 乘數=50, 到期時間='2026-10-28T13:30:00+08:00'),
     ], {})
+    tracker.process([], {'股票|9999':{'交易日':'2026-10-12','來源時間':'2026-10-12T10:00:00+08:00',
+        '策略':'當沖','策略版本':'V1.2-exec1-candidate','計畫來源':'股期戰略室','計畫類型':'股票當沖',
+        '候選診斷':{'名稱':'候選測試','商品鍵':'9999','方向':'多頭','候選':True,'計畫可執行性':'待調整',
+                     '原始RR':1.5,'淨RR':.8,'未建立原因':'扣成本風報比不足'}}})
     app = AppTest.from_string(script, default_timeout=30).run()
     assert not app.exception and app.session_state['profit'] == '模型勝率追蹤'
     assert str(app.date_input(key='model_period').value[-1]) == '2026-10-12'
@@ -394,6 +398,11 @@ with outer:
     assert any(button.label == '今天' for button in app.button)
     assert app.selectbox(key='model_plan_source').options == ['全部','股期戰略室','指數操作計畫','選擇權操作計畫']
     assert '2330｜台積電' in app.selectbox(key='model_code').options
+    assert '9999｜候選測試' in app.selectbox(key='model_code').options
+    app.toggle(key='model_candidate_events').set_value(True).run()
+    assert not app.exception
+    assert any('未建立原因' in d.value.columns and '扣成本風報比不足' in str(d.value['未建立原因'].tolist()) for d in app.dataframe)
+
     app.selectbox(key='model_plan_source').select('選擇權操作計畫').run()
     assert not app.exception
     assert app.selectbox(key='model_code').options == ['全部商品', 'TXOC｜單買BC']
