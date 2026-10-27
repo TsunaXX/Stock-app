@@ -300,6 +300,7 @@ def entry_economics(row, price):
     fill, exit_target, exit_stop = price + sign * slip, target - sign * slip, stop - sign * slip
     qty = costs['stock_shares'] if row['市場'] == '股票' else costs['futures_contracts']
     multiplier = row['乘數']
+    charges = []
     def net(exit_price):
         if row['市場'] == '股票':
             fee = sum(max(costs['stock_min_fee'], math.floor(p * qty * .001425 * costs['stock_discount'] / 10)) for p in (fill, exit_price))
@@ -310,6 +311,7 @@ def entry_economics(row, price):
                 return None
             fee = costs['futures_fee'] * qty * 2
             tax = sum(round(p * multiplier * qty * rate) for p in (fill, exit_price))
+        charges.append((fee,tax))
         return sign * (exit_price - fill) * multiplier * qty - fee - tax
     reward, loss = net(exit_target), net(exit_stop)
     reason = ('未確認交易成本，等待資料' if reward is None or loss is None else
@@ -319,6 +321,8 @@ def entry_economics(row, price):
             '淨RR': reward / -loss if reward is not None and loss is not None and loss < 0 else None,
             '預估成交價': fill, '進場滑價': slip, '出場滑價': slip,
             '目標淨損益': reward, '停損淨損益': loss,
+            '目標雙邊手續費':charges[0][0] if charges else None, '目標交易稅':charges[0][1] if charges else None,
+            '停損雙邊手續費':charges[1][0] if len(charges)>1 else None, '停損交易稅':charges[1][1] if len(charges)>1 else None,
             '目標雙邊成本': sign*(exit_target-fill)*multiplier*qty-reward if reward is not None else None,
             '停損雙邊成本': sign*(exit_stop-fill)*multiplier*qty-loss if loss is not None else None,
             '計畫可執行性': '待調整' if reason else '通過', '未建立原因': reason}

@@ -21637,6 +21637,7 @@ def model_tracking_samples(rows, stock, mode, direction_choice, config, seconds,
                 result = calculate_daytrade_filter_result(row, direction, *args[3:]) if mode == '當沖' else daily
                 if mode == '當沖' and not daily['eligible']:
                     result['eligible'] = False
+                    result['rule'] = '盤前門檻未通過（' + daily['rule'] + '）'
                 plan = build_trade_plan(row, direction, mode == '當沖', result, config.get('costs', DEFAULT_COSTS)) if execution_policy else build_trade_plan(row, direction, mode == '當沖', result)
                 quality = plan.get('execution', {})
                 state = classify_signal_state(result['rule'], result['eligible'], result['score'], config.get('min_score', 75))
