@@ -508,7 +508,7 @@ function validateModelExecutions_(merged, incoming) {
     if (row['識別版本'] !== 2 || row['原始計畫ID'] !== plan || row['交易ID'] !== id || row['交易執行ID'] !== id ||
         ['股期戰略室','指數操作計畫','選擇權操作計畫'].indexOf(row['計畫來源']) < 0 || !row['計畫類型']) throw new Error('V1.2 計畫或執行 ID 無效');
     if (!parentId && row['進場次數'] !== 1) throw new Error('首次進場次數無效');
-    if (row['重新觸發來源ID']) {
+    if (row['重新觸發來源ID'] && !parentId) {
       const prior = indexed[row['重新觸發來源ID']], clear = row['重新觸發解除證據'] || {}, proof = row['成交證據識別'] || {};
       const invalidTime = prior && modelTime_(prior['訊號失效時間']);
       const clearTime = modelTime_(clear['來源時間']), entryTime = modelTime_(row['進場時間']);

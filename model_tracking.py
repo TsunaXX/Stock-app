@@ -1222,6 +1222,13 @@ class ModelTracker:
                         for field in ('指標快照', '條件快照', '市場環境', '觸發條件'):
                             if field in quote:
                                 seed[field] = quote[field]
+                        if seed.get('失效重觸規則') == 'executable-reset-v1':
+                            quality = entry_economics(seed,seed['進場價'])
+                            seed.update(quality)
+                            if quality['未建立原因']:
+                                row['重入等待原因'] = quality['未建立原因']
+                                row['重入解除'] = cleared
+                                continue
                         candidate = advance(new_trade(seed), sample)
                         if candidate.get('模擬進場價') is not None and not candidate.get('資料缺口'):
                             candidate['同步確認'] = not bool(self.url)

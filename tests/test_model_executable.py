@@ -113,13 +113,13 @@ def test_cross_device_new_plan_identity_and_script_proof_validation(tmp_path):
     for name in ('desktop','phone'):
         t=ModelTracker(tmp_path/(name+'.sqlite'),start=False)
         seed=plan()
-        for i,p in enumerate((99,94,99,100)):
+        for i,p in enumerate((99,94,99,100,111,111,99,100)):
             q=sample(p,i,seed)
-            q['串流識別']=q['成交證據'][0]['串流識別']=name+':0'
+            q['串流識別']=q['成交證據'][0]['串流識別']=name+(':1' if i>=6 else ':0')
             t.process([seed] if i==0 else [],{'股票|2330':q})
         generated.append(t.records())
     assert {r['交易ID'] for r in generated[0]}=={r['交易ID'] for r in generated[1]}
-    assert len(merge_trades(*generated))==2
+    assert len(merge_trades(*generated))==3
     node=shutil.which('node')
     if not node:
         pytest.skip('Node required for shared storage verification')
