@@ -114,6 +114,8 @@ def plan_id(signal):
     fields = {key: signal.get(key, '') for key in ('市場', '商品鍵', '策略', '策略版本', '方向', '到期時間')}
     fields.update(plan_labels(signal))
     fields['交易日'] = signal.get('交易日', '') if signal.get('策略') == '當沖' else ''
+    if signal.get('失效重觸規則') == 'executable-reset-v1' and signal.get('重新觸發來源ID'):
+        fields['重新觸發來源ID'] = signal['重新觸發來源ID']
     fields['選擇權腿'] = sorted(signal.get('選擇權腿', []), key=lambda leg: (leg['代碼'], leg['買賣']))
     return hashlib.sha256(('plan-v2|' + json.dumps(fields, ensure_ascii=False, sort_keys=True, separators=(',', ':'))).encode()).hexdigest()
 
@@ -204,10 +206,11 @@ def merge_trades(remote, local):
                 break
         if row.get('識別版本') == 2 and old:
             row['同步確認'] = bool(old.get('同步確認') or incoming.get('同步確認'))
-            for key in ('重入解除', '重入來源時間', '重入最後序號', '重入串流識別', '重入等待原因'):
+            for key in ('重入解除', '重入來源時間', '重入最後序號', '重入串流識別', '重入等待原因',
+                        '新計畫解除', '新計畫來源時間', '新計畫最後序號', '新計畫串流識別', '新訊號觸發狀態'):
                 candidates = [item for item in (old, incoming) if key in item]
                 if candidates:
-                    row[key] = max(candidates, key=lambda item: str(item.get('重入來源時間', '')))[key]
+                    row[key] = max(candidates, key=lambda item: str(item.get('新計畫來源時間' if key.startswith(('新計畫', '新訊號')) else '重入來源時間', '')))[key]
         restore_profit_protection(row)
         merged[row['交易ID']] = row
     return list(merged.values())
@@ -285,14 +288,13 @@ def new_trade(signal):
     return row
 
 
-def entry_quality_reason(row, price):
-    """Check executable prices and both-side costs; never alter an existing position."""
-    if not row.get('進場品質檢查') or row.get('選擇權腿') or row.get('策略') != '當沖':
-        return ''
+def entry_economics(row, price):
+    """The same unrounded fee/tax/slippage calculation at publication and observed entry."""
     sign = 1 if row['方向'] in ('多頭', '偏多') else -1
     entry, stop, target = (float(row[k]) for k in ('進場價', '停損價', '目標價'))
-    if sign * (price - entry) > abs(entry - stop) * .25:
-        return '已偏離原進場點超過 0.25R，等待回測'
+    if (number(row.get('跳動點')) is None or row['跳動點'] <= 0
+            or number(row.get('乘數')) is None or row['乘數'] <= 0 or entry == stop):
+        return {'原始RR': None, '淨RR': None, '計畫可執行性': '未通過', '未建立原因': '未確認跳動點或乘數，等待資料'}
     costs = normalize_costs(row.get('成本設定'))
     slip = row['跳動點'] * costs['slippage_ticks']
     fill, exit_target, exit_stop = price + sign * slip, target - sign * slip, stop - sign * slip
@@ -310,11 +312,45 @@ def entry_quality_reason(row, price):
             tax = sum(round(p * multiplier * qty * rate) for p in (fill, exit_price))
         return sign * (exit_price - fill) * multiplier * qty - fee - tax
     reward, loss = net(exit_target), net(exit_stop)
-    if reward is None or loss is None:
-        return '未確認交易成本，等待資料'
-    if reward <= 0 or loss >= 0 or reward / -loss < 1:
-        return '扣除雙邊滑價與成本後風報比不足 1，等待回測'
-    return ''
+    reason = ('未確認交易成本，等待資料' if reward is None or loss is None else
+              '扣除雙邊滑價與成本後風報比不足 1，等待回測'
+              if reward <= 0 or loss >= 0 or reward / -loss < 1 else '')
+    return {'原始RR': abs(target-entry)/abs(entry-stop),
+            '淨RR': reward / -loss if reward is not None and loss is not None and loss < 0 else None,
+            '預估成交價': fill, '進場滑價': slip, '出場滑價': slip,
+            '目標淨損益': reward, '停損淨損益': loss,
+            '目標雙邊成本': sign*(exit_target-fill)*multiplier*qty-reward if reward is not None else None,
+            '停損雙邊成本': sign*(exit_stop-fill)*multiplier*qty-loss if loss is not None else None,
+            '計畫可執行性': '待調整' if reason else '通過', '未建立原因': reason}
+
+
+def entry_quality_reason(row, price):
+    """Check executable prices and both-side costs; never alter an existing position."""
+    if not row.get('進場品質檢查') or row.get('選擇權腿') or row.get('策略') != '當沖':
+        return ''
+    sign = 1 if row['方向'] in ('多頭', '偏多') else -1
+    if sign * (price - row['進場價']) > abs(row['進場價'] - row['停損價']) * .25:
+        return '已偏離原進場點超過 0.25R，等待回測'
+    return entry_economics(row, price)['未建立原因']
+
+
+def executable_entry_band(row):
+    """Reference only: keep frozen stop/target and search legal trigger prices up to 0.25R."""
+    entry, stop = row['進場價'], row['停損價']
+    sign = 1 if row['方向'] in ('多頭', '偏多') else -1
+    if entry_economics(row, entry)['未建立原因']:
+        return None
+    lo, hi = 0., min(abs(entry-stop)*.25, max(0., sign*((row['目標價']+1.3*stop)/2.3-entry)))
+    for _ in range(18):
+        mid = (lo+hi)/2
+        if entry_economics(row, entry+sign*mid)['未建立原因']:
+            hi = mid
+        else:
+            lo = mid
+    step = row['跳動點']
+    edge = float((Decimal(str(entry+sign*lo))/Decimal(str(step))).to_integral_value(
+        rounding=ROUND_FLOOR if sign > 0 else ROUND_CEILING)*Decimal(str(step)))
+    return [min(entry, edge), max(entry, edge)]
 
 
 def trade_pnl(row, exit_price, fills=None):
@@ -784,6 +820,7 @@ class ModelTracker:
         self.primary_streams = {}
         self.source_quotes = {}
         self.entry_permissions = {}
+        self.health = {'錯誤次數':0}
         self.last_sync = 0
         self.month_versions = {}
         self.sync_positions = {}
@@ -801,6 +838,10 @@ class ModelTracker:
             db.execute("CREATE INDEX IF NOT EXISTS trades_plan ON trades(json_extract(body,'$.原始計畫ID'))")
             db.execute('CREATE TABLE IF NOT EXISTS model_plans (id TEXT PRIMARY KEY, trade_id TEXT, ordinal INTEGER, scope TEXT)')
             db.execute('CREATE INDEX IF NOT EXISTS model_plans_scope ON model_plans(scope)')
+            db.execute('CREATE TABLE IF NOT EXISTS model_candidate_events (id TEXT PRIMARY KEY, day TEXT, scope TEXT, body TEXT)')
+            db.execute('CREATE INDEX IF NOT EXISTS model_candidate_events_day ON model_candidate_events(day,scope)')
+            db.execute('CREATE TABLE IF NOT EXISTS model_diagnostics (day TEXT, scope TEXT, body TEXT, PRIMARY KEY(day,scope))')
+            db.execute("CREATE INDEX IF NOT EXISTS trades_replan ON trades(json_extract(body,'$.重新觸發來源ID'))")
             db.execute('CREATE TABLE IF NOT EXISTS model_event_archives (id TEXT PRIMARY KEY, sha TEXT, body TEXT)')
             for raw in db.execute("SELECT body FROM trades WHERE state IN ('等待進場','模擬持倉')").fetchall():
                 row = json.loads(raw[0])
@@ -1012,6 +1053,11 @@ class ModelTracker:
                 self.overloaded = False
             for signal in signals:
                 row = new_trade(signal)
+                if row.get('失效重觸規則') == 'executable-reset-v1':
+                    quality = entry_economics(row, row['進場價'])
+                    if quality['未建立原因'] or (quality.get('原始RR') or 0)<1.3:
+                        continue
+                    row.update(quality)
                 if row.get('識別版本') == 2 and not self.url:
                     row['同步確認'] = True
                 existing = db.execute('SELECT body FROM trades WHERE id=?', (row['交易ID'],)).fetchone()
@@ -1060,7 +1106,11 @@ class ModelTracker:
                               and 0 <= (current_time - permission_time).total_seconds() <= max(30, float(quote.get('更新秒數', 5)) * 3))
                 for tick in evidence:
                     if str(tick.get('來源時間', '')) < str(updated['來源時間']):
+                        self.health['重播略過筆數'] = self.health.get('重播略過筆數',0)+1
                         continue
+                    if (tick.get('串流識別') == updated.get('串流識別') and tick.get('序號') is not None
+                            and updated.get('最後序號') is not None and tick['序號']>updated['最後序號']+1):
+                        self.health['記錄缺序次數'] = self.health.get('記錄缺序次數',0)+1
                     sample = {**quote, **tick}
                     # A new decision applies from its publication time, never to earlier observed fills.
                     tick_time = stamp(tick.get('來源時間')) if continuous and updated.get('模擬進場價') is None else None
@@ -1073,6 +1123,8 @@ class ModelTracker:
                     self.store(db, updated)
                     self.revision += 1
             self.reenter(db, quotes)
+            self.replan(db, quotes)
+            self.record_diagnostics(db, signals, quotes)
         for key, quote in quotes.items():
             if quote.get('策略') and quote.get('進場品質時間'):
                 identity = (key, quote['策略'])
@@ -1086,7 +1138,8 @@ class ModelTracker:
         seed_fields = ('交易日', '市場', '商品鍵', '代碼', '名稱', '交易時段', '策略', '策略版本', '方向',
                        '進場價', '停損價', '目標價', '觸發條件', '訊號狀態', '指標快照', '條件快照',
                        '跳動點', '乘數', '期交稅率', '成本設定', '進場品質檢查', '保利規則', '市場環境',
-                       '計畫來源', '計畫類型', '觸發商品', '商品類型', '選擇權腿', '到期時間', '限定風險寬度')
+                       '計畫來源', '計畫類型', '觸發商品', '商品類型', '選擇權腿', '到期時間', '限定風險寬度',
+                       '失效重觸規則', '重新觸發來源ID', '重新觸發解除證據', '原始RR', '淨RR', '計畫可執行性', '可執行進場區間')
         for key, quote in quotes.items():
             if not str(quote.get('策略版本', '')).startswith('V1.2'):
                 continue
@@ -1182,6 +1235,120 @@ class ModelTracker:
                     self.store(db, row)
                     self.revision += 1
 
+    def replan(self, db, quotes):
+        """Only new stock/futures rules may replace an unfilled invalid plan after a verified reset."""
+        for key, quote in quotes.items():
+            candidate = quote.get('候選計畫')
+            if not quote.get('候選診斷') or not quote.get('候選已重估'):
+                continue
+            market, product = key.split('|', 1)
+            scope = plan_scope({**quote, '市場':market, '商品鍵':product})
+            rows = db.execute("""SELECT t.body FROM model_plans p JOIN trades t ON p.trade_id=t.id
+                WHERE p.scope=? AND t.state='訊號失效' AND json_extract(t.body,'$.交易日')=?
+                AND json_extract(t.body,'$.失效重觸規則')='executable-reset-v1'
+                AND NOT EXISTS (SELECT 1 FROM trades c WHERE json_extract(c.body,'$.重新觸發來源ID')=t.id)""",
+                (scope, quote.get('交易日'))).fetchall()
+            for raw, in rows:
+                row = json.loads(raw)
+                if row.get('模擬進場價') is not None or row.get('資料缺口'):
+                    continue
+                original = json.loads(raw)
+                cursor_time = stamp(row.get('新計畫來源時間', row['訊號失效時間']))
+                cursor_seq = row.get('新計畫最後序號', row.get('最後序號'))
+                stream = row.get('新計畫串流識別', row.get('串流識別'))
+                cleared = row.get('新計畫解除')
+                if quote.get('休市') or not quote.get('有效'):
+                    cleared = None
+                for tick in quote.get('成交證據', []) if quote.get('有效') and not quote.get('休市') else []:
+                    ts, seq = stamp(tick.get('來源時間')), tick.get('序號')
+                    if ts is None or ts <= stamp(row['訊號失效時間']) or (cursor_time is not None and ts < cursor_time):
+                        continue
+                    if tick.get('串流識別') == stream and seq is not None and cursor_seq is not None and seq <= cursor_seq:
+                        continue
+                    continuous = (cursor_time is not None and 0 <= (ts-cursor_time).total_seconds() <= max(30,float(quote.get('更新秒數',5))*3)
+                                  and stream == tick.get('串流識別') and seq is not None and cursor_seq is not None and seq == cursor_seq+1)
+                    if not continuous or not tick.get('有效'):
+                        cleared = None
+                    cursor_time, cursor_seq, stream = ts, seq, tick.get('串流識別')
+                    row.update({'新計畫來源時間':ts.isoformat(), '新計畫最後序號':seq, '新計畫串流識別':stream})
+                    # A current candidate cannot grant permission to earlier buffered ticks.
+                    permission_time = stamp(quote.get('進場品質時間'))
+                    if permission_time is None or ts < permission_time or number(tick.get('價格')) is None:
+                        continue
+                    price = tick['價格']
+                    same_direction = quote.get('進場品質方向') == row['方向']
+                    allowed = bool(quote.get('進場品質許可') and same_direction)
+                    old_hit = price >= row['進場價'] if row['方向'] in ('多頭','偏多') else price <= row['進場價']
+                    if not allowed or not old_hit:
+                        if cleared is None:
+                            cleared = {**{k:tick.get(k) for k in ('來源時間','序號','串流識別','價格')}, '進場許可':allowed}
+                        row['新訊號觸發狀態'] = '已解除'
+                    elif cleared and continuous and ts > stamp(cleared['來源時間']) and candidate and candidate['方向'] == row['方向']:
+                        seed = {**candidate, '來源時間':ts.isoformat(), '重新觸發來源ID':row['交易ID'],
+                                '重新觸發解除證據':cleared, '新訊號觸發狀態':'再次成立', '進場次數':1}
+                        seed.pop('前次執行ID', None)
+                        if entry_economics(seed, seed['進場價'])['未建立原因']:
+                            continue
+                        current = advance(new_trade(seed), {**quote, **tick})
+                        active = db.execute("SELECT 1 FROM trades WHERE slot=? AND state IN ('等待進場','模擬持倉','監控中斷','資料不足') LIMIT 1",(trade_slot(current),)).fetchone()
+                        if current.get('模擬進場價') is not None and not current.get('資料缺口') and not active:
+                            current['同步確認'] = not bool(self.url)
+                            self.store(db, current)
+                            row['新訊號觸發狀態'] = '再次成立'
+                            self.revision += 1
+                            break
+                    else:
+                        row['新訊號觸發狀態'] = '已解除' if cleared else '等待解除'
+                row['新計畫解除'] = cleared
+                row.setdefault('新訊號觸發狀態', '等待解除')
+                if row != original:
+                    self.store(db, row)
+                    self.revision += 1
+
+    def record_diagnostics(self, db, signals, quotes):
+        for key, quote in quotes.items():
+            diagnostic = quote.get('候選診斷')
+            if not diagnostic:
+                continue
+            scope = plan_scope({**quote, '市場':key.split('|',1)[0], '商品鍵':key.split('|',1)[1]})
+            day = quote['交易日']
+            raw = db.execute('SELECT body FROM model_diagnostics WHERE day=? AND scope=?',(day,scope)).fetchone()
+            old = json.loads(raw[0]) if raw else {}
+            status = [diagnostic.get('方向'), diagnostic.get('計畫可執行性'), diagnostic.get('未建立原因')]
+            if old.get('狀態識別') == status:
+                continue
+            counts = old.get('狀態變更次數', {})
+            reason = diagnostic.get('未建立原因') or '候選通過'
+            counts[reason] = counts.get(reason,0)+1
+            row = {**diagnostic, '交易日':day, '策略版本':quote.get('策略版本'), '計畫來源':quote.get('計畫來源'),
+                   '計畫類型':quote.get('計畫類型'), '診斷範圍':scope, '進場許可':'有效' if quote.get('進場品質許可') else '未放行',
+                   '來源時間':quote['來源時間'], '狀態識別':status, '狀態變更次數':counts,
+                   '候選計畫數':old.get('候選計畫數',0)+bool(diagnostic.get('候選'))}
+            evidence = {**diagnostic, '交易日':day, '來源時間':quote['來源時間'],
+                        '策略版本':quote.get('策略版本'), '進場許可':row['進場許可']}
+            event_id = hashlib.sha256((day+'|'+scope+'|'+quote['來源時間']+'|'+json.dumps(status,ensure_ascii=False)).encode()).hexdigest()
+            db.execute('INSERT OR IGNORE INTO model_candidate_events VALUES (?,?,?,?)',
+                       (event_id,day,scope,json.dumps(evidence,ensure_ascii=False)))
+            db.execute('INSERT INTO model_diagnostics VALUES (?,?,?) ON CONFLICT(day,scope) DO UPDATE SET body=excluded.body',
+                       (day,scope,json.dumps(row,ensure_ascii=False)))
+        previous = self.health.get('檢查單調時間')
+        now = time.monotonic()
+        self.health.update({'檢查單調時間':now, '實際更新間隔':now-previous if previous else None,
+                            '成交緩衝筆數':sum(len(q.get('成交證據',[])) for q in quotes.values()),
+                            '記錄佇列批次':self.queue.qsize(), '檢查時間':datetime.now(TZ).isoformat()})
+
+    def diagnostics(self, start, end):
+        with closing(self.db()) as db:
+            return [json.loads(raw[0]) for raw in db.execute('SELECT body FROM model_diagnostics WHERE day>=? AND day<=?',(start,end))]
+
+    def diagnostic_events(self, start, end, scopes):
+        if not scopes:
+            return []
+        with closing(self.db()) as db:
+            rows = db.execute('SELECT body FROM model_candidate_events WHERE day>=? AND day<=? AND scope IN ('+
+                ','.join('?' for _ in scopes)+') ORDER BY rowid DESC LIMIT 500',(start,end,*scopes)).fetchall()
+        return [json.loads(raw[0]) for raw in rows]
+
     def mark_gaps(self):
         if not self.queue.empty():
             return  # Drain already observed evidence before declaring the producer inactive.
@@ -1260,6 +1427,10 @@ class ModelTracker:
             raise ValueError('Google Sheet 活動月份索引無效；保留待同步')
         if catalog.get('model_sync') == 2:
             return self.sync_delta(catalog, pending)
+        if catalog.get('model_replan') != 1:
+            with closing(self.db()) as db:
+                if db.execute("SELECT 1 FROM trades WHERE dirty=1 AND json_extract(body,'$.重新觸發來源ID') IS NOT NULL LIMIT 1").fetchone():
+                    raise ValueError('Apps Script 尚未支援失效重新觸發；新紀錄保留本機待同步')
         if catalog.get('model_reentry') != 1:
             with closing(self.db()) as db:
                 if db.execute("SELECT 1 FROM trades WHERE dirty=1 AND json_extract(body,'$.識別版本')=2 LIMIT 1").fetchone():
@@ -1354,8 +1525,22 @@ class ModelTracker:
             batch, size = [], 0
             for rowid, body in rows:
                 record = json.loads(body)
-                if record.get('識別版本') == 2 and catalog.get('model_reentry') != 1:
+                if (record.get('識別版本') == 2 and catalog.get('model_reentry') != 1) or (record.get('重新觸發來源ID') and catalog.get('model_replan') != 1):
                     blocked = True
+                    continue
+                parent_id = record.get('重新觸發來源ID')
+                if parent_id and all(r['交易ID'] != parent_id for _,r in batch):
+                    with closing(self.db()) as db:
+                        parent = db.execute('SELECT rowid,body FROM trades WHERE id=? AND month=? AND dirty=1',(parent_id,month)).fetchone()
+                    if parent:
+                        parent_size = len(parent[1].encode('utf8'))
+                        if batch and (len(batch)>=20 or size+parent_size>256_000):
+                            break
+                        batch.append((parent[0],json.loads(parent[1])))
+                        size += parent_size
+                if len(batch)>=20 or (size and size+len(body.encode('utf8'))>256_000):
+                    break
+                if any(r['交易ID'] == record['交易ID'] for _,r in batch):
                     continue
                 length = len(body.encode('utf-8'))
                 if batch and size + length > 256_000:
@@ -1381,7 +1566,7 @@ class ModelTracker:
         self.synced_at = datetime.now(TZ).strftime('%Y/%m/%d %H:%M:%S')
         with closing(self.db()) as db, db:
             remaining = db.execute('SELECT COUNT(*) FROM trades WHERE dirty=1').fetchone()[0]
-        self.status, self.error = (f'已回讀驗證；尚有 {remaining} 筆待同步' if remaining else '已回讀驗證'), ('Apps Script 尚未支援 V1.2 執行鏈；新紀錄保留本機待同步' if blocked else '')
+        self.status, self.error = (f'已回讀驗證；尚有 {remaining} 筆待同步' if remaining else '已回讀驗證'), ('Apps Script 尚未支援 V1.2 執行鏈或失效重觸；新紀錄保留本機待同步' if blocked else '')
 
     def run(self):
         pending = None
@@ -1390,7 +1575,9 @@ class ModelTracker:
             try:
                 if pending is None:
                     pending = self.queue.get(timeout=.25)
+                started = time.monotonic()
                 self.process(*pending)
+                self.health['記錄耗時'] = time.monotonic()-started
                 pending = None
                 if self.error == busy_message or (self.error == '記錄佇列已滿；保留資料缺口，不阻塞行情' and self.queue.empty()):
                     self.error = ''
@@ -1402,6 +1589,7 @@ class ModelTracker:
                     self.stop.wait(.25)
                     continue
                 pending = None
+                self.health['錯誤次數'] += 1
                 self.error = '本機記錄失敗：' + type(exc).__name__
             if time.monotonic() - self.last_gap_check >= 5:
                 self.last_gap_check = time.monotonic()

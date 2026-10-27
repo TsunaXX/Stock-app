@@ -44,7 +44,7 @@ from market_automation import (
     macro_results, merge_company_sections, merge_macro_results, vwap_guard,
 )
 
-from model_tracking import ModelTracker, DEFAULT_COSTS, VERSION as MODEL_VERSION, PROTECTION_POLICY, performance, plan_performance, excel_report, normalize_costs, option_fills, option_tick, advance as advance_model_trade
+from model_tracking import ModelTracker, DEFAULT_COSTS, VERSION as MODEL_VERSION, PROTECTION_POLICY, performance, plan_performance, excel_report, normalize_costs, option_fills, option_tick, entry_economics, executable_entry_band, advance as advance_model_trade
 
 logger = logging.getLogger(__name__)
 
@@ -16365,7 +16365,7 @@ def resolve_shioaji_futures_contract(api, root, contract_month):
         ),
     )
 
-def calculate_futures_strategy_levels(row, strategy_mode='當沖', direction_choice='自動', kbars=None):
+def calculate_futures_strategy_levels(row, strategy_mode='當沖', direction_choice='自動', kbars=None, costs=None):
     """計算期貨支撐壓力與條件式進出場點位；無即時 K 棒時採官方日行情備援。"""
     root = str(row.get('期貨代碼', ''))
     close = _safe_number(row.get('收盤價'))
@@ -16502,10 +16502,15 @@ def calculate_futures_strategy_levels(row, strategy_mode='當沖', direction_cho
                     '進出場點位': f'等待｜剩餘風報比不足｜目 {fmt_price(target)}', '方向': '觀望',
                     '觸發條件': '漲跌停範圍內剩餘風報比不足', 'VWAP': vwap, 'ATR': atr,
                     **guard_fields}
+    quality = check_plan_execution(row, False, direction, entry, stop, target, costs) if strategy_mode == '當沖' and costs is not None else {}
+    if quality.get('未建立原因'):
+        return {'支撐壓力': f'支 {fmt_price(support)}｜壓 {fmt_price(resistance)}',
+                '進出場點位': '計畫待調整｜扣成本風報比不足', '方向': direction,
+                '觸發條件': quality['未建立原因'], '_計畫可執行性': quality, 'VWAP':vwap, 'ATR':atr, **guard_fields}
     return {
         '支撐壓力': f'支 {fmt_price(support)}｜壓 {fmt_price(resistance)}',
         '進出場點位': f'進 {fmt_price(entry)}｜停 {fmt_price(stop)}｜目 {fmt_price(target)}',
-        '方向': direction, '觸發條件': trigger,
+        '方向': direction, '觸發條件': trigger, '_計畫可執行性': quality,
         'VWAP': vwap, 'ATR': atr,
         **guard_fields,
     }
@@ -16636,7 +16641,7 @@ def fetch_futures_contract_kbars(api, contract, lookback_days=20):
     except Exception:
         return pd.DataFrame()
 
-def update_futures_live_rows(rows, api, strategy_mode, direction_choice, include_analysis=True, stream_only=False, stream_room='futures'):
+def update_futures_live_rows(rows, api, strategy_mode, direction_choice, include_analysis=True, stream_only=False, stream_room='futures', costs=None):
     """批次更新顯示中的實際契約快照，並選擇性重算支撐壓力。"""
     if rows.empty or api is None:
         if stream_only and api is not None:
@@ -16726,7 +16731,7 @@ def update_futures_live_rows(rows, api, strategy_mode, direction_choice, include
         live_vwap = _safe_number(getattr(snapshot, 'avg_price', None)) if snapshot is not None else None
         if include_analysis:
             updated.at[index, '_live_vwap'] = live_vwap
-        analysis = calculate_futures_strategy_levels(updated.loc[index], strategy_mode, direction_choice, kbars) if include_analysis else {}
+        analysis = (calculate_futures_strategy_levels(updated.loc[index], strategy_mode, direction_choice, kbars, costs) if costs is not None else calculate_futures_strategy_levels(updated.loc[index], strategy_mode, direction_choice, kbars)) if include_analysis else {}
         if include_analysis and strategy_mode == '當沖':
             price = _safe_number(updated.at[index, '收盤價'])
             prior_stop = _safe_number(row.get('_last_intraday_stop'))
@@ -19862,7 +19867,30 @@ def calculate_daytrade_filter_result(row, direction, attention_counts=None, disp
         'data_time': row.get('_daytrade_data_time')
     }
 
-def build_trade_plan(row, direction, is_daytrade_mode, filter_result):
+def strategy_execution_terms(row, stock, direction, costs):
+    normalized = normalize_costs(costs)
+    price = _safe_number(row.get('收盤價'))
+    if not stock:
+        normalized['futures_fee'] = cathay_futures_fee({**CATHAY_FEE_DEFAULTS, **costs}, row.get('期貨代碼'),
+            row.get('商品類型', ''), str(row.get('小型期貨', '')).casefold() in {'true', '1'})
+    return {'市場': '股票' if stock else '期貨', '策略': '當沖', '方向': direction,
+            '成本設定': normalized,
+            '跳動點': get_tick_size(price) if stock and price else get_futures_tick_size(row.get('期貨代碼'), price, row.get('商品類型', '未知')) if not stock else None,
+            '乘數': 1 if stock else ({'TX':200, 'MTX':50, 'TMF':10, 'TE':4000, 'TF':1000}.get(str(row.get('期貨代碼')))
+                      if row.get('商品類型') == '指數' else _safe_number(row.get('乘數'))),
+            '期交稅率': None if stock or row.get('商品類型') not in ('指數', '股票', 'ETF') else .00002}
+
+
+def check_plan_execution(row, stock, direction, entry, stop, target, costs):
+    spec = {**strategy_execution_terms(row, stock, direction, costs), '進場價':entry, '停損價':stop, '目標價':target}
+    quality = entry_economics(spec, entry)
+    if quality.get('原始RR') is not None and quality['原始RR']<1.3:
+        quality.update({'未建立原因':'原始風報比不足 1.3', '計畫可執行性':'未通過'})
+    quality['可執行進場區間'] = executable_entry_band(spec) if not quality['未建立原因'] else None
+    return quality
+
+
+def build_trade_plan(row, direction, is_daytrade_mode, filter_result, costs=None):
     """依已通過的篩選條件建立觀察用進場、停損與目標價，不執行下單。"""
     minimum_reward_risk = 1.3
     maximum_chase_r = 0.25
@@ -19956,6 +19984,11 @@ def build_trade_plan(row, direction, is_daytrade_mode, filter_result):
                 return {'summary': f'等待｜現價剩餘風報比不足｜停 {fmt_price(stop)}｜目 {fmt_price(target)}',
                         'detail': f'現價剩餘風報比 {remaining_rr:.2f}，等待回測原進場點。',
                         'valid': False, 'reward_risk': round(remaining_rr, 2), 'blocking_reason': '現價剩餘風報比不足'}
+        quality = check_plan_execution(row, True, direction, entry, stop, target, costs) if is_daytrade_mode and costs is not None else {}
+        if quality.get('未建立原因'):
+            return {'summary': '計畫待調整｜扣成本風報比不足', 'detail': quality['未建立原因'],
+                    'valid': False, 'reward_risk': round(reward_risk, 2),
+                    'blocking_reason': quality['未建立原因'], 'execution': quality}
         summary = (
             f"進 {fmt_price(entry)}｜停 {fmt_price(stop)}｜目 {fmt_price(target)}｜"
             f"RR {reward_risk:.2f}"
@@ -19966,7 +19999,7 @@ def build_trade_plan(row, direction, is_daytrade_mode, filter_result):
                 f"{trigger_text}；預判進場 {fmt_price(entry)}、策略失效離場 {fmt_price(stop)}、"
                 f"第一目標 {fmt_price(target)}（實際風報比 {reward_risk:.2f}）"
             ),
-            'valid': True, 'reward_risk': round(reward_risk, 2),
+            'valid': True, 'reward_risk': round(reward_risk, 2), 'execution': quality,
         }
 
     if is_daytrade_mode:
@@ -20039,8 +20072,8 @@ def build_trade_plan(row, direction, is_daytrade_mode, filter_result):
     target = _round(entry - (stop - entry) * 1.5)
     return _format_plan(entry, stop, target, '次日開盤跌破昨低後再觀察進場')
 
-def build_guarded_stock_trade_plan(row, direction, is_daytrade, result):
-    plan = build_trade_plan(row, direction, is_daytrade, result)
+def build_guarded_stock_trade_plan(row, direction, is_daytrade, result, costs=None):
+    plan = build_trade_plan(row, direction, is_daytrade, result, costs)
     if not is_daytrade:
         return plan
     session = str(row.get('_daytrade_data_time', ''))[:10]
@@ -21195,7 +21228,7 @@ def model_tracking_config(room, stock, direction_choice='自動'):
                        'rules_version': get_model_rules_version(stock),
                        'market_bias': st.session_state.get('strategy_market_environment', {}).get('bias', '未取得'),
                        'costs': normalize_costs(cost_settings),
-                       'fee_schedule': {**CATHAY_FEE_DEFAULTS, 'futures_fee': cost_settings['futures_fee']}}
+                       'fee_schedule': {**CATHAY_FEE_DEFAULTS, **cost_settings}}
     prefix = 'indep_risk_' if room == 'stock_independent' else 'risk_filter_'
     if stock:
         tracking_config.update({'extension': st.session_state.get(prefix + 'max_extension', 2),
@@ -21246,23 +21279,13 @@ def background_intraday_rows(room, rows, visible_codes=None, strategy_mode='當�
             if futures_auto_night_scope(True, datetime.now(pytz.timezone('Asia/Taipei'))):
                 seed = filter_futures_strategy_display_rows(seed, only_night=True)
             refreshed, count = update_futures_live_rows(
-                seed, api, strategy_mode, direction_choice, stream_only=True, stream_room=scope,
+                seed, api, strategy_mode, direction_choice, stream_only=True, stream_room=scope, costs={**tracking_config.get('fee_schedule', {}), **tracking_config['costs']},
             )
         try:
-            signals, quotes = model_tracking_samples(refreshed, stock, strategy_mode, stock_direction, tracking_config, seconds, api)
-            if not stock:
-                fees_by_contract = {
-                    str(row.get('契約鍵')): cathay_futures_fee(
-                        tracking_config['fee_schedule'], row.get('期貨代碼'),
-                        row.get('商品類型', ''), str(row.get('小型期貨', '')).casefold() in {'true', '1'})
-                    for _, row in refreshed.iterrows() if row.get('契約鍵')
-                }
-                for signal in signals:
-                    fee = fees_by_contract.get(str(signal.get('商品鍵') or signal.get('代碼')))
-                    signal['成本設定']['futures_fee'] = fee if fee is not None else cathay_futures_fee(
-                        tracking_config['fee_schedule'], signal.get('代碼'))
+            signals, quotes = model_tracking_samples(refreshed, stock, strategy_mode, stock_direction, tracking_config, seconds, api, recalculate=True)
             tracker.submit(signals, quotes)
         except Exception as exc:
+            tracker.health['錯誤次數'] += 1
             tracker.error = '訊號記錄待補：' + type(exc).__name__
         return refreshed, count
 
@@ -21321,12 +21344,9 @@ def get_model_rules_version(stock):
     functions = (determine_stock_direction, calculate_risk_filter_result, calculate_daytrade_filter_result,
                  build_trade_plan, calculate_entry_confidence) if stock else (
                      calculate_futures_strategy_levels, enrich_futures_strategy_rows, calculate_entry_confidence)
-    functions += (model_tracking_samples,)
+    functions += (model_tracking_samples, strategy_execution_terms, check_plan_execution, entry_economics, executable_entry_band)
     fingerprint = data_version([PROTECTION_POLICY, *[inspect.getsource(f) for f in functions]])[:10]
-    # This CPU-only refactor has identical rules; later strategy edits still get new IDs.
-    if not stock and fingerprint == '10833cdc0b':
-        fingerprint = 'd8631cd521'
-    return MODEL_VERSION + '-' + fingerprint
+    return MODEL_VERSION + '-exec1-' + fingerprint
 
 
 def model_market_open(row, now_value=None):
@@ -21550,16 +21570,18 @@ def render_operation_protection(source, specs):
         st.caption(f"{row['名稱']}｜{row.get('計畫類型', '')}｜{model_protection_text(row)}")
 
 
-def model_tracking_samples(rows, stock, mode, direction_choice, config, seconds, api=None):
+def model_tracking_samples(rows, stock, mode, direction_choice, config, seconds, api=None, recalculate=False):
     """Use the same existing strategy helpers on quotes already obtained by the main table."""
     now = datetime.now(pytz.timezone('Asia/Taipei'))
     mode = '當沖' if mode == '當沖' else '波段'
     signals, quotes = [], {}
+    execution_policy = '-exec1-' in config.get('rules_version', '')
     if not stock:
         rows = enrich_futures_strategy_rows(rows, mode, config.get('market_bias', '盤整'))
     for _, row in rows.iterrows():
         key = str(row.get('代號' if stock else '契約鍵', ''))
         market = '股票' if stock else '期貨'
+        quality = row.get('_計畫可執行性') if isinstance(row.get('_計畫可執行性'), dict) else {}
         source = parse_strategy_data_time(row.get('_quote_time' if stock else '報價時間'))
         age = (now.replace(tzinfo=None) - source.to_pydatetime()).total_seconds() if source is not None else None
         valid = age is not None and 0 <= age <= 30 and not bool(row.get('_data_stale', False))
@@ -21600,7 +21622,7 @@ def model_tracking_samples(rows, stock, mode, direction_choice, config, seconds,
         quote['成交證據'] = ticks
         quotes[market + '|' + key] = quote
         if stock:
-            if '進出場預判' in row:
+            if '進出場預判' in row and not recalculate:
                 levels = parse_trade_plan_numbers(row.get('進出場預判'))
                 direction = str(row.get('_系統方向', determine_stock_direction(row, mode == '當沖', direction_choice)['direction']))
                 state = str(row.get('訊號狀態', ''))
@@ -21615,7 +21637,8 @@ def model_tracking_samples(rows, stock, mode, direction_choice, config, seconds,
                 result = calculate_daytrade_filter_result(row, direction, *args[3:]) if mode == '當沖' else daily
                 if mode == '當沖' and not daily['eligible']:
                     result['eligible'] = False
-                plan = build_trade_plan(row, direction, mode == '當沖', result)
+                plan = build_trade_plan(row, direction, mode == '當沖', result, config.get('costs', DEFAULT_COSTS)) if execution_policy else build_trade_plan(row, direction, mode == '當沖', result)
+                quality = plan.get('execution', {})
                 state = classify_signal_state(result['rule'], result['eligible'], result['score'], config.get('min_score', 75))
                 eligible = bool(plan.get('valid'))
                 levels = parse_trade_plan_numbers(plan['summary'])
@@ -21634,11 +21657,26 @@ def model_tracking_samples(rows, stock, mode, direction_choice, config, seconds,
                           if row.get('商品類型') == '指數' else _safe_number(row.get('乘數')))
             tax_rate = .00002 if row.get('商品類型') in ('指數', '股票', 'ETF') else None
             indicators = {k: _safe_number(row.get(k)) for k in ('VWAP', 'ATR', '量倉比')}
-        quote['進場品質許可'] = bool(eligible and None not in levels.values())
+        costs = dict(config.get('costs', DEFAULT_COSTS))
+        if execution_policy:
+            terms = strategy_execution_terms(row, stock, direction, {**config.get('fee_schedule', {}), **costs})
+            tick, multiplier, tax_rate, costs = (terms[k] for k in ('跳動點','乘數','期交稅率','成本設定'))
+            if mode == '當沖' and None not in levels.values() and levels['entry'] != levels['stop']:
+                quality = check_plan_execution(row, stock, direction, levels['entry'], levels['stop'], levels['target'],
+                                               {**config.get('fee_schedule', {}), **costs})
+                if quality['未建立原因'] or (quality.get('原始RR') or 0) < 1.3:
+                    eligible = False
+        reason = (quality.get('未建立原因') or ('策略條件未放行：' + rule if not eligible or None in levels.values() else '')
+                  or ('行情不完整或來源過期' if not signal_valid else '') or ('目前休市' if quote['休市'] else ''))
+        if execution_policy:
+            quote['候選診斷'] = {**quality, '名稱':str(row.get('名稱', key)), '商品鍵':key,
+                               '方向':direction, '未建立原因':reason, '候選':bool(quality or None not in levels.values()),
+                               '計畫可執行性':quality.get('計畫可執行性', '未通過' if reason else '通過')}
+        quote['進場品質許可'] = bool(eligible and None not in levels.values() and (not execution_policy or (signal_valid and not quote['休市'])))
         quote['進場品質方向'] = direction
         quote['進場品質時間'] = quote['來源時間']
         quote.update({'策略版本': config.get('rules_version', MODEL_VERSION), '計畫來源': '股期戰略室',
-                      '計畫類型': ('股票' if stock else '期貨') + mode, '成本設定': dict(config.get('costs', DEFAULT_COSTS)),
+                      '計畫類型': ('股票' if stock else '期貨') + mode, '成本設定': costs, '候選已重估':recalculate,
                       '指標快照': indicators, '市場環境': config.get('market_bias', '未取得'), '觸發條件': rule,
                       '條件快照': {name + '同向': (price > value if direction in ('多頭', '偏多') else price < value)
                                    for name, value in indicators.items() if price is not None and value is not None and name in ('VWAP', '均線')}})
@@ -21657,8 +21695,11 @@ def model_tracking_samples(rows, stock, mode, direction_choice, config, seconds,
                         '條件快照':{name + '同向': (price > value if long else price < value)
                                     for name,value in indicators.items() if value is not None and name in ('VWAP','均線')},
                         '跳動點':tick, '乘數':multiplier,
-                        '期交稅率':tax_rate, '成本設定':dict(config.get('costs', DEFAULT_COSTS)), '進場品質檢查': True, '保利規則': PROTECTION_POLICY,
-                        '市場環境':config.get('market_bias', '未取得')})
+                        '期交稅率':tax_rate, '成本設定':costs, '進場品質檢查': True, '保利規則': PROTECTION_POLICY,
+                        '市場環境':config.get('market_bias', '未取得'), **quality,
+                        **({'失效重觸規則':'executable-reset-v1'} if execution_policy and mode == '當沖' else {})})
+        if execution_policy:
+            quote['候選計畫'] = signals[-1]
     return signals, quotes
 
 
@@ -21805,7 +21846,7 @@ def _model_time_text(value):
 def _model_display_value(value, column=''):
     if value is None:
         return None
-    if column in {'觀察時間', '來源時間', '建立時間', '進場時間', '結案時間', '最後進場等待時間', '訊號失效時間', '進場觸發時間', '起始時間', '結束時間'} and value is not None and str(value).strip():
+    if column in {'觀察時間', '來源時間', '建立時間', '進場時間', '結案時間', '最後進場等待時間', '訊號失效時間', '進場觸發時間', '起始時間', '結束時間', '檢查時間', '新計畫來源時間'} and value is not None and str(value).strip():
         return _model_time_text(value)
     if column == '事件' and isinstance(value, (list, tuple)):
         lines = []
@@ -21851,7 +21892,7 @@ def _model_history_overview(frame):
             str(code or '') + ((' ' + str(name)) if name else '')
             for code, name in zip(codes.fillna(''), names.fillna(''))
         ]
-    first = ['交易日', '商品', '計畫來源', '計畫類型', '方向', '狀態', '進場次數', '模擬進場價', '模擬出場價', '保利價', '保利淨額', '保利狀態', '出場原因', '模擬損益', '策略版本', '最後進場等待原因', '訊號失效原因', '未進場分類', '事件數']
+    first = ['交易日', '商品', '計畫來源', '計畫類型', '方向', '狀態', '進場次數', '原始RR', '淨RR', '計畫可執行性', '新訊號觸發狀態', '模擬進場價', '模擬出場價', '保利價', '保利淨額', '保利狀態', '出場原因', '模擬損益', '策略版本', '最後進場等待原因', '訊號失效原因', '未進場分類', '事件數']
     columns = [column for column in first if column in result.columns]
     return result[columns], result[columns + [column for column in result.columns if column not in columns]]
 
@@ -21866,6 +21907,12 @@ def _model_column_config(frame):
         '保利最大浮盈(R)': '保利規則使用的最大浮盈倍數；選擇權以各腿扣除費用後的淨浮盈計算。',
         'MFE(R)': '原有標的點位最大浮盈倍數；選擇權的現金保利倍數另見保利最大浮盈(R)。',
         '保利規則': '均衡移動：達 1R 啟動，保留 1R 回撤空間，最低保護成本。',
+        '原始RR': '原計畫目標距離／停損距離；新版股期當沖至少 1.3。',
+        '淨RR': '發布時依相同成本與雙邊滑價計算的淨報酬／淨風險，至少 1；實際成交再驗證。',
+        '計畫可執行性': '按原進場價成交是否通過成本檢查；不代表已成交。',
+        '可執行進場區間': '在原觸發方向與 0.25R 限制內通過扣成本檢查的參考報價區間。',
+        '新訊號觸發狀態': '失效後等待解除、已解除或再次成立；新計畫獨立紀錄。',
+        '未建立原因': '候選未正式發布的當次原因；本機狀態改變才增加診斷計數。',
         '進場等待原因': '新版當沖在模擬成交前檢查追價與扣除雙邊成本後的空間；等待不算已成交。',
         '最後進場等待原因': '最後一次未能進場的原因；進場或失效後仍保留。',
         '訊號失效原因': '訊號終止或超過有效時間的原因，不覆蓋原等待原因。',
@@ -22089,7 +22136,12 @@ def render_model_tracking_room():
         if st.session_state.get('model_plan_source', '全部') not in sources:
             st.session_state['model_plan_source'] = '全部'
         plan_source = st.selectbox('計畫來源', sources, key='model_plan_source')
-    version_labels = model_version_display_labels(records)
+    diagnostic_options = [{**r, '市場': '股票' if r.get('計畫類型','').startswith('股票') else '期貨',
+                           '策略': '當沖' if r.get('計畫類型','').endswith('當沖') else '波段',
+                           '建立時間':r.get('來源時間'), '代碼':r.get('商品鍵')}
+                          for r in tracker.diagnostics(period[0].isoformat(),period[1].isoformat())]
+    option_records = records + diagnostic_options
+    version_labels = model_version_display_labels(option_records)
 
     def display_records(source_records, labels=None):
         labels = labels or version_labels
@@ -22104,7 +22156,7 @@ def render_model_tracking_room():
             result.append(displayed)
         return result
 
-    scope_records = [row for row in records if plan_source == '全部' or row.get('計畫來源') == plan_source]
+    scope_records = [row for row in option_records if plan_source == '全部' or row.get('計畫來源') == plan_source]
     version_tokens = {_model_market_version_key(row) + '|' + str(row.get('策略版本', MODEL_VERSION)) for row in scope_records}
     versions = ['全部'] + sorted(version_tokens)
     if st.session_state.get('model_version', '全部') not in versions:
@@ -22164,6 +22216,43 @@ def render_model_tracking_room():
             col.metric(key, str(metrics[key]))
         for col, key in zip(st.columns(4), ('勝率(%)', '累積模擬損益', '獲利因子', '最大回撤')):
             col.metric(key, '未確認' if metrics[key] is None else f'{metrics[key]:,.2f}'.rstrip('0').rstrip('.'))
+        diagnostics = tracker.diagnostics(period[0].isoformat(), period[1].isoformat())
+        diagnostics = [r for r in diagnostics if (plan_source == '全部' or r.get('計畫來源') == plan_source)
+                       and (market == '全部' or r.get('計畫類型','').startswith(market))
+                       and (mode == '全部' or r.get('計畫類型','').endswith(mode))
+                       and (direction == '全部' or direction in r.get('方向',''))
+                       and (version == '全部' or version.endswith('|' + str(r.get('策略版本'))))
+                       and (not query or query in (str(r.get('商品鍵',''))+str(r.get('名稱',''))).casefold())]
+        with st.expander('候選與未進場診斷', expanded=not records):
+            st.caption('本伺服器從新版啟用後開始累計，候選／阻擋次數按狀態變更計數；不回推舊行情。正式交易仍使用共用儲存及原勝率條件。')
+            totals = {'候選計畫數':sum(r.get('候選計畫數',0) for r in diagnostics),
+                      '成功發布計畫數':len({r.get('原始計畫ID',r['交易ID']) for r in records}),
+                      '成本風報比不足數':sum(n for r in diagnostics for reason,n in r.get('狀態變更次數',{}).items() if '成本' in reason),
+                      '策略未放行數':sum(n for r in diagnostics for reason,n in r.get('狀態變更次數',{}).items() if '策略條件' in reason),
+                      '未觸價數':sum(r.get('未進場分類')=='未觸價' for r in records),
+                      '已失效計畫數':sum(r['狀態']=='訊號失效' for r in records),
+                      '重新觸發計畫數':len({r['原始計畫ID'] for r in records if r.get('重新觸發來源ID')}),
+                      '有效進場數':sum(r.get('模擬進場價') is not None and not r.get('資料缺口') and (r.get('識別版本')!=2 or r.get('同步確認')) for r in records),
+                      '已平倉有效交易數':metrics['有效交易數'],
+                      '成交證據缺口數':sum(bool(r.get('資料缺口')) for r in records)}
+            st.dataframe(_model_display_frame(pd.DataFrame([totals])), hide_index=True, width='stretch')
+            if diagnostics:
+                diagnostic_frame = pd.DataFrame(diagnostics).drop(columns=['狀態識別','狀態變更次數','診斷範圍'],errors='ignore')
+                st.dataframe(_model_display_frame(diagnostic_frame), hide_index=True, width='stretch', column_config=_model_column_config(diagnostic_frame))
+            if st.toggle('查看候選診斷事件（最多500筆）',key='model_candidate_events'):
+                candidate_events = tracker.diagnostic_events(period[0].isoformat(),period[1].isoformat(),[r['診斷範圍'] for r in diagnostics])
+                if candidate_events:
+                    st.dataframe(_model_display_frame(pd.DataFrame(candidate_events)),hide_index=True,width='stretch')
+            health = tracker.health
+            st.caption(f"模型記錄：檢查 { _model_time_text(health.get('檢查時間')) if health.get('檢查時間') else '尚未收到報價'}｜實際間隔 {health.get('實際更新間隔',0) or 0:.2f}s｜耗時 {health.get('記錄耗時',0):.3f}s｜佇列 {tracker.queue.qsize()} 批｜成交緩衝 {health.get('成交緩衝筆數',0)} 筆｜錯誤 {health.get('錯誤次數',0)} 次")
+            st.caption(f"本機重播證據略過 {health.get('重播略過筆數',0)} 筆｜記錄缺序 {health.get('記錄缺序次數',0)} 次；略過已處理證據不等於遺失成交。")
+            worker = st.session_state.get('_intraday_background')
+            if worker is not None:
+                with worker.lock:
+                    stats = [{k:v for k,v in values.items() if k != '_started'} for room,values in worker.stats.items()
+                             if room.startswith(('stock','futures'))]
+                if stats:
+                    st.dataframe(_model_display_frame(pd.DataFrame(stats)),hide_index=True,width='stretch')
         export_ids = [row['交易ID'] for row in records]
         export_ready = tracker.events_ready(export_ids)
         if not export_ready and st.button('準備完整 Excel', key='model_prepare_excel'):
@@ -22889,7 +22978,7 @@ def render_futures_strategy_room():
         for index, row in display_rows.iterrows():
             cached = cache.get(str(row['契約鍵']))
             if not cached or cached.get('_策略週期') != strategy_mode or cached.get('_分析方向') != direction_choice:
-                analysis = calculate_futures_strategy_levels(display_rows.loc[index], strategy_mode, direction_choice)
+                analysis = calculate_futures_strategy_levels(display_rows.loc[index], strategy_mode, direction_choice, costs=load_model_tracking_costs())
                 set_futures_row_values(display_rows, index, analysis)
         display_rows = background_intraday_rows('futures', display_rows, strategy_mode=strategy_mode,
                                                 direction_choice=direction_choice)
@@ -22909,7 +22998,7 @@ def render_futures_strategy_room():
             else:
                 with st.spinner("正在更新期貨快照、夜盤資料與支撐壓力..."):
                     updated_rows, updated_count = update_futures_live_rows(
-                        display_rows, st.session_state.sj_api, strategy_mode, direction_choice, include_analysis=True
+                        display_rows, st.session_state.sj_api, strategy_mode, direction_choice, include_analysis=True, costs=load_model_tracking_costs()
                     )
                 for _, updated_row in updated_rows.iterrows():
                     cached_row = updated_row.to_dict()
@@ -23198,13 +23287,12 @@ def render_futures_strategy_room():
         if st.session_state.get('sj_logged_in', False) and st.session_state.get('sj_api') is not None:
             with st.spinner("正在取得實際契約報價與 K 棒..."):
                 independent_rows, _ = update_futures_live_rows(
-                    independent_rows, st.session_state.sj_api, strategy_mode, direction_choice, include_analysis=True
+                    independent_rows, st.session_state.sj_api, strategy_mode, direction_choice, include_analysis=True, costs=load_model_tracking_costs()
                 )
         else:
             for index, row in independent_rows.iterrows():
-                analysis = calculate_futures_strategy_levels(row, strategy_mode, direction_choice)
-                for column, value in analysis.items():
-                    independent_rows.at[index, column] = value
+                analysis = calculate_futures_strategy_levels(row, strategy_mode, direction_choice, costs=load_model_tracking_costs())
+                set_futures_row_values(independent_rows, index, analysis)
             st.info("目前未登入 Shioaji，獨立計算先使用期交所日行情；登入後可加入即時與夜盤 K 棒。")
         if enhanced_layer:
             independent_rows = enrich_futures_strategy_rows(independent_rows, strategy_mode, market_bias)
@@ -23220,9 +23308,8 @@ def render_futures_strategy_room():
         independent_rows = pd.DataFrame(cached_independent.get('rows', [])).astype(object)
         if not independent_rows.empty and cached_independent.get('strategy_mode') != strategy_mode:
             for index, row in independent_rows.iterrows():
-                analysis = calculate_futures_strategy_levels(row, strategy_mode, direction_choice)
-                for column, value in analysis.items():
-                    independent_rows.at[index, column] = value
+                analysis = calculate_futures_strategy_levels(row, strategy_mode, direction_choice, costs=load_model_tracking_costs())
+                set_futures_row_values(independent_rows, index, analysis)
             if enhanced_layer:
                 independent_rows = enrich_futures_strategy_rows(
                     independent_rows, strategy_mode, market_bias,
@@ -24643,7 +24730,7 @@ if tab1.open and stock_strategy_tab.open:
                             df_display.at[i, '評分'] = result['score']
                             df_display.at[i, '乖離'] = f"{_format_compact_number(result['extension'], 1, signed=True)} ATR" if result['extension'] is not None else "—"
                             df_display.at[i, '隔日規則'] = result['rule']
-                        trade_plan = build_guarded_stock_trade_plan(row, row_direction, is_daytrade_mode, result)
+                        trade_plan = build_guarded_stock_trade_plan(row, row_direction, is_daytrade_mode, result, load_model_tracking_costs())
                         if result.get('eligible') and not trade_plan.get('valid', False):
                             result['eligible'] = False
                             result['rule'] = f"觀察：{trade_plan.get('blocking_reason', '進場品質未達門檻')}"
@@ -24656,6 +24743,7 @@ if tab1.open and stock_strategy_tab.open:
                         df_display.at[i, '建議方向'] = direction_info['label']
                         df_display.at[i, '方向依據'] = direction_info['basis']
                         df_display.at[i, '_系統方向'] = row_direction
+                        set_futures_row_values(df_display, i, {'_計畫可執行性': trade_plan.get('execution', {})})
                         df_display.at[i, '進出場預判'] = trade_plan['summary']
                         df_display.at[i, '_預判僅追蹤'] = bool(trade_plan.get('tracking_only'))
                         signal_state = classify_signal_state(result['rule'], result['eligible'], result['score'], risk_min_score)
@@ -25377,7 +25465,7 @@ if tab1.open and stock_strategy_tab.open:
                                     df_indep.at[i, '風險'] = result['risk']
                                     df_indep.at[i, '乖離'] = f"{_format_compact_number(result['extension'], 1, signed=True)} ATR" if result['extension'] is not None else "—"
                                     df_indep.at[i, '隔日規則'] = result['rule']
-                                trade_plan = build_guarded_stock_trade_plan(row, row_direction, indep_is_daytrade, result)
+                                trade_plan = build_guarded_stock_trade_plan(row, row_direction, indep_is_daytrade, result, load_model_tracking_costs())
                                 if result.get('eligible') and not trade_plan.get('valid', False):
                                     result['eligible'] = False
                                     result['rule'] = f"觀察：{trade_plan.get('blocking_reason', '進場品質未達門檻')}"
@@ -25416,6 +25504,7 @@ if tab1.open and stock_strategy_tab.open:
                                 result['confidence'] = confidence
                                 df_indep.at[i, '建議方向'] = direction_info['label']
                                 df_indep.at[i, '方向依據'] = direction_info['basis']
+                                set_futures_row_values(df_indep, i, {'_計畫可執行性': trade_plan.get('execution', {})})
                                 df_indep.at[i, '進出場預判'] = trade_plan['summary']
                                 df_indep.at[i, '_預判僅追蹤'] = bool(trade_plan.get('tracking_only'))
                                 df_indep.at[i, '支撐壓力'] = build_stock_support_resistance(row, indep_is_daytrade)

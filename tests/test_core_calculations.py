@@ -17,7 +17,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import urljoin
 
-from model_tracking import PROTECTION_POLICY
+from model_tracking import PROTECTION_POLICY, entry_economics, executable_entry_band, normalize_costs
 
 import numpy as np
 import pandas as pd
@@ -35,7 +35,7 @@ APPS_SCRIPT_PATH = Path(__file__).parents[1] / "google_apps_script.gs"
 def load_app_symbols(*names):
     """Compile selected top-level helpers so importing app.py cannot render the UI."""
     names = set(names) | {"merge_stock_preferences", "_newer_timestamped_state", "_state_updated_at",
-                          "_stored_auto_time"}
+                          "_stored_auto_time", "strategy_execution_terms", "check_plan_execution", "CATHAY_FEE_DEFAULTS", "cathay_futures_fee"}
     tree = ast.parse(APP_PATH.read_text(encoding="utf-8"))
     selected = []
     for node in tree.body:
@@ -46,7 +46,7 @@ def load_app_symbols(*names):
             if targets.intersection(names):
                 selected.append(node)
     namespace = {
-        "PROTECTION_POLICY": PROTECTION_POLICY,
+        "PROTECTION_POLICY": PROTECTION_POLICY, "entry_economics": entry_economics, "executable_entry_band": executable_entry_band, "normalize_costs": normalize_costs,
         "calendar": calendar,
         "html": html,
         "io": io,

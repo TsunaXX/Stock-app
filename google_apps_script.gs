@@ -138,7 +138,7 @@ function doGet(e) {
           changed = true;
         });
         if (changed) saveScopeData_('strategy_signals', {model_active_months: active}, new Date().toISOString());
-        item.data = Object.assign({}, data, {model_reentry: 1, model_history: 1, model_events: 1, model_active_months: active});
+        item.data = Object.assign({}, data, {model_reentry: 1, model_replan: 1, model_history: 1, model_events: 1, model_active_months: active});
       }
       const ids = e && e.parameter && e.parameter.trade_ids;
       if (ids !== undefined) {
@@ -501,12 +501,27 @@ function validateModelExecutions_(merged, incoming) {
     fields['計畫來源'] = row['計畫來源']; fields['計畫類型'] = row['計畫類型'];
     fields['交易日'] = row['策略'] === '當沖' ? row['交易日'] : '';
     fields['選擇權腿'] = (row['選擇權腿'] || []).slice().sort(function(a,b) {return String(a['代碼']).localeCompare(String(b['代碼'])) || a['買賣']-b['買賣'];});
+    if (row['失效重觸規則'] === 'executable-reset-v1' && row['重新觸發來源ID']) fields['重新觸發來源ID'] = row['重新觸發來源ID'];
     const plan = modelDigest_('plan-v2|' + stableModelJson_(fields));
     const parentId = row['前次執行ID'] || '';
     const id = modelDigest_('execution-v2|' + plan + '|' + parentId);
     if (row['識別版本'] !== 2 || row['原始計畫ID'] !== plan || row['交易ID'] !== id || row['交易執行ID'] !== id ||
         ['股期戰略室','指數操作計畫','選擇權操作計畫'].indexOf(row['計畫來源']) < 0 || !row['計畫類型']) throw new Error('V1.2 計畫或執行 ID 無效');
     if (!parentId && row['進場次數'] !== 1) throw new Error('首次進場次數無效');
+    if (row['重新觸發來源ID']) {
+      const prior = indexed[row['重新觸發來源ID']], clear = row['重新觸發解除證據'] || {}, proof = row['成交證據識別'] || {};
+      const invalidTime = prior && modelTime_(prior['訊號失效時間']);
+      const clearTime = modelTime_(clear['來源時間']), entryTime = modelTime_(row['進場時間']);
+      const same = prior && ['市場','商品鍵','策略','策略版本','方向','計畫來源','計畫類型','交易日'].every(function(k) {return prior[k] === row[k];});
+      const released = same && (clear['進場許可'] === false || (['多頭','偏多'].indexOf(prior['方向'])>=0 ? clear['價格']<prior['進場價'] : clear['價格']>prior['進場價']));
+      if (!same || prior['狀態']!=='訊號失效' || prior['模擬進場價']!=null || prior['資料缺口'] || !released ||
+          row['失效重觸規則']!=='executable-reset-v1' || row['選擇權腿'] || !isFinite(invalidTime) || !isFinite(clearTime) || !isFinite(entryTime) ||
+          !(invalidTime<clearTime && clearTime<entryTime) || proof['來源時間']!==row['進場時間'] ||
+          !clear['串流識別'] || clear['串流識別']!==proof['串流識別'] || !(proof['序號']>clear['序號']) ||
+          !(clear['價格']>0) || !(proof['價格']>0) || row['計畫可執行性']!=='通過' || !(row['淨RR']>=1) || !(row['原始RR']>=1.3)) {
+        throw new Error('失效重新觸發缺少獨立計畫或完整解除／成交證據');
+      }
+    }
     if (parentId) {
       let parent = indexed[parentId];
       const cleared = row['重入解除證據'] || {};
@@ -594,9 +609,9 @@ function mergeModelTrades_(remote, incoming) {
       row['事件數'] = (archive['事件數'] || 0) - (archive['保留事件數'] || 0) + row['事件'].reduce(function(n,e) {return n + (e['次數'] || 1);}, 0);
       if (row['識別版本'] === 2) {
         row['同步確認'] = Boolean(old['同步確認'] || item['同步確認']);
-        ['重入解除','重入來源時間','重入最後序號','重入串流識別','重入等待原因'].forEach(function(k) {
+        ['重入解除','重入來源時間','重入最後序號','重入串流識別','重入等待原因','新計畫解除','新計畫來源時間','新計畫最後序號','新計畫串流識別','新訊號觸發狀態'].forEach(function(k) {
           const candidates = [old,item].filter(function(r) {return r[k] !== undefined;});
-          if (candidates.length) row[k] = candidates.sort(function(a,b) {return String(b['重入來源時間'] || '').localeCompare(String(a['重入來源時間'] || ''));})[0][k];
+          if (candidates.length) row[k] = candidates.sort(function(a,b) {return String(b[k.startsWith('新')?'新計畫來源時間':'重入來源時間'] || '').localeCompare(String(a[k.startsWith('新')?'新計畫來源時間':'重入來源時間'] || ''));})[0][k];
         });
       }
     }

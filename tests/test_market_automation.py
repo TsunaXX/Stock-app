@@ -706,7 +706,7 @@ def test_stock_background_publishes_current_limits_without_rewriting_strategy():
     ns['get_app_secret'] = lambda key: ''
     ns['get_model_tracker'] = lambda url: SimpleNamespace(submit=lambda *a: None)
     ns['model_tracking_config'] = lambda *a: ({}, '多頭')
-    ns['model_tracking_samples'] = lambda *a: ([], {})
+    ns['model_tracking_samples'] = lambda *a, **kw: ([], {})
     ns['begin_intraday_auto_update'] = lambda *a: True
     ns['finish_intraday_auto_update'] = lambda *a: None
     ns['refresh_daytrade_metrics_for_codes'] = lambda seed, *a, **kw: (

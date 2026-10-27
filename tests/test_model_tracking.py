@@ -387,6 +387,7 @@ with outer:
     app = AppTest.from_string(script, default_timeout=30).run()
     assert not app.exception and app.session_state['profit'] == '模型勝率追蹤'
     assert str(app.date_input(key='model_period').value[-1]) == '2026-10-12'
+    assert any(e.label == '候選與未進場診斷' for e in app.expander)
     assert len(app.get('download_button')) == 1
     assert any(metric.label == '全部訊號數' for metric in app.metric)
     assert any(metric.label == '資料不足數' for metric in app.metric)
