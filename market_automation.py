@@ -21,6 +21,7 @@ class IntradayBackground:
         self.lock = threading.RLock()
         self.wake = threading.Event()
         self.jobs = {}
+        self.stats = {}
         self.closed = False
         self.thread = threading.Thread(target=self._run, name='intraday-background', daemon=True)
         self.thread.start()
@@ -34,7 +35,7 @@ class IntradayBackground:
                 prior['cancelled'] = True
                 if not prior['running']:
                     self._release(prior)
-            self.jobs[room] = {'signature': signature, 'rows': copy.deepcopy(rows),
+            self.jobs[room] = {'room':room, 'signature': signature, 'rows': copy.deepcopy(rows),
                                'seconds': seconds, 'update': update, 'ready': ready,
                                'release': release, 'next': 0, 'result': None,
                                'running': False, 'cancelled': False, 'low_priority': low_priority}
@@ -111,6 +112,11 @@ class IntradayBackground:
                                      'updated_at': checked if changed and not error else prior.get('updated_at'),
                                      'version': version,
                                      'duration': time.monotonic() - started}
+                    stats = self.stats.get(job['room'], {})
+                    self.stats[job['room']] = {'範圍':job['room'], '檢查時間':checked,
+                        '實際間隔(秒)':started-stats['_started'] if '_started' in stats else None,
+                        '執行耗時(秒)':job['result']['duration'], '錯誤次數':stats.get('錯誤次數',0)+bool(error),
+                        '最近錯誤':error or '', '_started':started}
                     job['rows'] = rows
                     delay = max(1, job['seconds']) if outside else job['seconds']
                     if job['low_priority']:

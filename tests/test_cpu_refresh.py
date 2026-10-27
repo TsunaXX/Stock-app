@@ -138,12 +138,13 @@ def test_cpu_alias_is_exact_and_later_rules_get_new_versions():
     exec(compile(ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[])), source, 'exec'), ns)
     fingerprint = ns['data_version']([model.PROTECTION_POLICY, *[inspect.getsource(ns[name]) for name in (
         'calculate_futures_strategy_levels', 'enrich_futures_strategy_rows',
-        'calculate_entry_confidence', 'model_tracking_samples')]])[:10]
-    expected = model.VERSION + '-' + ('d8631cd521' if fingerprint == '10833cdc0b' else fingerprint)
+        'calculate_entry_confidence', 'model_tracking_samples', 'strategy_execution_terms',
+        'check_plan_execution', 'entry_economics', 'executable_entry_band')]])[:10]
+    expected = model.VERSION + '-exec1-' + fingerprint
     assert ns['get_model_rules_version'](False) == expected
     def future_strategy(*args):
         return 'Different rules require a new version'
     ns['calculate_futures_strategy_levels'] = future_strategy
     assert ns['get_model_rules_version'](False) != expected
     ns['data_version'] = lambda data: '10833cdc0b'
-    assert ns['get_model_rules_version'](False) == model.VERSION + '-d8631cd521'
+    assert ns['get_model_rules_version'](False) == model.VERSION + '-exec1-10833cdc0b'
