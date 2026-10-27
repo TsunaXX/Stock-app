@@ -127,7 +127,7 @@ def test_cross_device_new_plan_identity_and_script_proof_validation(tmp_path):
 global.Utilities={DigestAlgorithm:{SHA_256:'sha256'},Charset:{UTF_8:'utf8'},computeDigest:(a,t)=>Array.from(crypto.createHash(a).update(t).digest())};
 """+Path('google_apps_script.gs').read_text(encoding='utf8')+'\nconst rows='+json.dumps(generated[0],ensure_ascii=False)+""";
 validateModelExecutions_(rows,rows);
-const next=rows.find(r=>r['重新觸發來源ID']), old=rows.find(r=>!r['重新觸發來源ID']);
+const next=rows.find(r=>r['重新觸發來源ID']&&!r['前次執行ID']), old=rows.find(r=>!r['重新觸發來源ID']);
 assert.throws(()=>validateModelExecutions_([next],[next]));
 assert.throws(()=>validateModelExecutions_(rows,[{...next,'重新觸發解除證據':{...next['重新觸發解除證據'],'來源時間':old['訊號失效時間']}}]));
 assert.throws(()=>validateModelExecutions_(rows,[{...next,'成交證據識別':{...next['成交證據識別'],'串流識別':'other'}}]));
