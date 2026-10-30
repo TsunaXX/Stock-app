@@ -11960,6 +11960,13 @@ def parse_trade_plan_numbers(plan_text):
         values[key] = float(match.group(1).replace(',', '')) if match else None
     return values
 
+def has_trade_prediction_signal(value):
+    text = value if isinstance(value, str) else ''
+    if any(word in text for word in ('等待', '觀望', '資料不足', '待調整', '不建立', '待確認', '待進', '失效', '不追價')):
+        return False
+    return all(value is not None for value in parse_trade_plan_numbers(text).values())
+
+
 def classify_signal_state(rule, eligible, score=None, minimum_score=0):
     """把文字條件轉成簡短狀態，原始規則文字仍保留在明細。"""
     text = str(rule or '')
@@ -20371,6 +20378,7 @@ def generate_note_from_points(points, manual_note, show_3d):
 
 
 def filter_strategy_note_points(points, base_price):
+    points = [p for p in points if isinstance(p, dict)] if isinstance(points, list) else []
     limit_up, limit_down = calculate_limits(base_price)
     if not limit_up or not limit_down:
         return []
@@ -23072,6 +23080,8 @@ def render_futures_strategy_room():
                 name_style = 'background-color: #ff4b4b; color: #ffffff; font-weight: bold;'
             elif limit_state == 'down':
                 name_style = 'background-color: #00e676; color: #ffffff; font-weight: bold;'
+            elif has_trade_prediction_signal(source_row.get('進出場點位')):
+                name_style = 'background-color: #ffeb3b; color: #000000; font-weight: bold;'
             else:
                 name_style = 'color:#ff4b4b;font-weight:bold;' if direction == '偏多' else ('color:#00c853;font-weight:bold;' if direction == '偏空' else '')
             for position, column in enumerate(row.index):
@@ -24426,7 +24436,9 @@ if tab1.open and stock_strategy_tab.open:
                     )
                     ma5_val = row.get('_ma5')
                     if pd.isna(ma5_val):
-                        for p in row.get('_points', []):
+                        for p in row.get('_points', []) if isinstance(row.get('_points'), list) else []:
+                            if not isinstance(p, dict):
+                                continue
                             if p.get('tag') in ['多', '空', '平']:
                                 ma5_val = p.get('val')
                                 break
@@ -24852,7 +24864,7 @@ if tab1.open and stock_strategy_tab.open:
                         name_c = 'background-color: #ff4b4b; color: #ffffff; font-weight: bold;'
                     elif limit_state == 'down':
                         name_c = 'background-color: #00e676; color: #ffffff; font-weight: bold;'
-                    elif st_val == "命中":
+                    elif has_trade_prediction_signal(source_row.get('進出場預判')):
                         name_c = 'background-color: #ffeb3b; color: #000000; font-weight: bold;'
                     else:
                         name_c = (
