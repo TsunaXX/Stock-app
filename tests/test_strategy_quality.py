@@ -15,6 +15,9 @@ def test_reconnect_editor_accepts_missing_status_and_snapshot_projection():
     tree = ast.parse(Path('app.py').read_text(encoding='utf-8'))
     node = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == 'style_tab1_df')
     source = "import pandas as pd\nimport streamlit as st\nstrategy_row_limit_state = lambda row: None\n"
+    source += "import re\n"
+    for helper in ('parse_trade_plan_numbers', 'has_trade_prediction_signal'):
+        source += ast.unparse(next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == helper)) + "\n"
     source += ast.unparse(node) + "\n"
     source += """
 df_display = pd.DataFrame([{'名稱': '測試', '漲跌幅': '+1%', '狀態': '命中'}])
