@@ -20091,7 +20091,7 @@ def build_guarded_stock_trade_plan(row, direction, is_daytrade, result, costs=No
     if prior.get('session') == session and price is not None and not bool(row.get('_data_stale', False)):
         stop = prior['stop']
         stopped = price <= stop if prior['direction'] == '多頭' else price >= stop
-        if stopped:
+        if stopped and not plan.get('valid'):
             plan = {**plan, 'summary': f'⛔ 失效 {fmt_price(stop)}｜' + plan['summary']}
     if plan.get('valid'):
         levels = parse_trade_plan_numbers(plan['summary'])
@@ -21354,7 +21354,7 @@ def get_model_rules_version(stock):
                      calculate_futures_strategy_levels, enrich_futures_strategy_rows, calculate_entry_confidence)
     functions += (model_tracking_samples, strategy_execution_terms, check_plan_execution, entry_economics, executable_entry_band)
     fingerprint = data_version([PROTECTION_POLICY, *[inspect.getsource(f) for f in functions]])[:10]
-    return MODEL_VERSION + '-exec1-' + fingerprint
+    return MODEL_VERSION + '-exec2-' + fingerprint
 
 
 def model_market_open(row, now_value=None):
@@ -21400,7 +21400,7 @@ def apply_model_protection(rows, stock, mode):
                                      '當沖' if mode == '當沖' else '波段', day.date().isoformat())
     for index, row in rows.iterrows():
         record = plans.get(str(row[key_column]))
-        if record and record.get('模擬進場價') is not None:
+        if record and record.get('模擬進場價') is not None and record.get('狀態') != '已平倉':
             side = '多' if record['方向'] in ('多頭', '偏多') else '空'
             status = record.get('出場原因') or ('待確認' if record.get('資料缺口') else '已進場')
             protection = fmt_price(record['保利價']) if record.get('保利價') is not None else '—'
@@ -21583,7 +21583,8 @@ def model_tracking_samples(rows, stock, mode, direction_choice, config, seconds,
     now = datetime.now(pytz.timezone('Asia/Taipei'))
     mode = '當沖' if mode == '當沖' else '波段'
     signals, quotes = [], {}
-    execution_policy = '-exec1-' in config.get('rules_version', '')
+    reentry_policy = '-exec2-' in config.get('rules_version', '')
+    execution_policy = reentry_policy or '-exec1-' in config.get('rules_version', '')
     if not stock:
         rows = enrich_futures_strategy_rows(rows, mode, config.get('market_bias', '盤整'))
     for _, row in rows.iterrows():
@@ -21630,7 +21631,7 @@ def model_tracking_samples(rows, stock, mode, direction_choice, config, seconds,
         quote['成交證據'] = ticks
         quotes[market + '|' + key] = quote
         if stock:
-            if '進出場預判' in row and not recalculate:
+            if '進出場預判' in row and not (recalculate or reentry_policy):
                 levels = parse_trade_plan_numbers(row.get('進出場預判'))
                 direction = str(row.get('_系統方向', determine_stock_direction(row, mode == '當沖', direction_choice)['direction']))
                 state = str(row.get('訊號狀態', ''))
@@ -21685,7 +21686,8 @@ def model_tracking_samples(rows, stock, mode, direction_choice, config, seconds,
         quote['進場品質方向'] = direction
         quote['進場品質時間'] = quote['來源時間']
         quote.update({'策略版本': config.get('rules_version', MODEL_VERSION), '計畫來源': '股期戰略室',
-                      '計畫類型': ('股票' if stock else '期貨') + mode, '成本設定': costs, '候選已重估':recalculate,
+                      '計畫類型': ('股票' if stock else '期貨') + mode, '成本設定': costs, '候選已重估':recalculate or reentry_policy,
+                      '再入規則':'fresh-plan-v1' if reentry_policy else '',
                       '指標快照': indicators, '市場環境': config.get('market_bias', '未取得'), '觸發條件': rule,
                       '條件快照': {name + '同向': (price > value if direction in ('多頭', '偏多') else price < value)
                                    for name, value in indicators.items() if price is not None and value is not None and name in ('VWAP', '均線')}})
@@ -21735,6 +21737,12 @@ def record_model_table(room, rows, stock, mode, direction_choice='自動'):
     scope = job_room + '_' + str(id(worker))
 
     def update(plans):
+        if '-exec2-' in config.get('rules_version', ''):
+            if stock:
+                plans, _, _ = refresh_daytrade_metrics_for_codes(plans, True, api, stream_only=True, stream_room=scope)
+            else:
+                plans, _ = update_futures_live_rows(plans, api, mode, direction, stream_only=True, stream_room=scope,
+                    costs={**config.get('fee_schedule', {}), **config['costs']})
         contracts = [(index, get_shioaji_stock_contract(api, row.get('代號')) if stock else
                       resolve_shioaji_futures_contract(api, row.get('期貨代碼'), row.get('契約月份')))
                      for index, row in plans.iterrows()]

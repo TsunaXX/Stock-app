@@ -140,11 +140,11 @@ def test_cpu_alias_is_exact_and_later_rules_get_new_versions():
         'calculate_futures_strategy_levels', 'enrich_futures_strategy_rows',
         'calculate_entry_confidence', 'model_tracking_samples', 'strategy_execution_terms',
         'check_plan_execution', 'entry_economics', 'executable_entry_band')]])[:10]
-    expected = model.VERSION + '-exec1-' + fingerprint
+    expected = model.VERSION + '-exec2-' + fingerprint
     assert ns['get_model_rules_version'](False) == expected
     def future_strategy(*args):
         return 'Different rules require a new version'
     ns['calculate_futures_strategy_levels'] = future_strategy
     assert ns['get_model_rules_version'](False) != expected
     ns['data_version'] = lambda data: '10833cdc0b'
-    assert ns['get_model_rules_version'](False) == model.VERSION + '-exec1-10833cdc0b'
+    assert ns['get_model_rules_version'](False) == model.VERSION + '-exec2-10833cdc0b'

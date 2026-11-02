@@ -1150,6 +1150,15 @@ class ModelTracker:
             market, product = key.split('|', 1)
             scope = plan_scope({**quote, '市場': market, '商品鍵': product})
             plans = db.execute("SELECT t.body FROM model_plans p JOIN trades t ON t.id=p.trade_id WHERE p.scope=? AND t.state='已平倉'", (scope,)).fetchall()
+            fresh = quote.get('再入規則') == 'fresh-plan-v1' and quote.get('計畫來源') == '股期戰略室'
+            if fresh:
+                # One revalidated candidate per direction; never restart an older closed chain.
+                latest = {}
+                for raw, in plans:
+                    item = json.loads(raw)
+                    if item['方向'] not in latest or item['結案時間'] > json.loads(latest[item['方向']])['結案時間']:
+                        latest[item['方向']] = raw
+                plans = [(raw,) for raw in latest.values()]
             permission = self.entry_permissions.get((key, quote.get('策略')), {})
             before, current = stamp(permission.get('進場品質時間')), stamp(quote.get('進場品質時間'))
             permit_bridge = (permission.get('有效') and before is not None and current is not None
@@ -1204,7 +1213,23 @@ class ModelTracker:
                         continue
                     direction = sample.get('進場品質方向') or sample.get('許可方向')
                     allowed = sample.get('進場許可', True) and sample.get('進場品質許可', True) and (not direction or direction == row['方向'])
-                    hit = price >= row['進場價'] if row['方向'] in ('多頭', '偏多') else price <= row['進場價']
+                    current_candidate = quote.get('候選計畫') if fresh else None
+                    if fresh:
+                        evaluated = stamp(quote.get('進場品質時間'))
+                        candidate_time = stamp(current_candidate.get('來源時間')) if current_candidate else None
+                        ready = (quote.get('候選已重估') and current_candidate and evaluated is not None
+                                 and candidate_time == evaluated and closed_time < evaluated <= ts
+                                 and plan_scope(current_candidate) == scope and current_candidate['方向'] == row['方向'])
+                        if not ready:
+                            row['重入等待原因'] = '等待平倉後原策略與即時盤面重新驗證'
+                            continue
+                        active = db.execute("SELECT 1 FROM trades WHERE slot=? AND state IN ('等待進場','模擬持倉','監控中斷','資料不足') LIMIT 1", (trade_slot(row),)).fetchone()
+                        if active:
+                            continue
+                        cleared = {'來源時間': evaluated.isoformat(), '型態':'策略重驗',
+                                   '序號':seq, '串流識別':stream, '價格':price}
+                    reference_entry = current_candidate['進場價'] if fresh else row['進場價']
+                    hit = price >= reference_entry if row['方向'] in ('多頭', '偏多') else price <= reference_entry
                     permit_time = stamp(sample.get('進場許可時間'))
                     if (sample.get('進場許可識別') and sample['進場許可識別'] != row.get('進場許可識別')
                             and permit_time is not None and closed_time < permit_time <= ts):
@@ -1213,12 +1238,15 @@ class ModelTracker:
                         if cleared is None:
                             cleared = {'來源時間': ts.isoformat(), '序號': seq, '串流識別': stream, '價格': price}
                         row['重入等待原因'] = '原進場條件已解除，等待重新成立'
-                    elif cleared and continuous and (ts > stamp(cleared['來源時間']) or cleared.get('型態') == '新許可'):
+                    elif cleared and continuous and (ts > stamp(cleared['來源時間']) or cleared.get('型態') in ('新許可','策略重驗')):
                         seed = {field: row[field] for field in seed_fields if field in row}
+                        if fresh:
+                            seed.update({field:current_candidate[field] for field in seed_fields if field in current_candidate
+                                         and field not in ('重新觸發來源ID','重新觸發解除證據')})
                         seed.update({'來源時間': ts.isoformat(), '訊號價': price, '前次執行ID': row['交易ID'],
                                      '前次執行月份': row['交易日'][:7].replace('-', ''),
                                      '進場次數': row['進場次數'] + 1, '交易日': quote['交易日'],
-                                     '成本設定': quote.get('成本設定', row['成本設定']), '重入解除證據': cleared})
+                                     '成本設定': quote.get('成本設定', seed['成本設定']), '重入解除證據': cleared})
                         for field in ('指標快照', '條件快照', '市場環境', '觸發條件'):
                             if field in quote:
                                 seed[field] = quote[field]
