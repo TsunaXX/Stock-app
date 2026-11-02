@@ -150,3 +150,51 @@ global.Utilities={DigestAlgorithm:{SHA_256:'sha256'},Charset:{UTF_8:'utf8'},comp
 """+Path('google_apps_script.gs').read_text(encoding='utf-8')+'\nconst rows='+json.dumps(records,ensure_ascii=False)+';validateModelExecutions_(rows,rows);'
     result=subprocess.run([node],input=js,text=True,encoding='utf-8',capture_output=True)
     assert result.returncode==0,result.stderr
+
+
+@pytest.mark.parametrize('stock',[True,False])
+def test_published_plan_worker_revalidates_cached_live_metrics(stock):
+    from test_core_calculations import load_app_symbols
+    ns=real_stock_adapter()
+    ns.update(load_app_symbols('record_model_table'))
+    rows,config=stock_rows_with_evidence(ns,1)
+    rows['契約鍵']='2330';rows['期貨代碼']='CCF';rows['契約月份']='202611'
+    rows['進出場預判']=rows['進出場點位']='進 100｜停 95｜目 112'
+    config['rules_version']='V1.2-exec2-test'
+    captured={};observed=[];refreshes=[]
+    class Worker:
+        def configure(self,room,signature,seed,seconds,update,ready,release):
+            captured.update(update=update,seed=seed)
+        def remove(self,room): pass
+    api=object();worker=Worker()
+    def refresh(frame,*args,**kw):
+        assert kw['stream_only'] is True
+        refreshes.append(stock)
+        result=frame.copy();result['收盤價']=112
+        return (result,0,1) if stock else (result,1)
+    ns.update(weakref=__import__('weakref'),data_version=lambda x:str(x),
+              st=SimpleNamespace(session_state={'sj_api':api,'sj_logged_in':True}),
+              get_intraday_background=lambda:worker,check_shioaji_connection=lambda a:True,
+              model_tracking_config=lambda *a:(config,'多'),get_app_secret=lambda k:'',
+              get_model_tracker=lambda u:SimpleNamespace(submit=lambda *args:None),
+              intraday_auto_settings=lambda room:(False,5,None,None),
+              get_shioaji_stock_contract=lambda *a:SimpleNamespace(code='2330'),
+              resolve_shioaji_futures_contract=lambda *a:SimpleNamespace(code='2330'),
+              sync_strategy_stream_scope=lambda *a:None,fresh_strategy_stream_quote=lambda q:False,
+              get_stream_quotes=lambda *a,**kw:[],refresh_daytrade_metrics_for_codes=refresh,update_futures_live_rows=refresh,
+              model_tracking_samples=lambda frame,*a,**kw:(observed.append(frame.iloc[0]['收盤價']) or [],{}))
+    ns['record_model_table'].__globals__.update(ns)
+    ns['record_model_table']('stock' if stock else 'futures',rows,stock,'當沖')
+    captured['update'](captured['seed'])
+    assert refreshes==[stock] and observed[-1]==112
+
+
+def test_new_valid_stock_plan_is_not_prefixed_with_previous_stop():
+    from test_core_calculations import load_app_symbols
+    ns=load_app_symbols('build_guarded_stock_trade_plan','_safe_number','parse_trade_plan_numbers','fmt_price')
+    ns['st']=SimpleNamespace(session_state={'_stock_last_intraday_plans':{'2330':{
+        'session':'2026-11-02','stop':100,'direction':'多頭','summary':'進 105｜停 100｜目 115'}}})
+    ns['build_trade_plan']=lambda *a:{'valid':True,'summary':'進 99｜停 94｜目 111'}
+    result=ns['build_guarded_stock_trade_plan']({'代號':'2330','_daytrade_data_time':'2026-11-02',
+        '_daytrade_close':99},'多頭',True,{})
+    assert result['valid'] and '失效' not in result['summary'] and '進 99' in result['summary']
