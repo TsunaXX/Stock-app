@@ -169,6 +169,10 @@ def test_model_only_background_follows_published_plan_without_market_polling():
     ns['record_model_table'].__globals__.update(ns)
     ns['record_model_table']('stock', rows, True, '當沖')
     assert captured['room'] == 'stock_model' and submissions[0][0]
+    stream = ns['_stream_state'](api)
+    stream['connection_down'] = True
+    assert captured['update'](captured['seed'])[1] == 0 and len(submissions) == 1
+    stream['connection_down'] = False
     captured['update'](captured['seed'])
     assert len(submissions) == 2 and submissions[1][0][0]['進場價'] == 100.5
     old_release = captured['release']
