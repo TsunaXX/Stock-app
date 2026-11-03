@@ -555,7 +555,7 @@ def test_stream_disconnect_restores_subscriptions_without_polling():
 
 def test_failed_background_seed_retries_after_backoff_and_then_reuses_success():
     from concurrent.futures import Future
-    ns = load_app_symbols('get_strategy_intraday_history')
+    ns = load_app_symbols('get_strategy_intraday_history', '_is_shioaji_auth_error')
     state = {'lock': threading.RLock()}
     clock, attempts = [0.], []
     ns['time'] = SimpleNamespace(monotonic=lambda: clock[0], sleep=lambda _: None)
@@ -700,6 +700,7 @@ def test_stock_background_publishes_current_limits_without_rewriting_strategy():
     state = {'sj_api': object(), 'sj_logged_in': True}
     ns['st'] = SimpleNamespace(session_state=state)
     ns['intraday_auto_settings'] = lambda room: (True, 5, None, None)
+    ns['_stream_state'] = lambda api: {'lock': threading.RLock()}
     ns['check_shioaji_connection'] = lambda api: True
     ns['get_intraday_background'] = lambda: None
     ns['intraday_auto_window_open'] = lambda *a, **kw: True
