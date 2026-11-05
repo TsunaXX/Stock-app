@@ -81,11 +81,12 @@ def _write_json_atomic(path, payload, indent=2):
     with open(path,'w',encoding='utf-8') as file: json.dump(payload,file)
 def get_app_secret(key): return ""
 def render_dividend_status(year): pass
-def load_local_stock_names(): return {},{}
+def load_local_stock_names(): return {'2330':'台積電','0050':'元大台灣50'},{}
 st.session_state.cal_year=2026
 '''.replace('PATH',repr(path))+functions+'\nrender_dividend_settings()'
     page=AppTest.from_string(source).run()
     assert not page.exception and page.text_input[0].value=='0050,2330'
+    assert any('0050 元大台灣50、2330 台積電' in c.value for c in page.caption)
     page.text_input[0].set_value('2330').run()
     assert json.loads(Path(path).read_text())['codes']==['0050','2330']
     page.button(key='apply_dividend_tracking').click().run()
@@ -126,3 +127,66 @@ def test_same_day_distinct_periods_survive_within_the_preferred_source():
     fallback={**rows[1],'event_id':'fallback','source':'FinMind 股利備援'}
     chosen=selected_events([rows[1],second,fallback],['0050'],['股息發放日'])
     assert len(chosen)==2 and all(e['source']=='TWSE ETF 官方公告' for e in chosen)
+
+
+def dividend_fetch_namespace():
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from datetime import datetime
+    import pytz
+    tree=ast.parse((Path(__file__).parents[1]/'app.py').read_text(encoding='utf-8'))
+    node=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='fetch_dividend_updates')
+    namespace={'ThreadPoolExecutor':ThreadPoolExecutor,'as_completed':as_completed,'datetime':datetime,'pytz':pytz}
+    exec(ast.unparse(node),namespace)
+    return namespace
+
+
+def test_official_etfs_do_not_call_unnecessary_failing_fallbacks():
+    namespace=dividend_fetch_namespace()
+    official=etf_rows()+etf_events({'status':'ok','data':[
+        ['0056','元大高股息','115年10月22日','115年10月28日','115年11月11日','1.72']]},'https://www.twse.com.tw')
+    namespace['fetch_etf_dividend_feed']=lambda year: official if year==2026 else []
+    def fail(*args):
+        raise AssertionError('Official ETFs must not call FinMind or the stock feeds')
+    namespace['fetch_dividend_feed']=namespace['fetch_official_dividend_feed']=fail
+    result=namespace['fetch_dividend_updates'](['0050','0056','00919'],2026)
+    assert result['errors']==[] and len(result['events'])==7
+    assert all(e['ticker'] in ('0050','0056','00919') for e in result['events'])
+    namespace['fetch_etf_dividend_feed']=fail
+    assert namespace['fetch_dividend_updates']([],2026)['events']==[]
+
+
+def test_uncovered_stocks_keep_fallback_and_partial_official_data():
+    namespace=dividend_fetch_namespace()
+    namespace['fetch_etf_dividend_feed']=lambda year: etf_rows()
+    called=[]
+    def fallback(code,year):
+        called.append(code)
+        raise ValueError('source unavailable')
+    stock=finmind_events({'status':200,'data':[{'stock_id':'2330','year':'115Q1',
+        'CashExDividendTradingDate':'2026-11-06','CashEarningsDistribution':6}]},'2330','台積電')
+    namespace['fetch_dividend_feed']=fallback
+    namespace['fetch_official_dividend_feed']=lambda market: stock if market=='上市' else []
+    result=namespace['fetch_dividend_updates'](['0050','2330'],2026)
+    assert called==['2330'] and result['errors']==['2330：ValueError']
+    assert {e['ticker'] for e in result['events']}=={'0050','2330'}
+
+
+def test_official_failure_still_tries_the_alternate_source():
+    namespace=dividend_fetch_namespace()
+    def fail(year):
+        raise ValueError('official unavailable')
+    namespace['fetch_etf_dividend_feed']=fail
+    namespace['fetch_dividend_feed']=lambda code,year: [e for e in etf_rows() if e['ticker']==code]
+    namespace['fetch_official_dividend_feed']=lambda market: []
+    result=namespace['fetch_dividend_updates'](['0050'],2026)
+    assert len(result['events'])==4 and len(result['errors'])==2
+
+
+def test_calendar_settings_order_and_removed_separator():
+    source=(Path(__file__).parents[1]/'app.py').read_text(encoding='utf-8')
+    network=source.index('with st.expander("🌐 網路同步與追蹤事件"')
+    custom=source.index('with st.expander("🛠️ 自訂與校正行事曆事件"')
+    dividends=source.index('dividend_events = render_dividend_settings()',custom)
+    year=source.index('col_sel_y, col_sel_m = st.columns(2)',dividends)
+    assert network < custom < dividends < year
+    assert 'st.markdown("---")' not in source[network:year]
