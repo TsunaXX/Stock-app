@@ -3665,12 +3665,22 @@ def fetch_official_dividend_feed(market):
 
 def fetch_dividend_updates(selected, year):
     incoming, errors = [], []
+    if not selected:
+        return {'events':[], 'errors':[], 'checked_at':datetime.now(pytz.timezone('Asia/Taipei')).isoformat()}
     with ThreadPoolExecutor(max_workers=3) as pool:
-        jobs = {pool.submit(fetch_dividend_feed, code, year):code for code in selected}
-        jobs[pool.submit(fetch_etf_dividend_feed, year)] = 'ETF 官方公告'
-        jobs[pool.submit(fetch_etf_dividend_feed, year-1)] = 'ETF 前年度公告'
-        for market in ('上市','上櫃'):
-            jobs[pool.submit(fetch_official_dividend_feed,market)] = market+'除息公告'
+        jobs = {pool.submit(fetch_etf_dividend_feed, y):f'ETF {y} 年官方公告' for y in (year, year-1)}
+        for future in as_completed(jobs):
+            try:
+                incoming.extend(future.result())
+            except Exception as exc:
+                errors.append(f'{jobs[future]}：{type(exc).__name__}')
+        # Official ETF announcements already include payment dates; avoid redundant fallback requests.
+        covered = {event['ticker'] for event in incoming}
+        remaining = [code for code in selected if code not in covered]
+        jobs = {pool.submit(fetch_dividend_feed, code, year):code for code in remaining}
+        if remaining:
+            for market in ('上市','上櫃'):
+                jobs[pool.submit(fetch_official_dividend_feed,market)] = market+'除息公告'
         for future in as_completed(jobs):
             try:
                 incoming.extend(future.result())
@@ -3738,7 +3748,7 @@ def render_dividend_status(year):
                 _write_json_atomic(DIVIDEND_FILE,snapshot,indent=2)
             st.rerun()
     if selected:
-        result = get_public_maintenance_jobs().poll(('dividend-feed',selected,year,st.session_state.get('_dividend_refresh',0)),
+        result = get_public_maintenance_jobs().poll(('dividend-feed-official-first',selected,year,st.session_state.get('_dividend_refresh',0)),
             lambda:fetch_dividend_updates(selected,year), interval=21600)
         if result and result['checked_at'] != snapshot.get('checked_at'):
             snapshot.update(events=merge_dividend_events(snapshot.get('events',[]),result['events']),
@@ -3790,19 +3800,28 @@ def render_dividend_settings():
             st.multiselect('顯示股利事件',options=['除息日','股息發放日'],
                            key='dividend_kinds',disabled=not ready)
             st.form_submit_button('💾 套用股利設定',key='apply_dividend_tracking',on_click=save_dividend_settings,disabled=not ready)
-        st.caption('已套用：' + ('、'.join(snapshot.get('codes',[])) or '尚未選擇商品') +
+        names, _ = load_local_stock_names()
+        for event in snapshot.get('events',[]):
+            code = event['ticker']
+            name = event['title'].split('('+code+')',1)[0]
+            if name and name != code:
+                names.setdefault(code, name)
+        st.caption('已套用：' + ('、'.join(code + ' ' + names.get(code,'名稱待取得') for code in snapshot.get('codes',[])) or '尚未選擇商品') +
                    '｜' + ('、'.join(snapshot.get('kinds',['除息日','股息發放日'])) or '未顯示股利事件'))
         if st.session_state.get('_dividend_input_error'):
             st.error(st.session_state['_dividend_input_error'])
-        st.button('🧹 清空股利追蹤',key='clear_dividend_tracking',on_click=save_dividend_settings,args=(True,),disabled=not ready)
-        if st.button('🔄 更新股利公告',key='refresh_dividends'):
-            fetch_dividend_feed.clear()
-            fetch_etf_dividend_feed.clear()
-            fetch_official_dividend_feed.clear()
-            fetch_company_official_feed.clear()
-            st.session_state['_dividend_refresh']=st.session_state.get('_dividend_refresh',0)+1
+        clear_col, refresh_col = st.columns(2)
+        with clear_col:
+            st.button('🧹 清空股利追蹤',key='clear_dividend_tracking',on_click=save_dividend_settings,args=(True,),disabled=not ready)
+        with refresh_col:
+            if st.button('🔄 更新股利公告',key='refresh_dividends'):
+                fetch_dividend_feed.clear()
+                fetch_etf_dividend_feed.clear()
+                fetch_official_dividend_feed.clear()
+                fetch_company_official_feed.clear()
+                st.session_state['_dividend_refresh']=st.session_state.get('_dividend_refresh',0)+1
         render_dividend_status(st.session_state.cal_year)
-        st.caption('ETF 優先 TWSE 官方公告；個股與其他 ETF 發放日使用 FinMind 備援。來源失敗保留快照，查無公告不代表不配息。')
+        st.caption('ETF 優先 TWSE 官方公告（含股名、除息日與發放日），已涵蓋商品不再查詢 FinMind；未涵蓋商品才使用官方除息公告及 FinMind 備援。來源失敗保留快照，查無公告不代表不配息。')
     visible = selected_dividend_events(snapshot.get('events',[]),snapshot.get('codes',[]),snapshot.get('kinds',['除息日','股息發放日']))
     names, _ = load_local_stock_names()
     return [{**event,'title':event['title'].replace(event['ticker']+'('+event['ticker']+')',
@@ -27936,31 +27955,6 @@ with tab3:
     else:
         st.session_state.company_event_snapshot = normalize_company_event_snapshot(st.session_state.company_event_snapshot)
 
-    with st.expander("🛠️ 自訂與校正行事曆事件"):
-        st.info("若發現系統預設日期或時間有誤，可在此手動新增或覆寫事件（例如：提前休市、自訂總經數據時間）。")
-        edited_cal_df = st.data_editor(
-            st.session_state.cal_overrides,
-            num_rows="dynamic",
-            column_config={
-                "日期": st.column_config.DateColumn("日期 (YYYY-MM-DD)", required=True),
-                "事件名稱": st.column_config.TextColumn("事件名稱", required=True),
-                "文字顏色": st.column_config.SelectboxColumn(
-                    "文字顏色",
-                    options=["白色", "紅色", "綠色", "黃色", "藍色", "橘色", "紫紅色"],
-                    default="白色"
-                )
-            },
-            key="cal_override_editor",
-            width='stretch'
-        )
-        
-        if st.button("💾 儲存行事曆設定", key="btn_save_cal_override"):
-            st.session_state.cal_overrides = edited_cal_df
-            save_cal_overrides(edited_cal_df)
-            st.toast("自訂行事曆已儲存！", icon="✅")
-            st.rerun()
-    st.markdown("---")
-
     with st.expander("🌐 網路同步與追蹤事件", expanded=False):
         st.caption("選擇要顯示的事件；公司資料只讀取獨立分頁的最近快照，不會在切換月份時重新查詢。")
         if 'calendar_event_groups' in st.session_state:
@@ -28070,6 +28064,32 @@ with tab3:
                     selected_settlement_events,
                 )
                 st.toast("追蹤設定已儲存。", icon="✅")
+
+    with st.expander("🛠️ 自訂與校正行事曆事件"):
+        st.info("若發現系統預設日期或時間有誤，可在此手動新增或覆寫事件（例如：提前休市、自訂總經數據時間）。")
+        edited_cal_df = st.data_editor(
+            st.session_state.cal_overrides,
+            num_rows="dynamic",
+            column_config={
+                "日期": st.column_config.DateColumn("日期 (YYYY-MM-DD)", required=True),
+                "事件名稱": st.column_config.TextColumn("事件名稱", required=True),
+                "文字顏色": st.column_config.SelectboxColumn(
+                    "文字顏色",
+                    options=["白色", "紅色", "綠色", "黃色", "藍色", "橘色", "紫紅色"],
+                    default="白色"
+                )
+            },
+            key="cal_override_editor",
+            width='stretch'
+        )
+
+        if st.button("💾 儲存行事曆設定", key="btn_save_cal_override"):
+            st.session_state.cal_overrides = edited_cal_df
+            save_cal_overrides(edited_cal_df)
+            st.toast("自訂行事曆已儲存！", icon="✅")
+            st.rerun()
+
+    dividend_events = render_dividend_settings()
 
     st.caption("行事曆資料來源：TWSE、Federal Reserve、U.S. BLS、U.S. BEA、ISM、U.S. Department of Labor、ADP、Cboe、SGX、MSCI，以及 TradingView 免費經濟日曆備援；公司營收與財報顯示獨立分頁的最近快照。")
 
@@ -28194,7 +28214,7 @@ with tab3:
             + "。"
         )
 
-    network_events.extend(render_dividend_settings())
+    network_events.extend(dividend_events)
     company_snapshot = normalize_company_event_snapshot(st.session_state.company_event_snapshot)
     st.session_state.company_event_snapshot = company_snapshot
     company_snapshot = selected_company_calendar_snapshot(company_display_snapshot(company_snapshot))
