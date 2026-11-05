@@ -3810,10 +3810,8 @@ def render_dividend_settings():
                    '｜' + ('、'.join(snapshot.get('kinds',['除息日','股息發放日'])) or '未顯示股利事件'))
         if st.session_state.get('_dividend_input_error'):
             st.error(st.session_state['_dividend_input_error'])
-        clear_col, refresh_col = st.columns(2)
-        with clear_col:
+        with st.container(horizontal=True, horizontal_alignment='distribute'):
             st.button('🧹 清空股利追蹤',key='clear_dividend_tracking',on_click=save_dividend_settings,args=(True,),disabled=not ready)
-        with refresh_col:
             if st.button('🔄 更新股利公告',key='refresh_dividends'):
                 fetch_dividend_feed.clear()
                 fetch_etf_dividend_feed.clear()
