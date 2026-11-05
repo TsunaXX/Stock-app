@@ -73,6 +73,7 @@ def test_settings_widget_save_remove_and_restore(tmp_path):
     Path(path).write_text(json.dumps({'codes':['0050','2330'],'kinds':['除息日']}),encoding='utf-8')
     source='''import streamlit as st
 import json
+import re
 from datetime import datetime
 import pytz
 from dividend_calendar import codes as dividend_codes, selected_events as selected_dividend_events, snapshot as normalize_dividend_snapshot
@@ -81,44 +82,52 @@ def _write_json_atomic(path, payload, indent=2):
     with open(path,'w',encoding='utf-8') as file: json.dump(payload,file)
 def get_app_secret(key): return ""
 def render_dividend_status(year): pass
-def load_local_stock_names(): return {'2330':'台積電','0050':'元大台灣50'},{}
+def load_local_stock_names(): return {'2330':'台積電','0050':'元大台灣50','0056':'元大高股息'},{}
+def build_stock_search_options(allow_warrants=None):
+    assert allow_warrants is False
+    return [code+' '+name for code,name in load_local_stock_names()[0].items()]
 st.session_state.cal_year=2026
 '''.replace('PATH',repr(path))+functions+'\nrender_dividend_settings()'
     page=AppTest.from_string(source).run()
-    assert not page.exception and page.text_input[0].value=='0050,2330'
+    selected=lambda app:app.multiselect(key='dividend_symbols')
+    kinds=lambda app:app.multiselect(key='dividend_kinds')
+    assert not page.exception and selected(page).value==['0050','2330']
+    assert '0056 元大高股息' in selected(page).options and '2330 台積電' in selected(page).options
     assert any('0050 元大台灣50、2330 台積電' in c.value for c in page.caption)
-    page.text_input[0].set_value('2330').run()
+    selected(page).set_value(['2330','0056']).run()
     assert json.loads(Path(path).read_text())['codes']==['0050','2330']
     page.button(key='apply_dividend_tracking').click().run()
-    assert not page.exception and json.loads(Path(path).read_text())['codes']==['2330']
-    page.multiselect[0].set_value(['股息發放日']).run()
+    assert not page.exception and json.loads(Path(path).read_text())['codes']==['2330','0056']
+    kinds(page).set_value(['股息發放日']).run()
     page.button(key='apply_dividend_tracking').click().run()
     assert not page.exception and json.loads(Path(path).read_text())['kinds']==['股息發放日']
-    page.text_input[0].set_value('').run()
+    selected(page).set_value([]).run()
     page.button(key='apply_dividend_tracking').click().run()
-    assert not page.exception and json.loads(Path(path).read_text())['codes']==['2330']
+    assert not page.exception and json.loads(Path(path).read_text())['codes']==['2330','0056']
     fresh=AppTest.from_string(source).run()
-    assert fresh.text_input[0].value=='2330' and fresh.multiselect[0].value==['股息發放日']
+    assert selected(fresh).value==['2330','0056'] and kinds(fresh).value==['股息發放日']
+    fresh.session_state['dividend_tickers']='obsolete text widget'
     fresh.session_state['dividend_snapshot']={'codes':['00400A'],'kinds':['除息日']}
     fresh.session_state['_dividend_reset_widgets']=True
     fresh.run()
-    assert not fresh.exception and fresh.text_input[0].value=='00400A'
-    assert json.loads(Path(path).read_text())['codes']==['2330']
+    assert not fresh.exception and selected(fresh).value==['00400A']
+    assert '00400A 名稱待取得' in selected(fresh).options
+    assert json.loads(Path(path).read_text())['codes']==['2330','0056']
     fresh.run()
-    assert not fresh.exception and fresh.text_input[0].value=='00400A'
+    assert not fresh.exception and selected(fresh).value==['00400A']
     fresh.button(key='clear_dividend_tracking').click().run()
     assert not fresh.exception and json.loads(Path(path).read_text())['codes']==[]
-    assert fresh.text_input[0].value==''
+    assert selected(fresh).value==[]
     Path(path).unlink()
     cloud_source=source.replace('def get_app_secret(key): return ""','def get_app_secret(key): return "cloud"')
     waiting=AppTest.from_string(cloud_source).run()
-    assert not waiting.exception and waiting.text_input[0].disabled and waiting.multiselect[0].disabled
+    assert not waiting.exception and selected(waiting).disabled and kinds(waiting).disabled
     waiting.session_state['_dividend_remote_loaded']=True
     waiting.session_state['dividend_snapshot']={'codes':['00400A'],'kinds':['除息日']}
     waiting.session_state['_dividend_reset_widgets']=True
     waiting.run()
-    assert not waiting.exception and not waiting.text_input[0].disabled
-    assert waiting.text_input[0].value=='00400A' and not Path(path).exists()
+    assert not waiting.exception and not selected(waiting).disabled
+    assert selected(waiting).value==['00400A'] and not Path(path).exists()
 
 
 def test_same_day_distinct_periods_survive_within_the_preferred_source():
