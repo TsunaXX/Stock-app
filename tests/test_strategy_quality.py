@@ -127,7 +127,7 @@ def test_signal_notification_names_do_not_change_event_identity():
     fn = ns['notify_signal_state_changes']
     fn('stocks', {'2330': '等待'}, True, {'2330': '台積電（2330）'})
     fn('stocks', {'2330': '✅ 已觸發'}, True, {'2330': '台積電（2330）'})
-    assert messages == ['訊號狀態更新：台積電（2330） ✅ 已觸發']
+    assert messages == ['條件提醒：台積電（2330） ✅ 已觸發（尚未確認成交）']
     fn('stocks', {'2330': '✅ 已觸發'}, True, {'2330': '台積公司（2330）'})
     assert len(messages) == 1
     fn('futures', {'TXF 202610': '等待'}, True)

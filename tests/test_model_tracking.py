@@ -348,7 +348,7 @@ import streamlit as st
 import pandas as pd, numpy as np, json, pytz, threading, time
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import date,datetime,timedelta
-from model_tracking import ModelTracker,DEFAULT_COSTS,VERSION as MODEL_VERSION,performance,plan_performance,excel_report,normalize_costs
+from model_tracking import ModelTracker,DEFAULT_COSTS,VERSION as MODEL_VERSION,performance,plan_performance,excel_report,event_message,normalize_costs
 class ModelFixtureDatetime(datetime):
     @classmethod
     def now(cls, tz=None):
@@ -393,8 +393,8 @@ with outer:
     assert str(app.date_input(key='model_period').value[-1]) == '2026-10-12'
     assert any(e.label == '候選與未進場診斷' for e in app.expander)
     assert len(app.get('download_button')) == 1
-    assert any(metric.label == '全部訊號數' for metric in app.metric)
-    assert any(metric.label == '資料不足數' for metric in app.metric)
+    assert any(metric.label == '追蹤執行紀錄數' for metric in app.metric)
+    assert any(metric.label == '含資料缺口的執行紀錄數' for metric in app.metric)
     assert any(button.label == '今天' for button in app.button)
     assert app.selectbox(key='model_plan_source').options == ['全部','股期戰略室','指數操作計畫','選擇權操作計畫']
     assert '2330｜台積電' in app.selectbox(key='model_code').options
@@ -436,7 +436,7 @@ def test_model_display_frame_keeps_blank_cells_arrow_compatible():
     rows = pa.Table.from_pandas(frame.data, preserve_index=False).to_pylist()
     assert '>None<' not in frame.to_html()
     assert rows == [
-        {'勝率(%)': '', '平均獲利': '', '平均虧損': '', '方向': '偏多'},
+        {'勝率(%)': '—（無有效樣本）', '平均獲利': '', '平均虧損': '', '方向': '偏多'},
         {'勝率(%)': '0', '平均獲利': '120.5', '平均虧損': '-20', '方向': '偏空'},
     ]
     assert '0.000000' not in frame.to_html()
@@ -449,7 +449,7 @@ def test_model_display_frame_keeps_blank_cells_arrow_compatible():
         (column, str(empty_table.schema.field(column).type), empty_metrics.data[column].dtype,
          empty_metrics.data[column].tolist()) for column in empty_metrics.data
     ]
-    assert empty_table.to_pylist() == [{'勝率(%)': '', '平均獲利': '', '獲利因子': ''}]
+    assert empty_table.to_pylist() == [{'勝率(%)': '—（無有效樣本）', '平均獲利': '', '獲利因子': ''}]
     assert '>None<' not in empty_metrics.to_html()
     assert namespace['_model_number_text'](100.0000) == '100'
     assert namespace['_model_number_text'](0.001200) == '0'
@@ -476,8 +476,9 @@ def test_model_signal_counts_do_not_treat_missing_evidence_as_completed_trades()
         {'交易ID': 'closed', '狀態': '已平倉', '資料缺口': False, '模擬損益': 12.0},
     ]
     stats, _, _ = performance(rows)
-    assert stats['全部訊號數'] == 4
-    assert stats['資料不足數'] == 2
+    assert stats['追蹤執行紀錄數'] == 4
+    assert stats['含資料缺口的執行紀錄數'] == 1
+    assert stats['待確認執行紀錄數'] == 2
     assert stats['有效交易數'] == 1
     assert stats['勝率(%)'] == 100
 
@@ -916,7 +917,7 @@ def test_cached_model_performance_handles_legacy_metric_dict():
         {'狀態': '監控中斷', '資料缺口': True},
     ]
     summary, groups, data = ns['cached_model_performance'](json.dumps(sample))
-    assert summary['全部訊號數'] == 4
-    assert summary['資料不足數'] == 3
+    assert summary['追蹤執行紀錄數'] == 4
+    assert summary['含資料缺口的執行紀錄數'] == 2
     assert summary['有效交易數'] == 0
     assert len(data) == 4 and groups.empty

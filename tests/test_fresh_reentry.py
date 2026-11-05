@@ -111,10 +111,13 @@ def test_closed_projection_releases_both_tables_for_new_plan_apptest():
     tree=ast.parse(Path('app.py').read_text(encoding='utf-8'))
     function=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='apply_model_protection')
     script="""import streamlit as st
+import re
+from model_tracking import trade_display
 import pandas as pd, pytz
 from datetime import datetime
 from types import SimpleNamespace
 st.session_state['sj_logged_in']=True
+fmt_price=lambda value:str(value)
 get_app_secret=lambda key:''
 get_futures_trading_date=lambda value:value
 get_model_tracker=lambda url:SimpleNamespace(protection_plans=lambda *args:{'2330':{'模擬進場價':100,'狀態':'已平倉'}})

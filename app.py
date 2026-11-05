@@ -44,7 +44,7 @@ from market_automation import (
     macro_results, merge_company_sections, merge_macro_results, vwap_guard,
 )
 
-from model_tracking import ModelTracker, DEFAULT_COSTS, VERSION as MODEL_VERSION, PROTECTION_POLICY, performance, plan_performance, excel_report, normalize_costs, option_fills, option_tick, entry_economics, executable_entry_band, advance as advance_model_trade
+from model_tracking import ModelTracker, DEFAULT_COSTS, VERSION as MODEL_VERSION, PROTECTION_POLICY, performance, plan_performance, excel_report, trade_display, event_message, normalize_costs, option_fills, option_tick, entry_economics, executable_entry_band, advance as advance_model_trade
 
 logger = logging.getLogger(__name__)
 
@@ -11993,9 +11993,23 @@ def parse_trade_plan_numbers(plan_text):
 
 def has_trade_prediction_signal(value):
     text = value if isinstance(value, str) else ''
+    if '已出場' in text or '取消進場' in text:
+        return False
+    text = re.sub(r'^(?:[多空]·)?待進場｜', '', text)
     if any(word in text for word in ('等待', '觀望', '資料不足', '待調整', '不建立', '待確認', '待進', '失效', '不追價')):
         return False
     return all(value is not None for value in parse_trade_plan_numbers(text).values())
+
+
+def trade_plan_text_style(value):
+    text = str(value or '')
+    if any(word in text for word in ('⚠','待進場','取消進場')):
+        return 'color:#fbbf24;font-weight:bold;'
+    if '已出場' in text:
+        return 'color:#cbd5e1;font-weight:bold;'
+    if '已進場' in text:
+        return 'color:#67e8f9;font-weight:bold;'
+    return ''
 
 
 def classify_signal_state(rule, eligible, score=None, minimum_score=0):
@@ -12567,7 +12581,7 @@ def notify_signal_state_changes(scope, current_states, enabled, names=None):
         if changed:
             shown = '、'.join(f'{(names or {}).get(key, key)} {current_states[key]}' for key in changed[:5])
             suffix = f' 等 {len(changed)} 檔' if len(changed) > 5 else ''
-            st.toast(f'訊號狀態更新：{shown}{suffix}', icon='🔔')
+            st.toast(f'條件提醒：{shown}{suffix}（尚未確認成交）', icon='🔔')
     st.session_state[state_key] = dict(current_states)
 
 def render_strategy_validation_room():
@@ -21479,8 +21493,8 @@ def model_protection_text(row):
     return f"保 {unit}{fmt_price(value) if value is not None else '—'}·{status}"
 
 
-def apply_model_protection(rows, stock, mode):
-    """Project the same persisted simulator state; the UI never advances a second position."""
+def apply_model_protection(rows, stock, mode, room=None):
+    """Show confirmed model state and price plans without advancing the simulator."""
     if rows.empty or not st.session_state.get('sj_logged_in', False):
         return
     key_column, plan_column = ('代號', '進出場預判') if stock else ('契約鍵', '進出場點位')
@@ -21490,18 +21504,61 @@ def apply_model_protection(rows, stock, mode):
     tracker = get_model_tracker(get_app_secret('gsheet_api_url') or '')
     plans = tracker.protection_plans('股票' if stock else '期貨', rows[key_column].astype(str),
                                      '當沖' if mode == '當沖' else '波段', day.date().isoformat())
+    scope = room or ('stock' if stock else 'futures')
+    state_key = f'_model_trade_notices_{scope}_{mode}'
+    prior = st.session_state.get(state_key)
+    if prior and prior.get('day') != day.date().isoformat():
+        prior = None
+    states, notes, changes = {}, [], []
     for index, row in rows.iterrows():
-        record = plans.get(str(row[key_column]))
-        if record and record.get('模擬進場價') is not None and record.get('狀態') != '已平倉':
-            side = '多' if record['方向'] in ('多頭', '偏多') else '空'
-            status = record.get('出場原因') or ('待確認' if record.get('資料缺口') else '已進場')
-            protection = fmt_price(record['保利價']) if record.get('保利價') is not None else '—'
-            rows.at[index, plan_column] = (
-                f"{side}·{status}｜進 {fmt_price(record['進場價'])}｜停 {fmt_price(record['停損價'])}｜"
-                f"保 {protection}｜目 {fmt_price(record['目標價'])}"
-            )
-        elif plan_column in rows and None not in parse_trade_plan_numbers(row.get(plan_column)).values():
-            rows.at[index, plan_column] = str(row[plan_column]).replace('｜目 ', '｜保 —｜目 ', 1)
+        key = str(row[key_column])
+        record = plans.get(key)
+        candidate = row.get(plan_column)
+        probe = re.sub(r'^(?:[多空]·)?待進場｜', '', candidate) if isinstance(candidate, str) else ''
+        valid_candidate = bool(probe) and None not in parse_trade_plan_numbers(probe).values() and not any(word in probe for word in ('等待','觀望','資料不足','待調整','不建立','待確認','待進','失效','不追價','已進場','已出場','取消進場'))
+        if record:
+            view = trade_display(record)
+            entered = record.get('模擬進場價') is not None
+            state = view['交易狀態']
+            count = int(record.get('進場次數') or 1)
+            suffix = (str(count) + '次') if count > 1 else ''
+            side = '多' if record.get('方向') in ('多頭', '偏多') else '空'
+            fresh_plan = record.get('狀態') == '已平倉' and valid_candidate
+            if not fresh_plan:
+                label = state.replace('（停利）','(利)').replace('（停損）','(損)').replace('（保利）','(保)').replace('（收盤）','(收)')
+                protection = fmt_price(record['保利價']) if record.get('保利價') is not None else '—'
+                rows.at[index, plan_column] = (
+                    f"{side}·{label}{suffix}｜進 {fmt_price(record['進場價'])}｜停 {fmt_price(record['停損價'])}｜"
+                    f"保 {protection}｜目 {fmt_price(record['目標價'])}"
+                )
+            if entered or record.get('狀態') == '訊號失效':
+                source_time = record.get('結案時間') or record.get('訊號失效時間') or record.get('進場時間') or record.get('來源時間')
+                try:
+                    stamp = pd.Timestamp(source_time)
+                    if pd.isna(stamp):
+                        raise ValueError('Missing source time')
+                    stamp = stamp.tz_localize('Asia/Taipei') if stamp.tzinfo is None else stamp.tz_convert('Asia/Taipei')
+                    time_text, sort_time = stamp.strftime('%H:%M:%S'), stamp.isoformat()
+                except (TypeError, ValueError, OverflowError):
+                    time_text, sort_time = '時間未取得', ''
+                name = f"{row.get('名稱', key)}（{key}）"
+                note = f"{time_text} {name} {state}{suffix}：{view['狀態說明']}"
+                notes.append((sort_time, note))
+                states[key] = (record.get('交易ID'), state)
+                if prior is not None and prior.get('states', {}).get(key) != states[key]:
+                    changes.append(f"{name} {state}{suffix} {time_text}")
+            if not fresh_plan:
+                continue
+        if valid_candidate:
+            levels = parse_trade_plan_numbers(candidate)
+            direction = row.get('_系統方向') if stock else row.get('方向')
+            side = '多' if direction in ('多頭','偏多') else ('空' if direction in ('空頭','偏空') else '')
+            rows.at[index, plan_column] = f"{side + '·' if side else ''}待進場｜進 {fmt_price(levels['entry'])}｜停 {fmt_price(levels['stop'])}｜保 —｜目 {fmt_price(levels['target'])}"
+    st.session_state[state_key] = {'day':day.date().isoformat(), 'states':states}
+    if changes and st.session_state.get('stock_strategy_notify' if stock else 'futures_strategy_notify', True):
+        st.toast('交易狀態：' + '；'.join(changes[:3]), icon='🔔')
+    if notes:
+        st.caption('交易提醒：' + '；'.join(note for _, note in sorted(notes, reverse=True)[:3]))
 
 
 @st.cache_resource(max_entries=4)
@@ -21953,15 +22010,17 @@ def _model_time_text(value):
             stamp = stamp.tz_localize('Asia/Taipei')
         else:
             stamp = stamp.tz_convert('Asia/Taipei')
-        return stamp.strftime('%Y-%m-%d %H:%M:%S.') + f'{stamp.microsecond // 10000:02d}'
+        return stamp.strftime('%Y/%m/%d %H:%M:%S')
     except (TypeError, ValueError, OverflowError):
         return ''
 
 
 def _model_display_value(value, column=''):
+    if column.endswith('勝率(%)') and (value is None or pd.isna(value)):
+        return '—（無有效樣本）'
     if value is None:
         return None
-    if column in {'觀察時間', '來源時間', '建立時間', '進場時間', '結案時間', '最後進場等待時間', '訊號失效時間', '進場觸發時間', '起始時間', '結束時間', '檢查時間', '新計畫來源時間'} and value is not None and str(value).strip():
+    if column in {'時間', '重入來源時間', '觀察時間', '來源時間', '建立時間', '進場時間', '結案時間', '最後進場等待時間', '訊號失效時間', '進場觸發時間', '起始時間', '結束時間', '檢查時間', '新計畫來源時間'} and value is not None and str(value).strip():
         return _model_time_text(value)
     if column == '事件' and isinstance(value, (list, tuple)):
         lines = []
@@ -22007,8 +22066,8 @@ def _model_history_overview(frame):
             str(code or '') + ((' ' + str(name)) if name else '')
             for code, name in zip(codes.fillna(''), names.fillna(''))
         ]
-    first = ['交易日', '商品', '計畫來源', '計畫類型', '方向', '狀態', '進場次數', '原始RR', '淨RR', '計畫可執行性', '新訊號觸發狀態', '模擬進場價', '模擬出場價', '保利價', '保利淨額', '保利狀態', '出場原因', '模擬損益', '策略版本', '最後進場等待原因', '訊號失效原因', '未進場分類', '事件數']
-    columns = [column for column in first if column in result.columns]
+    first = ['交易日', '商品', '計畫來源', '計畫類型', '方向', '交易狀態', '狀態說明', '狀態', '進場次數', '原始RR', '淨RR', '計畫可執行性', '新訊號觸發狀態', '模擬進場價', '模擬出場價', '保利價', '保利淨額', '保利狀態', '出場原因', '模擬損益', '策略版本', '最後進場等待原因', '訊號失效原因', '未進場分類', '事件數']
+    columns = [column for column in first if column in result.columns and (column != '狀態' or '交易狀態' not in result.columns)]
     return result[columns], result[columns + [column for column in result.columns if column not in columns]]
 
 
@@ -22031,7 +22090,8 @@ def _model_column_config(frame):
         '進場等待原因': '新版當沖在模擬成交前檢查追價與扣除雙邊成本後的空間；等待不算已成交。',
         '最後進場等待原因': '最後一次未能進場的原因；進場或失效後仍保留。',
         '訊號失效原因': '訊號終止或超過有效時間的原因，不覆蓋原等待原因。',
-        '未進場分類': '進場前最後的等待分類；行情不完整與策略未放行分開記錄。',
+        '未進場分類': '進場前最後分類；成交後仍保留最後等待紀錄，實際是否進出場以交易狀態為準。',
+        '顯示訊息': '清楚說明進場／出場及失效原因；原原因、事件 ID 及歷史證據保留。',
         '資料缺口原因': '已確認中斷與缺漏的原因，不能藉重新同步清除。',
         '事件數': '事件發生次數；重複診斷區間的次數也納入，完整內容可匯出。',
         '計畫類型': '股票／期貨當沖或波段、日線／15分K、短波5分K、選擇權組合。',
@@ -22043,19 +22103,23 @@ def _model_column_config(frame):
         '保利出場比例(%)': '有效已結案交易中，出場原因為保利的比例。',
         '計畫觸發率(%)': '至少一次已進場的計畫數／原始計畫數。',
         '計畫有效率(%)': '至少一筆有效結案交易的計畫數／已觸發計畫數；在途另列，缺父紀錄時留空。',
-        '全部訊號數': '目前篩選條件下建立的策略訊號總數。',
+        '追蹤執行紀錄數': '目前篩選中的執行紀錄數，包含未進場及二次以上執行；不是原始計畫數。',
         '有效交易數': '有完整進出場證據、可納入勝率計算的已平倉筆數。',
-        '資料不足數': '行情或成交證據不足，暫不列入績效統計的筆數。',
+        '含資料缺口的執行紀錄數': '實際帶有資料缺口標記的執行紀錄數；尚在暖機等待不視為已遺失行情。',
         '勝率(%)': '獲利交易筆數 ÷ 有效交易數。',
         '累積模擬損益': '有效交易的模擬淨損益合計，已扣除估算成本。',
         '獲利因子': '獲利總額 ÷ 虧損總額絕對值。',
         '最大回撤': '累積模擬損益由高點至後續低點的最大降幅。',
-        '訊號有效率(%)': '有效交易數占全部訊號數的比例。',
+        '可計入績效比例(%)': '具有完整證據且已確認結案的有效交易數／追蹤執行紀錄數。',
         '資料完整率(%)': '目前篩選訊號中沒有資料缺口的比例。',
         '方向': '策略訊號判定的多空方向。',
         '市場': '商品所屬市場類別。',
         '策略': '訊號採用的當沖或波段週期。',
-        '狀態': '訊號目前的追蹤狀態。',
+        '狀態': '底層保存的原始追蹤狀態。',
+        '交易狀態': '待進場、已進場、已出場（含原因）或取消進場；⚠表示成交證據待確認。',
+        '狀態說明': '依已保存證據解釋持倉、出場與績效認定；不補造成交。',
+        '執行鏈完整': '前次執行 ID 是否都存在，不代表行情沒有缺口。',
+        '行情證據完整': '此計畫各次執行是否沒有缺口、資料不足或監控中斷。',
         '商品': '商品代碼與名稱。',
         '代碼': '股票或期貨商品代碼。',
         '名稱': '商品顯示名稱。',
@@ -22098,7 +22162,7 @@ def _model_display_frame(frame, color=True):
     result = frame.copy()
     for column in result.columns:
         result[column] = result[column].map(lambda value: _model_display_value(value, str(column)))
-        if result[column].isna().any():
+        if result[column].isna().any() or (str(column).endswith('勝率(%)') and not pd.api.types.is_numeric_dtype(result[column].dtype)):
             result[column] = result[column].map(lambda value: '' if pd.isna(value) else str(_model_number_text(value))).astype(object)
     styled = result.style.format(_model_number_text).set_table_styles([
         {'selector': 'th', 'props': [('color', '#93c5fd'), ('font-weight', 'bold')]},
@@ -22113,7 +22177,7 @@ def _model_display_frame(frame, color=True):
             number_value = float(value)
             if column in ('模擬損益', '毛損益', '結果(R)', '累積模擬損益', '平均獲利', '平均虧損', '每筆期望值'):
                 return 'color: #ff7373' if number_value > 0 else ('color: #55d6a8' if number_value < 0 else neutral)
-            if column in ('勝率(%)', '訊號有效率(%)', '資料完整率(%)'):
+            if column in ('勝率(%)', '可計入績效比例(%)', '資料完整率(%)'):
                 return 'color: #5eead4'
             if column == '最大回撤' and number_value > 0:
                 return 'color: #fbbf24'
@@ -22126,12 +22190,12 @@ def _model_display_frame(frame, color=True):
                 if '保利' in text:
                     return 'color: #67e8f9'
                 return 'color: #ff7373' if '停利' in text or '獲利' in text else ('color: #55d6a8' if '停損' in text or '虧損' in text else neutral)
-            if column == '狀態':
-                if '不足' in text or '中斷' in text or '失效' in text:
+            if column in ('狀態', '交易狀態'):
+                if any(word in text for word in ('不足','中斷','失效','⚠','取消')):
                     return 'color: #fbbf24'
-                if '持倉' in text or '等待' in text:
+                if '持倉' in text or '等待' in text or '待進場' in text:
                     return 'color: #67e8f9'
-                if '已平倉' in text:
+                if '已平倉' in text or '已出場' in text or '已進場' in text:
                     return 'color: #86efac'
             if column == '判定':
                 return 'color: #86efac' if '符合' in text and '未符合' not in text else ('color: #fbbf24' if '未符合' in text else neutral)
@@ -22215,7 +22279,7 @@ def render_trading_cost_settings():
 
 def render_model_tracking_room():
     st.caption('依股期進出場預判、指數操作計畫與選擇權操作計畫自動記錄；不讀取帳戶交易。只有成交證據完整的已平倉模擬交易會計入勝率。')
-    st.caption('觸價僅代表報價到達預判價；已進場／停損以模型成交證據為準。未通過進場檢查的訊號仍列為等待或失效，原因見「進場等待原因」。')
+    st.caption('待進場／觸價＝尚未成交；已進場＝模型持倉；已出場(利／損／保／收)＝停利／停損／保利／收盤。⚠表示證據待確認，不納入正式績效；2次代表第二次獨立進場。')
     with st.expander('📘 模型勝率追蹤使用說明', expanded=False):
         st.markdown(
             '開啟股期戰略室或指數／選擇權操作計畫並登入 Shioaji 後，系統會依畫面原有串流自動記錄，不需另外啟動追蹤。\n\n'
@@ -22327,10 +22391,11 @@ def render_model_tracking_room():
                    and (not query or query in ''.join(str(row.get(key, '') or '') for key in ('代碼', '名稱', '商品鍵')).replace(' ', '').casefold())]
         metrics, groups, frame = cached_model_performance(json.dumps(records, ensure_ascii=False), str((period, market, mode, direction, version, code, plan_source)))
         st.markdown('##### 交易績效（每次進場獨立計算）')
-        for col, key in zip(st.columns(3), ('全部訊號數', '有效交易數', '資料不足數')):
+        st.caption('追蹤執行紀錄包含尚未成交與二次以上執行；原始計畫數另列。只有證據完整且已同步確認的結案交易納入正式績效。')
+        for col, key in zip(st.columns(3), ('追蹤執行紀錄數', '有效交易數', '含資料缺口的執行紀錄數')):
             col.metric(key, str(metrics[key]))
         for col, key in zip(st.columns(4), ('勝率(%)', '累積模擬損益', '獲利因子', '最大回撤')):
-            col.metric(key, '未確認' if metrics[key] is None else f'{metrics[key]:,.2f}'.rstrip('0').rstrip('.'))
+            col.metric(key, ('—（無有效樣本）' if key.endswith('勝率(%)') else '未確認') if metrics[key] is None else f'{metrics[key]:,.2f}'.rstrip('0').rstrip('.'))
         diagnostics = tracker.diagnostics(period[0].isoformat(), period[1].isoformat())
         diagnostics = [r for r in diagnostics if (plan_source == '全部' or r.get('計畫來源') == plan_source)
                        and (market == '全部' or r.get('計畫類型','').startswith(market))
@@ -22401,7 +22466,10 @@ def render_model_tracking_room():
                         evidence = view[evidence_columns]
                         st.dataframe(_model_display_frame(evidence), hide_index=True, width='stretch',
                                      column_config=_model_column_config(evidence))
-                    event_rows = tracker.events(view['交易ID'])
+                    parents = {row['交易ID']:row for row in view.to_dict('records')}
+                    event_rows = [{**item, '商品': str(parents[item['交易ID']].get('代碼','')) + ' ' + str(parents[item['交易ID']].get('名稱','')),
+                                   '進場次數':parents[item['交易ID']].get('進場次數',1), '顯示訊息':event_message(parents[item['交易ID']],item)}
+                                  for item in tracker.events(view['交易ID'])]
                     if not tracker.events_ready(view['交易ID']):
                         st.info('完整事件正在背景載入；行情更新不受影響。')
                     st.caption(f"本頁事件發生 {int(view.get('事件數', pd.Series(dtype=float)).sum())} 次（重複診斷可能合併為區間）；畫面最多顯示 500 列，Excel 保留完整內容。")
@@ -22411,8 +22479,10 @@ def render_model_tracking_room():
             plan_history = tracker.plan_records([row['原始計畫ID'] for row in records if row.get('原始計畫ID')], period[1])
             plan_metrics, plan_rows = plan_performance(plan_history)
             st.caption('以目前篩選觸及的原始計畫歸組，合計至所選結束日的各次執行；缺少父紀錄時等待舊月份載入。舊制不推測共同計畫。平均R沿用保存的結果(R)，選擇權為標的觸發R，與金額保利R不同。')
-            for column, (label, value) in zip(st.columns(len(plan_metrics)), plan_metrics.items()):
-                column.metric(label, '未確認' if value is None else f'{value:,.2f}'.rstrip('0').rstrip('.'))
+            items = list(plan_metrics.items())
+            for offset in range(0, len(items), 3):
+                for column, (label, value) in zip(st.columns(3), items[offset:offset+3]):
+                    column.metric(label, ('—（無有效樣本）' if label.endswith('勝率(%)') else '未確認') if value is None else f'{value:,.2f}'.rstrip('0').rstrip('.'))
             if not plan_rows.empty:
                 st.dataframe(_model_display_frame(plan_rows), hide_index=True, width='stretch')
                 reasons = plan_rows.loc[~plan_rows['已觸發'], ['未進場分類', '訊號失效原因']]
@@ -22441,14 +22511,10 @@ def cached_model_performance(payload, view_key='default'):
         records = json.loads(payload)
         metrics, groups, frame = performance(records, state)
         # Older Streamlit cache entries or model modules may not include new UI fields.
-        if '全部訊號數' not in metrics or '資料不足數' not in metrics:
+        if '追蹤執行紀錄數' not in metrics or '含資料缺口的執行紀錄數' not in metrics:
             metrics = dict(metrics)
-            metrics['全部訊號數'] = len(records)
-            metrics['資料不足數'] = sum(
-                bool(row.get('資料缺口') or row.get('到期未確認')
-                     or row.get('狀態') in ('資料不足', '監控中斷'))
-                for row in records
-            )
+            metrics['追蹤執行紀錄數'] = len(records)
+            metrics['含資料缺口的執行紀錄數'] = sum(bool(row.get('資料缺口')) for row in records)
         return metrics, groups, frame
 
 
@@ -23212,7 +23278,9 @@ def render_futures_strategy_room():
                     styles[position] = 'color:#4fc3f7;font-weight:600;'
                 elif column in ('進出場點位', '觸發條件'):
                     value = str(row.get(column, ''))
-                    if any(keyword in value for keyword in ('資料不足', '不建立', '等待')):
+                    if column == '進出場點位' and (status_style := trade_plan_text_style(value)):
+                        styles[position] = status_style
+                    elif any(keyword in value for keyword in ('資料不足', '不建立', '等待')):
                         styles[position] = 'color:#ffd166;'
                     elif direction == '偏多':
                         styles[position] = 'color:#ff6b6b;'
@@ -23282,7 +23350,7 @@ def render_futures_strategy_room():
                 '未平倉量': st.column_config.NumberColumn(format='%d', width=content_width('未平倉量', 56, 100), disabled=True),
                 '方向': st.column_config.TextColumn(width=content_width('方向', 48, 86), disabled=True),
                 '支撐壓力': st.column_config.TextColumn(width=content_width('支撐壓力', 80), disabled=True),
-                '進出場點位': st.column_config.TextColumn(width=content_width('進出場點位', 96, 720, True), disabled=True, help='進＝條件成立後觀察價；停＝失效點；目＝第一目標。觸價＝報價達預判點位；已進場／停損＝模型成交證據確認，非券商成交。保＝達1R後移動保利，最低保護成本。'),
+                '進出場點位': st.column_config.TextColumn(width=content_width('進出場點位', 96, 720, True), disabled=True, help='進＝條件成立後觀察價；停＝失效點；目＝第一目標。待進場／觸價＝尚未成交；已進場＝模型持倉；已出場(利／損／保／收)＝已平倉及原因。⚠＝證據待確認；後續進場另列次數。保＝達1R後移動保利，最低保護成本。'),
                 '觸發條件': st.column_config.TextColumn(width=content_width('觸發條件', 72), disabled=True, help='條件成立後才評估進場；未成立時不以預判價直接下單。'),
                 '當日漲停價': st.column_config.NumberColumn(format='%.12g', width=content_width('當日漲停價', 54, 96), disabled=True, help='依期交所漲跌資料反推參考價後估算；實際限制以期交所與券商下單畫面為準。'),
                 '當日跌停價': st.column_config.NumberColumn(format='%.12g', width=content_width('當日跌停價', 54, 96), disabled=True, help='依期交所漲跌資料反推參考價後估算；實際限制以期交所與券商下單畫面為準。'),
@@ -23467,7 +23535,7 @@ def render_futures_strategy_room():
         if night_scope:
             st.caption('夜盤自動更新：僅顯示夜盤契約；關閉後還原原本分析標的。')
         record_model_table('futures_independent', independent_rows, False, strategy_mode, direction_choice)
-        apply_model_protection(independent_rows, False, strategy_mode)
+        apply_model_protection(independent_rows, False, strategy_mode, 'futures_independent')
         if not independent_rows.empty:
             if enhanced_layer:
                 independent_source_columns = (
@@ -25020,7 +25088,9 @@ if tab1.open and stock_strategy_tab.open:
                             styles[idx] = 'color:#4fc3f7;font-weight:600;'
                         elif col in ("盤中觸發", "隔日規則", "進出場預判"):
                             value = str(row.get(col, ''))
-                            if any(keyword in value for keyword in ('資料不足', '不建立', '觀察：', '等待')):
+                            if col == '進出場預判' and (status_style := trade_plan_text_style(value)):
+                                styles[idx] = status_style
+                            elif any(keyword in value for keyword in ('資料不足', '不建立', '觀察：', '等待')):
                                 styles[idx] = 'color:#ffd166;'
                             elif '多' in str(row.get('建議方向', '')):
                                 styles[idx] = 'color:#ff6b6b;'
@@ -25111,13 +25181,13 @@ if tab1.open and stock_strategy_tab.open:
                             "開盤區間": st.column_config.TextColumn(width=stock_content_width('開盤區間', 80, 150), disabled=True, help="09:00–09:15 顯示形成中的即時低點－高點；09:15 後固定為完整開盤區間。"),
                             "量能": st.column_config.TextColumn(width=stock_content_width('量能', 52, 96), disabled=True, help="目前累積量相對最近交易日同時段平均量。"),
                             "盤中觸發": st.column_config.TextColumn(width=stock_content_width('盤中觸發', 72), disabled=True, help="僅在盤中條件同時成立時提供觀察提示，不是自動買賣指令。"),
-                            "進出場預判": st.column_config.TextColumn(width=stock_content_width('進出場預判', 86, 720, True), disabled=True, help="通過條件後，以開盤區間與 VWAP 推估進場、策略失效離場與第一目標；僅供觀察與回測；觸價＝報價達預判點位；已進場／停損＝模型成交證據確認，非券商成交。保＝達1R後移動保利，最低保護成本。"),
+                            "進出場預判": st.column_config.TextColumn(width=stock_content_width('進出場預判', 86, 720, True), disabled=True, help="通過條件後，以開盤區間與 VWAP 推估進場、策略失效離場與第一目標；僅供觀察與回測；待進場／觸價＝尚未成交；已進場＝模型持倉；已出場(利／損／保／收)＝已平倉及原因。⚠＝證據待確認；後續進場另列次數。保＝達1R後移動保利，最低保護成本。"),
                         })
                     else:
                         risk_column_config.update({
                             "乖離": st.column_config.TextColumn(width=stock_content_width('乖離', 52, 96), disabled=True, help="收盤價相對 20 日線的 ATR 距離；數值越大越不宜追價或追空。"),
                             "隔日規則": st.column_config.TextColumn(width=stock_content_width('隔日規則', 72), disabled=True, help="僅在隔日條件成真時才列入評估，不是自動買賣指令。"),
-                            "進出場預判": st.column_config.TextColumn(width=stock_content_width('進出場預判', 86, 720, True), disabled=True, help="通過條件後，以昨高／昨低與 ATR 推估進場、策略失效離場與第一目標；僅供觀察與回測；觸價＝報價達預判點位；已進場／停損＝模型成交證據確認，非券商成交。保＝達1R後移動保利，最低保護成本。"),
+                            "進出場預判": st.column_config.TextColumn(width=stock_content_width('進出場預判', 86, 720, True), disabled=True, help="通過條件後，以昨高／昨低與 ATR 推估進場、策略失效離場與第一目標；僅供觀察與回測；待進場／觸價＝尚未成交；已進場＝模型持倉；已出場(利／損／保／收)＝已平倉及原因。⚠＝證據待確認；後續進場另列次數。保＝達1R後移動保利，最低保護成本。"),
                         })
 
                 stock_table_signature = abs(hash((
@@ -25666,7 +25736,7 @@ if tab1.open and stock_strategy_tab.open:
                             if col not in df_indep.columns: df_indep[col] = None
 
                         record_model_table('stock_independent', df_indep, True, indep_strategy_mode, indep_direction)
-                        apply_model_protection(df_indep, True, indep_strategy_mode)
+                        apply_model_protection(df_indep, True, indep_strategy_mode, 'stock_independent')
                         cols_to_fmt = ["當日漲停價", "當日跌停價", "成交價價差", "5日線價差"]
                         for c in cols_to_fmt:
                             if c in df_indep.columns: df_indep[c] = df_indep[c].apply(fmt_price)
