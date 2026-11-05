@@ -57,7 +57,7 @@ def test_legacy_reason_is_explained_without_changing_trade_or_event_identity():
 def test_unfilled_gap_cannot_be_shown_as_a_position_and_closed_gap_cannot_be_a_verified_win():
     waiting = {**record(),'狀態':'資料不足','資料缺口':True}
     holding = {**waiting,'模擬進場價':100.}
-    closed = {**holding,'狀態':'已平倉','模擬出場價':110.,'出場原因':'停利','模擬損益':1994.}
+    closed = {**holding,'狀態':'已平倉','模擬出場價':110.,'出場原因':'停利','模擬損益':300.}
     assert trade_display(waiting)['交易狀態'] == '待進場⚠'
     assert trade_display(holding)['交易狀態'] == '已進場⚠'
     shown = trade_display(closed)
@@ -68,7 +68,7 @@ def test_unfilled_gap_cannot_be_shown_as_a_position_and_closed_gap_cannot_be_a_v
 
 def test_record_counts_plan_counts_and_verified_first_reentries_have_distinct_meanings():
     rows = []
-    for index,pnl in enumerate((-1207,1013,2003,54)):
+    for index,pnl in enumerate((-120,100,200,5)):
         row = {**record(),'交易ID':f'first-{index}','原始計畫ID':f'plan-{index}',
                '狀態':'已平倉','模擬進場價':100.,'模擬出場價':101.,'結案時間':'2026-11-05T09:22:00+08:00',
                '模擬損益':pnl,'出場原因':'停損' if pnl<0 else '停利','同步確認':True}
@@ -77,12 +77,12 @@ def test_record_counts_plan_counts_and_verified_first_reentries_have_distinct_me
               '狀態':'訊號失效','最新價':95.,'未進場分類':'超過有效時間',
               '訊號失效原因':'未進場前已越過停損或交易日已結束'} for i in range(4)]
     rows.append({**rows[0],'交易ID':'second-0','進場次數':2,'前次執行ID':'first-0',
-                 '資料缺口':True,'模擬損益':1994.,'出場原因':'停利'})
+                 '資料缺口':True,'模擬損益':300.,'出場原因':'停利'})
     before = copy.deepcopy(rows)
     metrics,_,frame = performance(rows)
     plans,grouped = plan_performance(rows)
     assert metrics['追蹤執行紀錄數'] == 9 and metrics['含資料缺口的執行紀錄數'] == 1
-    assert metrics['有效交易數'] == 4 and metrics['勝率(%)'] == 75 and metrics['累積模擬損益'] == 1863
+    assert metrics['有效交易數'] == 4 and metrics['勝率(%)'] == 75 and metrics['累積模擬損益'] == 185
     assert plans['原始計畫數'] == 8 and plans['已觸發原始計畫數'] == 4
     assert plans['首次有效交易數'] == 4 and plans['二次以上有效交易數'] == 0
     assert plans['二次以上勝率(%)'] is None
