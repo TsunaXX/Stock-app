@@ -98,7 +98,7 @@ def snapshot(value):
     items = value.get('events', [])
     return {**value, 'codes':selected,
             'kinds':[kind for kind in value.get('kinds', KINDS) if kind in KINDS],
-            'events':[e for e in items if isinstance(e,dict) and e.get('event_id')
+            'events':[e for e in items if isinstance(e,dict) and all(isinstance(e.get(key),str) for key in ('event_id','ticker','title','source')) and e.get('event_id')
                       and e.get('kind') in KINDS and announced_date(e.get('date'))]}
 
 
