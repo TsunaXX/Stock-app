@@ -3699,7 +3699,8 @@ def save_dividend_settings(clear=False):
         st.session_state['_dividend_input_error'] = str(exc)
         return
     snapshot = st.session_state.dividend_snapshot
-    if not clear and selected == snapshot.get('codes',[]) and st.session_state.dividend_kinds == snapshot.get('kinds',['除息日','股息發放日']):
+    kinds = snapshot.get('kinds',['除息日','股息發放日']) if clear else st.session_state.dividend_kinds
+    if not clear and selected == snapshot.get('codes',[]) and kinds == snapshot.get('kinds',['除息日','股息發放日']):
         return
     if not selected and snapshot.get('codes') and not clear:
         st.session_state.dividend_tickers = ','.join(snapshot['codes'])
@@ -3707,7 +3708,8 @@ def save_dividend_settings(clear=False):
         return
     if clear:
         st.session_state.dividend_tickers = ''
-    snapshot.update(codes=selected, kinds=st.session_state.dividend_kinds,
+        st.session_state.dividend_kinds = kinds
+    snapshot.update(codes=selected, kinds=kinds,
                     settings_updated_at=datetime.now(pytz.timezone('Asia/Taipei')).isoformat())
     st.session_state.pop('_dividend_input_error', None)
     _write_json_atomic(DIVIDEND_FILE, snapshot, indent=2)
@@ -3781,11 +3783,15 @@ def render_dividend_settings():
     with st.expander('💰 個股／ETF 股利追蹤',expanded=False):
         if not ready:
             st.info('正在還原雲端股利設定，完成後即可編輯；不以初始空值覆蓋既有清單。')
-        st.caption('獨立於公司營收清單；輸入代碼即可追蹤，自動儲存。只顯示已取得日期，不推算發放日。最多 30 檔。')
-        st.text_input('股票／ETF 代碼',placeholder='2330, 0050, 00919',
-                      key='dividend_tickers',on_change=save_dividend_settings,disabled=not ready)
-        st.multiselect('顯示股利事件',options=['除息日','股息發放日'],
-                       key='dividend_kinds',on_change=save_dividend_settings,disabled=not ready)
+        st.caption('獨立於公司營收清單；調整後按「套用股利設定」保存並同步。只顯示已取得日期，不推算發放日。最多 30 檔。')
+        with st.form('dividend_tracking_form'):
+            st.text_input('股票／ETF 代碼',placeholder='2330, 0050, 00919',
+                          key='dividend_tickers',disabled=not ready)
+            st.multiselect('顯示股利事件',options=['除息日','股息發放日'],
+                           key='dividend_kinds',disabled=not ready)
+            st.form_submit_button('💾 套用股利設定',key='apply_dividend_tracking',on_click=save_dividend_settings,disabled=not ready)
+        st.caption('已套用：' + ('、'.join(snapshot.get('codes',[])) or '尚未選擇商品') +
+                   '｜' + ('、'.join(snapshot.get('kinds',['除息日','股息發放日'])) or '未顯示股利事件'))
         if st.session_state.get('_dividend_input_error'):
             st.error(st.session_state['_dividend_input_error'])
         st.button('🧹 清空股利追蹤',key='clear_dividend_tracking',on_click=save_dividend_settings,args=(True,),disabled=not ready)
