@@ -3704,7 +3704,7 @@ def sync_dividend_snapshot(url, payload):
 
 def save_dividend_settings(clear=False):
     try:
-        selected = [] if clear else dividend_codes(st.session_state.dividend_tickers)
+        selected = [] if clear else dividend_codes(','.join(st.session_state.dividend_symbols))
     except ValueError as exc:
         st.session_state['_dividend_input_error'] = str(exc)
         return
@@ -3713,11 +3713,11 @@ def save_dividend_settings(clear=False):
     if not clear and selected == snapshot.get('codes',[]) and kinds == snapshot.get('kinds',['除息日','股息發放日']):
         return
     if not selected and snapshot.get('codes') and not clear:
-        st.session_state.dividend_tickers = ','.join(snapshot['codes'])
+        st.session_state.dividend_symbols = list(snapshot['codes'])
         st.session_state['_dividend_input_error'] = '清空全部請使用「清空股利追蹤」，避免載入中的空值覆蓋清單。'
         return
     if clear:
-        st.session_state.dividend_tickers = ''
+        st.session_state.dividend_symbols = []
         st.session_state.dividend_kinds = kinds
     snapshot.update(codes=selected, kinds=kinds,
                     settings_updated_at=datetime.now(pytz.timezone('Asia/Taipei')).isoformat())
@@ -3785,8 +3785,8 @@ def render_dividend_settings():
         st.session_state['_dividend_pending']=bool(saved.get('settings_updated_at'))
     snapshot=st.session_state.dividend_snapshot
     restore = st.session_state.pop('_dividend_reset_widgets',False)
-    if restore or 'dividend_tickers' not in st.session_state:
-        st.session_state.dividend_tickers = ','.join(snapshot.get('codes',[]))
+    if restore or 'dividend_symbols' not in st.session_state:
+        st.session_state.dividend_symbols = list(snapshot.get('codes',[]))
     if restore or 'dividend_kinds' not in st.session_state:
         st.session_state.dividend_kinds = snapshot.get('kinds',['除息日','股息發放日'])
     ready = not get_app_secret('gsheet_api_url') or st.session_state.get('_dividend_remote_loaded') or bool(snapshot.get('settings_updated_at'))
@@ -3794,23 +3794,29 @@ def render_dividend_settings():
         if not ready:
             st.info('正在還原雲端股利設定，完成後即可編輯；不以初始空值覆蓋既有清單。')
         st.caption('獨立於公司營收清單；調整後按「套用股利設定」保存並同步。只顯示已取得日期，不推算發放日。最多 30 檔。')
-        with st.form('dividend_tracking_form'):
-            st.text_input('股票／ETF 代碼',placeholder='2330, 0050, 00919',
-                          key='dividend_tickers',disabled=not ready)
-            st.multiselect('顯示股利事件',options=['除息日','股息發放日'],
-                           key='dividend_kinds',disabled=not ready)
-            st.form_submit_button('💾 套用股利設定',key='apply_dividend_tracking',on_click=save_dividend_settings,disabled=not ready)
         names, _ = load_local_stock_names()
         for event in snapshot.get('events',[]):
             code = event['ticker']
             name = event['title'].split('('+code+')',1)[0]
             if name and name != code:
                 names.setdefault(code, name)
+        labels = {option.split(' ',1)[0]:option for option in build_stock_search_options(allow_warrants=False)
+                  if re.fullmatch(r'\d{4,6}[A-Z]?',option.split(' ',1)[0])}
+        for code in snapshot.get('codes',[]):
+            labels.setdefault(code, code + ' ' + names.get(code,'名稱待取得'))
+        with st.form('dividend_tracking_form'):
+            st.multiselect('🔍 股票／ETF 快速查詢（代碼／名稱）',options=list(labels),
+                           format_func=lambda code:labels[code],max_selections=30,
+                           placeholder='輸入股號或股名，例如 0056、元大高股息',
+                           key='dividend_symbols',disabled=not ready)
+            st.multiselect('顯示股利事件',options=['除息日','股息發放日'],
+                           key='dividend_kinds',disabled=not ready)
+            st.form_submit_button('💾 套用股利設定',key='apply_dividend_tracking',on_click=save_dividend_settings,disabled=not ready)
         st.caption('已套用：' + ('、'.join(code + ' ' + names.get(code,'名稱待取得') for code in snapshot.get('codes',[])) or '尚未選擇商品') +
                    '｜' + ('、'.join(snapshot.get('kinds',['除息日','股息發放日'])) or '未顯示股利事件'))
         if st.session_state.get('_dividend_input_error'):
             st.error(st.session_state['_dividend_input_error'])
-        with st.container(horizontal=True, horizontal_alignment='distribute'):
+        with st.container(horizontal=True):
             st.button('🧹 清空股利追蹤',key='clear_dividend_tracking',on_click=save_dividend_settings,args=(True,),disabled=not ready)
             if st.button('🔄 更新股利公告',key='refresh_dividends'):
                 fetch_dividend_feed.clear()
