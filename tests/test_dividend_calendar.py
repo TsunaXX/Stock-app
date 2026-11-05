@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 from streamlit.testing.v1 import AppTest
 
-from dividend_calendar import announced_date, codes, etf_events, finmind_events, merge_events, selected_events
+from dividend_calendar import announced_date, codes, etf_events, finmind_events, merge_events, selected_events, snapshot
 
 
 @pytest.mark.parametrize('raw', ['1151106','115/11/06','115年11月06日','2026-11-06'])
@@ -14,6 +14,7 @@ def test_announced_dates(raw):
 
 
 def test_missing_dates_are_never_guessed():
+    assert snapshot({'events':[None,{'event_id':'x','kind':'除息日','date':'2026-11-06'}]})['events']==[]
     for raw in ['',None,'待公告','0000-00-00','2026/02/30']:
         assert announced_date(raw)==''
 
