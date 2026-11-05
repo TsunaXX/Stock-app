@@ -3747,7 +3747,7 @@ def render_dividend_status(year):
                 st.session_state['_dividend_reset_widgets'] = True
                 _write_json_atomic(DIVIDEND_FILE,saved,indent=2)
                 st.rerun()
-    st.caption('資料檢查：' + str(snapshot.get('checked_at') or '背景準備中') +
+    st.caption('資料檢查：' + (_model_time_text(snapshot.get('checked_at')) or '背景準備中') +
                ('｜雲端待同步，保留本機並重試' if st.session_state.get('_dividend_pending') else '｜設定已保存'))
     if snapshot.get('errors'):
         st.warning('部分來源未取得，保留最後成功公告：'+'、'.join(snapshot['errors']))
