@@ -90,3 +90,11 @@ st.session_state.cal_year=2026
     assert not page.exception and json.loads(Path(path).read_text())['kinds']==['股息發放日']
     fresh=AppTest.from_string(source).run()
     assert fresh.text_input[0].value=='2330' and fresh.multiselect[0].value==['股息發放日']
+
+
+def test_same_day_distinct_periods_survive_within_the_preferred_source():
+    rows=etf_rows()
+    second={**rows[1],'event_id':rows[1]['event_id']+'-another-period'}
+    fallback={**rows[1],'event_id':'fallback','source':'FinMind 股利備援'}
+    chosen=selected_events([rows[1],second,fallback],['0050'],['股息發放日'])
+    assert len(chosen)==2 and all(e['source']=='TWSE ETF 官方公告' for e in chosen)

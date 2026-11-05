@@ -103,9 +103,15 @@ def snapshot(value):
 
 
 def selected_events(items, selected, kinds):
-    # Prefer the official ETF record when a fallback reports the same date/kind.
+    # Choose a source, not a single event: distinct periods can pay on the same day.
     result = {}
-    for event in sorted(items, key=lambda e: '官方' in e.get('source', '')):
+    for event in items:
         if event.get('ticker') in selected and event.get('kind') in kinds:
-            result[(event['ticker'], event['date'], event['kind'])] = event
-    return list(result.values())
+            key = (event['ticker'], event['date'], event['kind'])
+            priority = 2 if event.get('source') == 'TWSE ETF 官方公告' else int('官方' in event.get('source', ''))
+            previous, group = result.get(key, (-1, {}))
+            if priority > previous:
+                result[key] = (priority, {event['event_id']:event})
+            elif priority == previous:
+                group[event['event_id']] = event
+    return [event for _, group in result.values() for event in group.values()]
