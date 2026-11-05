@@ -78,6 +78,7 @@ from dividend_calendar import codes as dividend_codes, selected_events as select
 DIVIDEND_FILE = PATH
 def _write_json_atomic(path, payload, indent=2):
     with open(path,'w',encoding='utf-8') as file: json.dump(payload,file)
+def get_app_secret(key): return ""
 def render_dividend_status(year): pass
 def load_local_stock_names(): return {},{}
 st.session_state.cal_year=2026
@@ -88,8 +89,20 @@ st.session_state.cal_year=2026
     assert not page.exception and json.loads(Path(path).read_text())['codes']==['2330']
     page.multiselect[0].set_value(['股息發放日']).run()
     assert not page.exception and json.loads(Path(path).read_text())['kinds']==['股息發放日']
+    page.text_input[0].set_value('').run()
+    assert not page.exception and json.loads(Path(path).read_text())['codes']==['2330']
     fresh=AppTest.from_string(source).run()
     assert fresh.text_input[0].value=='2330' and fresh.multiselect[0].value==['股息發放日']
+    fresh.session_state['dividend_snapshot']={'codes':['00400A'],'kinds':['除息日']}
+    fresh.session_state['_dividend_reset_widgets']=True
+    fresh.run()
+    assert not fresh.exception and fresh.text_input[0].value=='00400A'
+    assert json.loads(Path(path).read_text())['codes']==['2330']
+    fresh.run()
+    assert not fresh.exception and fresh.text_input[0].value=='00400A'
+    fresh.button(key='clear_dividend_tracking').click().run()
+    assert not fresh.exception and json.loads(Path(path).read_text())['codes']==[]
+    assert fresh.text_input[0].value==''
 
 
 def test_same_day_distinct_periods_survive_within_the_preferred_source():
