@@ -21499,11 +21499,12 @@ def apply_model_protection(rows, stock, mode, room=None):
         return
     key_column, plan_column = ('代號', '進出場預判') if stock else ('契約鍵', '進出場點位')
     day = datetime.now(pytz.timezone('Asia/Taipei'))
+    display_day = day.date().isoformat()
     if not stock:
         day = get_futures_trading_date(day)
     tracker = get_model_tracker(get_app_secret('gsheet_api_url') or '')
     plans = tracker.protection_plans('股票' if stock else '期貨', rows[key_column].astype(str),
-                                     '當沖' if mode == '當沖' else '波段', day.date().isoformat())
+                                     '當沖' if mode == '當沖' else '波段', day.date().isoformat(), None, display_day)
     scope = room or ('stock' if stock else 'futures')
     state_key = f'_model_trade_notices_{scope}_{mode}'
     prior = st.session_state.get(state_key)
@@ -21525,7 +21526,9 @@ def apply_model_protection(rows, stock, mode, room=None):
         record = plans.get(key)
         candidate = row.get(plan_column)
         probe = re.sub(r'^(?:[多空]·)?待進場｜', '', candidate) if isinstance(candidate, str) else ''
-        valid_candidate = bool(probe) and None not in parse_trade_plan_numbers(probe).values() and not any(word in probe for word in ('等待','觀望','資料不足','待調整','不建立','待確認','待進','失效','不追價','已進場','已出場','取消進場'))
+        valid_candidate = bool(probe) and None not in parse_trade_plan_numbers(probe).values() and not any(word in probe for word in ('等待','觀望','資料不足','待調整','不建立','待確認','待進','失效','不追價','已進場','已出場','取消進場','目標觸價','觸價追蹤'))
+        if mode == '當沖' and any(word in str(row.get('資料狀態','')) for word in ('過期','中斷','資料不足','未取得')):
+            valid_candidate = False
         if record:
             view = trade_display(record)
             entered = record.get('模擬進場價') is not None

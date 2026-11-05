@@ -211,3 +211,56 @@ def test_same_update_close_and_reentry_reports_both_saved_transitions(tmp_path,c
     assert frame.iloc[0]['進出場預判'].startswith('多·已進場2次｜')
     ns['apply_model_protection'](frame,True,'當沖')
     assert len(messages)==1
+
+
+def test_cloud_restore_order_cannot_hide_the_latest_exit(tmp_path):
+    tracker = ModelTracker(tmp_path/'restore-order.sqlite',start=False)
+    latest = {**record(保利規則=PROTECTION_POLICY),'交易ID':'newest-exit','狀態':'已平倉',
+              '模擬進場價':100.,'出場原因':'停利','結案時間':'2026-11-05T13:13:47+08:00'}
+    older = {**latest,'交易ID':'older-invalid','狀態':'訊號失效','模擬進場價':None,
+             '結案時間':None,'訊號失效時間':'2026-11-05T09:22:57+08:00'}
+    with tracker.write_db() as db:
+        tracker.store(db,latest)
+        tracker.store(db,older)  # Read-back insertion order is not execution time.
+    shown = tracker.protection_plans('股票',['2330'],'當沖','2026-11-05')['2330']
+    assert shown['交易ID']=='newest-exit' and shown['狀態']=='已平倉'
+    holding = {**latest,'交易ID':'still-holding','狀態':'模擬持倉','結案時間':None,
+               '進場時間':'2026-11-05T09:00:00+08:00'}
+    with tracker.write_db() as db:
+        tracker.store(db,holding)
+    assert tracker.protection_plans('股票',['2330'],'當沖','2026-11-05')['2330']['交易ID']=='still-holding'
+
+
+@pytest.mark.parametrize('closed_time',['2026-11-05T13:13:47+08:00','2026-11-04T16:30:00+00:00'])
+def test_wave_closed_today_is_visible_even_when_it_entered_on_an_earlier_day(tmp_path,closed_time):
+    tracker = ModelTracker(tmp_path/'wave-exit.sqlite',start=False)
+    row = {**record(策略='波段',保利規則=PROTECTION_POLICY),'交易日':'2026-11-04',
+           '狀態':'已平倉','模擬進場價':100.,'結案時間':closed_time,'出場原因':'停利'}
+    with tracker.write_db() as db:
+        tracker.store(db,row)
+    assert tracker.protection_plans('股票',['2330'],'波段','2026-11-05')['2330']['交易ID']==row['交易ID']
+
+
+def test_futures_wave_exit_uses_display_day_without_changing_trading_day(tmp_path):
+    tracker = ModelTracker(tmp_path/'night-wave-exit.sqlite',start=False)
+    row = {**record(策略='波段',保利規則=PROTECTION_POLICY),'市場':'期貨','商品鍵':'TX:202611',
+           '交易日':'2026-11-04','狀態':'已平倉','模擬進場價':100.,
+           '結案時間':'2026-11-06T16:00:00+08:00','出場原因':'保利'}
+    with tracker.write_db() as db:
+        tracker.store(db,row)
+    shown=tracker.protection_plans('期貨',['TX:202611'],'波段','2026-11-09',None,'2026-11-06')
+    assert shown['TX:202611']['交易ID']==row['交易ID']
+    assert tracker.records()[0]['交易日']=='2026-11-04'
+
+
+def test_old_target_touch_and_stale_quotes_are_not_fresh_reentry_candidates():
+    ns=load_app_symbols('apply_model_protection','parse_trade_plan_numbers','fmt_price')
+    row={**record(),'狀態':'已平倉','模擬進場價':100.,'出場原因':'停利',
+         '結案時間':'2026-11-05T09:22:57+08:00','同步確認':True}
+    ns.update(trade_display=trade_display,st=SimpleNamespace(session_state={'sj_logged_in':True},
+              caption=lambda text:None,toast=lambda *a,**kw:None),get_app_secret=lambda key:'',
+              get_model_tracker=lambda url:SimpleNamespace(protection_plans=lambda *a:{'2330':row}))
+    for text,health in [('目標觸價｜進 100｜停 95｜目 110',''),('進 112｜停 107｜目 124','🔴 報價過期')]:
+        frame=pd.DataFrame([{'代號':'2330','名稱':'測試商品','_系統方向':'多頭','進出場預判':text,'資料狀態':health}])
+        ns['apply_model_protection'](frame,True,'當沖')
+        assert frame.iloc[0]['進出場預判'].startswith('多·已出場(利)｜')
