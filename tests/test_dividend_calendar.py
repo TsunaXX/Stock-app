@@ -87,10 +87,14 @@ st.session_state.cal_year=2026
     page=AppTest.from_string(source).run()
     assert not page.exception and page.text_input[0].value=='0050,2330'
     page.text_input[0].set_value('2330').run()
+    assert json.loads(Path(path).read_text())['codes']==['0050','2330']
+    page.button(key='apply_dividend_tracking').click().run()
     assert not page.exception and json.loads(Path(path).read_text())['codes']==['2330']
     page.multiselect[0].set_value(['股息發放日']).run()
+    page.button(key='apply_dividend_tracking').click().run()
     assert not page.exception and json.loads(Path(path).read_text())['kinds']==['股息發放日']
     page.text_input[0].set_value('').run()
+    page.button(key='apply_dividend_tracking').click().run()
     assert not page.exception and json.loads(Path(path).read_text())['codes']==['2330']
     fresh=AppTest.from_string(source).run()
     assert fresh.text_input[0].value=='2330' and fresh.multiselect[0].value==['股息發放日']
