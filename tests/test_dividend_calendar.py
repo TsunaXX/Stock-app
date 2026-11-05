@@ -103,6 +103,16 @@ st.session_state.cal_year=2026
     fresh.button(key='clear_dividend_tracking').click().run()
     assert not fresh.exception and json.loads(Path(path).read_text())['codes']==[]
     assert fresh.text_input[0].value==''
+    Path(path).unlink()
+    cloud_source=source.replace('def get_app_secret(key): return ""','def get_app_secret(key): return "cloud"')
+    waiting=AppTest.from_string(cloud_source).run()
+    assert not waiting.exception and waiting.text_input[0].disabled and waiting.multiselect[0].disabled
+    waiting.session_state['_dividend_remote_loaded']=True
+    waiting.session_state['dividend_snapshot']={'codes':['00400A'],'kinds':['除息日']}
+    waiting.session_state['_dividend_reset_widgets']=True
+    waiting.run()
+    assert not waiting.exception and not waiting.text_input[0].disabled
+    assert waiting.text_input[0].value=='00400A' and not Path(path).exists()
 
 
 def test_same_day_distinct_periods_survive_within_the_preferred_source():
