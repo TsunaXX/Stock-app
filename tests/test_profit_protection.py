@@ -160,6 +160,8 @@ def test_shared_stock_and_futures_projection_and_compact_history_apptest():
     functions = '\n\n'.join(ast.unparse(n) for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names)
     script = '''
 import streamlit as st
+import re
+from model_tracking import trade_display
 import pandas as pd
 import json
 import pytz
@@ -186,7 +188,7 @@ render_operation_protection('選擇權操作計畫', [{'商品鍵':'2330'}])
     assert '保 104.5' in app.dataframe[0].value.iloc[0]['進出場預判']
     assert '保 104.5' in app.dataframe[1].value.iloc[0]['進出場點位']
     assert {'保利價', '保利狀態', '策略版本'} <= set(app.dataframe[2].value.columns)
-    assert '保 淨額$123.45' in app.caption[0].value
+    assert any('保 淨額$123.45' in item.value for item in app.caption)
 
 
 def test_cost_space_is_required_and_wave_protection_keeps_original_tax_basis():

@@ -216,20 +216,78 @@ def merge_trades(remote, local):
     return list(merged.values())
 
 
+
+def invalidation_detail(record, reason):
+    """Known invalidations have explicit meanings; prose containing 結束 is not a timeout."""
+    # advance is fingerprinted; translate wording here without creating a new strategy version.
+    if reason == '未進場前已越過停損或交易日已結束':
+        stop, price = number(record.get('停損價')), number(record.get('最新價'))
+        prices = f'（停損 {stop:.10g}，最新 {price:.10g}）' if stop is not None and price is not None else ''
+        return '取消進場｜尚未成交，價格已觸及原停損防線' + prices, '進場前風險失效'
+    if reason == '當沖交易日已結束；缺少收盤成交證據時不估算損益':
+        return ('取消進場｜當沖交易日已結束，本次計畫未完成進場' if record.get('模擬進場價') is None else reason), '交易時段結束'
+    if reason == '契約已到期；沒有結算或到期前平倉證據，不估算損益':
+        return reason, '契約到期'
+    return reason, '訊號失效'
+
+
+def trade_display(record):
+    """A read-only presentation of saved evidence, never a new fill or historical rewrite."""
+    row = dict(record)
+    state, entered = row.get('狀態'), row.get('模擬進場價') is not None
+    gap = bool(row.get('資料缺口') or row.get('到期未確認') or state in ('監控中斷', '資料不足'))
+    reason = row.get('訊號失效原因') or row.get('異常原因', '')
+    if not entered and reason == '未進場前已越過停損或交易日已結束':
+        row['訊號失效原因'], row['未進場分類'] = invalidation_detail(row, reason)
+    if state == '已平倉':
+        cause = row.get('出場原因') or '原因待確認'
+        status = '已出場（' + cause + '）' + ('⚠' if gap else '')
+        confirmed = not gap and (row.get('識別版本') != 2 or row.get('同步確認')) and number(row.get('模擬損益')) is not None
+        result = '已納入績效' if confirmed else ('績效未確認，不納入勝率與累積損益' if gap else '待同步確認，暫不納入績效')
+        pnl = number(row.get('模擬損益'))
+        detail = cause + '出場｜' + (f'模擬淨損益 {pnl:+,.2f} 元；' if pnl is not None else '') + result
+    elif entered:
+        status = '已進場' + ('⚠' if gap or state == '訊號失效' else '')
+        detail = '已確認模擬進場，尚未確認出場' if not gap and state != '訊號失效' else '已確認模擬進場；行情證據有缺口，持倉／出場待確認'
+    elif state == '訊號失效':
+        status = '取消進場'
+        detail = row.get('訊號失效原因') or reason or '原計畫失效，尚未模擬成交'
+    else:
+        status = '待進場' + ('⚠' if gap else '')
+        detail = ('進場判定未確認｜成交證據不足' if gap else
+                  row.get('最後進場等待原因') or row.get('進場等待原因') or '等待有效進場條件及成交證據')
+    row.update({'交易狀態': status, '狀態說明': detail})
+    return row
+
+
+def event_message(record, item):
+    """Explain an archived event without changing its original reason or identity."""
+    reason = item.get('原因') or ''
+    if item.get('狀態') == '訊號失效':
+        return invalidation_detail(record, reason)[0]
+    if not reason and item.get('狀態') == '已平倉':
+        return trade_display(record)['狀態說明']
+    if not reason and item.get('狀態') == '模擬持倉':
+        return f"第 {record.get('進場次數', 1)} 次進場確認"
+    return reason[:240] + '…（完整內容見原原因）' if len(reason) > 240 else reason
+
+
 def event(record, state, ts, reason='', evidence=None):
+    if state == '訊號失效':
+        reason, category = invalidation_detail(record, reason)
     record['狀態'] = state
     record['來源時間'] = ts
     record['異常原因'] = reason
     if state == '訊號失效':
         record.update({'訊號失效原因': reason, '訊號失效時間': ts})
         if record.get('模擬進場價') is None:
-            record['未進場分類'] = '超過有效時間' if '結束' in reason or '到期' in reason else '訊號失效'
+            record['未進場分類'] = category
     if record.get('資料缺口') and reason and state in ('監控中斷', '資料不足'):
         causes = record.setdefault('資料缺口原因', [])
         if reason not in causes:
             causes.append(reason)
     if state in ('監控中斷', '資料不足') and record.get('模擬進場價') is None:
-        record['未進場分類'] = '行情不完整' if record.get('資料缺口') else '暖機等待'
+        record['未進場分類'] = '成交證據不足' if record.get('資料缺口') else '暖機等待'
     protection = {key: record[key] for key in ('保利價', '保利淨額', '保利最大浮盈', '初始風險') if key in record} if reason.startswith('保利') else {}
     identity = '|'.join([record['交易ID'], state, ts, reason]) + (json.dumps(protection, sort_keys=True) if protection else '')
     if evidence:
@@ -650,7 +708,7 @@ def advance(record, quote):
 
 
 def performance(records, state=None):
-    data = pd.DataFrame(records)
+    data = pd.DataFrame([trade_display(row) for row in records])
     closed = [r for r in records if r.get('狀態') == '已平倉' and not r.get('資料缺口')
               and (r.get('識別版本') != 2 or r.get('同步確認'))
               and number(r.get('模擬損益')) is not None]
@@ -691,7 +749,7 @@ def performance(records, state=None):
     count, wins, losses = len(closed), state['wins'], state['losses']
     insufficient = sum(bool(r.get('資料缺口') or r.get('到期未確認') or
                             r.get('狀態') in ('資料不足', '監控中斷')) for r in records)
-    metrics = {'全部訊號數': len(records), '資料不足數': insufficient,
+    metrics = {'追蹤執行紀錄數': len(records), '含資料缺口的執行紀錄數': sum(bool(r.get('資料缺口')) for r in records), '待確認執行紀錄數': insufficient,
                '有效交易數': count, '獲勝': wins, '虧損': losses,
                '勝率(%)': wins / count * 100 if count else None,
                '累積模擬損益': state['equity'], '平均獲利': state['profit'] / wins if wins else None,
@@ -700,7 +758,7 @@ def performance(records, state=None):
                '每筆期望值': state['equity'] / count if count else None, '最大回撤': state['drawdown'],
                '平均R值': state['r_total'] / state['r_count'] if state['r_count'] else None,
                '保利出場比例(%)': state['protected'] / count * 100 if count else None,
-               '訊號有效率(%)': count / len(records) * 100 if records else None,
+               '可計入績效比例(%)': count / len(records) * 100 if records else None,
                '資料完整率(%)': sum(not r.get('資料缺口', False) and r.get('狀態') != '資料不足' for r in records) / len(records) * 100 if records else None}
     groups = [{**g, '勝率(%)':g['獲勝']/g['有效交易數']*100} for g in state['groups'].values()]
 
@@ -720,19 +778,21 @@ def plan_performance(records):
         repeated += [row for row in valid if row['進場次數'] > 1]
         known = {row['交易ID'] for row in rows}
         complete = all(not row.get('前次執行ID') or row['前次執行ID'] in known for row in rows)
-        latest = max(rows, key=lambda row: (row['進場次數'], row['來源時間']))
+        latest = trade_display(max(rows, key=lambda row: (row['進場次數'], row['來源時間'])))
         triggered = any(row.get('模擬進場價') is not None for row in rows)
         result.append({'原始計畫ID': key, **plan_labels(rows[0]), '策略版本': rows[0]['策略版本'],
                        '商品': str(rows[0].get('代碼', '')) + ' ' + str(rows[0].get('名稱', '')),
-                       '已觸發': triggered, '計畫資料完整': complete,
+                       '已觸發': triggered, '執行鏈完整': complete,
+                       '行情證據完整': all(not row.get('資料缺口') and row.get('狀態') not in ('資料不足','監控中斷') for row in rows),
                        '未進場分類': '' if triggered else latest.get('未進場分類', '等待進場'),
                        '訊號失效原因': '' if triggered else latest.get('訊號失效原因', ''),
                        '有效交易數': len(valid), '計畫累積損益': sum(row['模擬損益'] for row in valid) if complete else None,
                        '未確認執行數': sum(bool(row.get('資料缺口') or not row.get('同步確認') or row.get('狀態') in ACTIVE) for row in rows)})
     count = len(result)
     triggered = sum(row['已觸發'] for row in result)
-    metrics = {'原始計畫數': count, '計畫觸發率(%)': triggered / count * 100 if count else None,
-               '計畫有效率(%)': sum(row['有效交易數'] > 0 for row in result) / triggered * 100 if triggered and all(row['計畫資料完整'] for row in result) else None,
+    metrics = {'原始計畫數': count, '已觸發原始計畫數': triggered,
+               '首次有效交易數': len(first), '二次以上有效交易數': len(repeated), '計畫觸發率(%)': triggered / count * 100 if count else None,
+               '計畫有效率(%)': sum(row['有效交易數'] > 0 for row in result) / triggered * 100 if triggered and all(row['執行鏈完整'] for row in result) else None,
                '首次進場勝率(%)': sum(row['模擬損益'] > 0 for row in first) / len(first) * 100 if first else None,
                '二次以上勝率(%)': sum(row['模擬損益'] > 0 for row in repeated) / len(repeated) * 100 if repeated else None}
     return metrics, pd.DataFrame(result)
@@ -747,6 +807,8 @@ def excel_report(records):
     metrics, groups, data = performance(light)
     book = Workbook(write_only=True)
     long_sheet = None
+    time_columns = {'來源時間','建立時間','進場時間','結案時間','最後進場等待時間','訊號失效時間','進場觸發時間','起始時間','結束時間','時間','重入來源時間','新計畫來源時間'}
+    price_columns = {'訊號價','進場價','停損價','目標價','模擬進場價','模擬出場價','保利價','最新價'}
     def write(name, columns, rows):
         nonlocal long_sheet
         sheet, page, count = None, 0, 0
@@ -762,6 +824,8 @@ def excel_report(records):
                 count = 0
             output = []
             for column, value in zip(columns, values):
+                if column in time_columns and value and (moment := stamp(value)) is not None:
+                    value = moment.astimezone(TZ).strftime('%Y/%m/%d %H:%M:%S')
                 if isinstance(value, (dict, list, tuple)):
                     value = json.dumps(value, ensure_ascii=False, default=str)
                 if isinstance(value, str) and len(value) > 16000:
@@ -780,6 +844,8 @@ def excel_report(records):
                 if isinstance(value, float) and not math.isfinite(value):
                     value = None
                 cell = WriteOnlyCell(sheet, value=value)
+                if column in price_columns and isinstance(value, (int, float)):
+                    cell.number_format = '#,##0.########'
                 if isinstance(value, str):
                     cell.data_type = 's'
                 output.append(cell)
@@ -789,8 +855,11 @@ def excel_report(records):
             book.create_sheet(name).append(columns)
     for name, frame in [('總覽', pd.DataFrame([metrics])), ('策略與指標', groups), ('歷史明細', data)]:
         write(name, list(frame.columns), frame.itertuples(index=False, name=None))
-    event_columns = list(dict.fromkeys(['交易ID'] + [key for row in records for event in row.get('事件', []) for key in event]))
-    write('事件', event_columns, (tuple(row['交易ID'] if key == '交易ID' else event.get(key) for key in event_columns)
+    event_columns = list(dict.fromkeys(['交易ID', '商品', '進場次數', '顯示訊息'] + [key for row in records for event in row.get('事件', []) for key in event]))
+    write('事件', event_columns, (tuple(row['交易ID'] if key == '交易ID' else
+                                str(row.get('代碼','')) + ' ' + str(row.get('名稱','')) if key == '商品' else
+                                row.get('進場次數', 1) if key == '進場次數' else
+                                event_message(row, event) if key == '顯示訊息' else event.get(key) for key in event_columns)
                                 for row in records for event in row.get('事件', [])))
     if any(row.get('原始計畫ID') for row in records):
         _, plans = plan_performance(light)
@@ -997,17 +1066,24 @@ class ModelTracker:
     def protection_plans(self, market, keys, mode, day, source=None):
         """Bounded current-plan reads by indexed instrument, without loading performance history."""
         result = {}
+        previous_fields = ('交易ID','狀態','方向','進場次數','出場原因','結案時間','模擬進場價','模擬損益','資料缺口','識別版本','同步確認','原始計畫ID')
+        previous_paths = ','.join("'$." + field + "'" for field in previous_fields)
         with closing(self.db()) as db:
             for key in keys:
                 prefix = f'{key}|{market}|{mode}|'
-                raw = db.execute("""SELECT body FROM trades WHERE slot>=? AND slot<?
-                    AND json_extract(body, '$.保利規則')=?
-                    AND (json_extract(body, '$.計畫來源')=? OR (?='股期戰略室' AND json_extract(body, '$.計畫來源') IS NULL))
-                    AND ((?='波段' AND state IN ('等待進場','模擬持倉','監控中斷','資料不足')) OR json_extract(body, '$.交易日')=?)
-                    ORDER BY (state IN ('模擬持倉','監控中斷','資料不足') AND json_extract(body, '$.模擬進場價') IS NOT NULL) DESC,
-                    rowid DESC LIMIT 1""", (prefix, prefix + '\uffff', PROTECTION_POLICY, source or '股期戰略室', source or '股期戰略室', mode, day)).fetchone()
+                raw = db.execute(f"""SELECT t.body,json_extract(p.body,{previous_paths}) FROM trades t LEFT JOIN trades p ON p.id=json_extract(t.body,'$.前次執行ID')
+                    WHERE t.slot>=? AND t.slot<?
+                    AND json_extract(t.body, '$.保利規則')=?
+                    AND (json_extract(t.body, '$.計畫來源')=? OR (?='股期戰略室' AND json_extract(t.body, '$.計畫來源') IS NULL))
+                    AND ((?='波段' AND t.state IN ('等待進場','模擬持倉','監控中斷','資料不足')) OR json_extract(t.body, '$.交易日')=?)
+                    ORDER BY (t.state IN ('模擬持倉','監控中斷','資料不足') AND json_extract(t.body, '$.模擬進場價') IS NOT NULL) DESC,
+                    t.rowid DESC LIMIT 1""", (prefix, prefix + '\uffff', PROTECTION_POLICY, source or '股期戰略室', source or '股期戰略室', mode, day)).fetchone()
                 if raw:
                     result[str(key)] = json.loads(raw[0])
+                    if raw[1]:
+                        previous = dict(zip(previous_fields,json.loads(raw[1])))
+                        if previous['原始計畫ID'] == result[str(key)].get('原始計畫ID'):
+                            result[str(key)]['_前次出場'] = previous
         return result
 
     def store(self, db, row, dirty=1):
