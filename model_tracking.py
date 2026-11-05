@@ -1063,7 +1063,7 @@ class ModelTracker:
             rows = db.execute("SELECT body FROM trades WHERE month=? AND state IN ('等待進場','模擬持倉','監控中斷','資料不足') AND json_extract(body,'$.計畫來源')=? AND json_extract(body,'$.交易日')=?", (month, source, day)).fetchall()
         return [row for raw in rows if (row := json.loads(raw[0])).get('計畫來源') == source and row.get('交易日') == day]
 
-    def protection_plans(self, market, keys, mode, day, source=None):
+    def protection_plans(self, market, keys, mode, day, source=None, display_day=None):
         """Bounded current-plan reads by indexed instrument, without loading performance history."""
         result = {}
         previous_fields = ('交易ID','狀態','方向','進場次數','出場原因','結案時間','模擬進場價','模擬損益','資料缺口','識別版本','同步確認','原始計畫ID')
@@ -1075,9 +1075,13 @@ class ModelTracker:
                     WHERE t.slot>=? AND t.slot<?
                     AND json_extract(t.body, '$.保利規則')=?
                     AND (json_extract(t.body, '$.計畫來源')=? OR (?='股期戰略室' AND json_extract(t.body, '$.計畫來源') IS NULL))
-                    AND ((?='波段' AND t.state IN ('等待進場','模擬持倉','監控中斷','資料不足')) OR json_extract(t.body, '$.交易日')=?)
+                    AND ((?='波段' AND (t.state IN ('等待進場','模擬持倉','監控中斷','資料不足')
+                        OR date(json_extract(t.body,'$.結案時間'),'+8 hours')=?)) OR json_extract(t.body, '$.交易日')=?)
                     ORDER BY (t.state IN ('模擬持倉','監控中斷','資料不足') AND json_extract(t.body, '$.模擬進場價') IS NOT NULL) DESC,
-                    t.rowid DESC LIMIT 1""", (prefix, prefix + '\uffff', PROTECTION_POLICY, source or '股期戰略室', source or '股期戰略室', mode, day)).fetchone()
+                    julianday(replace(COALESCE(NULLIF(json_extract(t.body,'$.結案時間'),''),
+                        NULLIF(json_extract(t.body,'$.訊號失效時間'),''),NULLIF(json_extract(t.body,'$.進場時間'),''),
+                        NULLIF(json_extract(t.body,'$.建立時間'),''),json_extract(t.body,'$.來源時間')),'/','-')) DESC,
+                    COALESCE(json_extract(t.body,'$.進場次數'),1) DESC,t.rowid DESC LIMIT 1""", (prefix, prefix + '\uffff', PROTECTION_POLICY, source or '股期戰略室', source or '股期戰略室', mode, display_day or day, day)).fetchone()
                 if raw:
                     result[str(key)] = json.loads(raw[0])
                     if raw[1]:
