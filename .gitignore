@@ -20,3 +20,5 @@ cal_override.json
 .streamlit/secrets.toml
 
 model_tracking.sqlite3*
+
+dividend_calendar_cache.json
