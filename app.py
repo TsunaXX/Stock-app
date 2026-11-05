@@ -38,6 +38,7 @@ import streamlit.components.v1 as components
 import pdfplumber
 import fitz  # PyMuPDF 用於將 PDF 轉為圖片
 from sec_financials import facts_revenue, release_revenue, sec_get
+from dividend_calendar import codes as dividend_codes, etf_events, finmind_events, merge_events as merge_dividend_events, selected_events as selected_dividend_events, events as make_dividend_events, snapshot as normalize_dividend_snapshot
 
 from market_automation import (
     BackgroundJobs, IntradayBackground, attach_macro_results, data_version, index_scenario,
@@ -3621,6 +3622,171 @@ def fetch_company_official_feed(url):
     if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
         raise ValueError('公司事件來源格式錯誤')
     return rows
+
+
+
+DIVIDEND_SCOPE = 'dividend_calendar'
+DIVIDEND_FILE = 'dividend_calendar_cache.json'
+
+
+@st.cache_data(ttl=21600, max_entries=128, show_spinner=False)
+def fetch_dividend_feed(code, year):
+    response = requests.get('https://api.finmindtrade.com/api/v4/data',
+        params={'dataset':'TaiwanStockDividend','data_id':code,'start_date':f'{year-1}-01-01'}, timeout=(4,12))
+    response.raise_for_status()
+    stamp = datetime.now(pytz.timezone('Asia/Taipei')).isoformat()
+    return [{**e,'fetched_at':stamp} for e in finmind_events(response.json(), code, code)]
+
+
+@st.cache_data(ttl=21600, max_entries=6, show_spinner=False)
+def fetch_etf_dividend_feed(year):
+    url = 'https://www.twse.com.tw/rwd/zh/ETF/etfDiv'
+    response = requests.get(url, params={'response':'json','startDate':f'{year}0101','endDate':f'{year}1231'}, timeout=(4,12))
+    response.raise_for_status()
+    stamp = datetime.now(pytz.timezone('Asia/Taipei')).isoformat()
+    return [{**e,'fetched_at':stamp} for e in etf_events(response.json(), url)]
+
+
+@st.cache_data(ttl=21600, max_entries=2, show_spinner=False)
+def fetch_official_dividend_feed(market):
+    url = ('https://openapi.twse.com.tw/v1/exchangeReport/TWT48U_ALL' if market == '上市'
+           else 'https://www.tpex.org.tw/openapi/v1/tpex_exright_prepost')
+    result = []
+    for row in fetch_company_official_feed(url):
+        if '息' not in str(row.get('Exdividend') or row.get('ExRrightsExDividend') or ''):
+            continue
+        code = str(row.get('Code') or row.get('SecuritiesCompanyCode') or '')
+        ex = row.get('Date') or row.get('ExRrightsExDividendDate')
+        result.extend(make_dividend_events(code,row.get('Name') or row.get('CompanyName') or code,
+            str(ex),ex,None,row.get('CashDividend'),market+'官方除息公告',url))
+    stamp = datetime.now(pytz.timezone('Asia/Taipei')).isoformat()
+    return [{**e,'fetched_at':stamp} for e in result]
+
+
+def fetch_dividend_updates(selected, year):
+    incoming, errors = [], []
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        jobs = {pool.submit(fetch_dividend_feed, code, year):code for code in selected}
+        jobs[pool.submit(fetch_etf_dividend_feed, year)] = 'ETF 官方公告'
+        jobs[pool.submit(fetch_etf_dividend_feed, year-1)] = 'ETF 前年度公告'
+        for market in ('上市','上櫃'):
+            jobs[pool.submit(fetch_official_dividend_feed,market)] = market+'除息公告'
+        for future in as_completed(jobs):
+            try:
+                incoming.extend(future.result())
+            except Exception as exc:
+                errors.append(f'{jobs[future]}：{type(exc).__name__}')
+    incoming = [event for event in incoming if event.get('ticker') in selected]
+    return {'events':incoming,'errors':errors,'checked_at':datetime.now(pytz.timezone('Asia/Taipei')).isoformat()}
+
+
+def sync_dividend_snapshot(url, payload):
+    with get_data_cache_sync_lock():
+        remote, error = _fetch_remote_scope(url, DIVIDEND_SCOPE, timeout=8)
+        if error:
+            return None
+        remote = normalize_dividend_snapshot(remote)
+        newer = remote if remote.get('settings_updated_at','') > payload.get('settings_updated_at','') else payload
+        merged = {**newer, 'events':merge_dividend_events(remote.get('events',[]),payload.get('events',[]))}
+        ok, saved = _save_remote_scope(url, DIVIDEND_SCOPE, merged, verify=True)
+        return saved if ok else None
+
+
+def save_dividend_settings():
+    try:
+        selected = dividend_codes(st.session_state.dividend_tickers)
+    except ValueError as exc:
+        st.session_state['_dividend_input_error'] = str(exc)
+        return
+    snapshot = st.session_state.dividend_snapshot
+    snapshot.update(codes=selected, kinds=st.session_state.dividend_kinds,
+                    settings_updated_at=datetime.now(pytz.timezone('Asia/Taipei')).isoformat())
+    st.session_state.pop('_dividend_input_error', None)
+    _write_json_atomic(DIVIDEND_FILE, snapshot, indent=2)
+    st.session_state['_dividend_pending'] = True
+
+
+@st.fragment(run_every=60)
+def render_dividend_status(year):
+    snapshot = st.session_state.dividend_snapshot
+    selected = tuple(snapshot.get('codes',[]))
+    url = get_app_secret('gsheet_api_url') or ''
+    if url and not st.session_state.get('_dividend_remote_loaded'):
+        loaded = get_public_maintenance_jobs().poll(('dividend-load',url),
+            lambda: _fetch_remote_scope(url,DIVIDEND_SCOPE,timeout=8), interval=60)
+        if loaded is not None and not loaded[1]:
+            try:
+                remote = normalize_dividend_snapshot(loaded[0])
+            except (TypeError,ValueError,AttributeError):
+                st.warning('雲端股利設定格式異常，保留本機資料。')
+                return
+            st.session_state['_dividend_remote_loaded'] = True
+            if remote.get('settings_updated_at','') > snapshot.get('settings_updated_at',''):
+                snapshot = {**remote,'events':merge_dividend_events(snapshot.get('events',[]),remote.get('events',[]))}
+                st.session_state.dividend_snapshot = snapshot
+                st.session_state['_dividend_reset_widgets'] = True
+                _write_json_atomic(DIVIDEND_FILE,snapshot,indent=2)
+                st.rerun()
+    if selected:
+        result = get_public_maintenance_jobs().poll(('dividend-feed',selected,year,st.session_state.get('_dividend_refresh',0)),
+            lambda:fetch_dividend_updates(selected,year), interval=21600)
+        if result and result['checked_at'] != snapshot.get('checked_at'):
+            snapshot.update(events=merge_dividend_events(snapshot.get('events',[]),result['events']),
+                            errors=result['errors'],checked_at=result['checked_at'])
+            _write_json_atomic(DIVIDEND_FILE,snapshot,indent=2)
+            st.session_state['_dividend_pending'] = True
+            st.rerun()
+    if url and st.session_state.get('_dividend_pending'):
+        payload = json.loads(json.dumps(snapshot))
+        saved = get_public_maintenance_jobs().poll(('dividend-save',data_version(payload)),
+            lambda:sync_dividend_snapshot(url,payload),interval=300)
+        if saved:
+            st.session_state['_dividend_pending'] = False
+            if saved.get('settings_updated_at','') > snapshot.get('settings_updated_at',''):
+                st.session_state.dividend_snapshot = saved
+                st.session_state['_dividend_reset_widgets'] = True
+                _write_json_atomic(DIVIDEND_FILE,saved,indent=2)
+                st.rerun()
+    st.caption('資料檢查：' + str(snapshot.get('checked_at') or '背景準備中') +
+               ('｜雲端待同步，保留本機並重試' if st.session_state.get('_dividend_pending') else '｜設定已保存'))
+    if snapshot.get('errors'):
+        st.warning('部分來源未取得，保留最後成功公告：'+'、'.join(snapshot['errors']))
+
+
+def render_dividend_settings():
+    if 'dividend_snapshot' not in st.session_state:
+        try:
+            with open(DIVIDEND_FILE,encoding='utf-8') as file:
+                saved=json.load(file)
+            saved = normalize_dividend_snapshot(saved)
+        except (OSError,ValueError,TypeError,AttributeError):
+            saved={}
+        st.session_state.dividend_snapshot=saved
+        st.session_state['_dividend_pending']=bool(saved.get('settings_updated_at'))
+    if st.session_state.pop('_dividend_reset_widgets',False):
+        st.session_state.pop('dividend_tickers',None)
+        st.session_state.pop('dividend_kinds',None)
+    snapshot=st.session_state.dividend_snapshot
+    with st.expander('💰 個股／ETF 股利追蹤',expanded=False):
+        st.caption('獨立於公司營收清單；輸入代碼即可追蹤，自動儲存。只顯示已取得日期，不推算發放日。最多 30 檔。')
+        st.text_input('股票／ETF 代碼',value=','.join(snapshot.get('codes',[])),placeholder='2330, 0050, 00919',
+                      key='dividend_tickers',on_change=save_dividend_settings)
+        st.multiselect('顯示股利事件',options=['除息日','股息發放日'],default=snapshot.get('kinds',['除息日','股息發放日']),
+                       key='dividend_kinds',on_change=save_dividend_settings)
+        if st.session_state.get('_dividend_input_error'):
+            st.error(st.session_state['_dividend_input_error'])
+        if st.button('🔄 更新股利公告',key='refresh_dividends'):
+            fetch_dividend_feed.clear()
+            fetch_etf_dividend_feed.clear()
+            fetch_official_dividend_feed.clear()
+            fetch_company_official_feed.clear()
+            st.session_state['_dividend_refresh']=st.session_state.get('_dividend_refresh',0)+1
+        render_dividend_status(st.session_state.cal_year)
+        st.caption('ETF 優先 TWSE 官方公告；個股與其他 ETF 發放日使用 FinMind 備援。來源失敗保留快照，查無公告不代表不配息。')
+    visible = selected_dividend_events(snapshot.get('events',[]),snapshot.get('codes',[]),snapshot.get('kinds',['除息日','股息發放日']))
+    names, _ = load_local_stock_names()
+    return [{**event,'title':event['title'].replace(event['ticker']+'('+event['ticker']+')',
+            names.get(event['ticker'],event['ticker'])+'('+event['ticker']+')')} for event in visible]
 
 
 def fetch_tracked_company_updates(symbols):
@@ -28008,6 +28174,7 @@ with tab3:
             + "。"
         )
 
+    network_events.extend(render_dividend_settings())
     company_snapshot = normalize_company_event_snapshot(st.session_state.company_event_snapshot)
     st.session_state.company_event_snapshot = company_snapshot
     company_snapshot = selected_company_calendar_snapshot(company_display_snapshot(company_snapshot))

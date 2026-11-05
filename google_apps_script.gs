@@ -11,6 +11,7 @@ const SCOPES = [
   'stock_strategy',
   'fibo_strategy',
   'company_events',
+  'dividend_calendar',
   'strategy_signals',
   'futures_strategy',
 ];
