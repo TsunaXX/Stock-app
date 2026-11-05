@@ -9,7 +9,7 @@ import pandas as pd
 import pytest
 from openpyxl import load_workbook
 
-from model_tracking import (advance, event_message, excel_report, new_trade,
+from model_tracking import (ModelTracker, PROTECTION_POLICY, advance, event_message, excel_report, new_trade,
                             performance, plan_performance, trade_display)
 from test_core_calculations import load_app_symbols
 from test_model_tracking import quote, signal
@@ -174,3 +174,40 @@ def test_event_times_are_taipei_seconds_and_no_samples_are_not_zero_percent():
     assert ns['_model_display_value']('2026-11-05T01:02:01.483062+00:00','時間') == '2026/11/05 09:02:01'
     assert ns['_model_display_value'](None,'二次以上勝率(%)') == '—（無有效樣本）'
     assert ns['_model_display_value'](0.,'勝率(%)') == 0.
+
+
+@pytest.mark.parametrize('cause',['停利','停損','保利'])
+def test_same_update_close_and_reentry_reports_both_saved_transitions(tmp_path,cause):
+    tracker = ModelTracker(tmp_path/'linked.sqlite',start=False)
+    first = {**record(保利規則=PROTECTION_POLICY),'模擬進場價':100.,'狀態':'模擬持倉'}
+    first_id = first['交易ID']
+    with tracker.write_db() as db:
+        tracker.store(db,first)
+    ns = load_app_symbols('apply_model_protection','parse_trade_plan_numbers','fmt_price')
+    class Clock(ns['datetime']):
+        @classmethod
+        def now(cls,tz=None):
+            value = pd.Timestamp('2026-11-05T10:00:00+08:00').to_pydatetime()
+            return value.astimezone(tz) if tz else value.replace(tzinfo=None)
+    ns['datetime'] = Clock
+    messages = []
+    ns.update(trade_display=trade_display, st=SimpleNamespace(
+        session_state={'sj_logged_in':True},caption=lambda text:None,toast=lambda text,**kw:messages.append(text)),
+        get_app_secret=lambda key:'',get_model_tracker=lambda url:tracker,get_futures_trading_date=lambda day:day)
+    frame = pd.DataFrame([{'代號':'2330','名稱':'測試商品','_系統方向':'多頭','進出場預判':'進 100｜停 95｜目 110'}])
+    ns['apply_model_protection'](frame,True,'當沖')
+    assert not messages
+    first.update({'狀態':'已平倉','出場原因':cause,'模擬損益':20.,'模擬出場價':101.,
+                  '結案時間':'2026-11-05T09:22:57+08:00','同步確認':True})
+    second = {**first,'交易ID':'new-execution','狀態':'模擬持倉','出場原因':'','模擬出場價':None,
+              '進場次數':2,'前次執行ID':first_id,'進場時間':'2026-11-05T09:22:58+08:00'}
+    second.pop('結案時間')
+    with tracker.write_db() as db:
+        tracker.store(db,first)
+        tracker.store(db,second)
+    ns['apply_model_protection'](frame,True,'當沖')
+    assert len(messages)==1 and '已出場（'+cause+'）' in messages[0] and '已進場2次' in messages[0]
+    assert messages[0].index('已出場') < messages[0].index('已進場')
+    assert frame.iloc[0]['進出場預判'].startswith('多·已進場2次｜')
+    ns['apply_model_protection'](frame,True,'當沖')
+    assert len(messages)==1

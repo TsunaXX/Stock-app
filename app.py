@@ -21509,6 +21509,16 @@ def apply_model_protection(rows, stock, mode, room=None):
     prior = st.session_state.get(state_key)
     if prior and prior.get('day') != day.date().isoformat():
         prior = None
+    def notice_time(value):
+        try:
+            stamp = pd.Timestamp(value)
+            if pd.isna(stamp):
+                raise ValueError('Missing source time')
+            stamp = stamp.tz_localize('Asia/Taipei') if stamp.tzinfo is None else stamp.tz_convert('Asia/Taipei')
+            return stamp.strftime('%H:%M:%S'), stamp.isoformat()
+        except (TypeError, ValueError, OverflowError):
+            return '時間未取得', ''
+
     states, notes, changes = {}, [], []
     for index, row in rows.iterrows():
         key = str(row[key_column])
@@ -21533,20 +21543,29 @@ def apply_model_protection(rows, stock, mode, room=None):
                 )
             if entered or record.get('狀態') == '訊號失效':
                 source_time = record.get('結案時間') or record.get('訊號失效時間') or record.get('進場時間') or record.get('來源時間')
-                try:
-                    stamp = pd.Timestamp(source_time)
-                    if pd.isna(stamp):
-                        raise ValueError('Missing source time')
-                    stamp = stamp.tz_localize('Asia/Taipei') if stamp.tzinfo is None else stamp.tz_convert('Asia/Taipei')
-                    time_text, sort_time = stamp.strftime('%H:%M:%S'), stamp.isoformat()
-                except (TypeError, ValueError, OverflowError):
-                    time_text, sort_time = '時間未取得', ''
+                time_text, sort_time = notice_time(source_time)
                 name = f"{row.get('名稱', key)}（{key}）"
                 note = f"{time_text} {name} {state}{suffix}：{view['狀態說明']}"
+                parent = record.get('_前次出場')
+                if parent and parent.get('狀態') == '已平倉':
+                    note += f"｜前次 {trade_display(parent)['交易狀態']} {notice_time(parent.get('結案時間'))[0]}"
+                elif record.get('前次執行ID'):
+                    note += '｜前次出場紀錄待同步'
                 notes.append((sort_time, note))
-                states[key] = (record.get('交易ID'), state)
-                if prior is not None and prior.get('states', {}).get(key) != states[key]:
-                    changes.append(f"{name} {state}{suffix} {time_text}")
+                transitions = []
+                for saved in (record.get('_前次出場'), record):
+                    if not saved or (saved is not record and saved.get('狀態') != '已平倉'):
+                        continue
+                    saved_state = trade_display(saved)['交易狀態']
+                    saved_count = int(saved.get('進場次數') or 1)
+                    saved_suffix = str(saved_count) + '次' if saved_count > 1 else ''
+                    saved_time = notice_time(saved.get('結案時間'))[0] if saved is not record else time_text
+                    notice_key = key + '|' + str(saved.get('交易ID'))
+                    states[notice_key] = saved_state
+                    if prior is not None and prior.get('states', {}).get(notice_key) != saved_state:
+                        transitions.append(f"{saved_state}{saved_suffix} {saved_time}")
+                if transitions:
+                    changes.append(name + ' ' + ' → '.join(transitions))
             if not fresh_plan:
                 continue
         if valid_candidate:
@@ -21556,7 +21575,8 @@ def apply_model_protection(rows, stock, mode, room=None):
             rows.at[index, plan_column] = f"{side + '·' if side else ''}待進場｜進 {fmt_price(levels['entry'])}｜停 {fmt_price(levels['stop'])}｜保 —｜目 {fmt_price(levels['target'])}"
     st.session_state[state_key] = {'day':day.date().isoformat(), 'states':states}
     if changes and st.session_state.get('stock_strategy_notify' if stock else 'futures_strategy_notify', True):
-        st.toast('交易狀態：' + '；'.join(changes[:3]), icon='🔔')
+        suffix = f'（另 {len(changes)-3} 檔）' if len(changes) > 3 else ''
+        st.toast('交易狀態：' + '；'.join(changes[:3]) + suffix, icon='🔔')
     if notes:
         st.caption('交易提醒：' + '；'.join(note for _, note in sorted(notes, reverse=True)[:3]))
 

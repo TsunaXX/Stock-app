@@ -1066,17 +1066,24 @@ class ModelTracker:
     def protection_plans(self, market, keys, mode, day, source=None):
         """Bounded current-plan reads by indexed instrument, without loading performance history."""
         result = {}
+        previous_fields = ('交易ID','狀態','方向','進場次數','出場原因','結案時間','模擬進場價','模擬損益','資料缺口','識別版本','同步確認','原始計畫ID')
+        previous_paths = ','.join("'$." + field + "'" for field in previous_fields)
         with closing(self.db()) as db:
             for key in keys:
                 prefix = f'{key}|{market}|{mode}|'
-                raw = db.execute("""SELECT body FROM trades WHERE slot>=? AND slot<?
-                    AND json_extract(body, '$.保利規則')=?
-                    AND (json_extract(body, '$.計畫來源')=? OR (?='股期戰略室' AND json_extract(body, '$.計畫來源') IS NULL))
-                    AND ((?='波段' AND state IN ('等待進場','模擬持倉','監控中斷','資料不足')) OR json_extract(body, '$.交易日')=?)
-                    ORDER BY (state IN ('模擬持倉','監控中斷','資料不足') AND json_extract(body, '$.模擬進場價') IS NOT NULL) DESC,
-                    rowid DESC LIMIT 1""", (prefix, prefix + '\uffff', PROTECTION_POLICY, source or '股期戰略室', source or '股期戰略室', mode, day)).fetchone()
+                raw = db.execute(f"""SELECT t.body,json_extract(p.body,{previous_paths}) FROM trades t LEFT JOIN trades p ON p.id=json_extract(t.body,'$.前次執行ID')
+                    WHERE t.slot>=? AND t.slot<?
+                    AND json_extract(t.body, '$.保利規則')=?
+                    AND (json_extract(t.body, '$.計畫來源')=? OR (?='股期戰略室' AND json_extract(t.body, '$.計畫來源') IS NULL))
+                    AND ((?='波段' AND t.state IN ('等待進場','模擬持倉','監控中斷','資料不足')) OR json_extract(t.body, '$.交易日')=?)
+                    ORDER BY (t.state IN ('模擬持倉','監控中斷','資料不足') AND json_extract(t.body, '$.模擬進場價') IS NOT NULL) DESC,
+                    t.rowid DESC LIMIT 1""", (prefix, prefix + '\uffff', PROTECTION_POLICY, source or '股期戰略室', source or '股期戰略室', mode, day)).fetchone()
                 if raw:
                     result[str(key)] = json.loads(raw[0])
+                    if raw[1]:
+                        previous = dict(zip(previous_fields,json.loads(raw[1])))
+                        if previous['原始計畫ID'] == result[str(key)].get('原始計畫ID'):
+                            result[str(key)]['_前次出場'] = previous
         return result
 
     def store(self, db, row, dirty=1):
