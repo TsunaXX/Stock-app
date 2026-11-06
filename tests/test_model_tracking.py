@@ -150,7 +150,7 @@ def test_excel_real_numeric_values_filters_and_performance():
     assert not groups.empty
     a['名稱'] = '=1+1'
     workbook = load_workbook(io.BytesIO(excel_report([a,b])))
-    assert workbook.sheetnames == ['總覽','策略與指標','歷史明細','事件']
+    assert workbook.sheetnames == ['總覽','參考績效','缺口參考交易','策略與指標','歷史明細','事件']
     sheet = workbook['歷史明細']
     headers = {c.value:c.column for c in sheet[1]}
     assert sheet.cell(2, headers['模擬損益']).data_type == 'n'
@@ -388,8 +388,18 @@ with outer:
         '策略':'當沖','策略版本':'V1.2-exec1-candidate','計畫來源':'股期戰略室','計畫類型':'股票當沖',
         '候選診斷':{'名稱':'候選測試','商品鍵':'9999','方向':'多頭','候選':True,'計畫可執行性':'待調整',
                      '原始RR':1.5,'淨RR':.8,'未建立原因':'扣成本風報比不足'}}})
+    gap_signal=signal(交易日='2026-10-12',來源時間='2026-10-12T10:00:00+08:00')
+    gap=advance(new_trade(gap_signal),quote(100,交易日='2026-10-12',來源時間='2026-10-12T10:00:00+08:00'))
+    gap=advance(gap,quote(111,交易日='2026-10-12',來源時間='2026-10-12T10:01:00+08:00'))
+    with tracker.write_db() as db:
+        tracker.store(db,gap)
     app = AppTest.from_string(script, default_timeout=30).run()
     assert not app.exception and app.session_state['profit'] == '模型勝率追蹤'
+    comparison=next(d.value for d in app.dataframe if '績效範圍' in d.value)
+    assert comparison['績效範圍'].tolist()==['完整驗證','缺口參考','合併參考']
+    assert comparison.loc[comparison['績效範圍']=='缺口參考','交易數'].iloc[0]==1
+    assert any(e.label=='缺口參考交易明細' for e in app.expander)
+    assert app.number_input(key='model_gap_page').value==1
     assert str(app.date_input(key='model_period').value[-1]) == '2026-10-12'
     assert any(e.label == '候選與未進場診斷' for e in app.expander)
     assert len(app.get('download_button')) == 1

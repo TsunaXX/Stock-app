@@ -231,6 +231,27 @@ def invalidation_detail(record, reason):
     return reason, '訊號失效'
 
 
+def gap_reference_trade(row):
+    """Saved fills with incomplete monitoring are estimates, never verified performance."""
+    if (row.get('狀態') != '已平倉' or not row.get('資料缺口') or row.get('到期未確認')
+            or str(row.get('異常原因', '')).startswith('跨裝置')):
+        return False
+    entered, closed = stamp(row.get('進場時間')), stamp(row.get('結案時間'))
+    values = [number(row.get(key)) for key in ('模擬進場價','模擬出場價','毛損益','交易成本','模擬損益')]
+    return (entered is not None and closed is not None and entered <= closed
+            and all(value is not None for value in values)
+            and values[3] >= 0 and math.isclose(values[2] - values[3], values[4], rel_tol=0, abs_tol=.01))
+
+
+def reference_performance_rows(metrics):
+    return [{'績效範圍': label, '交易數': metrics[count], '獲勝': metrics[wins], '虧損': metrics[losses],
+             '勝率(%)': metrics[rate], '累積模擬損益': metrics[pnl]}
+            for label,count,wins,losses,rate,pnl in (
+                ('完整驗證','有效交易數','獲勝','虧損','勝率(%)','累積模擬損益'),
+                ('缺口參考','缺口參考交易數','缺口參考獲勝','缺口參考虧損','缺口參考勝率(%)','缺口參考損益'),
+                ('合併參考','合併參考交易數','合併參考獲勝','合併參考虧損','合併參考勝率(%)','合併參考損益'))]
+
+
 def trade_display(record):
     """A read-only presentation of saved evidence, never a new fill or historical rewrite."""
     row = dict(record)
@@ -256,7 +277,14 @@ def trade_display(record):
         status = '待進場' + ('⚠' if gap else '')
         detail = ('進場判定未確認｜成交證據不足' if gap else
                   row.get('最後進場等待原因') or row.get('進場等待原因') or '等待有效進場條件及成交證據')
-    row.update({'交易狀態': status, '狀態說明': detail})
+    reference = gap_reference_trade(row)
+    category = ('缺口參考' if reference else '完整驗證' if state == '已平倉' and confirmed else
+                '待確認' if state == '已平倉' else '未結案')
+    if reference:
+        detail = detail.replace('績效未確認，不納入勝率與累積損益', '行情有缺口，已列入缺口參考績效')
+    if entered:
+        row['未進場分類'] = ''
+    row.update({'交易狀態': status, '狀態說明': detail, '績效分類': category})
     return row
 
 
@@ -535,7 +563,24 @@ def advance(record, quote):
         return row
     ts, prior = stamp(quote.get('來源時間')), stamp(row.get('來源時間'))
     price = number(quote.get('價格'))
-    if ts is None or (prior is not None and ts < prior):
+    if ts is None:
+        return row
+    if prior is not None and ts < prior:
+        stream, seq = quote.get('串流識別'), quote.get('序號')
+        previous = row.get('串流序號', {}).get(stream, row.get('最後序號'))
+        if stream == row.get('串流識別') and seq is not None and previous is not None and seq > previous:
+            if seq > previous + 1:
+                row['資料缺口'] = True
+                event(row, '監控中斷', prior.isoformat(), '成交證據佇列缺漏，不能確認停利停損先後',
+                      {'串流識別':stream,'缺漏起序':previous+1,'缺漏迄序':seq-1,'目前序號':seq})
+            # A received late tick advances evidence delivery, never the trade's market time or fills.
+            row['最後序號'] = seq
+            row.setdefault('串流序號', {})[stream] = seq
+            created = stamp(row.get('建立時間'))
+            if created is not None and ts >= created:
+                row['資料缺口'] = True
+                event(row, '監控中斷', prior.isoformat(), '成交時間倒序；觸價先後未確認',
+                      {'原始來源時間':ts.isoformat(),'前次來源時間':prior.isoformat(),'串流識別':stream,'序號':seq,'價格':price})
         return row
     restore_profit_protection(row)
     if row.get('到期時間') and ts >= stamp(row['到期時間']):
@@ -551,7 +596,11 @@ def advance(record, quote):
     old_stream = row.get('串流識別')
     if old_stream is not None and stream is not None and old_stream != stream and (old_stream.split(':')[0] == stream.split(':')[0] or not quote.get('銜接確認')):
         row['資料缺口'] = True
-        event(row, '監控中斷', text, '串流重新連線；中斷區間未確認')
+        previous_parts, current_parts = old_stream.split(':'), stream.split(':')
+        buffer_reset = (len(previous_parts) >= 3 and len(current_parts) >= 3
+                        and previous_parts[:2] == current_parts[:2] and previous_parts[2] != current_parts[2])
+        reason = '成交緩衝區重建；中斷區間未確認' if buffer_reset else '串流重新連線；中斷區間未確認'
+        event(row, '監控中斷', text, reason, {'前次串流識別':old_stream,'目前串流識別':stream})
     if stream is not None:
         row['串流識別'] = stream
     seq = quote.get('序號')
@@ -760,6 +809,18 @@ def performance(records, state=None):
                '保利出場比例(%)': state['protected'] / count * 100 if count else None,
                '可計入績效比例(%)': count / len(records) * 100 if records else None,
                '資料完整率(%)': sum(not r.get('資料缺口', False) and r.get('狀態') != '資料不足' for r in records) / len(records) * 100 if records else None}
+    reference = [row for row in records if gap_reference_trade(row)]
+    reference_count = len(reference)
+    reference_wins = sum(number(row['模擬損益']) > 0 for row in reference)
+    reference_losses = sum(number(row['模擬損益']) < 0 for row in reference)
+    reference_pnl = sum(number(row['模擬損益']) for row in reference)
+    combined = count + reference_count
+    metrics.update({'缺口參考交易數': reference_count, '缺口參考獲勝': reference_wins, '缺口參考虧損': reference_losses,
+                    '缺口參考勝率(%)': reference_wins / reference_count * 100 if reference_count else None,
+                    '缺口參考損益': reference_pnl, '合併參考交易數': combined,
+                    '合併參考獲勝': wins + reference_wins, '合併參考虧損': losses + reference_losses,
+                    '合併參考勝率(%)': (wins + reference_wins) / combined * 100 if combined else None,
+                    '合併參考損益': state['equity'] + reference_pnl})
     groups = [{**g, '勝率(%)':g['獲勝']/g['有效交易數']*100} for g in state['groups'].values()]
 
     return metrics, pd.DataFrame(groups), data
@@ -853,7 +914,9 @@ def excel_report(records):
             count += 1
         if sheet is None:
             book.create_sheet(name).append(columns)
-    for name, frame in [('總覽', pd.DataFrame([metrics])), ('策略與指標', groups), ('歷史明細', data)]:
+    reference = data.loc[data['績效分類'] == '缺口參考'] if '績效分類' in data else pd.DataFrame(columns=['交易ID','績效分類','模擬損益'])
+    for name, frame in [('總覽', pd.DataFrame([metrics])), ('參考績效', pd.DataFrame(reference_performance_rows(metrics))),
+                        ('缺口參考交易', reference), ('策略與指標', groups), ('歷史明細', data)]:
         write(name, list(frame.columns), frame.itertuples(index=False, name=None))
     event_columns = list(dict.fromkeys(['交易ID', '商品', '進場次數', '顯示訊息'] + [key for row in records for event in row.get('事件', []) for key in event]))
     write('事件', event_columns, (tuple(row['交易ID'] if key == '交易ID' else
@@ -1190,7 +1253,13 @@ class ModelTracker:
                               and 0 <= (current_time - permission_time).total_seconds() <= max(30, float(quote.get('更新秒數', 5)) * 3))
                 for tick in evidence:
                     if str(tick.get('來源時間', '')) < str(updated['來源時間']):
-                        self.health['重播略過筆數'] = self.health.get('重播略過筆數',0)+1
+                        seq = tick.get('序號')
+                        if (tick.get('串流識別') == updated.get('串流識別') and seq is not None
+                                and updated.get('最後序號') is not None and seq > updated['最後序號']):
+                            updated = advance(updated, {**quote, **tick})
+                            self.health['時間倒序筆數'] = self.health.get('時間倒序筆數',0)+1
+                        else:
+                            self.health['重播略過筆數'] = self.health.get('重播略過筆數',0)+1
                         continue
                     if (tick.get('串流識別') == updated.get('串流識別') and tick.get('序號') is not None
                             and updated.get('最後序號') is not None and tick['序號']>updated['最後序號']+1):

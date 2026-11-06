@@ -21470,6 +21470,8 @@ def sync_strategy_stream_scope(api, contracts, room):
         asset = room.split('_', 1)[0]
         retained = set().union(*(codes for scope, codes in scopes.items() if scope.split('_', 1)[0] == asset))
         all_retained = set().union(*scopes.values())
+        # Ordinary subscriptions also own their evidence; removing another scope must not reset it.
+        all_retained.update(set(state.get('subscriptions', {})) - {code for code, _ in removed})
         for code in list(state.get('model_tick_buffers', {})):
             if code not in all_retained:
                 state['model_tick_buffers'].pop(code, None)
@@ -22298,7 +22300,7 @@ def _model_history_overview(frame):
             str(code or '') + ((' ' + str(name)) if name else '')
             for code, name in zip(codes.fillna(''), names.fillna(''))
         ]
-    first = ['交易日', '商品', '計畫來源', '計畫類型', '方向', '交易狀態', '狀態說明', '狀態', '進場次數', '原始RR', '淨RR', '計畫可執行性', '新訊號觸發狀態', '模擬進場價', '模擬出場價', '保利價', '保利淨額', '保利狀態', '出場原因', '模擬損益', '策略版本', '最後進場等待原因', '訊號失效原因', '未進場分類', '事件數']
+    first = ['交易日', '商品', '計畫來源', '計畫類型', '方向', '交易狀態', '狀態說明', '績效分類', '狀態', '進場次數', '原始RR', '淨RR', '計畫可執行性', '新訊號觸發狀態', '模擬進場價', '模擬出場價', '保利價', '保利淨額', '保利狀態', '出場原因', '模擬損益', '策略版本', '最後進場等待原因', '訊號失效原因', '未進場分類', '事件數']
     columns = [column for column in first if column in result.columns and (column != '狀態' or '交易狀態' not in result.columns)]
     return result[columns], result[columns + [column for column in result.columns if column not in columns]]
 
@@ -22322,7 +22324,9 @@ def _model_column_config(frame):
         '進場等待原因': '新版當沖在模擬成交前檢查追價與扣除雙邊成本後的空間；等待不算已成交。',
         '最後進場等待原因': '最後一次未能進場的原因；進場或失效後仍保留。',
         '訊號失效原因': '訊號終止或超過有效時間的原因，不覆蓋原等待原因。',
-        '未進場分類': '進場前最後分類；成交後仍保留最後等待紀錄，實際是否進出場以交易狀態為準。',
+        '未進場分類': '僅未進場交易顯示目前分類；成交後留空，最後等待原因與原事件仍完整保留。',
+        '績效分類': '完整驗證、缺口參考、待確認或未結案；參考交易不會清除行情缺口。',
+        '績效範圍': '完整驗證沿用原條件；缺口參考有完整保存的進出場及損益；合併參考為兩者相加。',
         '顯示訊息': '清楚說明進場／出場及失效原因；原原因、事件 ID 及歷史證據保留。',
         '資料缺口原因': '已確認中斷與缺漏的原因，不能藉重新同步清除。',
         '事件數': '事件發生次數；重複診斷區間的次數也納入，完整內容可匯出。',
@@ -22407,7 +22411,7 @@ def _model_display_frame(frame, color=True):
         neutral = 'color: #dbeafe'
         try:
             number_value = float(value)
-            if column in ('模擬損益', '毛損益', '結果(R)', '累積模擬損益', '平均獲利', '平均虧損', '每筆期望值'):
+            if column in ('模擬損益', '毛損益', '結果(R)', '累積模擬損益', '平均獲利', '平均虧損', '每筆期望值', '缺口參考損益', '合併參考損益'):
                 return 'color: #ff7373' if number_value > 0 else ('color: #55d6a8' if number_value < 0 else neutral)
             if column in ('勝率(%)', '可計入績效比例(%)', '資料完整率(%)'):
                 return 'color: #5eead4'
@@ -22416,6 +22420,8 @@ def _model_display_frame(frame, color=True):
             return neutral
         except (TypeError, ValueError):
             text = str(value or '')
+            if column in ('績效分類','績效範圍'):
+                return 'color: #fbbf24' if '參考' in text or '確認' in text else 'color: #67e8f9'
             if column == '方向':
                 return 'color: #ff7373' if '多' in text else ('color: #55d6a8' if '空' in text else neutral)
             if column == '出場原因':
@@ -22511,7 +22517,7 @@ def render_trading_cost_settings():
 
 def render_model_tracking_room():
     st.caption('依股期進出場預判、指數操作計畫與選擇權操作計畫自動記錄；不讀取帳戶交易。只有成交證據完整的已平倉模擬交易會計入勝率。')
-    st.caption('待進場／觸價＝尚未成交；已進場＝模型持倉；已出場(利／損／保／收)＝停利／停損／保利／收盤。⚠表示證據待確認，不納入正式績效；2次代表第二次獨立進場。')
+    st.caption('待進場／觸價＝尚未成交；已進場＝模型持倉；已出場(利／損／保／收)＝停利／停損／保利／收盤。⚠表示證據待確認，已保存進出場與損益者另列缺口參考；2次代表第二次獨立進場。')
     with st.expander('📘 模型勝率追蹤使用說明', expanded=False):
         st.markdown(
             '開啟股期戰略室或指數／選擇權操作計畫並登入 Shioaji 後，系統會依畫面原有串流自動記錄，不需另外啟動追蹤。\n\n'
@@ -22600,6 +22606,7 @@ def render_model_tracking_room():
     filter_scope = (period, plan_source, version, code, market, mode, direction)
     if st.session_state.get('_model_filter_scope') != filter_scope:
         st.session_state['model_page'] = 1
+        st.session_state['model_gap_page'] = 1
         st.session_state['_model_filter_scope'] = filter_scope
     show_evidence = st.toggle('顯示指標與事件證據', key='model_evidence')
     show_full_history = st.toggle('顯示完整明細欄位', key='model_full_history', value=False)
@@ -22622,12 +22629,31 @@ def render_model_tracking_room():
                    and (plan_source == '全部' or row.get('計畫來源', '股期戰略室') == plan_source)
                    and (not query or query in ''.join(str(row.get(key, '') or '') for key in ('代碼', '名稱', '商品鍵')).replace(' ', '').casefold())]
         metrics, groups, frame = cached_model_performance(json.dumps(records, ensure_ascii=False), str((period, market, mode, direction, version, code, plan_source)))
-        st.markdown('##### 交易績效（每次進場獨立計算）')
+        st.markdown('##### 完整驗證績效（每次進場獨立計算）')
         st.caption('追蹤執行紀錄包含尚未成交與二次以上執行；原始計畫數另列。只有證據完整且已同步確認的結案交易納入正式績效。')
         for col, key in zip(st.columns(3), ('追蹤執行紀錄數', '有效交易數', '含資料缺口的執行紀錄數')):
             col.metric(key, str(metrics[key]))
         for col, key in zip(st.columns(4), ('勝率(%)', '累積模擬損益', '獲利因子', '最大回撤')):
             col.metric(key, ('—（無有效樣本）' if key.endswith('勝率(%)') else '未確認') if metrics[key] is None else f'{metrics[key]:,.2f}'.rstrip('0').rstrip('.'))
+        from model_tracking import reference_performance_rows
+        st.markdown('##### 缺口與合併參考績效')
+        st.caption('缺口參考保留已記錄的進出場、成本及損益，不推算中斷期間的成交；合併參考＝完整驗證＋缺口參考，不代表行情缺口已補齊。成交／成本衝突或資料不完整仍待確認。')
+        reference_summary = pd.DataFrame(reference_performance_rows(metrics))
+        st.dataframe(_model_display_frame(reference_summary), hide_index=True, width='stretch',
+                     column_config=_model_column_config(reference_summary))
+        references = frame.loc[frame['績效分類'] == '缺口參考'] if '績效分類' in frame else pd.DataFrame()
+        with st.expander('缺口參考交易明細', expanded=not references.empty):
+            st.caption('沿用上方日期、來源、商品及策略篩選。只列已保存的進出場與淨損益，不變更原交易及缺口標記；Excel 另有完整工作表。')
+            if references.empty:
+                st.caption('目前沒有符合條件的缺口已平倉交易。')
+            else:
+                reference_page = st.number_input('缺口參考明細頁碼', min_value=1, step=1, key='model_gap_page')
+                columns = [key for key in ('交易日','代碼','名稱','計畫來源','計畫類型','策略版本','方向','進場時間','模擬進場價',
+                                           '結案時間','模擬出場價','毛損益','交易成本','模擬損益','資料缺口原因','同步確認','交易ID') if key in references]
+                reference_view = references.sort_values('結案時間', ascending=False).iloc[(reference_page-1)*100:reference_page*100][columns]
+                st.caption(f'每頁100筆｜共{len(references)}筆缺口參考交易')
+                st.dataframe(_model_display_frame(pd.DataFrame(display_records(reference_view.to_dict('records'), current_labels))),
+                             hide_index=True, width='stretch', column_config=_model_column_config(reference_view))
         diagnostics = tracker.diagnostics(period[0].isoformat(), period[1].isoformat())
         diagnostics = [r for r in diagnostics if (plan_source == '全部' or r.get('計畫來源') == plan_source)
                        and (market == '全部' or r.get('計畫類型','').startswith(market))
@@ -22641,7 +22667,7 @@ def render_model_tracking_room():
                       '成功發布計畫數':len({r.get('原始計畫ID',r['交易ID']) for r in records}),
                       '成本風報比不足數':sum(n for r in diagnostics for reason,n in r.get('狀態變更次數',{}).items() if '成本' in reason),
                       '策略未放行數':sum(n for r in diagnostics for reason,n in r.get('狀態變更次數',{}).items() if '策略條件' in reason),
-                      '未觸價數':sum(r.get('未進場分類')=='未觸價' for r in records),
+                      '未觸價數':sum(r.get('模擬進場價') is None and r.get('未進場分類')=='未觸價' for r in records),
                       '已失效計畫數':sum(r['狀態']=='訊號失效' for r in records),
                       '重新觸發計畫數':len({r['原始計畫ID'] for r in records if r.get('重新觸發來源ID')}),
                       '有效進場數':sum(r.get('模擬進場價') is not None and not r.get('資料缺口') and (r.get('識別版本')!=2 or r.get('同步確認')) for r in records),
@@ -22657,7 +22683,7 @@ def render_model_tracking_room():
                     st.dataframe(_model_display_frame(pd.DataFrame(candidate_events)),hide_index=True,width='stretch')
             health = tracker.health
             st.caption(f"模型記錄：檢查 { _model_time_text(health.get('檢查時間')) if health.get('檢查時間') else '尚未收到報價'}｜實際間隔 {health.get('實際更新間隔',0) or 0:.2f}s｜耗時 {health.get('記錄耗時',0):.3f}s｜佇列 {tracker.queue.qsize()} 批｜成交緩衝 {health.get('成交緩衝筆數',0)} 筆｜錯誤 {health.get('錯誤次數',0)} 次")
-            st.caption(f"本機重播證據略過 {health.get('重播略過筆數',0)} 筆｜記錄缺序 {health.get('記錄缺序次數',0)} 次；略過已處理證據不等於遺失成交。")
+            st.caption(f"本機重播證據略過 {health.get('重播略過筆數',0)} 筆｜時間倒序 {health.get('時間倒序筆數',0)} 筆｜記錄缺序 {health.get('記錄缺序次數',0)} 次；已接收的倒序成交不重複計為遺失。")
             worker = st.session_state.get('_intraday_background')
             if worker is not None:
                 with worker.lock:
@@ -22742,7 +22768,7 @@ def cached_model_performance(payload, view_key='default'):
     with lock:
         records = json.loads(payload)
         metrics, groups, frame = performance(records, state)
-        # Older Streamlit cache entries or model modules may not include new UI fields.
+        # The report includes separate gap-reference and combined-reference columns.
         if '追蹤執行紀錄數' not in metrics or '含資料缺口的執行紀錄數' not in metrics:
             metrics = dict(metrics)
             metrics['追蹤執行紀錄數'] = len(records)
