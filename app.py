@@ -20922,16 +20922,12 @@ def fetch_stock_data_raw(
         except Exception: 
             pass
 
-    # 僅當未使用永豐 API，且需獲取即時資訊時，才透過 twstock.realtime 補足今日最新
+    # 備援即時報價只更新行情欄位，不能補成一根完整日 K。
     if include_live_quote and source_used != "shioaji" and live_quote_price is None:
         try:
             rt_data = twstock.realtime.get(code)
             if rt_data['success'] and rt_data['realtime']['latest_trade_price'] not in ['-', None, '']:
                 rt_price = float(rt_data['realtime']['latest_trade_price'])
-                rt_open = float(rt_data['realtime']['open']) if rt_data['realtime']['open'] != '-' else rt_price
-                rt_high = float(rt_data['realtime']['high']) if rt_data['realtime']['high'] != '-' else rt_price
-                rt_low = float(rt_data['realtime']['low']) if rt_data['realtime']['low'] != '-' else rt_price
-                rt_vol = float(rt_data['realtime']['accumulate_trade_volume']) if rt_data['realtime']['accumulate_trade_volume'] != '-' else 0.0
                 live_quote_price = rt_price
                 yesterday_close = _safe_number(rt_data['realtime'].get('yesterday_close'))
                 if yesterday_close is not None and yesterday_close > 0:
@@ -20944,24 +20940,6 @@ def fetch_stock_data_raw(
                     live_quote_price = live_quote_rate = None
                     raise ValueError("twstock 即時報價日期落後")
                 live_quote_time = rt_time_str
-                quote_date = pd.Timestamp(rt_dt.date())
-
-                if hist.empty:
-                    hist = pd.DataFrame([{'Open': rt_open, 'High': rt_high, 'Low': rt_low, 'Close': rt_price, 'Volume': rt_vol}], index=[quote_date])
-                else:
-                    if hist.index.tzinfo is not None: hist.index = hist.index.tz_localize(None)
-                    last_hist_date = hist.index[-1]
-                    if last_hist_date < quote_date:
-                        if rt_dt.weekday() < 5:
-                            new_row = pd.DataFrame([{'Open': rt_open, 'High': rt_high, 'Low': rt_low, 'Close': rt_price, 'Volume': rt_vol}], index=[quote_date])
-                            hist = pd.concat([hist, new_row])
-                            hist.sort_index(inplace=True)
-                    elif last_hist_date == quote_date:
-                        hist.at[last_hist_date, 'Close'] = rt_price
-                        hist.at[last_hist_date, 'High'] = max(hist.at[last_hist_date, 'High'], rt_high)
-                        hist.at[last_hist_date, 'Low'] = min(hist.at[last_hist_date, 'Low'], rt_low)
-                        hist.at[last_hist_date, 'Volume'] = rt_vol
-                        if hist.at[last_hist_date, 'Open'] == 0: hist.at[last_hist_date, 'Open'] = rt_open
         except Exception: pass
 
     if hist.empty: return None
@@ -21214,7 +21192,7 @@ def refresh_persisted_stock_rows(
 
 
 def refresh_risk_metrics_for_codes(stock_data, futures_set, saved_notes_dict, name_map_dict, sj_logged_in=False, sj_api=None):
-    """重抓日 K 指標，並以一個批次同步目前可取得的即時報價。"""
+    """一併更新日 K 策略基準、備註及指標，再批次更新報價。"""
     if stock_data.empty or '代號' not in stock_data.columns:
         return stock_data, 0, 0
 
@@ -21235,7 +21213,10 @@ def refresh_risk_metrics_for_codes(stock_data, futures_set, saved_notes_dict, na
                 sj_logged_in, sj_api, include_live_quote=False,
             )
             if result:
-                return code, {column: result.get(column) for column in RISK_METRIC_COLUMNS}
+                columns = (*RISK_METRIC_COLUMNS, '_strategy_close', '_strategy_change_rate',
+                           '_strategy_data_as_of', '_points', '_ma5', '_auto_note', '戰略備註',
+                           '當日漲停價', '當日跌停價', '_漲跌停基準', '_data_stale')
+                return code, {column: result.get(column) for column in columns}
         except Exception:
             pass
         return code, None
@@ -21243,15 +21224,17 @@ def refresh_risk_metrics_for_codes(stock_data, futures_set, saved_notes_dict, na
     with ThreadPoolExecutor(max_workers=ANALYSIS_MAX_WORKERS) as executor:
         results = list(executor.map(fetch_metrics, tasks))
 
-    refreshed = stock_data.copy()
+    refreshed = stock_data.astype(object)
     updated_count = 0
     for code, metrics in results:
-        if not metrics or metrics.get('_risk_atr14') is None or metrics.get('_risk_ma20') is None:
+        if not metrics:
             continue
-        row_mask = refreshed['代號'].astype(str) == code
-        for column, value in metrics.items():
-            refreshed.loc[row_mask, column] = value
-        updated_count += int(row_mask.sum())
+        for index in refreshed.index[refreshed['代號'].astype(str) == code]:
+            for column, value in metrics.items():
+                if column not in refreshed:
+                    refreshed[column] = None
+                refreshed.at[index, column] = value
+            updated_count += 1
     refreshed, quote_count = refresh_stock_quotes_for_codes(
         refreshed, sj_logged_in, sj_api,
     )
@@ -21793,13 +21776,54 @@ def opening_reference_plans(db, market, keys, mode, since, before):
     return result
 
 
-def apply_opening_reference(rows, stock, mode):
+def stock_opening_reference(row, expected_day, direction_choice):
+    """Use the same completed daily candle as the strategy note."""
+    close = _safe_number(row.get('_strategy_close'))
+    if str(row.get('_data_stale')) == 'True' or str(row.get('_strategy_data_as_of')) != expected_day or not close:
+        return '—', '⚪ 等待最新完整日 K'
+    limit_up, limit_down = calculate_limits(close)
+    if not 0 < limit_down < limit_up:
+        return '—', '⚪ 等待隔日漲跌停價'
+
+    daily_row = {**row, '收盤價': close, '漲跌幅': row.get('_strategy_change_rate')}
+    direction = determine_stock_direction(daily_row, direction_choice=direction_choice)['direction']
+    if any((_safe_number(row.get(key)) or 0) <= 0
+           for key in ('_risk_atr14', '_plan_prev_high', '_plan_prev_low')):
+        return '—', '⚪ 日 K 點位不足'
+    plan = build_trade_plan(daily_row, direction, False, {'eligible': True})
+    if not plan['valid']:
+        return '—', '⚪ 日 K 點位不足'
+
+    levels = parse_trade_plan_numbers(plan['summary'])
+    entry, stop, target = (max(limit_down, min(levels[key], limit_up)) for key in ('entry', 'stop', 'target'))
+    ordered = stop < entry < target if direction == '多頭' else target < entry < stop
+    if not ordered or abs(target - entry) < 1.3 * abs(entry - stop) - 1e-9:
+        return '—', '⚪ 隔日價格區間不足'
+
+    activation = round_to_tick(entry + (entry - stop))
+    protect = f'保啟≈{fmt_price(activation)}' if min(entry, target) < activation < max(entry, target) else '保 —'
+    return f'進 {fmt_price(entry)}｜停 {fmt_price(stop)}｜目 {fmt_price(target)}｜{protect}', '⚪ 開盤參考'
+
+
+def apply_opening_reference(rows, stock, mode, direction_choice='系統自動'):
     """Project saved levels after the live plan has already been sent to the tracker."""
     key_column, plan_column = ('代號', '進出場預判') if stock else ('契約鍵', '進出場點位')
     if rows.empty or plan_column not in rows:
         return
     now = datetime.now(pytz.timezone('Asia/Taipei'))
-    market = '股票' if stock else '期貨'
+    if stock:
+        if model_market_open({'市場': '股票'}, now):
+            return
+        expected_day = latest_completed_stock_trading_date(now).strftime('%Y/%m/%d')
+        for index, row in rows.iterrows():
+            if '已進場' in str(row.get(plan_column)):
+                continue
+            summary, status = stock_opening_reference(row, expected_day, direction_choice)
+            rows.at[index, plan_column] = summary
+            if '訊號狀態' in rows:
+                rows.at[index, '訊號狀態'] = status
+        return
+    market = '期貨'
     pending = [(index, str(row[key_column])) for index, row in rows.iterrows()
                if '已進場' not in str(row.get(plan_column))
                and not model_market_open({'市場': market, '交易時段': row.get('交易時段', '日盤+夜盤')}, now)]
@@ -25268,9 +25292,7 @@ if tab1.open and stock_strategy_tab.open:
                         if cache_sync_notice:
                             st.warning(cache_sync_notice)
                         market_risk_data = st.session_state.risk_filter_market_data
-                        if market_risk_data.get('updated') and not market_risk_data.get('errors'):
-                            st.caption(f"上市／上櫃注意與處置名單更新：{market_risk_data['updated']}。")
-                        elif market_risk_data.get('errors'):
+                        if market_risk_data.get('errors'):
                             if st.session_state.pop('_show_market_risk_errors', False):
                                 with st.expander('查看未取得的來源', expanded=True):
                                     for source_error in market_risk_data['errors']:
@@ -25282,7 +25304,7 @@ if tab1.open and stock_strategy_tab.open:
                                 )
                             else:
                                 st.warning("部分來源尚未取得；上市、上櫃分開查核，失敗市場或市場不明的股票仍標示未查核。")
-                        else:
+                        elif not market_risk_data.get('updated'):
                             st.info("尚未更新上市／上櫃注意與處置名單；資料未查核時不會被誤判為安全。")
 
                     market_risk_data = st.session_state.risk_filter_market_data
@@ -25412,7 +25434,7 @@ if tab1.open and stock_strategy_tab.open:
                     input_cols = stock_strategy_display_columns(False, False, False)
                 record_model_table('stock', df_display, True, strategy_mode, st.session_state.get('risk_filter_direction', '系統自動'))
                 apply_model_protection(df_display, True, strategy_mode)
-                apply_opening_reference(df_display, True, strategy_mode)
+                apply_opening_reference(df_display, True, strategy_mode, st.session_state.get('risk_filter_direction', '系統自動'))
                 for col in input_cols:
                     if col not in df_display.columns: df_display[col] = None
 
@@ -25462,7 +25484,9 @@ if tab1.open and stock_strategy_tab.open:
                         name_c = 'background-color: #ff4b4b; color: #ffffff; font-weight: bold;'
                     elif limit_state == 'down':
                         name_c = 'background-color: #00e676; color: #ffffff; font-weight: bold;'
-                    elif has_trade_prediction_signal(source_row.get('進出場預判')):
+                    elif has_trade_prediction_signal(source_row.get('進出場預判')) and (
+                        source_row.get('訊號狀態') != '⚪ 開盤參考'
+                    ):
                         name_c = 'background-color: #ffeb3b; color: #000000; font-weight: bold;'
                     else:
                         name_c = (
@@ -26150,7 +26174,7 @@ if tab1.open and stock_strategy_tab.open:
 
                         record_model_table('stock_independent', df_indep, True, indep_strategy_mode, indep_direction)
                         apply_model_protection(df_indep, True, indep_strategy_mode, 'stock_independent')
-                        apply_opening_reference(df_indep, True, indep_strategy_mode)
+                        apply_opening_reference(df_indep, True, indep_strategy_mode, indep_direction)
                         cols_to_fmt = ["當日漲停價", "當日跌停價", "成交價價差", "5日線價差"]
                         for c in cols_to_fmt:
                             if c in df_indep.columns: df_indep[c] = df_indep[c].apply(fmt_price)
