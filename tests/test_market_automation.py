@@ -130,7 +130,7 @@ def test_delayed_company_result_only_fills_missing_events_without_replacing_newe
 @pytest.mark.parametrize('include_analysis', [False, True])
 def test_futures_quote_refresh_preserves_strategy_or_checks_each_rows_prior_stop(include_analysis):
     ns = load_app_symbols('update_futures_live_rows', 'shioaji_contract_limits', '_safe_number', 'snapshot_change_rate',
-                          '_stream_datetime', 'set_futures_row_values', 'parse_trade_plan_numbers')
+                          '_stream_datetime', 'set_futures_row_values', 'parse_trade_plan_numbers', 'apply_retained_futures_levels')
     rows = pd.DataFrame([{'期貨代碼': code, '契約月份': '202610', '收盤價': 100,
         '開盤價': 100, '當日高': 101, '當日低': 99, '當日成交口數': 10,
         '原始保證金率': 13., '維持保證金率': 10., '乘數': 2000., 'VWAP': 100.,
@@ -153,6 +153,7 @@ def test_futures_quote_refresh_preserves_strategy_or_checks_each_rows_prior_stop
         return {'方向': '偏多', '進出場點位': '等待｜均價緩衝區內',
                 '_daytrade_guard_session': 'night'}
     ns['get_strategy_intraday_history'], ns['calculate_futures_strategy_levels'] = history, analysis
+    ns['fresh_strategy_stream_quote'] = lambda snapshot: True
     ns['fmt_price'] = lambda value: str(value)
     updated, count = ns['update_futures_live_rows'](rows, object(), '當沖', '自動', include_analysis)
     assert count == 2 and list(updated['收盤價']) == [100.5, 100.5]
@@ -167,6 +168,18 @@ def test_futures_quote_refresh_preserves_strategy_or_checks_each_rows_prior_stop
         ns['fresh_strategy_stream_quote'] = lambda snapshot: True
         entered, _ = ns['update_futures_live_rows'](rows, object(), '當沖', '自動', True)
         assert entered.iloc[1]['進出場點位'] == '觸價｜進 100｜停 99｜目 103'
+        ns['calculate_futures_strategy_levels'] = analysis
+        waiting, _ = ns['update_futures_live_rows'](entered, object(), '當沖', '自動', True)
+        assert waiting.iloc[1]['進出場點位'] == '等待｜均價緩衝區內'
+        ns['apply_retained_futures_levels'](waiting, '當沖')
+        assert waiting.iloc[1]['進出場點位'].startswith('多·觀望·沿用｜進 100｜停 99｜目 103｜保 —')
+        assert waiting.iloc[1]['_預判僅追蹤']
+        ns['calculate_futures_strategy_levels'] = lambda *args: {
+            **analysis(), '_daytrade_guard_session': 'next-session',
+        }
+        rolled, _ = ns['update_futures_live_rows'](entered, object(), '當沖', '自動', True)
+        ns['apply_retained_futures_levels'](rolled, '當沖')
+        assert rolled.iloc[1]['進出場點位'] == '等待｜均價緩衝區內'
         ns['fresh_strategy_stream_quote'] = lambda snapshot: False
         stale, _ = ns['update_futures_live_rows'](rows, object(), '當沖', '自動', True)
         assert '已進場' not in stale.iloc[1]['進出場點位']
@@ -237,7 +250,8 @@ def test_extra_company_scopes_survive_normalization_and_calendar_only_selection(
 
 
 def test_stock_guard_keeps_direction_and_stop_notice_even_while_waiting():
-    ns = load_app_symbols('determine_stock_direction', '_as_float', 'build_guarded_stock_trade_plan', '_safe_number')
+    ns = load_app_symbols('determine_stock_direction', '_as_float', 'build_guarded_stock_trade_plan', '_safe_number',
+                          'parse_trade_plan_numbers')
     ns['st'] = SimpleNamespace(session_state={})
     ns['build_trade_plan'] = lambda *args: {'summary': '—', 'valid': False}
     ns['fmt_price'] = lambda v: f'{v:g}'

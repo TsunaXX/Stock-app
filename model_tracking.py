@@ -1153,6 +1153,33 @@ class ModelTracker:
                             result[str(key)]['_前次出場'] = previous
         return result
 
+    def opening_reference_plans(self, market, keys, mode, since, before):
+        """Read recent published levels without retrieving the event history."""
+        result = {}
+        with closing(self.db()) as db:
+            for key in keys:
+                prefix = f'{key}|{market}|{mode}|'
+                raw = db.execute("""SELECT source, direction, entry, stop, target FROM (
+                        SELECT *, julianday(source, CASE WHEN instr(substr(source,20),'+')>0
+                            OR instr(substr(source,20),'-')>0 OR source LIKE '%Z'
+                            THEN '+0 hours' ELSE '-8 hours' END) AS published_at
+                        FROM (SELECT REPLACE(COALESCE(NULLIF(json_extract(body,'$.建立時間'),''),
+                                                json_extract(body,'$.來源時間')), '/', '-') AS source,
+                               json_extract(body,'$.方向') AS direction,
+                               CAST(json_extract(body,'$.進場價') AS REAL) AS entry,
+                               CAST(json_extract(body,'$.停損價') AS REAL) AS stop,
+                               CAST(json_extract(body,'$.目標價') AS REAL) AS target,
+                               COALESCE(json_extract(body,'$.計畫來源'),'股期戰略室') AS room
+                        FROM trades WHERE slot>=? AND slot<?)
+                    ) WHERE room='股期戰略室'
+                      AND published_at BETWEEN julianday(?) AND julianday(?)
+                      AND ((direction IN ('多頭','偏多') AND 0<stop AND stop<entry AND entry<target)
+                           OR (direction IN ('空頭','偏空') AND 0<target AND target<entry AND entry<stop))
+                    ORDER BY published_at DESC LIMIT 1""", (prefix, prefix + '\uffff', since, before)).fetchone()
+                if raw:
+                    result[key] = raw
+        return result
+
     def store(self, db, row, dirty=1):
         row.update(plan_labels(row))
         db.execute('INSERT INTO trades VALUES (?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET state=excluded.state,body=excluded.body,dirty=MAX(trades.dirty,excluded.dirty)',

@@ -12205,7 +12205,7 @@ def has_trade_prediction_signal(value):
     if '已出場' in text or '取消進場' in text:
         return False
     text = re.sub(r'^(?:[多空]·)?待進場｜', '', text)
-    if any(word in text for word in ('等待', '觀望', '資料不足', '待調整', '不建立', '待確認', '待進', '失效', '不追價')):
+    if any(word in text for word in ('等待', '觀望', '資料不足', '待調整', '不建立', '待確認', '待進', '失效', '不追價', '追蹤', '沿用', '開盤參考')):
         return False
     return all(value is not None for value in parse_trade_plan_numbers(text).values())
 
@@ -17053,21 +17053,25 @@ def update_futures_live_rows(rows, api, strategy_mode, direction_choice, include
         analysis = (calculate_futures_strategy_levels(updated.loc[index], strategy_mode, direction_choice, kbars, costs) if costs is not None else calculate_futures_strategy_levels(updated.loc[index], strategy_mode, direction_choice, kbars)) if include_analysis else {}
         if include_analysis and strategy_mode == '當沖':
             price = _safe_number(updated.at[index, '收盤價'])
-            prior_stop = _safe_number(row.get('_last_intraday_stop'))
-            same_session = row.get('_last_intraday_session') == analysis.get('_daytrade_guard_session')
-            if prior_stop is not None and price is not None and same_session:
-                stopped = price <= prior_stop if row.get('_last_intraday_direction') == '偏多' else price >= prior_stop
-                if stopped:
-                    analysis['進出場點位'] = f'⛔ 失效 {fmt_price(prior_stop)}｜' + analysis['進出場點位']
-            levels = parse_trade_plan_numbers(analysis.get('進出場點位'))
-            if price is not None and levels['entry'] is not None and levels['stop'] is not None and (
-                (analysis.get('方向') == '偏多' and price >= levels['entry'])
-                or (analysis.get('方向') == '偏空' and price <= levels['entry'])
-            ):
+            plan_text = analysis.get('進出場點位', '資料不足')
+            levels = parse_trade_plan_numbers(plan_text)
+            session = analysis.get('_daytrade_guard_session')
+            if all(value is not None for value in levels.values()):
                 if snapshot is not None and fresh_strategy_stream_quote(snapshot):
-                    analysis['進出場點位'] = '觸價｜' + analysis['進出場點位']
-                analysis.update({'_last_intraday_stop': levels['stop'], '_last_intraday_direction': analysis['方向'],
-                                 '_last_intraday_session': analysis.get('_daytrade_guard_session')})
+                    if session:
+                        analysis.update({'_last_intraday_stop': levels['stop'], '_last_intraday_direction': analysis['方向'],
+                                         '_last_intraday_session': session, '_last_intraday_summary': plan_text})
+                    if price is not None and (
+                        (analysis.get('方向') == '偏多' and price >= levels['entry'])
+                        or (analysis.get('方向') == '偏空' and price <= levels['entry'])
+                    ):
+                        analysis['進出場點位'] = '觸價｜' + plan_text
+            elif session and row.get('_last_intraday_session') == session:
+                prior_stop = _safe_number(row.get('_last_intraday_stop'))
+                if prior_stop is not None and price is not None:
+                    stopped = price <= prior_stop if row.get('_last_intraday_direction') == '偏多' else price >= prior_stop
+                    if stopped:
+                        analysis['進出場點位'] = f'⛔ 失效 {fmt_price(prior_stop)}｜' + plan_text
         if include_analysis and live_vwap is not None and live_vwap > 0 and strategy_mode == '當沖':
             analysis['VWAP'] = live_vwap
         for column, value in analysis.items():
@@ -20391,26 +20395,29 @@ def build_trade_plan(row, direction, is_daytrade_mode, filter_result, costs=None
     target = _round(entry - (stop - entry) * 1.5)
     return _format_plan(entry, stop, target, '次日開盤跌破昨低後再觀察進場')
 
-def build_guarded_stock_trade_plan(row, direction, is_daytrade, result, costs=None):
+def build_guarded_stock_trade_plan(row, direction, is_daytrade, result, costs=None, room='stock'):
     plan = build_trade_plan(row, direction, is_daytrade, result, costs)
     if not is_daytrade:
         return plan
-    session = str(row.get('_daytrade_data_time', ''))[:10]
+    session = str(row.get('_daytrade_data_time') or '')[:10].replace('/', '-')
+    if len(session) != 10:
+        session = datetime.now(pytz.timezone('Asia/Taipei')).date().isoformat()
     code = str(row.get('代號', ''))
-    plans = st.session_state.setdefault('_stock_last_intraday_plans', {})
+    plans = st.session_state.setdefault(f'_{room}_last_intraday_plans', {})
     prior = plans.get(code, {})
+    same_session = str(prior.get('session') or '').replace('/', '-') == session
     price = _safe_number(row.get('_daytrade_close'))
-    if prior.get('session') == session and price is not None and not bool(row.get('_data_stale', False)):
+    if same_session and price is not None and not bool(row.get('_data_stale', False)):
         stop = prior['stop']
         stopped = price <= stop if prior['direction'] == '多頭' else price >= stop
-        if stopped and not plan.get('valid'):
+        if stopped and not plan.get('valid') and not prior.get('reference_only'):
             plan = {**plan, 'summary': f'⛔ 失效 {fmt_price(stop)}｜' + plan['summary']}
     if plan.get('valid'):
         levels = parse_trade_plan_numbers(plan['summary'])
         entry = levels.get('entry')
         if entry is not None and levels.get('stop') is not None and price is not None:
             triggered = not bool(row.get('_data_stale', False)) and (price >= entry if direction == '多頭' else price <= entry)
-            if prior.get('session') == session and prior.get('direction') == direction and prior.get('summary') == plan['summary']:
+            if same_session and prior.get('direction') == direction and prior.get('summary') == plan['summary']:
                 triggered = triggered or bool(prior.get('triggered'))
             plans[code] = {'session': session, 'direction': direction, 'stop': levels['stop'],
                            'summary': plan['summary'], 'target': levels.get('target'), 'triggered': triggered}
@@ -20418,11 +20425,22 @@ def build_guarded_stock_trade_plan(row, direction, is_daytrade, result, costs=No
                 plan['summary'] = '觸價｜' + plan['summary']
     elif isinstance(row.get('_daytrade_guard_reason'), str) and row.get('_daytrade_guard_reason') and not plan['summary'].startswith('⛔'):
         plan['summary'] = '等待｜' + row['_daytrade_guard_reason']
-    if (not plan.get('valid') and prior.get('session') == session and prior.get('summary')):
+    if plan.get('valid'):
+        return plan
+    levels = parse_trade_plan_numbers(plan['summary'])
+    if (not same_session or prior.get('reference_only')) and levels['stop'] is not None and levels['target'] is not None:
+        _, _, detail = plan['summary'].partition('｜')
+        plans[code] = {'session': session, 'direction': direction, 'stop': levels['stop'], 'target': levels['target'],
+                       'summary': (detail or plan['summary']) + '｜保 —', 'reference_only': True}
+        return {**plan, 'summary': plan['summary'] + '｜保 —', 'tracking_only': True}
+    if same_session and prior.get('summary'):
         status = '觸價·追蹤' if prior.get('triggered') else '待進·追蹤'
+        if prior.get('reference_only'):
+            side = '多' if prior.get('direction') == '多頭' else '空'
+            status = side + '·觀望·沿用'
         if bool(row.get('_data_stale', False)):
             status = '行情待確認'
-        elif price is not None:
+        elif price is not None and not prior.get('reference_only'):
             if price <= prior['stop'] if prior['direction'] == '多頭' else price >= prior['stop']:
                 status = '失效'
             elif prior.get('target') is not None and (price >= prior['target'] if prior['direction'] == '多頭' else price <= prior['target']):
@@ -21695,6 +21713,64 @@ def get_model_tracker(url=''):
     return ModelTracker('model_tracking.sqlite3', url, market_open=model_market_open)
 
 
+def apply_retained_futures_levels(rows, mode):
+    if mode != '當沖':
+        return
+    for index, row in rows.iterrows():
+        summary = row.get('_last_intraday_summary')
+        session = row.get('_daytrade_guard_session')
+        if (not isinstance(summary, str) or not summary or not isinstance(session, str) or not session
+                or row.get('_last_intraday_session') != session
+                or all(value is not None for value in parse_trade_plan_numbers(row.get('進出場點位')).values())):
+            continue
+        side = '多' if row.get('_last_intraday_direction') == '偏多' else '空'
+        stale = any(word in str(row.get('資料狀態')) for word in ('過期', '待確認', '中斷', '分 K 準備中'))
+        status = '行情待確認·沿用' if stale else '觀望·沿用'
+        reason = str(row.get('進出場點位')).split('｜目 ', 1)[0]
+        set_futures_row_values(rows, index, {
+            '進出場點位': f"{side}·{status}｜{summary}｜保 —｜{reason}", '_預判僅追蹤': True,
+        })
+        if '訊號狀態' in rows:
+            rows.at[index, '訊號狀態'] = '🟡 等待'
+
+
+def apply_opening_reference(rows, stock, mode):
+    """Project saved levels after the live plan has already been sent to the tracker."""
+    key_column, plan_column = ('代號', '進出場預判') if stock else ('契約鍵', '進出場點位')
+    if rows.empty or plan_column not in rows:
+        return
+    now = datetime.now(pytz.timezone('Asia/Taipei'))
+    market = '股票' if stock else '期貨'
+    pending = [(index, str(row[key_column])) for index, row in rows.iterrows()
+               if '已進場' not in str(row.get(plan_column))
+               and not model_market_open({'市場': market, '交易時段': row.get('交易時段', '日盤+夜盤')}, now)]
+    if not pending:
+        return
+    tracker = get_model_tracker(get_app_secret('gsheet_api_url') or '')
+    references = tracker.opening_reference_plans(
+        market, {key for _, key in pending}, '當沖' if mode == '當沖' else '波段',
+        (now - timedelta(days=7)).isoformat(), now.isoformat(),
+    )
+    if not references and not tracker.hydrated:
+        st.caption('開盤參考等待模型歷史同步，完成後重新整理即可查看。')
+    for index, key in pending:
+        if key not in references:
+            continue
+        source, direction, entry, stop, target = references[key]
+        source_time = pd.Timestamp(source)
+        if source_time.tzinfo is not None:
+            source_time = source_time.tz_convert('Asia/Taipei')
+        side = '多' if direction in ('多頭', '偏多') else '空'
+        activation = entry + (entry - stop)
+        protect = f'保啟≈{fmt_price(activation)}' if min(entry, target) < activation < max(entry, target) else '保啟 —'
+        rows.at[index, plan_column] = (
+            f"{side}·開盤參考｜進 {fmt_price(entry)}｜停 {fmt_price(stop)}｜目 {fmt_price(target)}"
+            f"｜{protect}｜來源 {source_time:%m/%d %H:%M}"
+        )
+        if '訊號狀態' in rows:
+            rows.at[index, '訊號狀態'] = '⚪ 開盤參考'
+
+
 def model_protection_text(row):
     status = row.get('保利狀態', '未啟動')
     if row.get('資料缺口') or row.get('狀態') in ('資料不足', '監控中斷'):
@@ -21750,6 +21826,8 @@ def apply_model_protection(rows, stock, mode, room=None):
             fresh_plan = record.get('狀態') == '已平倉' and valid_candidate
             if not fresh_plan:
                 label = state.replace('（停利）','(利)').replace('（停損）','(損)').replace('（保利）','(保)').replace('（收盤）','(收)')
+                if not entered and record.get('狀態') != '訊號失效' and row.get('_預判僅追蹤') == True:
+                    label = '行情待確認·沿用' if '行情待確認' in str(candidate) else '觀望·沿用'
                 protection = fmt_price(record['保利價']) if record.get('保利價') is not None else '—'
                 rows.at[index, plan_column] = (
                     f"{side}·{label}{suffix}｜進 {fmt_price(record['進場價'])}｜停 {fmt_price(record['停損價'])}｜"
@@ -23506,7 +23584,9 @@ def render_futures_strategy_room():
             futures_display_columns = futures_basic_columns
 
         record_model_table('futures', display_rows, False, strategy_mode, direction_choice)
+        apply_retained_futures_levels(display_rows, strategy_mode)
         apply_model_protection(display_rows, False, strategy_mode)
+        apply_opening_reference(display_rows, False, strategy_mode)
 
         def style_futures_row(row, source_frame=None):
             styles = [''] * len(row)
@@ -23608,7 +23688,7 @@ def render_futures_strategy_room():
                 '未平倉量': st.column_config.NumberColumn(format='%d', width=content_width('未平倉量', 56, 100), disabled=True),
                 '方向': st.column_config.TextColumn(width=content_width('方向', 48, 86), disabled=True),
                 '支撐壓力': st.column_config.TextColumn(width=content_width('支撐壓力', 80), disabled=True),
-                '進出場點位': st.column_config.TextColumn(width=content_width('進出場點位', 96, 720, True), disabled=True, help='進＝條件成立後觀察價；停＝失效點；目＝第一目標。待進場／觸價＝尚未成交；已進場＝模型持倉；已出場(利／損／保／收)＝已平倉及原因。⚠＝證據待確認；後續進場另列次數。保＝達1R後移動保利，最低保護成本。'),
+                '進出場點位': st.column_config.TextColumn(width=content_width('進出場點位', 96, 720, True), disabled=True, help='進＝條件成立後觀察價；停＝失效點；目＝第一目標。待進場／觸價＝尚未成交；已進場＝模型持倉；已出場(利／損／保／收)＝已平倉及原因。⚠＝證據待確認；後續進場另列次數。保＝達1R後移動保利，最低保護成本。開盤參考取自近七日同商品、同模式的計畫；保啟為依原點位估算的 1R 啟動價，實際保價依成交與費用計算。'),
                 '觸發條件': st.column_config.TextColumn(width=content_width('觸發條件', 72), disabled=True, help='條件成立後才評估進場；未成立時不以預判價直接下單。'),
                 '當日漲停價': st.column_config.NumberColumn(format='%.12g', width=content_width('當日漲停價', 54, 96), disabled=True, help='依期交所漲跌資料反推參考價後估算；實際限制以期交所與券商下單畫面為準。'),
                 '當日跌停價': st.column_config.NumberColumn(format='%.12g', width=content_width('當日跌停價', 54, 96), disabled=True, help='依期交所漲跌資料反推參考價後估算；實際限制以期交所與券商下單畫面為準。'),
@@ -23793,7 +23873,9 @@ def render_futures_strategy_room():
         if night_scope:
             st.caption('夜盤自動更新：僅顯示夜盤契約；關閉後還原原本分析標的。')
         record_model_table('futures_independent', independent_rows, False, strategy_mode, direction_choice)
+        apply_retained_futures_levels(independent_rows, strategy_mode)
         apply_model_protection(independent_rows, False, strategy_mode, 'futures_independent')
+        apply_opening_reference(independent_rows, False, strategy_mode)
         if not independent_rows.empty:
             if enhanced_layer:
                 independent_source_columns = (
@@ -25258,6 +25340,7 @@ if tab1.open and stock_strategy_tab.open:
                     input_cols = stock_strategy_display_columns(False, False, False)
                 record_model_table('stock', df_display, True, strategy_mode, st.session_state.get('risk_filter_direction', '系統自動'))
                 apply_model_protection(df_display, True, strategy_mode)
+                apply_opening_reference(df_display, True, strategy_mode)
                 for col in input_cols:
                     if col not in df_display.columns: df_display[col] = None
 
@@ -25439,13 +25522,13 @@ if tab1.open and stock_strategy_tab.open:
                             "開盤區間": st.column_config.TextColumn(width=stock_content_width('開盤區間', 80, 150), disabled=True, help="09:00–09:15 顯示形成中的即時低點－高點；09:15 後固定為完整開盤區間。"),
                             "量能": st.column_config.TextColumn(width=stock_content_width('量能', 52, 96), disabled=True, help="目前累積量相對最近交易日同時段平均量。"),
                             "盤中觸發": st.column_config.TextColumn(width=stock_content_width('盤中觸發', 72), disabled=True, help="僅在盤中條件同時成立時提供觀察提示，不是自動買賣指令。"),
-                            "進出場預判": st.column_config.TextColumn(width=stock_content_width('進出場預判', 86, 720, True), disabled=True, help="通過條件後，以開盤區間與 VWAP 推估進場、策略失效離場與第一目標；僅供觀察與回測；待進場／觸價＝尚未成交；已進場＝模型持倉；已出場(利／損／保／收)＝已平倉及原因。⚠＝證據待確認；後續進場另列次數。保＝達1R後移動保利，最低保護成本。"),
+                            "進出場預判": st.column_config.TextColumn(width=stock_content_width('進出場預判', 86, 720, True), disabled=True, help="通過條件後，以開盤區間與 VWAP 推估進場、策略失效離場與第一目標；僅供觀察與回測；待進場／觸價＝尚未成交；已進場＝模型持倉；已出場(利／損／保／收)＝已平倉及原因。⚠＝證據待確認；後續進場另列次數。保＝達1R後移動保利，最低保護成本。開盤參考取自近七日同商品、同模式的計畫；保啟為依原點位估算的 1R 啟動價，實際保價依成交與費用計算。"),
                         })
                     else:
                         risk_column_config.update({
                             "乖離": st.column_config.TextColumn(width=stock_content_width('乖離', 52, 96), disabled=True, help="收盤價相對 20 日線的 ATR 距離；數值越大越不宜追價或追空。"),
                             "隔日規則": st.column_config.TextColumn(width=stock_content_width('隔日規則', 72), disabled=True, help="僅在隔日條件成真時才列入評估，不是自動買賣指令。"),
-                            "進出場預判": st.column_config.TextColumn(width=stock_content_width('進出場預判', 86, 720, True), disabled=True, help="通過條件後，以昨高／昨低與 ATR 推估進場、策略失效離場與第一目標；僅供觀察與回測；待進場／觸價＝尚未成交；已進場＝模型持倉；已出場(利／損／保／收)＝已平倉及原因。⚠＝證據待確認；後續進場另列次數。保＝達1R後移動保利，最低保護成本。"),
+                            "進出場預判": st.column_config.TextColumn(width=stock_content_width('進出場預判', 86, 720, True), disabled=True, help="通過條件後，以昨高／昨低與 ATR 推估進場、策略失效離場與第一目標；僅供觀察與回測；待進場／觸價＝尚未成交；已進場＝模型持倉；已出場(利／損／保／收)＝已平倉及原因。⚠＝證據待確認；後續進場另列次數。保＝達1R後移動保利，最低保護成本。開盤參考取自近七日同商品、同模式的計畫；保啟為依原點位估算的 1R 啟動價，實際保價依成交與費用計算。"),
                         })
 
                 stock_table_signature = abs(hash((
@@ -25923,7 +26006,7 @@ if tab1.open and stock_strategy_tab.open:
                                     df_indep.at[i, '風險'] = result['risk']
                                     df_indep.at[i, '乖離'] = f"{_format_compact_number(result['extension'], 1, signed=True)} ATR" if result['extension'] is not None else "—"
                                     df_indep.at[i, '隔日規則'] = result['rule']
-                                trade_plan = build_guarded_stock_trade_plan(row, row_direction, indep_is_daytrade, result, load_model_tracking_costs())
+                                trade_plan = build_guarded_stock_trade_plan(row, row_direction, indep_is_daytrade, result, load_model_tracking_costs(), room='stock_independent')
                                 if result.get('eligible') and not trade_plan.get('valid', False):
                                     result['eligible'] = False
                                     result['rule'] = f"觀察：{trade_plan.get('blocking_reason', '進場品質未達門檻')}"
@@ -25995,6 +26078,7 @@ if tab1.open and stock_strategy_tab.open:
 
                         record_model_table('stock_independent', df_indep, True, indep_strategy_mode, indep_direction)
                         apply_model_protection(df_indep, True, indep_strategy_mode, 'stock_independent')
+                        apply_opening_reference(df_indep, True, indep_strategy_mode)
                         cols_to_fmt = ["當日漲停價", "當日跌停價", "成交價價差", "5日線價差"]
                         for c in cols_to_fmt:
                             if c in df_indep.columns: df_indep[c] = df_indep[c].apply(fmt_price)
