@@ -17053,7 +17053,7 @@ def update_futures_live_rows(rows, api, strategy_mode, direction_choice, include
         analysis = (calculate_futures_strategy_levels(updated.loc[index], strategy_mode, direction_choice, kbars, costs) if costs is not None else calculate_futures_strategy_levels(updated.loc[index], strategy_mode, direction_choice, kbars)) if include_analysis else {}
         if include_analysis and strategy_mode == '當沖':
             price = _safe_number(updated.at[index, '收盤價'])
-            plan_text = analysis['進出場點位']
+            plan_text = analysis.get('進出場點位', '資料不足')
             levels = parse_trade_plan_numbers(plan_text)
             session = analysis.get('_daytrade_guard_session')
             if all(value is not None for value in levels.values()):
