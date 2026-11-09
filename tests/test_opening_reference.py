@@ -109,7 +109,7 @@ st.dataframe(frame)
     app = AppTest.from_string(script).run()
     assert not app.exception
     displayed = app.dataframe[0].value['進出場預判']
-    assert displayed.iloc[0] == '多·開盤參考｜進 100｜停 95｜目 110｜保啟≈105｜來源 11/06 09:00'
+    assert displayed.iloc[0] == '進 100｜停 95｜目 110｜保啟≈105'
     assert displayed.iloc[1].startswith('空·已進場')
     assert app.dataframe[0].value['訊號狀態'].iloc[0] == '⚪ 開盤參考'
     app.checkbox(key='unavailable').set_value(True).run()
