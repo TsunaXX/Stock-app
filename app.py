@@ -2471,6 +2471,27 @@ def _signed_percent_arrow(value):
     return f"{arrow} {_format_compact_number(number, 2, signed=True)}%"
 
 
+def render_strategy_market_caption(bias, source=None, change=None, tail=''):
+    bias = str(bias)
+    bias_color = (
+        '#ff4b4b' if any(word in bias for word in ('多', '上漲', '走高'))
+        else '#00e676' if any(word in bias for word in ('空', '下跌', '走低'))
+        else None
+    )
+    bias_text = html.escape(bias)
+    if bias_color:
+        bias_text = f'<span style="color:{bias_color}">{bias_text}</span>'
+    details = f'｜依據 {html.escape(str(source))}' if source else ''
+    change_value = _safe_number(change)
+    if change_value is not None:
+        change_text = html.escape(_signed_percent_arrow(change_value))
+        change_color = '#ff4b4b' if change_value > 0 else ('#00e676' if change_value < 0 else None)
+        if change_color:
+            change_text = f'<span style="color:{change_color}">{change_text}</span>'
+        details += f' {change_text}'
+    st.caption(f'市場環境：{bias_text}{details}{html.escape(str(tail))}', unsafe_allow_html=True)
+
+
 def _percent_badge_html(value, font_size=14):
     """產生可放入精簡市場卡的紅漲綠跌百分比。"""
     number = _to_number(str(value).replace('%', ''))
@@ -21437,7 +21458,15 @@ def render_intraday_auto_controls(room):
         if room == 'stock':
             st.session_state['_stock_auto_settings_changed'] = True
 
-    st.markdown('⏰ 獨立分析自動更新' if room.endswith('_independent') else '⏰ 主表自動更新')
+    main_auto_help = (
+        '更新間隔與時段會自動記憶；重新開啟後仍需自行啟用自動更新。'
+        '僅更新此表顯示標的；登入後由伺服器背景執行，縮小視窗或切到其他瀏覽器分頁仍持續更新。'
+        '登出即停止，關閉或斷線超過 2 分鐘停止。'
+    )
+    st.markdown(
+        '⏰ 獨立分析自動更新' if room.endswith('_independent') else '⏰ 主表自動更新',
+        help=main_auto_help if room in ('stock', 'futures') else None,
+    )
     st.toggle('啟用自動更新', value=config.get('enabled', False),
               key=f'{room}_auto_enabled', on_change=save_settings)
     st.number_input('更新間隔（秒）', min_value=1, max_value=300, value=config.get('seconds', 5),
@@ -21451,8 +21480,9 @@ def render_intraday_auto_controls(room):
                         key=f'{room}_auto_start', on_change=save_settings)
         right.time_input('結束時間', value=config.get('end', dt_time(13, 30)),
                          key=f'{room}_auto_end', on_change=save_settings)
-    st.caption('更新間隔與時段會自動記憶；重新開啟後仍需自行啟用自動更新。')
-    st.caption('僅更新此表顯示標的；登入後由伺服器背景執行，縮小視窗或切到其他瀏覽器分頁仍持續更新。登出即停止，關閉或斷線超過 2 分鐘停止。')
+    if room.endswith('_independent'):
+        st.caption('更新間隔與時段會自動記憶；重新開啟後仍需自行啟用自動更新。')
+        st.caption('僅更新此表顯示標的；登入後由伺服器背景執行，縮小視窗或切到其他瀏覽器分頁仍持續更新。登出即停止，關閉或斷線超過 2 分鐘停止。')
     return intraday_auto_settings(room)
 
 
@@ -21791,16 +21821,11 @@ def apply_opening_reference(rows, stock, mode):
     for index, key in pending:
         if key not in references:
             continue
-        source, direction, entry, stop, target = references[key]
-        source_time = pd.Timestamp(source)
-        if source_time.tzinfo is not None:
-            source_time = source_time.tz_convert('Asia/Taipei')
-        side = '多' if direction in ('多頭', '偏多') else '空'
+        _, _, entry, stop, target = references[key]
         activation = entry + (entry - stop)
         protect = f'保啟≈{fmt_price(activation)}' if min(entry, target) < activation < max(entry, target) else '保啟 —'
         rows.at[index, plan_column] = (
-            f"{side}·開盤參考｜進 {fmt_price(entry)}｜停 {fmt_price(stop)}｜目 {fmt_price(target)}"
-            f"｜{protect}｜來源 {source_time:%m/%d %H:%M}"
+            f"進 {fmt_price(entry)}｜停 {fmt_price(stop)}｜目 {fmt_price(target)}｜{protect}"
         )
         if '訊號狀態' in rows:
             rows.at[index, '訊號狀態'] = '⚪ 開盤參考'
@@ -23222,7 +23247,8 @@ def render_futures_strategy_room():
                 )
             with enhanced_col3:
                 futures_notify = st.checkbox(
-                    "🔔 訊號變化提醒", value=True, key='futures_strategy_notify', disabled=not enhanced_layer
+                    "🔔 訊號變化提醒", value=True, key='futures_strategy_notify', disabled=not enhanced_layer,
+                    help='訊號狀態變更時提供提醒；盤中提示僅供觀察，不代表實際成交或下單。',
                 )
 
             control1, control2, control3 = st.columns(3)
@@ -23549,7 +23575,9 @@ def render_futures_strategy_room():
             values = row.to_dict()
             values.update({'_策略週期': strategy_mode, '_分析方向': direction_choice})
             cache[str(row['契約鍵'])] = values
-        st.caption(f'市場環境：{market_bias}｜' + intraday_auto_status_text('futures', futures_auto_enabled))
+        render_strategy_market_caption(
+            market_bias, tail='｜' + intraday_auto_status_text('futures', futures_auto_enabled),
+        )
         if st.session_state.get('futures_auto_updated_at'):
             st.caption('自動更新時間：' + st.session_state['futures_auto_updated_at'])
 
@@ -25043,6 +25071,27 @@ if tab1.open and stock_strategy_tab.open:
                     stock_notify = bool(st.session_state.get('stock_strategy_notify', True))
                     st.session_state.pop('_reopen_stock_strategy_settings', None)
                     if strategy_settings_open:
+                        risk_ready_count = int(df_display.reindex(columns=RISK_METRIC_COLUMNS).apply(
+                            lambda row: all(_safe_number(row.get(column)) is not None for column in RISK_METRIC_COLUMNS),
+                            axis=1,
+                        ).sum())
+                        daytrade_ready_count = int(df_display.reindex(columns=DAYTRADE_METRIC_COLUMNS).apply(
+                            lambda row: (
+                                all(_safe_number(row.get(column)) is not None for column in DAYTRADE_REQUIRED_COLUMNS)
+                                and parse_strategy_data_time(row.get('_daytrade_data_time')) is not None
+                            ),
+                            axis=1,
+                        ).sum())
+                        risk_data = st.session_state.risk_filter_market_data
+                        risk_updated = str(risk_data.get('updated') or '尚未更新')
+                        if risk_data.get('errors'):
+                            risk_updated += '（沿用上次成功資料／來源未完整）' if risk_data.get('using_last_success') else '（來源未完整）'
+                        stock_signal_help = (
+                            f'日 K 策略指標：{risk_ready_count} / {len(df_display)} 檔可計算；資料不足時，先按「重抓日 K 並計算策略指標」。'
+                            f'\n\n當沖盤中指標：{daytrade_ready_count} / {len(df_display)} 檔可計算；09:00–09:15 使用快照＋1 分 K，'
+                            '09:15 後固定開盤區間、接近一檔即預告突破價；背景準備分 K，後續以串流與快取更新。'
+                            f'\n\n上市／上櫃注意與處置名單更新：{risk_updated}。'
+                        )
                         if st.session_state.get('risk_filter_direction') in ('多頭', '空頭'):
                             st.session_state['risk_filter_direction'] = '多' if st.session_state['risk_filter_direction'] == '多頭' else '空'
                         risk_col1, risk_col2, risk_col3, risk_col4 = st.columns(
@@ -25072,7 +25121,10 @@ if tab1.open and stock_strategy_tab.open:
                                 help='戰略備註維持原樣；其餘細節移到個股明細。'
                             )
                         with risk_col4:
-                            stock_notify = st.checkbox("🔔 訊號變化提醒", value=True, key='stock_strategy_notify')
+                            stock_notify = st.checkbox(
+                                "🔔 訊號變化提醒", value=True, key='stock_strategy_notify',
+                                help=stock_signal_help,
+                            )
                             if st.button(
                                 "📊 重抓日 K 並計算策略指標",
                                 key="refresh_risk_filter_metrics", width='stretch',
@@ -25233,23 +25285,6 @@ if tab1.open and stock_strategy_tab.open:
                         else:
                             st.info("尚未更新上市／上櫃注意與處置名單；資料未查核時不會被誤判為安全。")
 
-                        risk_ready_mask = df_display.reindex(columns=RISK_METRIC_COLUMNS).apply(
-                            lambda row: all(_safe_number(row.get(column)) is not None for column in RISK_METRIC_COLUMNS),
-                            axis=1,
-                        )
-                        risk_ready_count = int(risk_ready_mask.sum())
-                        st.caption(f"日 K 策略指標：{risk_ready_count} / {len(df_display)} 檔可計算；資料不足時，先按「重抓日 K 並計算策略指標」。")
-                        if is_daytrade_mode:
-                            daytrade_ready_mask = df_display.reindex(columns=DAYTRADE_METRIC_COLUMNS).apply(
-                                lambda row: (
-                                    all(_safe_number(row.get(column)) is not None for column in DAYTRADE_REQUIRED_COLUMNS)
-                                    and parse_strategy_data_time(row.get('_daytrade_data_time')) is not None
-                                ),
-                                axis=1,
-                            )
-                            daytrade_ready_count = int(daytrade_ready_mask.sum())
-                            st.caption(f"當沖盤中指標：{daytrade_ready_count} / {len(df_display)} 檔可計算；09:00–09:15 使用快照＋1 分 K，09:15 後固定開盤區間、接近一檔即預告突破價；背景準備分 K，後續以串流與快取更新。")
-
                     market_risk_data = st.session_state.risk_filter_market_data
                     attention_counts = market_risk_data.get('attention', {})
                     disposition_codes = market_risk_data.get('disposition', [])
@@ -25262,8 +25297,10 @@ if tab1.open and stock_strategy_tab.open:
                     market_bias = str(market_environment.get('bias', '盤整'))
                     market_source = str(market_environment.get('source', '臺指期資料不足'))
                     market_change = _safe_number(market_environment.get('change'))
-                    market_change_text = f" {_signed_percent_arrow(market_change)}" if market_change is not None else ''
-                    st.caption(f"市場環境：{market_bias}｜依據 {market_source}{market_change_text}；只提供順逆勢標示，不改動原選股順位。" + "｜" + intraday_auto_status_text('stock', stock_auto_enabled))
+                    render_strategy_market_caption(
+                        market_bias, market_source, market_change,
+                        '；只提供順逆勢標示，不改動原選股順位。｜' + intraday_auto_status_text('stock', stock_auto_enabled),
+                    )
 
                     for i, row in df_display.iterrows():
                         market_lists_updated = market_risk_checked_for_row(
