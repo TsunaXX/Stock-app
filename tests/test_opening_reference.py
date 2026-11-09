@@ -1,4 +1,5 @@
 import ast
+from contextlib import closing
 from types import SimpleNamespace
 
 from streamlit.testing.v1 import AppTest
@@ -52,34 +53,54 @@ def test_latest_saved_reference_is_scoped_and_read_only(tmp_path):
             tracker.store(db, record)
     before = tracker.records()
     times = ('2026-11-02T08:30:00+08:00', '2026-11-09T08:30:00+08:00')
-    assert tracker.opening_reference_plans('股票', ['2330', '1815'], '當沖', *times) == {
-        '2330': ('2026-11-06T09:00:00+08:00', '多頭', 101, 95, 110),
-    }
-    assert tracker.opening_reference_plans('期貨', ['2330', 'TX:202611'], '當沖', *times)['2330'][2] == 105
-    assert tracker.opening_reference_plans('期貨', ['TX:202611'], '當沖', *times)['TX:202611'][2] == 100
+    query = load_app_symbols('opening_reference_plans')['opening_reference_plans']
+    with closing(tracker.db()) as db:
+        assert query(db, '股票', ['2330', '1815'], '當沖', *times) == {
+            '2330': ('2026-11-06T09:00:00+08:00', '多頭', 101, 95, 110),
+        }
+        assert query(db, '期貨', ['2330', 'TX:202611'], '當沖', *times)['2330'][2] == 105
+        assert query(db, '期貨', ['TX:202611'], '當沖', *times)['TX:202611'][2] == 100
     assert tracker.records() == before
 
 
-def test_opening_reference_renders_in_table_then_yields_to_live_plan():
-    # Load the actual table projection without starting the production app or broker.
-    render = ast.unparse(next(node for node in ast.parse(APP_PATH.read_text(encoding='utf-8')).body
-                              if isinstance(node, ast.FunctionDef) and node.name == 'apply_opening_reference'))
-    script = """
+def test_opening_reference_uses_cached_legacy_tracker_and_yields_to_live_plan(tmp_path):
+    db_path = tmp_path / 'legacy.sqlite'
+    tracker = ModelTracker(db_path, start=False)
+    with tracker.write_db() as db:
+        tracker.store(db, new_trade(signal(交易日='2026-11-06', 來源時間='2026-11-06T09:00:00+08:00')))
+    tree = ast.parse(APP_PATH.read_text(encoding='utf-8'))
+    names = {'opening_reference_plans', 'apply_opening_reference'}
+    render = '\n'.join(ast.unparse(node) for node in tree.body
+                       if isinstance(node, ast.FunctionDef) and node.name in names)
+    script = f"database = {str(db_path)!r}\n" + """
+import sqlite3
+from contextlib import closing
+from sqlite3 import OperationalError
 import pandas as pd
 import pytz
 import streamlit as st
-from datetime import datetime, timedelta
+from datetime import datetime as real_datetime, timedelta
 from types import SimpleNamespace
+class datetime:
+    @staticmethod
+    def now(tz):
+        return tz.localize(real_datetime(2026, 11, 9, 8, 30))
 def model_market_open(row, now):
     return market_open
 get_app_secret = lambda key: ''
-get_model_tracker = lambda url: SimpleNamespace(opening_reference_plans=lambda *a: {
-    '2330': ('2026-11-06T09:00:00+08:00','多頭',100,95,110),
-    '1815': ('2026-11-06T09:00:00+08:00','空頭',100,105,90),
-})
-fmt_price = str
+@st.cache_resource
+def get_model_tracker(url):
+    def connect():
+        if st.session_state.get('unavailable', False):
+            raise OperationalError('temporary unavailable')
+        return sqlite3.connect(database)
+    return SimpleNamespace(db=connect, hydrated=True)
+fmt_price = lambda value: f'{value:g}'
+cached_tracker = get_model_tracker('')
+assert not hasattr(cached_tracker, 'opening_reference_plans')
 """ + render + """
 market_open = st.checkbox('已開盤')
+st.checkbox('模擬讀取失敗', key='unavailable')
 frame = pd.DataFrame([{'代號':'2330','進出場預判':'—','訊號狀態':'等待'},
                       {'代號':'1815','進出場預判':'空·已進場｜進 100｜停 105｜保 98｜目 90'}])
 apply_opening_reference(frame,True,'當沖')
@@ -91,5 +112,10 @@ st.dataframe(frame)
     assert displayed.iloc[0] == '多·開盤參考｜進 100｜停 95｜目 110｜保啟≈105｜來源 11/06 09:00'
     assert displayed.iloc[1].startswith('空·已進場')
     assert app.dataframe[0].value['訊號狀態'].iloc[0] == '⚪ 開盤參考'
+    app.checkbox(key='unavailable').set_value(True).run()
+    assert not app.exception and app.dataframe[0].value['進出場預判'].iloc[0] == '—'
+    assert '開盤參考暫時無法讀取' in app.caption[0].value
+    app.checkbox(key='unavailable').set_value(False).run()
+    assert not app.exception and app.dataframe[0].value['進出場預判'].iloc[0] == displayed.iloc[0]
     app.checkbox[0].set_value(True).run()
     assert not app.exception and app.dataframe[0].value['進出場預判'].iloc[0] == '—'
