@@ -156,7 +156,8 @@ def test_protection_queries_are_scoped_and_export_contains_new_columns(tmp_path)
 def test_shared_stock_and_futures_projection_and_compact_history_apptest():
     stock = advance(advance(new_trade(protected_signal()), quote(100)), quote(110, 1))
     tree = ast.parse(Path('app.py').read_text(encoding='utf-8'))
-    names = {'model_protection_text', 'apply_model_protection', '_model_history_overview', 'render_operation_protection'}
+    names = {'model_protection_text', 'apply_model_protection', '_model_history_overview',
+             'read_operation_protection', 'render_operation_protection'}
     functions = '\n\n'.join(ast.unparse(n) for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names)
     script = '''
 import streamlit as st

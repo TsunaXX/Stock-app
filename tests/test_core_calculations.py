@@ -2271,8 +2271,8 @@ def test_mobile_layout_prevents_metrics_and_table_cells_from_overlapping():
     assert "def render_compact_metric_card_grid" in source
     assert "compact-metric-grid index-level-metric-grid" in source
     assert "compact-metric-grid fibo-suggestion-metric-grid" in source
-    assert "compact-metric-grid index-entry-risk-grid" in source
-    assert "compact-metric-grid index-short-risk-grid" in source
+    assert "@media(max-width:700px){.compact-metric-grid{grid-template-columns:repeat(2,minmax(0,1fr))" in source
+    assert "@media(max-width:340px){.compact-metric-grid{grid-template-columns:1fr}}" in source
 
 
 def test_index_operation_plan_colors_entry_stop_target_and_reward_risk_metrics():

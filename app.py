@@ -4993,14 +4993,21 @@ def get_cached_index_minutes(api, interval):
     if contract is None:
         return pd.DataFrame()
     ensure_market_stream_subscription(api, contract)
-    data = get_strategy_intraday_history(api, contract, 'futures', wait=False)
+    data = get_strategy_intraday_history(api, contract, 'futures', wait=False, copy_result=False)
     if data.empty:
         return data
     if interval == '60min':
-        return completed_index_hour_bars(data)
-    return data.resample(interval, origin='start_day').agg({
-        'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum',
-    }).dropna(subset=['Open', 'High', 'Low', 'Close'])
+        recent = completed_index_hour_bars(data.tail(3000))
+        return recent if len(recent) >= 21 or len(data) <= 3000 else completed_index_hour_bars(data)
+    def resample(minutes):
+        return minutes.resample(interval, origin='start_day').agg({
+            'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum',
+        }).dropna(subset=['Open', 'High', 'Low', 'Close'])
+
+    # Allow a complete 14-hour night session plus the 12-bar fallback, or the latest 30 five-minute bars.
+    window, required = {'5min': (155, 30), '15min': (1035, 12)}.get(interval, (len(data), 0))
+    recent = resample(data.tail(window))
+    return recent if len(data) <= window or len(recent) > required else resample(data)
 
 
 def completed_index_hour_bars(data):
@@ -5041,9 +5048,9 @@ def calculate_hourly_index_plan(data):
     return result
 
 
-def render_hourly_index_plan(hourly, live_price, fresh):
+def render_hourly_index_plan(hourly, live_price, fresh, daily_atr, quantity):
     st.divider()
-    st.markdown('#### 🕐 60 分 K 判讀')
+    st.markdown('#### 🕐 趨勢與關鍵價位（60 分 K）')
     if not hourly:
         st.info('等待完整 60 分 K，資料就緒後顯示點位。')
         return
@@ -5057,6 +5064,8 @@ def render_hourly_index_plan(hourly, live_price, fresh):
         {'label': label, 'label_color': color, 'value': f"{hourly[key]:,.0f}", 'color': color}
         for key, label in (('entry', '觀察進場'), ('stop', '失效／停損'), ('target', '第一目標'))
     ] + [{'label': '預估風報比', 'label_color': '#40c4ff', 'value': '1 : 2', 'color': '#40c4ff'}])
+    risk, reward = abs(hourly['entry'] - hourly['stop']), abs(hourly['target'] - hourly['entry'])
+    render_index_plan_risk_cards(risk, reward, daily_atr, quantity, '60 分 K 風險點數', '60 分 K 盈利點數')
     hit = fresh and (live_price >= hourly['entry'] if direction == '偏多' else live_price <= hourly['entry'])
     st.caption(('已觸及觀察價' if hit else '等待觸及觀察價' if fresh else '等待最新串流') + '｜依最近完成 60 分 K 的高低點及 ATR 判讀。')
 
@@ -5313,6 +5322,26 @@ def get_trade_risk_level(risk_points, atr):
     if ratio <= 0.9:
         return '中', '#ffc107', ratio
     return '高', '#ff4b4b', ratio
+
+
+def render_index_plan_risk_cards(risk, reward, atr, quantity, risk_label, reward_label, protection=None):
+    level, color, ratio = get_trade_risk_level(risk, atr)
+    items = [
+        {'label': risk_label, 'value': f'{risk:,.0f} 點', 'detail': f'風險等級：{level}', 'color': color},
+        {'label': reward_label, 'value': f'{reward:,.0f} 點', 'color': '#ff4b4b'},
+        {'label': f'{quantity} 口最大風險', 'value': f'${risk * 10 * quantity:,.0f}', 'color': color},
+        {'label': f'{quantity} 口預估收益', 'value': f'${reward * 10 * quantity:,.0f}', 'color': '#ff4b4b'},
+    ]
+    if protection is not None:
+        items.append(protection)
+    render_compact_metric_card_grid(items, columns=len(items))
+    return ratio
+
+
+def index_plan_protection_card(row):
+    value, _, status = model_protection_text(row).partition('·') if row else ('保 —', '', '等待模型紀錄')
+    return {'label': '移動保利', 'value': value, 'detail': status,
+            'color': '#ffc107' if status == '資料待確認' else '#40c4ff'}
 
 
 def _is_shioaji_auth_error(exc):
@@ -8325,8 +8354,13 @@ def render_operation_plan(seed_data, option_page=False, seconds=5, snapshot=None
             options=[1, 2, 3, 4, 5],
             format_func=lambda count: f"{count} 口微型臺指",
             key="trade_plan_position_count",
-            help="此設定會連動更新進出依據與短波當沖的停損金額及預估收益。",
+            help="依所選微台口數估算各區塊的最大風險及預估收益。每口每點 10 元，未扣費稅及滑價。",
         )
+        kinds = ('短波5分K', '日線／15分K')
+        model_keys = [f"{live_snapshot['contract_code']}|{kind}" for kind in kinds] if live_snapshot else []
+        protection = read_operation_protection('指數操作計畫', model_keys)
+        short_model, main_model = (protection.get(key) for key in model_keys) if model_keys else (None, None)
+        short_protection = index_plan_protection_card(short_model)
         if short_wave_direction == '偏多':
             short_recommendation, short_color = '短多觀察', '#ff4b4b'
         elif short_wave_direction == '偏空':
@@ -8376,34 +8410,10 @@ def render_operation_plan(seed_data, option_page=False, seconds=5, snapshot=None
                 f"EMA5 {short_wave['ema_fast']:,.0f}｜量比 {_format_compact_number(short_wave['volume_ratio'], 2)}</div>",
                 unsafe_allow_html=True,
             )
-            short_risk_level, short_risk_color, short_risk_ratio = get_trade_risk_level(
-                short_wave['risk'], plan['atr'],
+            short_risk_ratio = render_index_plan_risk_cards(
+                short_wave['risk'], short_wave['reward'], plan['atr'], position_count,
+                '短波風險點數', '短波盈利點數', short_protection,
             )
-            short_risk_amount = short_wave['risk'] * 10 * position_count
-            short_reward_amount = short_wave['reward'] * 10 * position_count
-            render_compact_metric_card_grid([
-                {
-                    'label': '短波風險點數',
-                    'value': f"{short_wave['risk']:,.0f} 點",
-                    'detail': f'風險等級：{short_risk_level}',
-                    'color': short_risk_color,
-                },
-                {
-                    'label': '短波盈利點數',
-                    'value': f"{short_wave['reward']:,.0f} 點",
-                    'color': '#ff4b4b',
-                },
-                {
-                    'label': f'{position_count} 口最大風險',
-                    'value': f'${short_risk_amount:,.0f}',
-                    'color': short_risk_color,
-                },
-                {
-                    'label': f'{position_count} 口預估收益',
-                    'value': f'${short_reward_amount:,.0f}',
-                    'color': '#ff4b4b',
-                },
-            ], columns=4, class_name='compact-metric-grid index-short-risk-grid')
             st.caption(
                 "以最新 6 根 5 分 K、EMA5 與前根高低點計算；短波停損為日 ATR 的 "
                 f"{_format_compact_number(short_risk_ratio, 2)} 倍。"
@@ -8413,6 +8423,8 @@ def render_operation_plan(seed_data, option_page=False, seconds=5, snapshot=None
             st.info("5 分 K 資料尚未就緒，暫不提供短波點位；目前僅有觀察方向，不代表進場條件已通過。")
         else:
             st.info("尚未形成可辨識的盤中方向；短波暫不啟用，避免在區間中段雙向追價。")
+        if not short_wave:
+            render_compact_metric_card_grid([short_protection], columns=4)
         st.divider()
         confirmation_text = intraday_state['confirmation_text']
         display_direction, direction_color = {
@@ -8538,8 +8550,6 @@ def render_operation_plan(seed_data, option_page=False, seconds=5, snapshot=None
         )
         st.caption("以日線費波支撐／壓力與 15 分 K 確認；保＝達1R後移動保利，保留1R回撤，最低保護成本。")
         st.info(f"**進場確認：** {plan['trigger']}")
-        model_specs = snapshot.get('model_specs', [])
-        render_operation_protection('指數操作計畫', model_specs)
         execution_direction = trade_state.get('execution_direction') or plan.get('direction')
         execution_color = (
             '#ff4b4b' if execution_direction == '偏多'
@@ -8573,34 +8583,10 @@ def render_operation_plan(seed_data, option_page=False, seconds=5, snapshot=None
                 'color': entry_rr_color,
             },
         ])
-        entry_risk_level, entry_risk_color, entry_risk_ratio = get_trade_risk_level(
-            trade_state['risk_points'], plan['atr'],
+        entry_risk_ratio = render_index_plan_risk_cards(
+            trade_state['risk_points'], trade_state['reward_points'], plan['atr'], position_count,
+            '計畫風險點數', '預估盈利點數', index_plan_protection_card(main_model),
         )
-        entry_risk_amount = trade_state['risk_points'] * 10 * position_count
-        entry_reward_amount = trade_state['reward_points'] * 10 * position_count
-        render_compact_metric_card_grid([
-            {
-                'label': '計畫風險點數',
-                'value': f"{trade_state['risk_points']:,.0f} 點",
-                'detail': f'風險等級：{entry_risk_level}',
-                'color': entry_risk_color,
-            },
-            {
-                'label': '預估盈利點數',
-                'value': f"{trade_state['reward_points']:,.0f} 點",
-                'color': '#ff4b4b',
-            },
-            {
-                'label': f'{position_count} 口最大風險',
-                'value': f'${entry_risk_amount:,.0f}',
-                'color': entry_risk_color,
-            },
-            {
-                'label': f'{position_count} 口預估收益',
-                'value': f'${entry_reward_amount:,.0f}',
-                'color': '#ff4b4b',
-            },
-        ], columns=4, class_name='compact-metric-grid index-entry-risk-grid')
         st.caption(
             f"風險等級以停損距離相對日 ATR 判定：{_format_compact_number(entry_risk_ratio, 2)} ATR；"
             "微台每點 10 元。"
@@ -8626,7 +8612,8 @@ def render_operation_plan(seed_data, option_page=False, seconds=5, snapshot=None
         )
         st.caption("｜".join(signal_details))
 
-        render_hourly_index_plan(snapshot.get('hourly'), live_price, snapshot.get('fresh', False))
+        render_hourly_index_plan(snapshot.get('hourly'), live_price, snapshot.get('fresh', False),
+                                 plan['atr'], position_count)
 
     else:
         option_mode_choices = [
@@ -21665,6 +21652,8 @@ def intraday_auto_interval(room, enabled, seconds, start=None, end=None):
     if not intraday_auto_window_open(now_tw, start, end, stock=room.startswith('stock')):
         st.session_state[f'{room}_auto_status'] = '目前不在更新時段；保留上次資料與來源時間。'
         return None
+    if room == 'index' and not model_market_open({'市場': '期貨', '交易時段': '日盤+夜盤'}, now_tw):
+        return max(seconds, 60)
     return seconds
 
 
@@ -22254,14 +22243,17 @@ def record_operation_models(source, specs, api, seconds, tracker=None, cursors=N
                     stream = quote['串流識別'].rsplit(':', 1)[0] if spec.get('選擇權腿') else quote['串流識別']
                     cursors[spec['商品鍵']] = {'stream': stream, 'sequence': quote['序號'],
                                             'time': quote['來源時間'], 'allowed': spec['進場許可'], 'direction': spec['方向']}
-def render_operation_protection(source, specs):
-    if not st.session_state.get('sj_logged_in', False):
-        return
-    specs = [spec for spec in specs if spec]
+def read_operation_protection(source, keys):
+    if not keys or not st.session_state.get('sj_logged_in', False):
+        return {}
     tracker = get_model_tracker(get_app_secret('gsheet_api_url') or '')
     day = get_futures_trading_date(datetime.now(pytz.timezone('Asia/Taipei'))).date().isoformat()
-    plans = tracker.protection_plans('期貨', [spec['商品鍵'] for spec in specs], '當沖', day, source)
-    if specs and not plans:
+    return tracker.protection_plans('期貨', keys, '當沖', day, source)
+
+
+def render_operation_protection(source, specs):
+    plans = read_operation_protection(source, [spec['商品鍵'] for spec in specs if spec])
+    if any(specs) and not plans and st.session_state.get('sj_logged_in', False):
         st.caption('保 —｜均衡保利：達 1R 啟動、保留 1R 回撤，最低保護成本。')
     for key, row in plans.items():
         st.caption(f"{row['名稱']}｜{row.get('計畫類型', '')}｜{model_protection_text(row)}")
@@ -23108,7 +23100,7 @@ def finish_intraday_auto_update(room, started, count, error=None):
     st.session_state[f'{room}_auto_lock'].release()
 
 
-def get_strategy_intraday_history(api, contract, asset='stock', wait=False):
+def get_strategy_intraday_history(api, contract, asset='stock', wait=False, copy_result=True):
     """Seed visible history once in the background; timer ticks read memory only."""
     state = _stream_state(api)
     now_tw = datetime.now(pytz.timezone('Asia/Taipei'))
@@ -23185,7 +23177,7 @@ def get_strategy_intraday_history(api, contract, asset='stock', wait=False):
     quote = _stream_quote_for_contract(api, contract)
     data = merge_stream_quote_into_intraday(entry['data'], quote, '1m')
     entry['data'] = data
-    return data.copy()
+    return data.copy() if copy_result else data
 
 
 def fresh_strategy_stream_quote(quote, now_tw=None):
@@ -27621,11 +27613,15 @@ with tab_fibo:
             def render_active_operation_plan():
                 if option_page and _post_close_target_date()[1] != seed_date:
                     st.rerun()
+                if not option_page and interval != intraday_auto_interval('index', True, seconds):
+                    st.rerun()
                 snapshot = None if option_page else index_operation_snapshot(thermometer_data, seconds)
                 checked_at = datetime.now(pytz.timezone('Asia/Taipei')).strftime('%Y/%m/%d %H:%M:%S')
                 if snapshot is not None:
                     checked_at = _stream_datetime(snapshot['updated_at']).strftime('%Y/%m/%d %H:%M:%S') if snapshot.get('updated_at') else '等待資料'
                 st.caption(
+                    f'⏰ 休市待機：每 {interval} 秒檢查開盤｜保留最近分析｜自動更新時間：{checked_at}'
+                    if interval and interval != seconds else
                     f'⏰ 全頁自動更新：每 {seconds} 秒｜分析與即時點位同步更新｜自動更新時間：{checked_at}'
                     if interval else '⏰ 自動追蹤：等待 Shioaji 登入；保留最近完整資料。'
                 )
