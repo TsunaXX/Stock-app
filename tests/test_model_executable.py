@@ -108,6 +108,62 @@ def test_replan_requires_fresh_unbroken_reset_and_current_strategy(tmp_path,bloc
     assert len(t.records())==1
 
 
+@pytest.mark.parametrize('block', [None, 'no_permission', 'gap', 'reconnect', 'wrong_version'])
+def test_replan_uses_previous_candidate_for_a_brief_short_trigger(tmp_path, block):
+    tracker = ModelTracker(tmp_path / 'intrawindow.sqlite', start=False)
+    key = '股票|2330'
+    original = plan(方向='空頭', 進場價=103, 停損價=108, 目標價=95.5)
+    new = plan(方向='空頭', 進場價=102.9, 停損價=106, 目標價=96)
+
+    def short(price, second, candidate=None, allowed=True, **changes):
+        return sample(price, second, candidate, allowed, 進場品質方向='空頭', **changes)
+
+    tracker.process([original], {key: short(104, 0, original)})
+    tracker.process([], {key: short(108, 1, original)})
+    prior = short(104, 2, new, allowed=block != 'no_permission')
+    if block == 'wrong_version':
+        prior['候選計畫']['策略版本'] = 'V1.2-exec1-other'
+    tracker.process([], {key: prior})
+    last = short(104, 5, allowed=False)
+    if block == 'reconnect':
+        last['串流識別'] = last['成交證據'][0]['串流識別'] = 'desktop:1'
+    ticks = [short(102.9, 3)['成交證據'][0], short(96, 4)['成交證據'][0]]
+    if block == 'gap':
+        ticks[0]['序號'] += 5
+    last['成交證據'] = ticks + last['成交證據']
+    tracker.process([], {key: last})
+    rows = tracker.records()
+    if block:
+        assert len(rows) == 1
+        return
+    parent = next(row for row in rows if row['狀態'] == '訊號失效')
+    child = next(row for row in rows if row.get('重新觸發來源ID'))
+    assert len(rows) == 2 and child['重新觸發來源ID'] == parent['交易ID']
+    assert parent['新訊號觸發狀態'] == '再次成立'
+    assert child['進場價'] == 102.9 and child['進場時間'] == ticks[0]['來源時間']
+    assert child['狀態'] == '已平倉' and child['出場原因'] == '停利' and not child['資料缺口']
+    tracker.process([], {key: last})
+    replayed = {row['交易ID']: row for row in tracker.records()}
+    assert set(replayed) == {parent['交易ID'], child['交易ID']}
+    assert replayed[child['交易ID']]['事件'] == child['事件']
+
+
+def test_replan_observes_price_reset_before_current_permission_without_backdating_it(tmp_path):
+    tracker = ModelTracker(tmp_path / 'samewindow.sqlite', start=False)
+    key = '股票|2330'
+    seed = plan()
+    tracker.process([seed], {key: sample(99, 0, seed)})
+    tracker.process([], {key: sample(94, 1, seed)})
+    last = sample(100, 4, seed)
+    early = {**sample(100, 3)['成交證據'][0], '來源時間': last['來源時間']}
+    last['成交證據'] = [sample(99, 2)['成交證據'][0], early, last['成交證據'][0]]
+    tracker.process([], {key: last})
+    child = next(row for row in tracker.records() if row.get('重新觸發來源ID'))
+    assert child['重新觸發解除證據']['來源時間'] == sample(99, 2)['來源時間']
+    assert child['進場時間'] == last['來源時間']
+    assert child['成交證據識別']['序號'] == last['序號']
+
+
 def test_cross_device_new_plan_identity_and_script_proof_validation(tmp_path):
     generated=[]
     for name in ('desktop','phone'):
