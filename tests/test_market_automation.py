@@ -343,6 +343,20 @@ def test_compact_near_future_supplies_both_index_minute_plans():
     assert ns['resolve_shioaji_futures_contract'](api,'MTX','202610') is mini
 
 
+def test_index_hourly_bars_align_to_day_night_and_exclude_forming_hour():
+    ns = load_app_symbols('completed_index_hour_bars', 'calculate_hourly_index_plan')
+    index = pd.date_range('2026-11-10 08:46', '2026-11-10 10:00', freq='min').append(
+        pd.date_range('2026-11-10 15:01', '2026-11-10 16:30', freq='min'))
+    frame = pd.DataFrame({key: range(len(index)) for key in ('Open', 'High', 'Low', 'Close', 'Volume')}, index=index)
+    bars = ns['completed_index_hour_bars'](frame)
+    assert list(bars.index.strftime('%H:%M')) == ['09:45', '16:00']
+    assert bars['Close'].tolist() == [59, 134]
+    close = pd.Series(range(100, 120), index=pd.date_range('2026-11-09', periods=20, freq='h'))
+    plan = ns['calculate_hourly_index_plan'](pd.DataFrame({'High': close + 2, 'Low': close - 2, 'Close': close}))
+    assert plan['direction'] == '偏多' and plan['entry'] == 122
+    assert plan['stop'] < plan['entry'] < plan['target']
+
+
 def test_index_tracking_fragment_ui_keeps_daily_plan_when_live_price_changes():
     from streamlit.testing.v1 import AppTest
     tree = ast.parse((Path(__file__).parents[1] / 'app.py').read_text(encoding='utf-8'))
