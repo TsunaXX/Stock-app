@@ -18,6 +18,8 @@ NOW = pytz.timezone('Asia/Taipei').localize(datetime(2026, 10, 12, 10))
 
 def adapter():
     ns = load_app_symbols('operation_model_spec', 'operation_model_samples', 'record_operation_models',
+                          'index_operation_model_specs', 'calculate_short_wave_plan',
+                          '_stream_payload', '_stream_number', '_stream_datetime',
                           'cathay_futures_fee', 'cathay_option_fee',
                           '_safe_number', 'parse_strategy_data_time')
     state = {'lock': threading.RLock(), 'strategy_stream_scopes': {'index': {'TMFJ6'}, 'options': {'C1', 'P1', 'P2'}},
@@ -66,6 +68,55 @@ def tick(state, code, price, second, sequence=None, epoch='test:0'):
 
 def sample(ns, specs, second):
     return ns['operation_model_samples'](specs, object(), 5, NOW+timedelta(seconds=second))
+
+
+@pytest.mark.parametrize('direction,sign', [('偏多', 1), ('偏空', -1)])
+def test_short_index_point_and_protection_use_actual_tmf_trades(tmp_path, direction, sign):
+    from model_tracking import entry_economics
+    ns, state = adapter()
+    close = pd.Series([20000 + sign * i * 2 for i in range(30)], dtype=float)
+    ns['get_cached_index_minutes'] = lambda *a: pd.DataFrame({
+        'Open': close, 'Close': close, 'High': close + 25, 'Low': close - 25, 'Volume': 10,
+    })
+    ns['entry_economics'] = entry_economics
+    wave = ns['calculate_short_wave_plan'](object(), direction, precise=True)
+    assert all(isinstance(wave[key], int) for key in ('entry', 'stop', 'target'))
+    assert wave['entry'] == close.iloc[-2] + sign and wave['momentum_ready']
+    snapshot = {'plan': {'direction': direction, 'trigger': '日線計畫'}, 'live_snapshot': {'contract_code':'TMFJ6'},
+                'trade_state': {'entry_level':0,'invalidation':0,'target':0,'can_enter':False},
+                'intraday_state': {}, 'short_wave': wave, 'short_wave_direction': direction}
+    costs = {**DEFAULT_COSTS, 'futures_tmf_fee': 10}
+    plan = ns['index_operation_model_specs'](snapshot, 1, 'default', cost_settings=costs)[-1]
+    assert plan['進場價'] == wave['entry'] and plan['新訊號']
+    snapshot['short_wave'] = {**wave, 'momentum_ready': False}
+    assert not ns['index_operation_model_specs'](snapshot, 1, 'default', cost_settings=costs)[-1]['新訊號']
+    tracker = ModelTracker(tmp_path/'short-point.sqlite', start=False)
+    state['quotes'] = {}
+    state['model_tick_buffers']['TMFJ6'] = deque()
+    api = object()
+    def push(price, second, volume=1, simtrade=False):
+        payload = SimpleNamespace(code='TMFJ6', close=price, volume=volume, simtrade=simtrade,
+                                  datetime=(NOW + timedelta(seconds=second)).replace(tzinfo=None))
+        ns['_stream_payload'](api, payload, 'FOP')
+    push(wave['entry'] - sign, 1)
+    tracker.process(*sample(ns, [plan], 1))
+    assert tracker.records()[0]['狀態'] == '等待進場'
+    push(wave['target'], 3, volume=0)
+    push(wave['target'], 3, simtrade=True)
+    push(wave['entry'], 2)
+    assert [tick['序號'] for tick in state['model_tick_buffers']['TMFJ6']] == [1, 2]
+    tracker.process(*sample(ns, [plan], 3))
+    entered = tracker.records()[0]
+    assert entered['狀態'] == '模擬持倉' and not entered.get('資料缺口')
+    peak = entered['模擬進場價'] + sign * (entered['初始風險'] + 1)
+    push(peak, 4)
+    tracker.process(*sample(ns, [plan], 4))
+    held = tracker.records()[0]
+    assert held['保利狀態'] == '保利中' and held['保利價'] is not None
+    push(held['保利價'], 5)
+    tracker.process(*sample(ns, [plan], 5))
+    closed = tracker.records()[0]
+    assert closed['出場原因'] == '保利' and closed['模擬損益'] >= 0 and not closed.get('資料缺口')
 
 
 def test_index_plan_permission_direction_freeze_replay_and_costs(tmp_path):

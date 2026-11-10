@@ -265,7 +265,11 @@ def _stream_payload(api, payload, security_type):
         previous.update(values)
         state['quotes'][code] = previous
         buffer = state.get('model_tick_buffers', {}).get(code)
-        if buffer is not None and close is not None and getattr(payload, 'datetime', None) is not None:
+        # TMF Quote v1 also publishes book updates with the last price and zero new volume.
+        trade_evidence = security_type != 'FOP' or not code.startswith('TMF') or (
+            (values.get('volume') or 0) > 0 and not getattr(payload, 'simtrade', False)
+        )
+        if buffer is not None and trade_evidence and close is not None and getattr(payload, 'datetime', None) is not None:
             sequence = state.setdefault('model_tick_sequences', {}).get(code, 0) + 1
             state['model_tick_sequences'][code] = sequence
             buffer.append({'價格': close, '來源時間': pytz.timezone('Asia/Taipei').localize(updated_at).isoformat(),
@@ -5027,7 +5031,7 @@ def completed_index_hour_bars(data):
     return bars[bars.index <= data.index[-1]]
 
 
-def calculate_hourly_index_plan(data):
+def calculate_hourly_index_plan(data, daily_plan):
     data = data.tail(21)
     if len(data) < 15:
         return None
@@ -5037,37 +5041,62 @@ def calculate_hourly_index_plan(data):
     atr = pd.concat([data['High'] - data['Low'], (data['High'] - close.shift()).abs(),
                      (data['Low'] - close.shift()).abs()], axis=1).max(axis=1).tail(14).mean()
     direction = '偏多' if close.iloc[-1] >= fast > slow else '偏空' if close.iloc[-1] <= fast < slow else '盤整'
-    result = {'direction': direction, 'source_time': data.index[-1], 'ema': fast}
+    support, resistance = daily_plan.get('support'), daily_plan.get('resistance')
+    result = {'direction': direction, 'source_time': data.index[-1], 'ema': fast,
+              'support': support, 'resistance': resistance}
     if direction == '盤整' or not np.isfinite(atr) or atr <= 0:
         return result
     long = direction == '偏多'
     sign = 1 if long else -1
-    entry = float(data['High' if long else 'Low'].iloc[-1]) + sign
+    entry = math.floor(data['High'].iloc[-1]) + 1 if long else math.ceil(data['Low'].iloc[-1]) - 1
     risk = max(1, round(atr * .5))
-    result.update(entry=entry, stop=entry - sign * risk, target=entry + sign * risk * 2)
+    if long:
+        if support is not None:
+            entry = max(entry, math.ceil(support))
+        stop = max(entry - risk, math.ceil(support) - 1) if support is not None else entry - risk
+        target = entry + 2 * (entry - stop)
+        if resistance is not None and close.iloc[-1] <= resistance:
+            target = min(target, math.floor(resistance))
+    else:
+        if resistance is not None:
+            entry = min(entry, math.floor(resistance))
+        stop = min(entry + risk, math.floor(resistance) + 1) if resistance is not None else entry + risk
+        target = entry - 2 * (stop - entry)
+        if support is not None and close.iloc[-1] >= support:
+            target = max(target, math.ceil(support))
+    if sign * (target - entry) < abs(entry - stop):
+        return {**result, 'wait_reason': '前方日線費波撐壓限制目標，風報比不足 1，先觀察。'}
+    result.update(entry=entry, stop=stop, target=target)
     return result
 
 
 def render_hourly_index_plan(hourly, live_price, fresh, daily_atr, quantity):
     st.divider()
-    st.markdown('#### 🕐 趨勢與關鍵價位（60 分 K）')
+    st.markdown('#### 🕐 日線費波撐壓 × 60 分 K 趨勢')
     if not hourly:
         st.info('等待完整 60 分 K，資料就緒後顯示點位。')
         return
     direction = hourly['direction']
     color = {'偏多': '#ff4b4b', '偏空': '#00c853'}.get(direction, '#ffc107')
-    st.caption(f"{direction}｜完成 K 棒 {hourly['source_time']:%Y/%m/%d %H:%M}｜EMA5 {hourly['ema']:,.0f}")
+    st.markdown(
+        f"<div style='font-size:14px;color:#cbd5e1'><strong style='color:{color}'>{direction}</strong>"
+        f"｜完成 K 棒 {hourly['source_time']:%Y/%m/%d %H:%M}｜EMA5 {hourly['ema']:,.0f}</div>",
+        unsafe_allow_html=True,
+    )
+    st.caption(f"日線費波支撐 {_format_compact_number(hourly.get('support'), 0)}"
+               f"｜壓力 {_format_compact_number(hourly.get('resistance'), 0)}")
     if 'entry' not in hourly:
-        st.info('均線方向未一致，先觀察。')
+        st.info(hourly.get('wait_reason', '均線方向未一致，先觀察。'))
         return
+    risk, reward = abs(hourly['entry'] - hourly['stop']), abs(hourly['target'] - hourly['entry'])
     render_index_plan_metric_cards([
         {'label': label, 'label_color': color, 'value': f"{hourly[key]:,.0f}", 'color': color}
         for key, label in (('entry', '觀察進場'), ('stop', '失效／停損'), ('target', '第一目標'))
-    ] + [{'label': '預估風報比', 'label_color': '#40c4ff', 'value': '1 : 2', 'color': '#40c4ff'}])
-    risk, reward = abs(hourly['entry'] - hourly['stop']), abs(hourly['target'] - hourly['entry'])
+    ] + [{'label': '預估風報比', 'label_color': '#40c4ff',
+          'value': f"1 : {_format_compact_number(reward / risk, 2)}", 'color': '#40c4ff'}])
     render_index_plan_risk_cards(risk, reward, daily_atr, quantity, '60 分 K 風險點數', '60 分 K 盈利點數')
     hit = fresh and (live_price >= hourly['entry'] if direction == '偏多' else live_price <= hourly['entry'])
-    st.caption(('已觸及觀察價' if hit else '等待觸及觀察價' if fresh else '等待最新串流') + '｜依最近完成 60 分 K 的高低點及 ATR 判讀。')
+    st.caption(('已觸及觀察價' if hit else '等待觸及觀察價' if fresh else '等待最新串流') + '｜綜合日線費波撐壓、最近完成 60 分 K 高低點及 ATR。')
 
 
 def get_futures_intraday_state(api, direction, logged_in=None):
@@ -5340,8 +5369,22 @@ def render_index_plan_risk_cards(risk, reward, atr, quantity, risk_label, reward
 
 def index_plan_protection_card(row):
     value, _, status = model_protection_text(row).partition('·') if row else ('保 —', '', '等待模型紀錄')
+    if row:
+        state = row.get('狀態')
+        if state == '已平倉':
+            status = '保利出場' if row.get('出場原因') == '保利' else '已平倉'
+        elif state == '訊號失效':
+            status = '計畫失效'
+        elif state in ('監控中斷', '資料不足'):
+            status = '行情待確認｜保價暫停' if row.get('模擬進場價') is not None else '等待成交證據'
+        elif row.get('模擬進場價') is None:
+            status = '等待進場'
+        elif row.get('資料缺口'):
+            status = '持倉有行情缺口｜保價暫停'
+        elif status == '未啟動':
+            status = f"未達 1R（{row.get('保利最大浮盈(R)', 0) or 0:.2f}R）"
     return {'label': '移動保利', 'value': value, 'detail': status,
-            'color': '#ffc107' if status == '資料待確認' else '#40c4ff'}
+            'color': '#ffc107' if row and (row.get('資料缺口') or '待確認' in status) else '#40c4ff'}
 
 
 def _is_shioaji_auth_error(exc):
@@ -5502,7 +5545,7 @@ def fetch_taifex_index_margin_map():
     return margin_map
 
 
-def calculate_short_wave_plan(api, direction):
+def calculate_short_wave_plan(api, direction, precise=False):
     """Calculate an intentionally fast 5-minute pullback/breakout plan."""
     if api is None or direction not in ('偏多', '偏空'):
         return None
@@ -5555,6 +5598,18 @@ def calculate_short_wave_plan(api, direction):
                 f"即時價受壓於 EMA5 約 {ema_fast:,.0f}，或跌破前一根低點 {float(previous_bar['Low']):,.0f} 即可小部位試空；"
                 "不必等待完整 5 分 K 收盤。"
             )
+        if precise:
+            sign = 1 if direction == '偏多' else -1
+            previous_close = float(previous_bar['Close'])
+            entry = (math.ceil(max(ema_fast, previous_close + 1)) if sign > 0
+                     else math.floor(min(ema_fast, previous_close - 1)))
+            stop = entry - sign * max(1, math.ceil(atr * .45))
+            target = (math.ceil(max(range_high, entry + atr * .85)) if sign > 0
+                      else math.floor(min(range_low, entry - atr * .85)))
+            momentum_ready = sign * (latest - entry) >= 0
+            side = '達到或高於' if sign > 0 else '達到或低於'
+            trigger = (f"EMA5 與前根收盤同向確認，微台逐筆成交須{side} {entry:,} 點。"
+                       "模型會再檢查同向許可、0.25R 追價上限及扣除成本後的風報比。")
         return {
             'latest': latest, 'entry': entry, 'stop': stop, 'target': target,
             'zone': zone, 'risk': abs(entry - stop), 'reward': abs(target - entry),
@@ -5566,17 +5621,17 @@ def calculate_short_wave_plan(api, direction):
         return None
 
 
-def get_cached_short_wave_plan(api, direction, max_age_seconds=8):
+def get_cached_short_wave_plan(api, direction, max_age_seconds=8, precise=False):
     """Reuse the 5-minute calculation briefly so one refresh does not reload all bars."""
     shared, cache_lock = get_shared_market_data_cache()
     cache = shared['short_wave']
-    cache_key = (direction, id(api) if api is not None else None)
+    cache_key = (direction, id(api) if api is not None else None, precise)
     with cache_lock:
         cached = cache.get(cache_key)
     now = time.monotonic()
     if cached and now - cached['saved_at'] <= max_age_seconds:
         return dict(cached['value']) if cached['value'] else None
-    value = calculate_short_wave_plan(api, direction)
+    value = calculate_short_wave_plan(api, direction, precise=precise)
     with cache_lock:
         cache.clear()
         cache[cache_key] = {'saved_at': now, 'value': dict(value) if value else None}
@@ -8108,13 +8163,14 @@ def calculate_operation_snapshot(seed_data, api, entry_profile, state, backgroun
     short_wave_direction, short_direction_note = resolve_short_wave_direction(
         plan, trade_state, intraday_state,
     )
-    short_wave = get_cached_short_wave_plan(api, short_wave_direction, max_age_seconds=0)
+    short_wave = get_cached_short_wave_plan(api, short_wave_direction, max_age_seconds=0,
+                                           precise=state.get('include_hourly', False))
     if short_wave and not fresh:
         short_wave = {**short_wave, 'momentum_ready': False}
     if state.get('include_hourly') and api is not None and time.monotonic() >= state.get('hourly_retry', 0):
         state['hourly_retry'] = time.monotonic() + 30
         try:
-            hourly = calculate_hourly_index_plan(get_cached_index_minutes(api, '60min'))
+            hourly = calculate_hourly_index_plan(get_cached_index_minutes(api, '60min'), plan)
             if hourly is not None:
                 state['hourly'] = hourly
         except (TypeError, ValueError, KeyError, AttributeError):
@@ -8139,11 +8195,17 @@ def index_operation_model_specs(snapshot, quantity, profile, cost_settings=None,
         {'VWAP': intraday.get('vwap'), 'ATR': plan.get('atr')}, plan['trigger'],
         cost_settings=cost_settings, version=version)]
     if wave:
-        specs.append(operation_model_spec(
+        short = operation_model_spec(
             '指數操作計畫', '短波5分K', live, snapshot['short_wave_direction'],
             wave['entry'], wave['stop'], wave['target'], wave['momentum_ready'], quantity, profile,
             {'EMA5': wave.get('ema_fast'), '量比': wave.get('volume_ratio')}, wave['trigger'],
-            cost_settings=cost_settings, version=version))
+            cost_settings=cost_settings, version=version)
+        if short:
+            reason = entry_economics(short, short['進場價'])['未建立原因']
+            short['未建立原因'] = reason
+            short['進場許可'] = short['進場許可'] and not reason
+            short['新訊號'] = short['進場許可']
+            specs.append(short)
     return specs
 
 
@@ -8361,6 +8423,19 @@ def render_operation_plan(seed_data, option_page=False, seconds=5, snapshot=None
         protection = read_operation_protection('指數操作計畫', model_keys)
         short_model, main_model = (protection.get(key) for key in model_keys) if model_keys else (None, None)
         short_protection = index_plan_protection_card(short_model)
+        recorded_short = short_model and short_model.get('狀態') in ('等待進場', '模擬持倉', '監控中斷', '資料不足')
+        held_short = recorded_short and short_model.get('模擬進場價') is not None
+        recorded_short = recorded_short and (held_short or short_model.get('方向') == short_wave_direction)
+        if short_wave and recorded_short:
+            short_wave_direction = short_model['方向']
+            is_long = short_wave_direction == '偏多'
+            entry = (math.ceil if is_long else math.floor)(short_model['進場價'])
+            stop = (math.floor if is_long else math.ceil)(short_model['停損價'])
+            target = (math.ceil if is_long else math.floor)(short_model['目標價'])
+            risk, reward = abs(entry - stop), abs(target - entry)
+            short_wave = {**short_wave, 'entry': entry, 'stop': stop, 'target': target, 'risk': risk,
+                          'reward': reward, 'rr': reward / risk if risk else None,
+                          'trigger': '沿用已記錄的進場、停損與目標，依微台逐筆成交更新。'}
         if short_wave_direction == '偏多':
             short_recommendation, short_color = '短多觀察', '#ff4b4b'
         elif short_wave_direction == '偏空':
@@ -8371,16 +8446,13 @@ def render_operation_plan(seed_data, option_page=False, seconds=5, snapshot=None
             f"#### ⚡ 短波當沖（5 分 K） <span style='font-size:15px;color:{short_color};font-weight:700'>　{short_recommendation}</span>",
             unsafe_allow_html=True,
         )
-        st.caption(f"{short_direction_note}。短波採 EMA5 或前根高低點即時觸發，不等待完整 5 分 K 收盤。")
+        st.caption('短波沿用已成交的模擬計畫。' if held_short else f"{short_direction_note}。以 EMA5 與前根收盤確認同向動能。")
         if short_wave:
             short_rr_color = '#40c4ff' if (short_wave['rr'] or 0) >= 1.25 else '#ffc107'
             render_index_plan_metric_cards([
                 {
-                    'label': '短波進場區', 'label_color': '#40c4ff',
-                    'value': (
-                        f"{_format_compact_number(short_wave['entry'], 0)} ± "
-                        f"{_format_compact_number(short_wave['zone'], 0)}"
-                    ),
+                    'label': '短波進場點', 'label_color': '#40c4ff',
+                    'value': _format_compact_number(short_wave['entry'], 0),
                     'color': short_color,
                 },
                 {
@@ -8403,10 +8475,17 @@ def render_operation_plan(seed_data, option_page=False, seconds=5, snapshot=None
                 },
             ])
             st.info(f"**快速進場條件：** {short_wave['trigger']}")
-            momentum_label = "已達快速觸發" if short_wave['momentum_ready'] else "接近觸發，等待穿越前根高低點"
+            if held_short:
+                momentum_label = '已記錄模擬進場'
+            elif recorded_short and short_model.get('最後進場等待原因'):
+                momentum_label = short_model['最後進場等待原因']
+            else:
+                reason = next((spec.get('未建立原因') for spec in snapshot.get('model_specs', [])
+                               if spec and spec.get('計畫類型') == '短波5分K'), '')
+                momentum_label = reason or ('同向動能已確認，等待模型成交' if short_wave['momentum_ready'] else '等待同向動能')
             momentum_color = '#ff4b4b' if short_wave_direction == '偏多' else '#00c853'
             st.markdown(
-                f"<div style='font-size:14px;font-weight:700;color:{momentum_color}'>即時狀態：{momentum_label}｜"
+                f"<div style='font-size:14px;font-weight:700;color:{momentum_color}'>即時狀態：{html.escape(momentum_label)}｜"
                 f"EMA5 {short_wave['ema_fast']:,.0f}｜量比 {_format_compact_number(short_wave['volume_ratio'], 2)}</div>",
                 unsafe_allow_html=True,
             )
@@ -8415,7 +8494,7 @@ def render_operation_plan(seed_data, option_page=False, seconds=5, snapshot=None
                 '短波風險點數', '短波盈利點數', short_protection,
             )
             st.caption(
-                "以最新 6 根 5 分 K、EMA5 與前根高低點計算；短波停損為日 ATR 的 "
+                "以最近 6 根 5 分 K、EMA5 與前根收盤計算；短波停損為日 ATR 的 "
                 f"{_format_compact_number(short_risk_ratio, 2)} 倍。"
                 "短波可先於日線進場許可觸發，但只適合小部位快進快出。"
             )
@@ -8545,7 +8624,7 @@ def render_operation_plan(seed_data, option_page=False, seconds=5, snapshot=None
 
         st.divider()
         st.markdown(
-            f"#### 🎯 進出依據 <span style='font-size:15px;color:{position_color};font-weight:700'>　{position_recommendation}</span>",
+            f"#### 🎯 日線費波撐壓 × 15 分 K 確認 <span style='font-size:15px;color:{position_color};font-weight:700'>　{position_recommendation}</span>",
             unsafe_allow_html=True,
         )
         st.caption("以日線費波支撐／壓力與 15 分 K 確認；保＝達1R後移動保利，保留1R回撤，最低保護成本。")
@@ -22082,6 +22161,8 @@ def apply_model_protection(rows, stock, mode, room=None):
 def get_operation_model_version(source):
     functions = (calculate_index_trade_plan, evaluate_trade_entry_state, calculate_short_wave_plan,
                  operation_model_spec, operation_model_samples)
+    if source == '指數操作計畫':
+        functions += (index_operation_model_specs,)
     if source == '選擇權操作計畫':
         functions += (recommend_txo_strategy, evaluate_txo_directional_quality, option_fills, option_tick, advance_model_trade)
     return MODEL_VERSION + '-plan-' + data_version([source, PROTECTION_POLICY, *[inspect.getsource(f) for f in functions]])[:10]
