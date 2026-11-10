@@ -520,7 +520,8 @@ def record_operation_models(source, specs, api, seconds, **kw):
     st.session_state['model_plan_count'] = len([spec for spec in specs if spec])
 '''
     anchor = 'tab1, tab_fibo, tab2, tab_db, tab_company, tab3 = st.tabs(['
-    source = source.replace(anchor, 'CONFIG_FILE = ' + repr(str(tmp_path / 'config.json')) + '\n' + setup + '\n' + anchor)
+    setup = f"CONFIG_FILE = {str(tmp_path / 'config.json')!r}\nSTOCK_STRATEGY_CACHE_FILE = {str(tmp_path / 'stock.json')!r}\n" + setup
+    source = source.replace(anchor, setup + '\n' + anchor)
     with patch('requests.get', side_effect=requests.ConnectionError('offline UI fixture')), \
          patch('requests.post', side_effect=requests.ConnectionError('offline UI fixture')), \
          patch('yfinance.download', return_value=pd.DataFrame()), \
