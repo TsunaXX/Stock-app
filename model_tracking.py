@@ -1285,7 +1285,8 @@ class ModelTracker:
                 current_time = stamp(quote['進場品質時間'])
                 if current_time is not None and (previous_time is None or current_time >= previous_time):
                     self.entry_permissions[identity] = {
-                        field: quote.get(field) for field in ('進場品質許可', '進場品質方向', '進場品質時間', '有效', '交易日', '串流識別')}
+                        field: quote.get(field) for field in ('進場品質許可', '進場品質方向', '進場品質時間',
+                                                           '有效', '交易日', '串流識別', '候選已重估', '候選計畫')}
 
     def reenter(self, db, quotes):
         seed_fields = ('交易日', '市場', '商品鍵', '代碼', '名稱', '交易時段', '策略', '策略版本', '方向',
@@ -1426,7 +1427,6 @@ class ModelTracker:
     def replan(self, db, quotes):
         """Only new stock/futures rules may replace an unfilled invalid plan after a verified reset."""
         for key, quote in quotes.items():
-            candidate = quote.get('候選計畫')
             if not quote.get('候選診斷') or not quote.get('候選已重估'):
                 continue
             market, product = key.split('|', 1)
@@ -1436,51 +1436,83 @@ class ModelTracker:
                 AND json_extract(t.body,'$.失效重觸規則')='executable-reset-v1'
                 AND NOT EXISTS (SELECT 1 FROM trades c WHERE json_extract(c.body,'$.重新觸發來源ID')=t.id)""",
                 (scope, quote.get('交易日'))).fetchall()
+            if not rows:
+                continue
+            previous = self.entry_permissions.get((key, quote.get('策略')), {})
+            before = stamp(previous.get('進場品質時間'))
+            published = stamp(quote.get('進場品質時間'))
+            published_seq = quote.get('序號')
+            gap_limit = max(30, float(quote.get('更新秒數', 5)) * 3)
+            bridge = (previous.get('有效') and previous.get('交易日') == quote.get('交易日')
+                      and previous.get('串流識別') == quote.get('串流識別')
+                      and before is not None and published is not None
+                      and 0 <= (published - before).total_seconds() <= gap_limit)
+            evidence = quote.get('成交證據', []) if quote.get('有效') and not quote.get('休市') else []
             for raw, in rows:
                 row = json.loads(raw)
                 if row.get('模擬進場價') is not None or row.get('資料缺口'):
                     continue
                 original = json.loads(raw)
+                invalidated = stamp(row['訊號失效時間'])
                 cursor_time = stamp(row.get('新計畫來源時間', row['訊號失效時間']))
                 cursor_seq = row.get('新計畫最後序號', row.get('最後序號'))
                 stream = row.get('新計畫串流識別', row.get('串流識別'))
                 cleared = row.get('新計畫解除')
                 if quote.get('休市') or not quote.get('有效'):
                     cleared = None
-                for tick in quote.get('成交證據', []) if quote.get('有效') and not quote.get('休市') else []:
+                for index, tick in enumerate(evidence):
                     ts, seq = stamp(tick.get('來源時間')), tick.get('序號')
-                    if ts is None or ts <= stamp(row['訊號失效時間']) or (cursor_time is not None and ts < cursor_time):
+                    if ts is None or invalidated is None or ts <= invalidated or (cursor_time is not None and ts < cursor_time):
                         continue
                     if tick.get('串流識別') == stream and seq is not None and cursor_seq is not None and seq <= cursor_seq:
                         continue
-                    continuous = (cursor_time is not None and 0 <= (ts-cursor_time).total_seconds() <= max(30,float(quote.get('更新秒數',5))*3)
+                    continuous = (cursor_time is not None and 0 <= (ts-cursor_time).total_seconds() <= gap_limit
                                   and stream == tick.get('串流識別') and seq is not None and cursor_seq is not None and seq == cursor_seq+1)
                     if not continuous or not tick.get('有效'):
                         cleared = None
                     cursor_time, cursor_seq, stream = ts, seq, tick.get('串流識別')
                     row.update({'新計畫來源時間':ts.isoformat(), '新計畫最後序號':seq, '新計畫串流識別':stream})
-                    # A current candidate cannot grant permission to earlier buffered ticks.
-                    permission_time = stamp(quote.get('進場品質時間'))
-                    if permission_time is None or ts < permission_time or number(tick.get('價格')) is None:
+                    price = number(tick.get('價格'))
+                    if not tick.get('有效') or price is None or price <= 0 or stream != quote.get('串流識別'):
                         continue
-                    price = tick['價格']
-                    same_direction = quote.get('進場品質方向') == row['方向']
-                    allowed = bool(quote.get('進場品質許可') and same_direction)
+                    # Each tick can use only the decision already in effect at its time.
+                    permission, permission_time = {}, None
+                    if published is not None and (published < ts or (
+                        published == ts and (published_seq is None or seq is not None and seq >= published_seq)
+                    )):
+                        permission, permission_time = quote, published
+                    elif bridge and before <= ts:
+                        permission, permission_time = previous, before
+                    allowed = (bool(permission.get('進場品質許可') and permission.get('進場品質方向') == row['方向'])
+                               if permission_time is not None else None)
                     old_hit = price >= row['進場價'] if row['方向'] in ('多頭','偏多') else price <= row['進場價']
-                    if not allowed or not old_hit:
+                    if allowed is False or not old_hit:
                         if cleared is None:
                             cleared = {**{k:tick.get(k) for k in ('來源時間','序號','串流識別','價格')}, '進場許可':allowed}
                         row['新訊號觸發狀態'] = '已解除'
-                    elif cleared and continuous and ts > stamp(cleared['來源時間']) and candidate and candidate['方向'] == row['方向']:
-                        seed = {**candidate, '來源時間':ts.isoformat(), '重新觸發來源ID':row['交易ID'],
+                    elif allowed and cleared and continuous and ts > stamp(cleared['來源時間']):
+                        candidate = permission.get('候選計畫')
+                        if (not permission.get('候選已重估') or not candidate or candidate['方向'] != row['方向']
+                                or plan_scope(candidate) != scope or candidate.get('交易日') != quote.get('交易日')
+                                or not invalidated < permission_time or stamp(candidate.get('來源時間')) != permission_time):
+                            continue
+                        seed = {**candidate, '來源時間':ts.isoformat(), '訊號價':price, '重新觸發來源ID':row['交易ID'],
                                 '重新觸發解除證據':cleared, '新訊號觸發狀態':'再次成立', '進場次數':1}
                         seed.pop('前次執行ID', None)
-                        if entry_economics(seed, seed['進場價'])['未建立原因']:
+                        quality = entry_economics(seed, seed['進場價'])
+                        if quality['未建立原因'] or (quality.get('原始RR') or 0) < 1.3:
                             continue
-                        current = advance(new_trade(seed), {**quote, **tick})
+                        seed.update(quality)
+                        sample = {**quote, **tick, '進場品質許可': allowed,
+                                  '進場品質方向': row['方向'], '進場品質時間': permission_time.isoformat()}
+                        current = advance(new_trade(seed), sample)
                         active = db.execute("SELECT 1 FROM trades WHERE slot=? AND state IN ('等待進場','模擬持倉','監控中斷','資料不足') LIMIT 1",(trade_slot(current),)).fetchone()
                         if current.get('模擬進場價') is not None and not current.get('資料缺口') and not active:
                             current['同步確認'] = not bool(self.url)
+                            for later in evidence[index + 1:]:
+                                if current['狀態'] not in ACTIVE:
+                                    break
+                                current = advance(current, {**quote, **later})
                             self.store(db, current)
                             row['新訊號觸發狀態'] = '再次成立'
                             self.revision += 1
