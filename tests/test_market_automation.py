@@ -306,9 +306,31 @@ def test_index_intraday_resample_reuses_history_and_never_downloads_on_timer():
     ns['get_near_futures_contract'] = lambda *args: object()
     ns['ensure_market_stream_subscription'] = lambda *args: True
     history = bars([100 + i / 10 for i in range(20)])
-    ns['get_strategy_intraday_history'] = lambda api, contract, asset, wait: history
+    ns['get_strategy_intraday_history'] = lambda api, contract, asset, wait, copy_result: history
     result = ns['get_cached_index_minutes'](object(), '5min')
     assert len(result) == 4 and result['Volume'].sum() == 2000
+
+
+def test_index_minute_windows_preserve_strategy_bars_after_long_history():
+    ns = load_app_symbols('get_cached_index_minutes', 'completed_index_hour_bars')
+    ns['get_near_futures_contract'] = lambda *args: object()
+    ns['ensure_market_stream_subscription'] = lambda *args: True
+    history = bars(list(range(4500)))
+    history = history.loc[(history.index.minute != 27) | (history.index.hour != 12)]
+    ns['get_strategy_intraday_history'] = lambda api, contract, asset, wait, copy_result: history
+    for interval, required in [('5min', 30), ('15min', 56)]:
+        original = history.resample(interval, origin='start_day').agg({
+            'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum',
+        }).dropna(subset=['Open', 'High', 'Low', 'Close'])
+        actual = ns['get_cached_index_minutes'](object(), interval)
+        pd.testing.assert_frame_equal(actual.tail(required), original.tail(required), check_freq=False, check_dtype=False)
+        assert len(actual) < len(original)
+    original_hours = ns['completed_index_hour_bars'](history).tail(21)
+    assert len(original_hours) >= 15
+    pd.testing.assert_frame_equal(ns['get_cached_index_minutes'](object(), '60min').tail(21), original_hours,
+                                  check_freq=False, check_dtype=False)
+    history.loc[history.index[-150:], 'Open'] = float('nan')
+    assert len(ns['get_cached_index_minutes'](object(), '5min')) > 30
 
 
 def test_compact_near_future_supplies_both_index_minute_plans():
@@ -324,7 +346,7 @@ def test_compact_near_future_supplies_both_index_minute_plans():
     ns['ensure_market_stream_subscription'] = lambda *a:True
     history = bars([20000+i for i in range(100)])
     calls = []
-    def cached_history(api, contract, asset, wait):
+    def cached_history(api, contract, asset, wait, copy_result):
         assert contract is compact and asset == 'futures' and not wait
         calls.append(contract.code)
         return history
@@ -466,7 +488,13 @@ get_live_futures_snapshot = lambda *a, **kw: {'price':st.session_state.get('live
 get_cached_futures_intraday_state = lambda *a, **kw: {'available':False,'confirmation_text':'背景分 K',
     'confirmed':False,'is_up_bar':False,'is_down_bar':False,'bullish_break':False,'bearish_break':False,
     'vwap':None,'opening_high':None,'opening_low':None,'latest':None}
-get_cached_short_wave_plan = lambda *a, **kw: None
+get_cached_short_wave_plan = lambda *a, **kw: {
+    'entry':20000.,'zone':10.,'stop':19960.,'target':20100.,'risk':40.,'reward':100.,
+    'rr':2.5,'trigger':'測試短波','momentum_ready':True,'ema_fast':20000.,'volume_ratio':1.}
+get_cached_index_minutes = lambda *a: pd.DataFrame()
+calculate_hourly_index_plan = lambda *a: {
+    'direction':'偏空','source_time':pd.Timestamp('2026-10-06 09:45'),'ema':20000.,
+    'entry':19800.,'stop':19850.,'target':19700.}
 resolve_short_wave_direction = lambda *a: ('偏多' if st.session_state.get('live',20110.) >= 20000 else '偏空','測試方向')
 select_txo_expiry = lambda *a, **kw: ([],None,'測試來源')
 def get_txo_directional_quote(api, plan, *a, **kw):
@@ -483,7 +511,10 @@ def intraday_auto_interval(room, enabled, seconds):
     return seconds
 render_postclose_maintenance = lambda: None
 refresh_index_background_history = lambda api, seed: seed
-get_model_tracker = lambda *a: SimpleNamespace(protection_plans=lambda *a, **kw: {})
+def protection_plans(market, keys, mode, day, source):
+    assert source == '指數操作計畫' and keys == ['TMF|短波5分K','TMF|日線／15分K']
+    return {keys[0]:{'資料缺口':True}, keys[1]:{'保利狀態':'保利中','保利價':19876}}
+get_model_tracker = lambda *a: SimpleNamespace(protection_plans=protection_plans)
 def record_operation_models(source, specs, api, seconds, **kw):
     st.session_state['model_plan_source'] = source
     st.session_state['model_plan_count'] = len([spec for spec in specs if spec])
@@ -516,6 +547,19 @@ def record_operation_models(source, specs, api, seconds, **kw):
         assert not app.exception
         assert any('19,970' in m.value for m in app.markdown)
         assert app.session_state['model_plan_source'] == '指數操作計畫'
+        sections = [m.value for m in app.markdown]
+        short = next(i for i, value in enumerate(sections) if '短波風險點數' in value)
+        main = next(i for i, value in enumerate(sections) if '計畫風險點數' in value)
+        hourly = next(i for i, value in enumerate(sections) if '60 分 K 風險點數' in value)
+        assert short < main < hourly
+        assert '移動保利' in sections[short] and '保 —' in sections[short] and '資料待確認' in sections[short]
+        assert '移動保利' in sections[main] and '保 19876' in sections[main] and '保利中' in sections[main]
+        assert any('趨勢與關鍵價位（60 分 K）' in value for value in sections)
+        assert all(value in sections[hourly] for value in ('50 點','100 點','1 口最大風險','$500','1 口預估收益','$1,000'))
+        app.selectbox(key='trade_plan_position_count').set_value(2).run()
+        assert not app.exception
+        hourly_risk = next(m.value for m in app.markdown if '60 分 K 風險點數' in m.value)
+        assert all(value in hourly_risk for value in ('2 口最大風險','$1,000','2 口預估收益','$2,000'))
         app.number_input(key='index_scenario_seconds').set_value(9).run()
         assert not app.exception and app.session_state['timer_seconds'] == 9
         assert app.session_state['timer_room'] == 'index'
@@ -650,6 +694,26 @@ def test_refresh_failure_releases_gate_without_claiming_new_data_time():
     assert not state['stock_independent_auto_lock'].locked()
     assert state['stock_independent_auto_updated_at'] == 'original'
     assert '下一輪重試' in state['stock_independent_auto_status']
+
+
+def test_index_view_slows_outside_session_and_resumes_at_next_open():
+    from datetime import datetime
+    ns = load_app_symbols('intraday_auto_interval', 'intraday_auto_window_open', 'model_market_open')
+    now = [datetime(2026, 11, 10, 13, 40)]
+    state = {'sj_logged_in': True, 'sj_api': object()}
+    ns['st'] = SimpleNamespace(session_state=state)
+    ns['datetime'] = SimpleNamespace(now=lambda tz: now[0])
+    ns['is_market_closed_func'] = lambda day: day.weekday() >= 5
+    interval = ns['intraday_auto_interval']
+    assert interval('index', True, 5) == 5
+    now[0] = now[0].replace(hour=14)
+    assert interval('index', True, 5) == 60
+    assert interval('index', True, 90) == 90
+    assert interval('options', True, 5) == 5
+    now[0] = now[0].replace(hour=15, minute=0)
+    assert interval('index', True, 5) == 5
+    state['sj_logged_in'] = False
+    assert interval('index', True, 5) is None
 
 
 def test_table_timers_use_user_interval_and_stop_or_resume_at_session_boundaries():
