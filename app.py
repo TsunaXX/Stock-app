@@ -4996,9 +4996,69 @@ def get_cached_index_minutes(api, interval):
     data = get_strategy_intraday_history(api, contract, 'futures', wait=False)
     if data.empty:
         return data
+    if interval == '60min':
+        return completed_index_hour_bars(data)
     return data.resample(interval, origin='start_day').agg({
         'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum',
     }).dropna(subset=['Open', 'High', 'Low', 'Close'])
+
+
+def completed_index_hour_bars(data):
+    """Align full 60-minute candles to 08:45 and 15:00 without mixing sessions."""
+    data = data.sort_index()
+    if data.empty:
+        return data
+    clock = data.index.time
+    day = (clock > dt_time(8, 45)) & (clock <= dt_time(13, 45))
+    night = (clock > dt_time(15)) | (clock <= dt_time(5))
+    columns = {'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'}
+    groups = []
+    for mask, offset in ((day, '45min'), (night, '0min')):
+        sampled = data[mask].resample('60min', origin='start_day', offset=offset, closed='right', label='right')
+        groups.append(sampled.agg(columns).loc[sampled['Close'].count() >= 60])
+    bars = pd.concat(groups).dropna(subset=['Open', 'High', 'Low', 'Close']).sort_index()
+    return bars[bars.index <= data.index[-1]]
+
+
+def calculate_hourly_index_plan(data):
+    data = data.tail(21)
+    if len(data) < 15:
+        return None
+    close = data['Close']
+    fast = close.ewm(span=5, adjust=False).mean().iloc[-1]
+    slow = close.ewm(span=10, adjust=False).mean().iloc[-1]
+    atr = pd.concat([data['High'] - data['Low'], (data['High'] - close.shift()).abs(),
+                     (data['Low'] - close.shift()).abs()], axis=1).max(axis=1).tail(14).mean()
+    direction = '偏多' if close.iloc[-1] >= fast > slow else '偏空' if close.iloc[-1] <= fast < slow else '盤整'
+    result = {'direction': direction, 'source_time': data.index[-1], 'ema': fast}
+    if direction == '盤整' or not np.isfinite(atr) or atr <= 0:
+        return result
+    long = direction == '偏多'
+    sign = 1 if long else -1
+    entry = float(data['High' if long else 'Low'].iloc[-1]) + sign
+    risk = max(1, round(atr * .5))
+    result.update(entry=entry, stop=entry - sign * risk, target=entry + sign * risk * 2)
+    return result
+
+
+def render_hourly_index_plan(hourly, live_price, fresh):
+    st.divider()
+    st.markdown('#### 🕐 60 分 K 判讀')
+    if not hourly:
+        st.info('等待完整 60 分 K，資料就緒後顯示點位。')
+        return
+    direction = hourly['direction']
+    color = {'偏多': '#ff4b4b', '偏空': '#00c853'}.get(direction, '#ffc107')
+    st.caption(f"{direction}｜完成 K 棒 {hourly['source_time']:%Y/%m/%d %H:%M}｜EMA5 {hourly['ema']:,.0f}")
+    if 'entry' not in hourly:
+        st.info('均線方向未一致，先觀察。')
+        return
+    render_index_plan_metric_cards([
+        {'label': label, 'label_color': color, 'value': f"{hourly[key]:,.0f}", 'color': color}
+        for key, label in (('entry', '觀察進場'), ('stop', '失效／停損'), ('target', '第一目標'))
+    ] + [{'label': '預估風報比', 'label_color': '#40c4ff', 'value': '1 : 2', 'color': '#40c4ff'}])
+    hit = fresh and (live_price >= hourly['entry'] if direction == '偏多' else live_price <= hourly['entry'])
+    st.caption(('已觸及觀察價' if hit else '等待觸及觀察價' if fresh else '等待最新串流') + '｜依最近完成 60 分 K 的高低點及 ATR 判讀。')
 
 
 def get_futures_intraday_state(api, direction, logged_in=None):
@@ -8022,12 +8082,20 @@ def calculate_operation_snapshot(seed_data, api, entry_profile, state, backgroun
     short_wave = get_cached_short_wave_plan(api, short_wave_direction, max_age_seconds=0)
     if short_wave and not fresh:
         short_wave = {**short_wave, 'momentum_ready': False}
+    if state.get('include_hourly') and api is not None and time.monotonic() >= state.get('hourly_retry', 0):
+        state['hourly_retry'] = time.monotonic() + 30
+        try:
+            hourly = calculate_hourly_index_plan(get_cached_index_minutes(api, '60min'))
+            if hourly is not None:
+                state['hourly'] = hourly
+        except (TypeError, ValueError, KeyError, AttributeError):
+            pass  # A malformed hourly input must not block the short-wave plan.
     return {'plan': plan, 'thermometer_data': thermometer_data,
             'index_item': index_item, 'futures_item': futures_item,
             'live_snapshot': live_snapshot, 'live_price': live_price, 'live_change': live_change,
             'intraday_state': intraday_state, 'trade_state': trade_state,
             'short_wave_direction': short_wave_direction, 'short_direction_note': short_direction_note,
-            'short_wave': short_wave, 'fresh': fresh}
+            'short_wave': short_wave, 'fresh': fresh, 'hourly': state.get('hourly')}
 
 
 def index_operation_model_specs(snapshot, quantity, profile, cost_settings=None, version=None):
@@ -8107,7 +8175,7 @@ def index_operation_snapshot(seed_data, seconds):
     signature = data_version([id(api), seconds, profile, quantity, costs, version,
                               st.session_state.get('_index_refresh_generation', 0)])
     scope = f'index_{id(worker)}_{signature[:10]}'
-    state = {}
+    state = {'include_hourly': True}
     cursors = st.session_state.setdefault('_index_operation_cursors', {})
     history_jobs = get_public_maintenance_jobs()
     def load_history():
@@ -8252,6 +8320,100 @@ def render_operation_plan(seed_data, option_page=False, seconds=5, snapshot=None
     if live_snapshot:
         st.caption('來源時間：' + _stream_datetime(live_snapshot['updated']).strftime('%Y/%m/%d %H:%M:%S'))
     if not option_page:
+        position_count = st.selectbox(
+            "預計進場口數",
+            options=[1, 2, 3, 4, 5],
+            format_func=lambda count: f"{count} 口微型臺指",
+            key="trade_plan_position_count",
+            help="此設定會連動更新進出依據與短波當沖的停損金額及預估收益。",
+        )
+        if short_wave_direction == '偏多':
+            short_recommendation, short_color = '短多觀察', '#ff4b4b'
+        elif short_wave_direction == '偏空':
+            short_recommendation, short_color = '短空觀察', '#00c853'
+        else:
+            short_recommendation, short_color = '等待盤中動能', '#ffc107'
+        st.markdown(
+            f"#### ⚡ 短波當沖（5 分 K） <span style='font-size:15px;color:{short_color};font-weight:700'>　{short_recommendation}</span>",
+            unsafe_allow_html=True,
+        )
+        st.caption(f"{short_direction_note}。短波採 EMA5 或前根高低點即時觸發，不等待完整 5 分 K 收盤。")
+        if short_wave:
+            short_rr_color = '#40c4ff' if (short_wave['rr'] or 0) >= 1.25 else '#ffc107'
+            render_index_plan_metric_cards([
+                {
+                    'label': '短波進場區', 'label_color': '#40c4ff',
+                    'value': (
+                        f"{_format_compact_number(short_wave['entry'], 0)} ± "
+                        f"{_format_compact_number(short_wave['zone'], 0)}"
+                    ),
+                    'color': short_color,
+                },
+                {
+                    'label': '短波停損', 'label_color': '#ffc107',
+                    'value': _format_compact_number(short_wave['stop'], 0),
+                    'color': '#ffc107',
+                },
+                {
+                    'label': '短波目標', 'label_color': '#40c4ff',
+                    'value': _format_compact_number(short_wave['target'], 0),
+                    'color': short_color,
+                },
+                {
+                    'label': '短波風報比', 'label_color': '#40c4ff',
+                    'value': (
+                        f"1 : {_format_compact_number(short_wave['rr'], 2)}"
+                        if short_wave['rr'] is not None else "—"
+                    ),
+                    'color': short_rr_color,
+                },
+            ])
+            st.info(f"**快速進場條件：** {short_wave['trigger']}")
+            momentum_label = "已達快速觸發" if short_wave['momentum_ready'] else "接近觸發，等待穿越前根高低點"
+            momentum_color = '#ff4b4b' if short_wave_direction == '偏多' else '#00c853'
+            st.markdown(
+                f"<div style='font-size:14px;font-weight:700;color:{momentum_color}'>即時狀態：{momentum_label}｜"
+                f"EMA5 {short_wave['ema_fast']:,.0f}｜量比 {_format_compact_number(short_wave['volume_ratio'], 2)}</div>",
+                unsafe_allow_html=True,
+            )
+            short_risk_level, short_risk_color, short_risk_ratio = get_trade_risk_level(
+                short_wave['risk'], plan['atr'],
+            )
+            short_risk_amount = short_wave['risk'] * 10 * position_count
+            short_reward_amount = short_wave['reward'] * 10 * position_count
+            render_compact_metric_card_grid([
+                {
+                    'label': '短波風險點數',
+                    'value': f"{short_wave['risk']:,.0f} 點",
+                    'detail': f'風險等級：{short_risk_level}',
+                    'color': short_risk_color,
+                },
+                {
+                    'label': '短波盈利點數',
+                    'value': f"{short_wave['reward']:,.0f} 點",
+                    'color': '#ff4b4b',
+                },
+                {
+                    'label': f'{position_count} 口最大風險',
+                    'value': f'${short_risk_amount:,.0f}',
+                    'color': short_risk_color,
+                },
+                {
+                    'label': f'{position_count} 口預估收益',
+                    'value': f'${short_reward_amount:,.0f}',
+                    'color': '#ff4b4b',
+                },
+            ], columns=4, class_name='compact-metric-grid index-short-risk-grid')
+            st.caption(
+                "以最新 6 根 5 分 K、EMA5 與前根高低點計算；短波停損為日 ATR 的 "
+                f"{_format_compact_number(short_risk_ratio, 2)} 倍。"
+                "短波可先於日線進場許可觸發，但只適合小部位快進快出。"
+            )
+        elif short_wave_direction:
+            st.info("5 分 K 資料尚未就緒，暫不提供短波點位；目前僅有觀察方向，不代表進場條件已通過。")
+        else:
+            st.info("尚未形成可辨識的盤中方向；短波暫不啟用，避免在區間中段雙向追價。")
+        st.divider()
         confirmation_text = intraday_state['confirmation_text']
         display_direction, direction_color = {
             '偏多': ('偏多', '#ff4b4b'), '偏空': ('偏空', '#00c853'),
@@ -8376,13 +8538,6 @@ def render_operation_plan(seed_data, option_page=False, seconds=5, snapshot=None
         )
         st.caption("以日線費波支撐／壓力與 15 分 K 確認；保＝達1R後移動保利，保留1R回撤，最低保護成本。")
         st.info(f"**進場確認：** {plan['trigger']}")
-        position_count = st.selectbox(
-            "預計進場口數",
-            options=[1, 2, 3, 4, 5],
-            format_func=lambda count: f"{count} 口微型臺指",
-            key="trade_plan_position_count",
-            help="此設定會連動更新進出依據與短波當沖的停損金額及預估收益。",
-        )
         model_specs = snapshot.get('model_specs', [])
         render_operation_protection('指數操作計畫', model_specs)
         execution_direction = trade_state.get('execution_direction') or plan.get('direction')
@@ -8471,93 +8626,7 @@ def render_operation_plan(seed_data, option_page=False, seconds=5, snapshot=None
         )
         st.caption("｜".join(signal_details))
 
-        st.divider()
-        if short_wave_direction == '偏多':
-            short_recommendation, short_color = '短多觀察', '#ff4b4b'
-        elif short_wave_direction == '偏空':
-            short_recommendation, short_color = '短空觀察', '#00c853'
-        else:
-            short_recommendation, short_color = '等待盤中動能', '#ffc107'
-        st.markdown(
-            f"#### ⚡ 短波當沖（5 分 K） <span style='font-size:15px;color:{short_color};font-weight:700'>　{short_recommendation}</span>",
-            unsafe_allow_html=True,
-        )
-        st.caption(f"{short_direction_note}。短波採 EMA5 或前根高低點即時觸發，不等待完整 5 分 K 收盤。")
-        if short_wave:
-            short_rr_color = '#40c4ff' if (short_wave['rr'] or 0) >= 1.25 else '#ffc107'
-            render_index_plan_metric_cards([
-                {
-                    'label': '短波進場區', 'label_color': '#40c4ff',
-                    'value': (
-                        f"{_format_compact_number(short_wave['entry'], 0)} ± "
-                        f"{_format_compact_number(short_wave['zone'], 0)}"
-                    ),
-                    'color': short_color,
-                },
-                {
-                    'label': '短波停損', 'label_color': '#ffc107',
-                    'value': _format_compact_number(short_wave['stop'], 0),
-                    'color': '#ffc107',
-                },
-                {
-                    'label': '短波目標', 'label_color': '#40c4ff',
-                    'value': _format_compact_number(short_wave['target'], 0),
-                    'color': short_color,
-                },
-                {
-                    'label': '短波風報比', 'label_color': '#40c4ff',
-                    'value': (
-                        f"1 : {_format_compact_number(short_wave['rr'], 2)}"
-                        if short_wave['rr'] is not None else "—"
-                    ),
-                    'color': short_rr_color,
-                },
-            ])
-            st.info(f"**快速進場條件：** {short_wave['trigger']}")
-            momentum_label = "已達快速觸發" if short_wave['momentum_ready'] else "接近觸發，等待穿越前根高低點"
-            momentum_color = '#ff4b4b' if short_wave_direction == '偏多' else '#00c853'
-            st.markdown(
-                f"<div style='font-size:14px;font-weight:700;color:{momentum_color}'>即時狀態：{momentum_label}｜"
-                f"EMA5 {short_wave['ema_fast']:,.0f}｜量比 {_format_compact_number(short_wave['volume_ratio'], 2)}</div>",
-                unsafe_allow_html=True,
-            )
-            short_risk_level, short_risk_color, short_risk_ratio = get_trade_risk_level(
-                short_wave['risk'], plan['atr'],
-            )
-            short_risk_amount = short_wave['risk'] * 10 * position_count
-            short_reward_amount = short_wave['reward'] * 10 * position_count
-            render_compact_metric_card_grid([
-                {
-                    'label': '短波風險點數',
-                    'value': f"{short_wave['risk']:,.0f} 點",
-                    'detail': f'風險等級：{short_risk_level}',
-                    'color': short_risk_color,
-                },
-                {
-                    'label': '短波盈利點數',
-                    'value': f"{short_wave['reward']:,.0f} 點",
-                    'color': '#ff4b4b',
-                },
-                {
-                    'label': f'{position_count} 口最大風險',
-                    'value': f'${short_risk_amount:,.0f}',
-                    'color': short_risk_color,
-                },
-                {
-                    'label': f'{position_count} 口預估收益',
-                    'value': f'${short_reward_amount:,.0f}',
-                    'color': '#ff4b4b',
-                },
-            ], columns=4, class_name='compact-metric-grid index-short-risk-grid')
-            st.caption(
-                "以最新 6 根 5 分 K、EMA5 與前根高低點計算；短波停損為日 ATR 的 "
-                f"{_format_compact_number(short_risk_ratio, 2)} 倍。"
-                "短波可先於日線進場許可觸發，但只適合小部位快進快出。"
-            )
-        elif short_wave_direction:
-            st.info("5 分 K 資料尚未就緒，暫不提供短波點位；目前僅有觀察方向，不代表進場條件已通過。")
-        else:
-            st.info("尚未形成可辨識的盤中方向；短波暫不啟用，避免在區間中段雙向追價。")
+        render_hourly_index_plan(snapshot.get('hourly'), live_price, snapshot.get('fresh', False))
 
     else:
         option_mode_choices = [
@@ -10427,6 +10496,69 @@ def _is_turnover_security_code(value):
     """Keep ordinary four-digit stocks and 00-prefixed listed/OTC ETFs only."""
     code = str(value or "").strip().upper()
     return bool(re.fullmatch(r"(?:\d{4}|00[0-9A-Z]{4})", code))
+
+
+def official_model_stock_closes(day, codes):
+    """Independently validate each exchange's regular-session closing data."""
+    codes = set(codes)
+    closes = {}
+    try:
+        response = requests.get(_TWSE_DAILY_QUOTES_URL, params={
+            'date': day.strftime('%Y%m%d'), 'type': 'ALLBUT0999', 'response': 'json',
+        }, timeout=(3, 8))
+        response.raise_for_status()
+        payload = response.json()
+        if isinstance(payload, dict) and _parse_roc_trade_date(payload.get('date')) == day:
+            for table in payload.get('tables', []):
+                fields = table.get('fields', [])
+                if '證券代號' not in fields or '收盤價' not in fields:
+                    continue
+                for values in table.get('data', []):
+                    row = dict(zip(fields, values))
+                    code = str(row.get('證券代號', '')).strip()
+                    close = _official_number(row.get('收盤價'))
+                    if code in codes and close and close > 0:
+                        closes[code] = close
+                break
+    except (requests.RequestException, ValueError):
+        pass
+    if codes.difference(closes):
+        try:
+            with _tpex_verified_session() as session:
+                response = session.get(_TPEX_DAILY_QUOTES_URL, timeout=(3, 8))
+                response.raise_for_status()
+                for row in response.json():
+                    if not isinstance(row, dict):
+                        continue
+                    code = str(row.get('SecuritiesCompanyCode', '')).strip()
+                    close = _official_number(row.get('Close'))
+                    if code in codes and code not in closes and close and close > 0 and _parse_roc_trade_date(row.get('Date')) == day:
+                        closes[code] = close
+        except (requests.RequestException, ValueError):
+            pass
+    return closes
+
+
+def check_model_stock_closes(tracker=None):
+    """Use the shared maintenance pool to reconcile once official data is available."""
+    now = datetime.now(pytz.timezone('Asia/Taipei'))
+    if model_market_open({'市場': '股票'}, now):
+        return
+    day = latest_completed_stock_trading_date(now)
+    if tracker is None:
+        url = get_app_secret('gsheet_api_url') or ''
+        if not url and not st.session_state.get('sj_logged_in', False):
+            return
+        tracker = get_model_tracker(url)
+    tracker.last_activity = time.monotonic()
+
+    def settle():
+        codes = {row['商品鍵'] for row in tracker.active_plans('股期戰略室', day.isoformat())
+                 if row.get('市場') == '股票' and row.get('策略') == '當沖' and row.get('模擬進場價') is not None}
+        if codes:
+            tracker.settle_stock_closes(day.isoformat(), official_model_stock_closes(day, codes))
+
+    get_public_maintenance_jobs().poll(('model-stock-closes', id(tracker), day), settle, interval=180)
 
 
 def _build_official_turnover_ranking(
@@ -22060,9 +22192,10 @@ def operation_model_samples(specs, api, seconds, now_value=None, after=None):
         last = evidence[-1] if evidence else {}
         source = parse_strategy_data_time(last.get('來源時間') or spec.get('觀察時間'))
         age = (now.replace(tzinfo=None) - source.to_pydatetime()).total_seconds() if source is not None else None
-        signal_valid = not disconnected and age is not None and 0 <= age <= 30
-        valid = signal_valid and bool(last)
         source_time = pytz.timezone('Asia/Taipei').localize(source.to_pydatetime()).isoformat() if source is not None else now.isoformat()
+        signal_valid = (not disconnected and age is not None and 0 <= age <= 30
+                        and get_futures_trading_date(datetime.fromisoformat(source_time)).date().isoformat() == day)
+        valid = signal_valid and bool(last)
         if spec.get('選擇權腿'):
             valid = valid and all(
                 (premium := last.get('權利金證據', {}).get(leg['代碼'])) is not None
@@ -22099,6 +22232,17 @@ def record_operation_models(source, specs, api, seconds, tracker=None, cursors=N
     current_keys = {spec['商品鍵'] for spec in specs}
     specs += [{**row, '新訊號': False, '進場許可': False} for row in active
               if row['商品鍵'] not in current_keys]
+    lookup = getattr(getattr(api, 'contracts', None), 'get', None)
+    if source == '選擇權操作計畫' and callable(lookup):
+        contracts = []
+        for code in {leg['代碼'] for spec in specs for leg in spec.get('選擇權腿', [])}:
+            try:
+                contract = lookup(code)
+            except (AttributeError, KeyError, TypeError, ValueError):
+                continue
+            if contract is not None and str(contract.code) == code:
+                contracts.append(contract)
+        sync_strategy_stream_scope(api, contracts, 'options_models')
     cursors = st.session_state.setdefault('_operation_model_cursors', {}) if cursors is None else cursors
     signals, quotes = operation_model_samples(specs, api, seconds, after=cursors)
     if signals or quotes:
@@ -22144,9 +22288,8 @@ def model_tracking_samples(rows, stock, mode, direction_choice, config, seconds,
         quote = {'價格': price, '交易日': day.isoformat(), '策略': mode, '更新秒數': seconds,
                  '有效': valid, '休市': not model_market_open({'市場':market,'交易時段':row.get('交易時段','日盤+夜盤')}),
                  '休市銜接': mode == '波段', '來源時間': source.isoformat() if valid else now.isoformat(),
-                 '收盤確認': valid and ((stock and source.time() >= dt_time(13, 30)) or
-                              (not stock and (dt_time(13, 45) <= source.time() < dt_time(15) or
-                                              dt_time(5) <= source.time() < dt_time(8, 45))))}
+                 '收盤確認': valid and not stock and (dt_time(13, 45) <= source.time() < dt_time(15) or
+                                                       dt_time(5) <= source.time() < dt_time(8, 45))}
         stream_code = key
         if not stock and api is not None:
             contract = resolve_shioaji_futures_contract(api, row.get('期貨代碼'), row.get('契約月份'))
@@ -22692,6 +22835,7 @@ def render_model_tracking_room():
         )
     tracker = get_model_tracker(get_app_secret('gsheet_api_url') or '')
     tracker.last_activity = time.monotonic()
+    check_model_stock_closes(tracker)
     cols = st.columns(4)
     with cols[0]:
         now_tw = datetime.now(pytz.timezone('Asia/Taipei'))
@@ -24464,6 +24608,7 @@ def restore_stock_source():
 @st.fragment(run_every=60)
 def render_postclose_maintenance():
     restore_stock_quick_search()
+    check_model_stock_closes()
     if st.session_state.get('_stock_source_restore_needed'):
         restore_stock_source()
     # Reuse this minute tick to resume paused tables; no extra polling fragment.
@@ -27457,6 +27602,7 @@ with tab_fibo:
             sync_strategy_stream_scope(st.session_state.sj_api, [], 'index')
         if not (tab_fibo.open and tab_option_plan.open):
             sync_strategy_stream_scope(st.session_state.sj_api, [], 'options')
+            sync_strategy_stream_scope(st.session_state.sj_api, [], 'options_models')
     if active_plan:
         option_page = tab_option_plan.open
         page = tab_option_plan if option_page else tab_trade_plan

@@ -97,6 +97,29 @@ def test_index_plan_permission_direction_freeze_replay_and_costs(tmp_path):
     assert advance(row, quote)['狀態'] == '等待進場'
 
 
+def test_previous_futures_trading_date_cannot_publish_a_new_operation_signal():
+    ns, state = adapter()
+    ns['get_futures_trading_date'] = lambda now: pd.Timestamp(now.date()) + timedelta(days=now.hour >= 15)
+    tick(state, 'TMFJ6', 20000, 17999)
+    signals, quotes = sample(ns, [spec(ns)], 18000)
+    assert not signals and not next(iter(quotes.values()))['有效']
+
+
+def test_option_recording_keeps_active_legs_when_candidate_changes(tmp_path):
+    ns, state = adapter()
+    tracker = ModelTracker(tmp_path / 'retained-option.sqlite', start=False)
+    plan = spec(ns, option(True), spread=True)
+    for code, price in [('P1', 30), ('P2', 12), ('TMFJ6', 20000)]:
+        tick(state, code, price, 0)
+    tracker.process(*sample(ns, [plan], 0))
+    assert tracker.records()[0]['狀態'] == '模擬持倉'
+    calls = []
+    ns['sync_strategy_stream_scope'] = lambda api, contracts, room: calls.append((room, {c.code for c in contracts}))
+    api = SimpleNamespace(contracts={'P1': SimpleNamespace(code='P1'), 'P2': SimpleNamespace(code='P2')})
+    ns['record_operation_models']('選擇權操作計畫', [], api, 5, tracker=tracker, cursors={})
+    assert calls == [('options_models', {'P1', 'P2'})]
+
+
 @pytest.mark.parametrize('put', [False, True])
 def test_single_bc_bp_use_observed_premium_and_option_tax(tmp_path, put):
     ns, state = adapter()

@@ -24,7 +24,8 @@ def runtime_fixture():
 f = runtime_fixture()
 ns = load_app_symbols('index_operation_snapshot', 'get_intraday_background',
                       'get_stable_index_trade_plan', 'calculate_operation_snapshot',
-                      'index_operation_model_specs', '_stream_datetime', 'parse_strategy_data_time')
+                      'index_operation_model_specs', '_stream_datetime', 'parse_strategy_data_time',
+                      'calculate_hourly_index_plan')
 frame = pd.DataFrame({'Close':[20000.,20100.]}, index=pd.to_datetime(['2026-10-15','2026-10-16']))
 seed = [('加權','^TWII',frame,'synthetic',{'score':50.}), ('期貨','TWF=F',frame,'synthetic',{'score':50.})]
 st.session_state['sj_api'], st.session_state['sj_logged_in'] = f['api'], True
@@ -50,6 +51,7 @@ ns.update(st=st, weakref=weakref, IntradayBackground=IntradayBackground,
     get_cached_futures_intraday_state=lambda *a,**kw:{'vwap':20000.},
     evaluate_trade_entry_state=lambda plan,price,*a:{'can_enter':True,'entry_level':20000.,'invalidation':19900.,'target':20500.},
     resolve_short_wave_direction=lambda *a:('偏多','fixture'),get_cached_short_wave_plan=lambda *a,**kw:None,
+    get_cached_index_minutes=lambda api, interval:pd.DataFrame(),
     operation_model_spec=lambda *a,**kw:None,record_operation_models=record)
 
 st.title('指數操作計畫背景工作驗證')

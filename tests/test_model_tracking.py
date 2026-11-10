@@ -358,6 +358,7 @@ datetime = ModelFixtureDatetime
 '''+f"tracker=ModelTracker({str(tmp_path/'ui.sqlite')!r},start=False)\n"+'''
 get_model_tracker=lambda *a: tracker
 get_app_secret=lambda *a: None
+check_model_stock_closes=lambda tracker: None
 _model_test_config={}
 load_config=lambda: _model_test_config
 CONFIG_FILE='test-config.json'
@@ -757,10 +758,33 @@ def test_verified_close_after_session_end_and_cost_conflict(tmp_path):
     t.process([],{'股票|2330':q})
     row=t.records()[0]
     assert row['狀態']=='已平倉' and row['出場原因']=='收盤' and not row['資料缺口']
+    assert row['模擬出場價'] == 101
     other={**row,'成本設定':{**DEFAULT_COSTS,'slippage_ticks':0}}
     assert merge_trades([row],[other])[0]['資料缺口']
     invalid={**row,'資料缺口':True,'結案時間':'2026-10-08T13:29:59+08:00'}
     assert not merge_trades([invalid],[row])[0]['資料缺口']
+
+
+def test_official_stock_close_settles_entered_daytrade_as_gap_reference(tmp_path):
+    tracker = ModelTracker(tmp_path / 'official-close.sqlite', start=False)
+    day = '2026-10-08'
+    seed = signal(方向='空頭', 進場價=63.6, 停損價=66.5, 目標價=59.3, 跳動點=.1)
+    entered = advance(new_trade(seed), quote(63.6, 序號=1, 串流識別='regular'))
+    entered.update(狀態='監控中斷', 資料缺口=True, 來源時間=f'{day}T13:30:32+08:00')
+    waiting = new_trade(signal(商品鍵='2469'))
+    with tracker.write_db() as db:
+        tracker.store(db, entered)
+        tracker.store(db, waiting)
+    assert tracker.settle_stock_closes('2026-10-09', {'2330': 66}) == 0
+    assert tracker.settle_stock_closes(day, {'2330': 66, '2469': 70}) == 1
+    rows = {r['商品鍵']: r for r in tracker.records()}
+    row = rows['2330']
+    assert row['狀態'] == '已平倉' and row['出場原因'] == '收盤'
+    assert row['模擬進場價'] == 63.5 and row['模擬出場價'] == 66
+    assert row['毛損益'] == -2500 and row['模擬損益'] == -2646
+    assert row['資料缺口'] and performance([row])[0]['有效交易數'] == 0
+    assert rows['2469']['狀態'] == '等待進場'
+    assert tracker.settle_stock_closes(day, {'2330': 67}) == 0
 
 
 def test_new_connection_requires_overlapping_original_evidence():

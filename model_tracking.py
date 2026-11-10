@@ -735,6 +735,9 @@ def advance(record, quote):
     reached_close = (cutoff.hour == 13 and cutoff.minute >= (30 if row['市場'] == '股票' else 45)) or (row['市場'] == '期貨' and cutoff.hour == 5)
     close_session = quote.get('收盤確認', False) and reached_close and row['策略'] == '當沖'
     if stopped or targeted or protected or close_session:
+        if close_session and not option_legs and not (stopped or targeted or protected):
+            exit_price = price
+            pnl = trade_pnl(row, exit_price)
         if option_legs:
             if exit_fills is None:
                 row['資料缺口'] = True
@@ -1125,6 +1128,51 @@ class ModelTracker:
         with closing(self.db()) as db, db:
             rows = db.execute("SELECT body FROM trades WHERE month=? AND state IN ('等待進場','模擬持倉','監控中斷','資料不足') AND json_extract(body,'$.計畫來源')=? AND json_extract(body,'$.交易日')=?", (month, source, day)).fetchall()
         return [row for raw in rows if (row := json.loads(raw[0])).get('計畫來源') == source and row.get('交易日') == day]
+
+    def settle_stock_closes(self, day, official_closes):
+        """Settle still-open stock day trades from date-verified exchange closes."""
+        if not official_closes:
+            return 0
+        month = day[:7].replace('-', '')
+        close_time = f'{day}T13:30:00+08:00'
+        cutoff = stamp(close_time)
+        count = 0
+        with self.write_db() as db:
+            rows = db.execute("""SELECT body FROM trades WHERE month=?
+                AND state IN ('模擬持倉','監控中斷','資料不足')
+                AND json_extract(body,'$.市場')='股票' AND json_extract(body,'$.策略')='當沖'
+                AND json_extract(body,'$.交易日')=?""", (month, day)).fetchall()
+            for raw, in rows:
+                row = json.loads(raw)
+                close = number(official_closes.get(row.get('商品鍵')))
+                entry = number(row.get('模擬進場價'))
+                entered = stamp(row.get('進場時間'))
+                if (close is None or close <= 0 or entry is None or entry <= 0 or entered is None
+                        or entered >= cutoff or entered.date().isoformat() != day or row.get('模擬出場價') is not None):
+                    continue
+                last = stamp(row.get('來源時間'))
+                verified = (row['狀態'] == '模擬持倉' and last == cutoff and row.get('最後序號') is not None
+                            and number(row.get('最新價')) == close)
+                if not verified:
+                    row['資料缺口'] = True
+                    causes = row.setdefault('資料缺口原因', [])
+                    reason = '收盤價已核對；收盤前逐筆行情未完整確認'
+                    if reason not in causes:
+                        causes.append(reason)
+                risk = abs(entry - row['停損價'])
+                sign = 1 if row['方向'] in ('多頭', '偏多') else -1
+                row.update({**trade_pnl(row, close), '模擬出場價': close, '最新價': close,
+                            '結案時間': close_time, '出場原因': '收盤',
+                            '結果(R)': round(sign * (close - entry) / risk, 4) if risk else None})
+                event(row, '已平倉', close_time, '依交易所同日正式收盤價結算')
+                if last is not None and last > cutoff:
+                    row['來源時間'] = last.isoformat()
+                if self.url:
+                    row['同步確認'] = False
+                self.store(db, row)
+                self.revision += 1
+                count += 1
+        return count
 
     def protection_plans(self, market, keys, mode, day, source=None, display_day=None):
         """Bounded current-plan reads by indexed instrument, without loading performance history."""

@@ -281,6 +281,7 @@ def test_background_completion_respects_freeze_and_newer_manual_snapshot():
     exec(compile(ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[])), APP_PATH, 'exec'), ns)
     ns['is_market_closed_func'] = lambda day: day.weekday() >= 5
     ns['time'] = time
+    ns['check_model_stock_closes'] = lambda: None
     current = [pd.Timestamp('2026-10-05 08:30:00', tz='Asia/Taipei')]
     def timestamp(value):
         return pd.Timestamp(value)
@@ -339,6 +340,7 @@ import time
 from datetime import date, time as dt_time
 from types import SimpleNamespace
 restore_stock_quick_search = lambda: None
+check_model_stock_closes = lambda: None
 check_intraday_auto_timer = lambda room: None
 supplement_frozen_stock_rankings = lambda *a: None
 postclose_maintenance_window = lambda now: (pd.Timestamp('2026-10-02 21:00'), date(2026, 10, 2), True, True)
