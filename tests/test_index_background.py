@@ -14,7 +14,7 @@ from test_intraday_background import wait_result
 
 def harness():
     ns = load_app_symbols('index_operation_snapshot', 'calculate_operation_snapshot',
-                          'get_stable_index_trade_plan', 'index_operation_model_specs')
+                          'get_stable_index_trade_plan', 'index_operation_model_specs', 'calculate_hourly_index_plan')
     api = object()
     state = {'lock': threading.RLock()}
     session = {'sj_api': api, 'sj_logged_in': True}
@@ -63,6 +63,7 @@ def harness():
         evaluate_trade_entry_state=lambda plan, price, *a:{'can_enter':True, 'entry_level':20000.,
             'invalidation':19900., 'target':20500., 'price':price},
         resolve_short_wave_direction=lambda *a:('偏多','原方向'), get_cached_short_wave_plan=lambda *a, **kw:None,
+        get_cached_index_minutes=lambda api, interval: pd.DataFrame(),
         operation_model_spec=lambda source, kind, *a, **kw:{'商品鍵':'TMFJ6|'+kind, '進場許可':a[5]},
         record_operation_models=record)
     data = pd.DataFrame({'Close':[20000.,20100.]}, index=pd.to_datetime(['2026-10-15','2026-10-16']))

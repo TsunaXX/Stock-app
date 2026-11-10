@@ -8083,8 +8083,13 @@ def calculate_operation_snapshot(seed_data, api, entry_profile, state, backgroun
     if short_wave and not fresh:
         short_wave = {**short_wave, 'momentum_ready': False}
     if state.get('include_hourly') and api is not None and time.monotonic() >= state.get('hourly_retry', 0):
-        state['hourly'] = calculate_hourly_index_plan(get_cached_index_minutes(api, '60min'))
         state['hourly_retry'] = time.monotonic() + 30
+        try:
+            hourly = calculate_hourly_index_plan(get_cached_index_minutes(api, '60min'))
+            if hourly is not None:
+                state['hourly'] = hourly
+        except (TypeError, ValueError, KeyError, AttributeError):
+            pass  # A malformed hourly input must not block the short-wave plan.
     return {'plan': plan, 'thermometer_data': thermometer_data,
             'index_item': index_item, 'futures_item': futures_item,
             'live_snapshot': live_snapshot, 'live_price': live_price, 'live_change': live_change,
