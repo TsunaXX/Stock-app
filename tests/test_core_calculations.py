@@ -2300,7 +2300,7 @@ def test_index_operation_plan_waits_and_retries_without_missing_data_warning():
     assert '目前缺少足夠的加權或期貨日 K' not in source
     assert "'label': '觀察進場區', 'label_color': '#40c4ff'" in source
     assert "'label': '失效／停損', 'label_color': '#ffc107'" in source
-    assert "'label': '短波進場區', 'label_color': '#40c4ff'" in source
+    assert "'label': '短波進場點', 'label_color': '#40c4ff'" in source
     assert "'label': '短波停損', 'label_color': '#ffc107'" in source
     assert "entry_rr_color" in source
     assert "short_rr_color" in source

@@ -374,9 +374,17 @@ def test_index_hourly_bars_align_to_day_night_and_exclude_forming_hour():
     assert list(bars.index.strftime('%H:%M')) == ['09:45', '16:00']
     assert bars['Close'].tolist() == [59, 134]
     close = pd.Series(range(100, 120), index=pd.date_range('2026-11-09', periods=20, freq='h'))
-    plan = ns['calculate_hourly_index_plan'](pd.DataFrame({'High': close + 2, 'Low': close - 2, 'Close': close}))
+    calculate = ns['calculate_hourly_index_plan']
+    frame = pd.DataFrame({'High': close + 2, 'Low': close - 2, 'Close': close})
+    plan = calculate(frame, {'support': 118, 'resistance': 125.4})
     assert plan['direction'] == '偏多' and plan['entry'] == 122
-    assert plan['stop'] < plan['entry'] < plan['target']
+    assert plan['stop'] == 120 and plan['target'] == 125
+    assert '風報比不足' in calculate(frame, {'support': 118, 'resistance': 123.4})['wait_reason']
+    falling = frame * -1 + 220
+    falling[['High', 'Low']] = falling[['Low', 'High']].to_numpy()
+    short = calculate(falling, {'support': 95.4, 'resistance': 103})
+    assert short['direction'] == '偏空' and short['entry'] == 98
+    assert short['stop'] == 100 and short['target'] == 96
 
 
 def test_index_tracking_fragment_ui_keeps_daily_plan_when_live_price_changes():
@@ -513,7 +521,9 @@ render_postclose_maintenance = lambda: None
 refresh_index_background_history = lambda api, seed: seed
 def protection_plans(market, keys, mode, day, source):
     assert source == '指數操作計畫' and keys == ['TMF|短波5分K','TMF|日線／15分K']
-    return {keys[0]:{'資料缺口':True}, keys[1]:{'保利狀態':'保利中','保利價':19876}}
+    return {keys[0]:{'資料缺口':True,'狀態':'資料不足','方向':'偏空',
+                    '進場價':19985.4,'停損價':20035.2,'目標價':19875.3},
+            keys[1]:{'保利狀態':'保利中','保利價':19876,'狀態':'模擬持倉','模擬進場價':20000}}
 get_model_tracker = lambda *a: SimpleNamespace(protection_plans=protection_plans)
 def record_operation_models(source, specs, api, seconds, **kw):
     st.session_state['model_plan_source'] = source
@@ -553,9 +563,12 @@ def record_operation_models(source, specs, api, seconds, **kw):
         main = next(i for i, value in enumerate(sections) if '計畫風險點數' in value)
         hourly = next(i for i, value in enumerate(sections) if '60 分 K 風險點數' in value)
         assert short < main < hourly
-        assert '移動保利' in sections[short] and '保 —' in sections[short] and '資料待確認' in sections[short]
+        assert '移動保利' in sections[short] and '保 —' in sections[short] and '等待成交證據' in sections[short]
         assert '移動保利' in sections[main] and '保 19876' in sections[main] and '保利中' in sections[main]
-        assert any('趨勢與關鍵價位（60 分 K）' in value for value in sections)
+        assert any('日線費波撐壓 × 15 分 K 確認' in value for value in sections)
+        assert any('日線費波撐壓 × 60 分 K 趨勢' in value for value in sections)
+        assert any('短波進場點' in value and '19,985' in value and '±' not in value for value in sections)
+        assert any('color:#00c853' in value and '完成 K 棒' in value and 'EMA5' in value for value in sections)
         assert all(value in sections[hourly] for value in ('50 點','100 點','1 口最大風險','$500','1 口預估收益','$1,000'))
         app.selectbox(key='trade_plan_position_count').set_value(2).run()
         assert not app.exception
