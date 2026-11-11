@@ -25950,48 +25950,61 @@ if tab1.open and stock_strategy_tab.open:
                              if len(cand_to_fetch) >= needed: break
 
                         if cand_to_fetch:
-                            with st.spinner(f"正在遞補 {len(cand_to_fetch)} 檔股票..."):
-                                # 🚀 1. 優先從「背景預載快取」提取 (瞬間完成)
-                                ready_results = []
-                                remaining_to_fetch = []
+                            prefetch = st.session_state.prefetch_cache
+                            ready_results = []
+                            remaining_to_fetch = []
+                            for cand in cand_to_fetch:
+                                cached = prefetch.get(cand[0])
+                                if cached and str(cached.get('代號')) == cand[0]:
+                                    ready_results.append(cached)
+                                else:
+                                    remaining_to_fetch.append(cand)
 
-                                for cand in cand_to_fetch:
-                                    t_code = cand[0]
-                                    cached = st.session_state.get('prefetch_cache', {}).pop(t_code, None)
-                                    if cached and str(cached.get('代號')) == t_code:
-                                        ready_results.append(cached)
-                                    else:
-                                        remaining_to_fetch.append(cand)
+                            if remaining_to_fetch:
+                                auto_refill = bool(st.session_state.get('stock_auto_timer_seconds'))
+                                worker_sj_logged_in = st.session_state.get('sj_logged_in', False)
+                                worker_sj_api = st.session_state.get('sj_api')
 
-                                # 🚀 2. 若快取不足(例如剛開啟網頁還沒預載完)，才即時抓取剩下的
-                                if remaining_to_fetch:
-                                    worker_sj_logged_in = st.session_state.get('sj_logged_in', False)
-                                    worker_sj_api = st.session_state.get('sj_api')
-                                    def _replenish_worker(cand):
-                                        time.sleep(API_REQUEST_GAP_SECONDS)
-                                        t_code, t_name, t_src, t_extra = cand
-                                        res = fetch_stock_data_raw(
-                                            t_code, t_name, t_extra, futures_copy, notes_copy,
-                                            code_map_copy, worker_sj_logged_in, worker_sj_api,
-                                        )
-                                        if res: res.update({'_source': t_src, '_order': t_extra, '_source_rank': 1})
-                                        return res
+                                def fetch_replacement(cand):
+                                    time.sleep(API_REQUEST_GAP_SECONDS)
+                                    code, name, _, extra = cand
+                                    return fetch_stock_data_raw(
+                                        code, name, extra, futures_copy, notes_copy, code_map_copy,
+                                        worker_sj_logged_in, worker_sj_api, include_live_quote=not auto_refill,
+                                    )
 
-                                    with ThreadPoolExecutor(max_workers=ANALYSIS_MAX_WORKERS) as executor:
-                                        results = list(executor.map(_replenish_worker, remaining_to_fetch))
-                                        valid_results = [r for r in results if r]
-                                        ready_results.extend(valid_results)
+                                if auto_refill:
+                                    key = ('stock-replacements', id(worker_sj_api), data_version([
+                                        st.session_state.get('_stock_source_updated_at'),
+                                        latest_completed_stock_trading_date().isoformat(), remaining_to_fetch,
+                                    ]))
+                                    results = get_public_maintenance_jobs().poll(
+                                        key, lambda: [fetch_replacement(cand) for cand in remaining_to_fetch],
+                                        interval=60,
+                                    )
+                                    if results is None:
+                                        st.caption('正在背景遞補股票；現有表格持續更新。')
+                                        ready_results.clear()
+                                    elif not any(results) and not ready_results:
+                                        st.caption('暫未取得遞補資料；保留現有清單並稍後重試。')
+                                else:
+                                    with st.spinner(f"正在遞補 {len(remaining_to_fetch)} 檔股票..."):
+                                        with ThreadPoolExecutor(max_workers=ANALYSIS_MAX_WORKERS) as executor:
+                                            results = list(executor.map(fetch_replacement, remaining_to_fetch))
+                                    if not any(results) and not ready_results:
+                                        st.warning('本次尚未取得遞補股票資料，保留現有清單，稍後可再試。')
+                                ready_results.extend(row for row in (results or []) if row)
 
+                            if ready_results:
                                 candidate_order = {str(cand[0]): i for i, cand in enumerate(cand_to_fetch)}
                                 ready_results.sort(key=lambda row: candidate_order[str(row['代號'])])
+                                for row in ready_results:
+                                    prefetch.pop(str(row['代號']), None)
                                 st.session_state.stock_data = append_replacement_stock_rows(
                                     st.session_state.stock_data, ready_results,
                                 )
-
                                 save_data_cache(st.session_state.stock_data, st.session_state.ignored_stocks, st.session_state.all_candidates, st.session_state.saved_notes, sync_cloud=False)
-                                if ready_results:
-                                    st.rerun()  # Only rerun after a successful addition.
-                                st.warning('本次尚未取得遞補股票資料，保留現有清單，稍後可再試。')
+                                st.rerun()
 
 
                 st.markdown("---")
