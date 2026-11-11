@@ -397,7 +397,8 @@ def test_background_cloud_sync_merges_each_scope_and_requires_readback(tmp_path)
     assert all(row[1]['from_remote'] == row[0] and row[2]['verify'] is True for row in writes)
 
 def test_background_merge_preserves_remote_selections_and_newer_ranking():
-    ns = helpers('merge_postclose_scope', '_newer_timestamped_state', '_state_updated_at')
+    ns = helpers('merge_postclose_scope', '_newer_timestamped_state', '_state_updated_at',
+                 '_prefer_newer_cache_payload', '_cache_payload_timestamp')
     remote = {'stock_data': [{'代號': '2330'}], 'quick_search_state': {'codes': ['2330']},
               'strategy_ranking_snapshots': {'daytrade': {'updated_at': '2026-10-02T22:00:00+08:00', 'score': 99}}}
     local = {'stock_data': [{'代號': '1815'}], 'quick_search_state': {'codes': ['1815']},
