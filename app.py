@@ -25865,9 +25865,9 @@ if tab1.open and stock_strategy_tab.open:
                     # The auto worker already warms these histories when active.
                     api = st.session_state.sj_api
                     for code in st.session_state.stock_main_visible_codes:
+                        contract = get_shioaji_stock_contract(api, code)
                         if not check_shioaji_connection(api):
                             break
-                        contract = get_shioaji_stock_contract(api, code)
                         if contract is not None:
                             get_strategy_intraday_history(api, contract, copy_result=False)
                 edited_df = st.container(key='stock-strategy-grid').data_editor(

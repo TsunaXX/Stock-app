@@ -2022,10 +2022,10 @@ def test_independent_tables_use_the_same_post_21_ranking():
     source = APP_PATH.read_text(encoding="utf-8")
     assert "independent_rows, strategy_mode, '期貨獨立計算'" in source
     assert "df_indep, indep_strategy_mode, '股票獨立計算'" in source
-    main_futures_table = source.index("edited = st.data_editor(", source.index("def futures_column_config"))
+    main_futures_table = source.index("key=futures_editor_key", source.index("def futures_column_config"))
     main_futures_rank = source.index("render_strategy_ranking(display_rows, strategy_mode, '期貨',")
     assert main_futures_table < main_futures_rank
-    main_stock_table = source.index("edited_df = st.data_editor(", source.index("stock_editor_key ="))
+    main_stock_table = source.index("key=stock_editor_key", source.index("stock_editor_key ="))
     main_stock_rank = source.index("render_strategy_ranking(df_display, strategy_mode, '股票',")
     assert main_stock_table < main_stock_rank
     assert "查看策略信心明細" not in source
