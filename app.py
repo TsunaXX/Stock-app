@@ -13508,10 +13508,12 @@ def normalize_stock_display_settings(value):
                 if not isinstance(quote, dict):
                     continue
                 day = _parse_roc_trade_date(quote.get('date'))
-                price = _safe_number(quote.get('price'))
-                if day is not None and price is not None and price > 0:
+                price = _to_number(quote.get('price'))
+                change = _to_number(quote.get('change'))
+                if day is not None and price is not None and math.isfinite(price) and price > 0:
                     normalized[str(code)] = {
-                        'date': day.isoformat(), 'price': price, 'change': _safe_number(quote.get('change')),
+                        'date': day.isoformat(), 'price': price,
+                        'change': change if change is not None and math.isfinite(change) else None,
                     }
         elif key == 'independent_analysis':
             normalized = {

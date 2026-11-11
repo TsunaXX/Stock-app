@@ -580,7 +580,7 @@ def test_stock_table_reconciles_missing_closes_after_auction_and_keeps_strategy_
 
 
 def test_stock_close_sync_preserves_both_devices_and_newer_trade_date():
-    ns = helpers('normalize_stock_display_settings', '_parse_roc_trade_date')
+    ns = load_app_symbols('normalize_stock_display_settings', '_parse_roc_trade_date', '_to_number')
     normalize = ns['normalize_stock_display_settings']
     merge = ns['merge_stock_preferences']
     earlier = '2026-11-11T14:00:00+08:00'
