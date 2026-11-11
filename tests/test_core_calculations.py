@@ -2194,7 +2194,7 @@ def test_render_uses_persistent_shioaji_env_and_cached_startup_snapshots():
     requirements = (APP_PATH.parent / "requirements.txt").read_text(encoding="utf-8")
     assert "SHIOAJI_API_KEY" in render_yaml
     assert "SHIOAJI_SECRET_KEY" in render_yaml
-    assert "st.session_state._stock_cache_refresh_pending = False" in source
+    assert "st.session_state['_stock_cache_refresh_pending'] = False" in source
     assert "def _fetch_remote_scope_cached" in source
     assert "save_fibo_config(sync_cloud=False)" in source
     assert "def fetch_fibonacci_yahoo_history" in source

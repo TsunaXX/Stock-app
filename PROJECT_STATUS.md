@@ -14,7 +14,7 @@
 | 電腦本機版本／未提交修改 | 本次於 Windows 工作目錄完成指定功能與測試；日後狀態以當時 Git 狀態為準 |
 
 ## 當前結果
-- [PR #98](https://github.com/TsunaXX/Stock-app/pull/98) 重啟後若首次讀取股票快照逾時，背景回讀成功會還原完整主表。獨立計算與主表分開顯示，成功的股票與期貨獨立結果沿用 Google Sheet 同步。離開交易日或契約到期時不顯示失效策略。模擬啟動逾時、後續恢復、顯式清空及還原獨立分析的本機回歸通過。
+- [PR #98](https://github.com/TsunaXX/Stock-app/pull/98) 重啟後若首次讀取股票快照逾時，背景回讀成功會還原完整主表。獨立計算與主表分開顯示，成功的股票與期貨獨立結果沿用 Google Sheet 同步。離開交易日或契約到期時不顯示失效策略。模擬啟動逾時、後續恢復、顯式清空及還原獨立分析的本機回歸通過，390px 版面可顯示已還原的股票獨立表格且頁面無橫向溢出。
 - [PR #97](https://github.com/TsunaXX/Stock-app/pull/97) 股期主表和獨立分析在下一輪結果抵達前保持原行情與點位清晰可讀。股票自動更新期間，缺額遞補在背景處理，成功後維持來源列、遞補列、快速查詢列的排序。Streamlit 1.61.1 模擬連續更新時，1280px 與 390px 兩種寬度都保持表格不變淡。[Python 3.12／3.14 CI](https://github.com/TsunaXX/Stock-app/actions/runs/42938579866) 各 618 項通過。
 - [PR #96](https://github.com/TsunaXX/Stock-app/pull/96) 指數短波改顯示與模型共用的整點觸發價；微台模型以有成交量的逐筆成交作為證據。保利狀態分開顯示等待、持倉、出場與行情缺口，60 分 K 納入日線費波撐壓。[Python 3.12／3.14 CI](https://github.com/TsunaXX/Stock-app/actions/runs/42802237222) 各 617 項通過，多空模擬均走完進場、達 1R 啟動、保利出場。Streamlit 18:53:20 拉取合併提交 08b8206220a83e6691eed428294d9d87f5a73754；行情回呼執行版本待驗證。
 - [PR #95](https://github.com/TsunaXX/Stock-app/pull/95) 指數操作計畫將保利卡片分別置於短波與日線／15 分 K，頁尾「趨勢與關鍵價位（60 分 K）」新增風險及收益卡片。分鐘 K 優先聚合策略實際需要的資料，休市畫面降頻。[Python 3.12／3.14 CI](https://github.com/TsunaXX/Stock-app/actions/runs/42797236731) 各 615 項通過。68,400 根合成分鐘 K 聚合中位耗時，5／15／60 分 K 分別從 8.12／5.74／39.27 ms 降至 2.24／2.26／6.89 ms。
