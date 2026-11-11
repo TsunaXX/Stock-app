@@ -21,6 +21,7 @@ from model_tracking import PROTECTION_POLICY, entry_economics, executable_entry_
 
 import numpy as np
 import pandas as pd
+import pytest
 import pytz
 import plotly.graph_objects as go
 from bs4 import BeautifulSoup
@@ -2021,10 +2022,10 @@ def test_independent_tables_use_the_same_post_21_ranking():
     source = APP_PATH.read_text(encoding="utf-8")
     assert "independent_rows, strategy_mode, '期貨獨立計算'" in source
     assert "df_indep, indep_strategy_mode, '股票獨立計算'" in source
-    main_futures_table = source.index("edited = st.data_editor(", source.index("def futures_column_config"))
+    main_futures_table = source.index("key=futures_editor_key", source.index("def futures_column_config"))
     main_futures_rank = source.index("render_strategy_ranking(display_rows, strategy_mode, '期貨',")
     assert main_futures_table < main_futures_rank
-    main_stock_table = source.index("edited_df = st.data_editor(", source.index("stock_editor_key ="))
+    main_stock_table = source.index("key=stock_editor_key", source.index("stock_editor_key ="))
     main_stock_rank = source.index("render_strategy_ranking(df_display, strategy_mode, '股票',")
     assert main_stock_table < main_stock_rank
     assert "查看策略信心明細" not in source
@@ -3839,7 +3840,8 @@ def test_stream_status_names_actual_fallbacks_and_clears_recovered_warning():
     assert not ns['get_market_stream_status'](None)['fallback_products']
 
 
-def test_stock_refill_ui_keeps_quick_query_after_cached_replacement():
+@pytest.mark.parametrize('auto_refill', [False, True])
+def test_stock_refill_ui_keeps_quick_query_after_replacement(auto_refill):
     from unittest.mock import patch
     import requests
     from streamlit.testing.v1 import AppTest
@@ -3862,6 +3864,25 @@ render_opening_direction_prompt = lambda: None
 """
     # Set up once: the deletion path reruns after a replacement is inserted.
     setup = "if not st.session_state.get('_refill_fixture'):\n" + ''.join('    '+line+'\n' for line in setup.strip().splitlines()) + "    st.session_state['_refill_fixture'] = True\n"
+    if auto_refill:
+        setup += """
+if 'refill_row' not in st.session_state:
+    st.session_state.refill_row = st.session_state.prefetch_cache.pop('8111')
+def fixture_auto_timer(room):
+    st.session_state[f'{room}_auto_timer_seconds'] = 5 if room == 'stock' else None
+    return st.session_state[f'{room}_auto_timer_seconds']
+configure_intraday_auto_timer = fixture_auto_timer
+check_intraday_auto_timer = lambda room: None
+def poll_replacement(key, loader, interval):
+    assert key[0] == 'stock-replacements' and interval == 60
+    return loader() if st.session_state.get('refill_ready') else None
+get_public_maintenance_jobs = lambda: SimpleNamespace(poll=poll_replacement)
+def fixture_replacement(*args, include_live_quote, background):
+    assert background and not include_live_quote
+    return st.session_state.refill_row
+fetch_stock_data_raw = fixture_replacement
+API_REQUEST_GAP_SECONDS = 0
+"""
     anchor = 'tab1, tab_fibo, tab2, tab_db, tab_company, tab3 = st.tabs(['
     source = source.replace(anchor, setup + '\n' + anchor)
     with patch('requests.get', side_effect=requests.ConnectionError('offline')), \
@@ -3870,6 +3891,12 @@ render_opening_direction_prompt = lambda: None
          patch('yfinance.Ticker', return_value=SimpleNamespace(history=lambda *a, **kw: pd.DataFrame(), fast_info={}, info={})):
         app = AppTest.from_string(source, default_timeout=120).run()
         assert not app.exception
+        if auto_refill:
+            assert app.session_state['stock_data']['代號'].tolist() == ['2413','6226','4989','7751','1815']
+            assert any('正在背景遞補股票' in caption.value for caption in app.caption)
+            app.session_state['refill_ready'] = True
+            app.run()
+            assert not app.exception
         assert app.session_state['stock_data']['代號'].tolist() == ['2413','6226','4989','7751','8111','1815']
 
 

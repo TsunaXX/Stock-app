@@ -11291,6 +11291,12 @@ st.markdown("""
     .holiday-tag { font-size: 0.85em; margin-bottom: 2px; color: #ffeb3b; background-color: rgba(0,0,0,0.5); border-radius: 3px; padding: 1px;}
     .today-border { border: 3px solid #ffff00 !important; }
     div[data-testid="stDataFrame"], div[data-testid="stDataEditor"] { font-size:0.84rem; }
+    /* Keep the last rendered strategy grid readable while its fragment updates. */
+    :is(.st-key-stock-strategy-grid, .st-key-stock-independent-grid,
+        .st-key-futures-strategy-grid, .st-key-futures-independent-grid) [data-stale="true"] {
+        opacity:1;
+        transition:none;
+    }
     div[data-testid="stDataFrame"] [role="gridcell"],
     div[data-testid="stDataFrame"] [role="columnheader"],
     div[data-testid="stDataEditor"] [role="gridcell"],
@@ -21044,7 +21050,7 @@ def completed_stock_strategy_history(history, now_value=None):
 def fetch_stock_data_raw(
     code, name_hint="", extra_data=None, futures_set=None,
     saved_notes_dict=None, name_map_dict=None, sj_logged_in=False,
-    sj_api=None, include_live_quote=True, strategy_target_date=None,
+    sj_api=None, include_live_quote=True, strategy_target_date=None, background=False,
 ):
     code = str(code).strip()
     hist = pd.DataFrame()
@@ -21054,7 +21060,7 @@ def fetch_stock_data_raw(
     
     # 優先使用永豐 API 擷取昨日/歷史日 K 線資料
     if sj_logged_in and sj_api is not None:
-        sj_df = fetch_shioaji_data(sj_api, code, interval='1d', lookback_days=180)
+        sj_df = fetch_shioaji_data(sj_api, code, interval='1d', lookback_days=180, background=background)
         if not sj_df.empty:
             hist = sj_df
             source_used = "shioaji"
@@ -21875,13 +21881,12 @@ def background_intraday_rows(room, rows, visible_codes=None, strategy_mode='當�
         if result is None:
             st.session_state[f'{room}_auto_status'] = '伺服器背景更新啟動中；保留上次資料與來源時間。'
             return rows
-        checked = pd.Timestamp(result['checked_at']).tz_convert('Asia/Taipei').strftime('%Y/%m/%d %H:%M:%S')
-        status = (f"伺服器背景更新｜本輪 {result['count']} 檔｜耗時 {result['duration']:.2f} 秒｜檢查時間：{checked}"
-                  if result['count'] else f'等待新串流或背景分 K 資料；保留上次資料與來源時間。｜背景檢查時間：{checked}')
+        status = (f"伺服器背景更新｜本輪 {result['count']} 檔" if result['count']
+                  else '暫無新行情；顯示上次資料與來源時間。')
         if result['outside']:
-            status = '目前不在更新時段；保留上次資料與來源時間。｜背景檢查時間：' + checked
+            status = '目前不在更新時段；保留上次資料與來源時間。'
         if result['error']:
-            status = '本輪更新失敗，下一輪重試；保留上次資料與來源時間。｜背景檢查時間：' + checked
+            status = '本輪更新失敗，下一輪重試；保留上次資料與來源時間。'
         st.session_state[f'{room}_auto_status'] = status
         if result['updated_at']:
             st.session_state[f'{room}_auto_updated_at'] = pd.Timestamp(result['updated_at']).tz_convert('Asia/Taipei').strftime('%Y/%m/%d %H:%M:%S')
@@ -24038,7 +24043,7 @@ def render_futures_strategy_room():
             editor_display = display_rows[futures_display_columns].copy()
             editor_display['收盤價'] = editor_display['收盤價'].apply(fmt_price)
             editor_display['漲跌幅'] = editor_display['漲跌幅'].apply(_signed_percent)
-            edited = st.data_editor(
+            edited = st.container(key='futures-strategy-grid').data_editor(
                 editor_display.style.apply(style_futures_row, axis=1, source_frame=display_rows),
                 column_config=futures_column_config(editor_display),
                 hide_index=True, width='stretch', row_height=30,
@@ -24196,7 +24201,7 @@ def render_futures_strategy_room():
             independent_display = independent_rows[independent_columns].copy()
             independent_display['收盤價'] = independent_display['收盤價'].apply(fmt_price)
             independent_display['漲跌幅'] = independent_display['漲跌幅'].apply(_signed_percent)
-            st.dataframe(
+            st.container(key='futures-independent-grid').dataframe(
                 independent_display.style.apply(style_futures_row, axis=1, source_frame=independent_rows),
                 column_config=futures_column_config(independent_display, include_ignore=False),
                 hide_index=True, width='stretch', row_height=30
@@ -25852,19 +25857,20 @@ if tab1.open and stock_strategy_tab.open:
                     f"main_editor_{st.session_state.stock_strategy_editor_revision}_{stock_table_signature}"
                 )
                 st.session_state.stock_main_visible_codes = df_display['代號'].astype(str).tolist()
-                if stock_auto_enabled:
+                if stock_auto_enabled and st.session_state.stock_main_visible_codes != codes:
                     background_intraday_rows('stock', st.session_state.stock_data,
                                              visible_codes=st.session_state.stock_main_visible_codes)
-                if st.session_state.get('sj_logged_in', False) and st.session_state.get('sj_api') is not None:
-                    # Warm the manual button's history without blocking table display.
+                if (not st.session_state.get('stock_auto_timer_seconds')
+                        and st.session_state.get('sj_logged_in', False) and st.session_state.get('sj_api') is not None):
+                    # The auto worker already warms these histories when active.
+                    api = st.session_state.sj_api
                     for code in st.session_state.stock_main_visible_codes:
-                        api = st.session_state.sj_api
                         contract = get_shioaji_stock_contract(api, code)
                         if not check_shioaji_connection(api):
                             break
                         if contract is not None:
-                            get_strategy_intraday_history(api, contract)
-                edited_df = st.data_editor(
+                            get_strategy_intraday_history(api, contract, copy_result=False)
+                edited_df = st.container(key='stock-strategy-grid').data_editor(
                     styled_df,
                     column_config={
                         **risk_column_config,
@@ -25944,48 +25950,62 @@ if tab1.open and stock_strategy_tab.open:
                              if len(cand_to_fetch) >= needed: break
 
                         if cand_to_fetch:
-                            with st.spinner(f"正在遞補 {len(cand_to_fetch)} 檔股票..."):
-                                # 🚀 1. 優先從「背景預載快取」提取 (瞬間完成)
-                                ready_results = []
-                                remaining_to_fetch = []
+                            prefetch = st.session_state.prefetch_cache
+                            ready_results = []
+                            remaining_to_fetch = []
+                            for cand in cand_to_fetch:
+                                cached = prefetch.get(cand[0])
+                                if cached and str(cached.get('代號')) == cand[0]:
+                                    ready_results.append(cached)
+                                else:
+                                    remaining_to_fetch.append(cand)
 
-                                for cand in cand_to_fetch:
-                                    t_code = cand[0]
-                                    cached = st.session_state.get('prefetch_cache', {}).pop(t_code, None)
-                                    if cached and str(cached.get('代號')) == t_code:
-                                        ready_results.append(cached)
-                                    else:
-                                        remaining_to_fetch.append(cand)
+                            if remaining_to_fetch:
+                                auto_refill = bool(st.session_state.get('stock_auto_timer_seconds'))
+                                worker_sj_logged_in = st.session_state.get('sj_logged_in', False)
+                                worker_sj_api = st.session_state.get('sj_api')
 
-                                # 🚀 2. 若快取不足(例如剛開啟網頁還沒預載完)，才即時抓取剩下的
-                                if remaining_to_fetch:
-                                    worker_sj_logged_in = st.session_state.get('sj_logged_in', False)
-                                    worker_sj_api = st.session_state.get('sj_api')
-                                    def _replenish_worker(cand):
-                                        time.sleep(API_REQUEST_GAP_SECONDS)
-                                        t_code, t_name, t_src, t_extra = cand
-                                        res = fetch_stock_data_raw(
-                                            t_code, t_name, t_extra, futures_copy, notes_copy,
-                                            code_map_copy, worker_sj_logged_in, worker_sj_api,
-                                        )
-                                        if res: res.update({'_source': t_src, '_order': t_extra, '_source_rank': 1})
-                                        return res
+                                def fetch_replacement(cand):
+                                    time.sleep(API_REQUEST_GAP_SECONDS)
+                                    code, name, _, extra = cand
+                                    return fetch_stock_data_raw(
+                                        code, name, extra, futures_copy, notes_copy, code_map_copy,
+                                        worker_sj_logged_in, worker_sj_api,
+                                        include_live_quote=not auto_refill, background=auto_refill,
+                                    )
 
-                                    with ThreadPoolExecutor(max_workers=ANALYSIS_MAX_WORKERS) as executor:
-                                        results = list(executor.map(_replenish_worker, remaining_to_fetch))
-                                        valid_results = [r for r in results if r]
-                                        ready_results.extend(valid_results)
+                                if auto_refill:
+                                    key = ('stock-replacements', id(worker_sj_api), data_version([
+                                        st.session_state.get('_stock_source_updated_at'),
+                                        latest_completed_stock_trading_date().isoformat(), remaining_to_fetch,
+                                    ]))
+                                    results = get_public_maintenance_jobs().poll(
+                                        key, lambda: [fetch_replacement(cand) for cand in remaining_to_fetch],
+                                        interval=60,
+                                    )
+                                    if results is None:
+                                        st.caption('正在背景遞補股票；現有表格持續更新。')
+                                        ready_results.clear()
+                                    elif not any(results) and not ready_results:
+                                        st.caption('暫未取得遞補資料；保留現有清單並稍後重試。')
+                                else:
+                                    with st.spinner(f"正在遞補 {len(remaining_to_fetch)} 檔股票..."):
+                                        with ThreadPoolExecutor(max_workers=ANALYSIS_MAX_WORKERS) as executor:
+                                            results = list(executor.map(fetch_replacement, remaining_to_fetch))
+                                    if not any(results) and not ready_results:
+                                        st.warning('本次尚未取得遞補股票資料，保留現有清單，稍後可再試。')
+                                ready_results.extend(row for row in (results or []) if row)
 
+                            if ready_results:
                                 candidate_order = {str(cand[0]): i for i, cand in enumerate(cand_to_fetch)}
                                 ready_results.sort(key=lambda row: candidate_order[str(row['代號'])])
+                                for row in ready_results:
+                                    prefetch.pop(str(row['代號']), None)
                                 st.session_state.stock_data = append_replacement_stock_rows(
                                     st.session_state.stock_data, ready_results,
                                 )
-
                                 save_data_cache(st.session_state.stock_data, st.session_state.ignored_stocks, st.session_state.all_candidates, st.session_state.saved_notes, sync_cloud=False)
-                                if ready_results:
-                                    st.rerun()  # Only rerun after a successful addition.
-                                st.warning('本次尚未取得遞補股票資料，保留現有清單，稍後可再試。')
+                                st.rerun()
 
 
                 st.markdown("---")
@@ -26455,7 +26475,7 @@ if tab1.open and stock_strategy_tab.open:
                                 })
 
                         st.session_state.stock_independent_visible_codes = df_indep['代號'].astype(str).tolist()
-                        st.dataframe(
+                        st.container(key='stock-independent-grid').dataframe(
                             styled_indep,
                             column_config={
                                 **indep_column_config,

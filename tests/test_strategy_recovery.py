@@ -193,8 +193,8 @@ def test_stock_history_warmup_auth_error_keeps_table_visible_in_app_test():
     names = {'get_shioaji_stock_contract','_is_shioaji_auth_error','check_shioaji_connection','invalidate_shioaji_connection'}
     definitions = '\n'.join(ast.unparse(n) for n in ast.parse(source).body
                             if isinstance(n, ast.FunctionDef) and n.name in names)
-    marker = source.index('# Warm the manual button')
-    start = source.rfind("                if st.session_state.get('sj_logged_in'", 0, marker)
+    marker = source.index('# The auto worker already warms these histories')
+    start = source.rfind("                if (not st.session_state.get('stock_auto_timer_seconds')", 0, marker)
     warmup = textwrap.dedent(source[start:source.index('                edited_df =', marker)])
     setup = """
 import streamlit as st
