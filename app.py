@@ -11291,6 +11291,12 @@ st.markdown("""
     .holiday-tag { font-size: 0.85em; margin-bottom: 2px; color: #ffeb3b; background-color: rgba(0,0,0,0.5); border-radius: 3px; padding: 1px;}
     .today-border { border: 3px solid #ffff00 !important; }
     div[data-testid="stDataFrame"], div[data-testid="stDataEditor"] { font-size:0.84rem; }
+    /* Keep the last rendered strategy grid readable while its fragment updates. */
+    :is(.st-key-stock-strategy-grid, .st-key-stock-independent-grid,
+        .st-key-futures-strategy-grid, .st-key-futures-independent-grid) [data-stale="true"] {
+        opacity:1;
+        transition:none;
+    }
     div[data-testid="stDataFrame"] [role="gridcell"],
     div[data-testid="stDataFrame"] [role="columnheader"],
     div[data-testid="stDataEditor"] [role="gridcell"],
@@ -21875,13 +21881,12 @@ def background_intraday_rows(room, rows, visible_codes=None, strategy_mode='當�
         if result is None:
             st.session_state[f'{room}_auto_status'] = '伺服器背景更新啟動中；保留上次資料與來源時間。'
             return rows
-        checked = pd.Timestamp(result['checked_at']).tz_convert('Asia/Taipei').strftime('%Y/%m/%d %H:%M:%S')
-        status = (f"伺服器背景更新｜本輪 {result['count']} 檔｜耗時 {result['duration']:.2f} 秒｜檢查時間：{checked}"
-                  if result['count'] else f'等待新串流或背景分 K 資料；保留上次資料與來源時間。｜背景檢查時間：{checked}')
+        status = (f"伺服器背景更新｜本輪 {result['count']} 檔" if result['count']
+                  else '暫無新行情；顯示上次資料與來源時間。')
         if result['outside']:
-            status = '目前不在更新時段；保留上次資料與來源時間。｜背景檢查時間：' + checked
+            status = '目前不在更新時段；保留上次資料與來源時間。'
         if result['error']:
-            status = '本輪更新失敗，下一輪重試；保留上次資料與來源時間。｜背景檢查時間：' + checked
+            status = '本輪更新失敗，下一輪重試；保留上次資料與來源時間。'
         st.session_state[f'{room}_auto_status'] = status
         if result['updated_at']:
             st.session_state[f'{room}_auto_updated_at'] = pd.Timestamp(result['updated_at']).tz_convert('Asia/Taipei').strftime('%Y/%m/%d %H:%M:%S')
@@ -24038,7 +24043,7 @@ def render_futures_strategy_room():
             editor_display = display_rows[futures_display_columns].copy()
             editor_display['收盤價'] = editor_display['收盤價'].apply(fmt_price)
             editor_display['漲跌幅'] = editor_display['漲跌幅'].apply(_signed_percent)
-            edited = st.data_editor(
+            edited = st.container(key='futures-strategy-grid').data_editor(
                 editor_display.style.apply(style_futures_row, axis=1, source_frame=display_rows),
                 column_config=futures_column_config(editor_display),
                 hide_index=True, width='stretch', row_height=30,
@@ -24196,7 +24201,7 @@ def render_futures_strategy_room():
             independent_display = independent_rows[independent_columns].copy()
             independent_display['收盤價'] = independent_display['收盤價'].apply(fmt_price)
             independent_display['漲跌幅'] = independent_display['漲跌幅'].apply(_signed_percent)
-            st.dataframe(
+            st.container(key='futures-independent-grid').dataframe(
                 independent_display.style.apply(style_futures_row, axis=1, source_frame=independent_rows),
                 column_config=futures_column_config(independent_display, include_ignore=False),
                 hide_index=True, width='stretch', row_height=30
@@ -25852,19 +25857,20 @@ if tab1.open and stock_strategy_tab.open:
                     f"main_editor_{st.session_state.stock_strategy_editor_revision}_{stock_table_signature}"
                 )
                 st.session_state.stock_main_visible_codes = df_display['代號'].astype(str).tolist()
-                if stock_auto_enabled:
+                if stock_auto_enabled and st.session_state.stock_main_visible_codes != codes:
                     background_intraday_rows('stock', st.session_state.stock_data,
                                              visible_codes=st.session_state.stock_main_visible_codes)
-                if st.session_state.get('sj_logged_in', False) and st.session_state.get('sj_api') is not None:
-                    # Warm the manual button's history without blocking table display.
+                if (not st.session_state.get('stock_auto_timer_seconds')
+                        and st.session_state.get('sj_logged_in', False) and st.session_state.get('sj_api') is not None):
+                    # The auto worker already warms these histories when active.
+                    api = st.session_state.sj_api
                     for code in st.session_state.stock_main_visible_codes:
-                        api = st.session_state.sj_api
-                        contract = get_shioaji_stock_contract(api, code)
                         if not check_shioaji_connection(api):
                             break
+                        contract = get_shioaji_stock_contract(api, code)
                         if contract is not None:
-                            get_strategy_intraday_history(api, contract)
-                edited_df = st.data_editor(
+                            get_strategy_intraday_history(api, contract, copy_result=False)
+                edited_df = st.container(key='stock-strategy-grid').data_editor(
                     styled_df,
                     column_config={
                         **risk_column_config,
@@ -26455,7 +26461,7 @@ if tab1.open and stock_strategy_tab.open:
                                 })
 
                         st.session_state.stock_independent_visible_codes = df_indep['代號'].astype(str).tolist()
-                        st.dataframe(
+                        st.container(key='stock-independent-grid').dataframe(
                             styled_indep,
                             column_config={
                                 **indep_column_config,
