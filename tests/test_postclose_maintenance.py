@@ -480,3 +480,145 @@ def test_sync_follows_up_settings_changed_during_first_write(tmp_path):
     assert ns['sync_postclose_scopes']('configured', ['stock']) == ['stock']
     assert [row['display_settings']['limit_rows'] for row in writes] == [5, 6]
     assert json.loads(path.read_text()) == {'display_settings': {'limit_rows': 6}}
+
+
+def test_official_closing_quotes_validate_dates_and_preserve_model_prices():
+    ns = helpers('fetch_official_stock_closes', 'official_model_stock_closes',
+                 '_official_number', '_parse_roc_trade_date')
+    day = date(2026, 11, 11)
+    twse = {'date': '20261111', 'tables': [{
+        'fields': ['證券代號', '收盤價', '漲跌(+/-)', '漲跌價差'],
+        'data': [['2468', '68.30', '<p>+</p>', '2.30'],
+                 ['2227', '35', '<p>-</p>', '1.00'],
+                 ['2330', '630', 'X', '0.00'],
+                 ['5203', '--', '', '0']],
+    }]}
+    tpex = [{'Date': '1151111', 'SecuritiesCompanyCode': '1815', 'Close': '140.50', 'Change': '+12.50'},
+            {'Date': '1151111', 'SecuritiesCompanyCode': '6925', 'Close': '104.50', 'Change': '0.00'},
+            {'Date': '1151110', 'SecuritiesCompanyCode': '6538', 'Close': '309.50', 'Change': '-2.00'}]
+
+    def response(data):
+        return SimpleNamespace(raise_for_status=lambda: None, json=lambda: data)
+
+    class Tpex:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def get(self, *args, **kwargs):
+            return response(tpex)
+
+    ns.update(requests=SimpleNamespace(get=lambda *args, **kwargs: response(twse), RequestException=OSError),
+              _TWSE_DAILY_QUOTES_URL='twse', _TPEX_DAILY_QUOTES_URL='tpex', _tpex_verified_session=Tpex)
+    quotes = ns['fetch_official_stock_closes'](day)
+    assert quotes == {
+        '2468': {'price': 68.3, 'change': 2.3},
+        '2227': {'price': 35.0, 'change': -1.0},
+        '2330': {'price': 630.0, 'change': None},
+        '1815': {'price': 140.5, 'change': 12.5},
+        '6925': {'price': 104.5, 'change': 0.0},
+    }
+    assert ns['official_model_stock_closes'](day, ('2468', '1815', '6538')) == {'2468': 68.3, '1815': 140.5}
+    twse['date'] = '20261110'
+    assert set(ns['fetch_official_stock_closes'](day)) == {'1815', '6925'}
+
+
+def test_stock_table_reconciles_missing_closes_after_auction_and_keeps_strategy_rows_intact():
+    ns = helpers('stock_close_display_day', 'latest_completed_stock_trading_date',
+                 'saved_stock_closing_quotes', 'check_stock_table_closes', 'stock_close_display_rows',
+                 'fmt_price', '_signed_percent', '_to_number', '_format_compact_number')
+    ns['is_market_closed_func'] = lambda day: day.weekday() >= 5
+    state = {'stock_main_visible_codes': ['2468', '1815']}
+    ns['st'] = SimpleNamespace(session_state=state)
+    old = {'date': '2026-11-10', 'price': 128.0, 'change': 0.0}
+    saved = {'1815': old}
+    ns['get_stock_display_settings'] = lambda: {'stock_closing_quotes': {'values': saved}}
+    calls = []
+    feed = {'2468': {'price': 68.3, 'change': 2.3}, '5202': {'price': 21.1, 'change': None}}
+    ns['fetch_official_stock_closes'] = lambda day: feed
+
+    def poll(key, fetch, interval):
+        calls.append((key, interval))
+        return fetch()
+
+    def persist(group, values):
+        assert group == 'stock_closing_quotes'
+        saved.update(values)
+        return True
+
+    ns['get_public_maintenance_jobs'] = lambda: SimpleNamespace(poll=poll)
+    ns['persist_shared_display_setting'] = persist
+    day = date(2026, 11, 11)
+    now = pd.Timestamp('2026-11-11 13:33', tz='Asia/Taipei')
+    check = ns['check_stock_table_closes']
+    assert not check(now - pd.Timedelta(seconds=1))
+    assert calls == []
+    assert check(now)
+    assert '5202' not in saved and saved['1815'] == old
+    assert set(ns['saved_stock_closing_quotes'](day)) == {'2468'}
+    feed = {'1815': {'price': 140.5, 'change': 12.5}}
+    assert check(now + pd.Timedelta(minutes=12))
+    assert not check(now + pd.Timedelta(minutes=13))
+    assert calls == [(('stock-table-closes', day), 180)] * 2
+    assert ns['stock_close_display_day'](pd.Timestamp('2026-11-12 08:55', tz='Asia/Taipei')) == day
+    assert ns['stock_close_display_day'](pd.Timestamp('2026-11-12 09:00', tz='Asia/Taipei')) is None
+
+    rows = pd.DataFrame([{'代號': '2468', '收盤價': '66', '漲跌幅': '0%', '成交價價差': '0', '5日線價差': '1',
+                          '_ma5': 65, '_strategy_close': 66, '_quote_time': '2026/11/10 13:30:00',
+                          '進出場預判': '待進｜進 67', '戰略備註': '原戰略', '訊號狀態': '等待'},
+                         {'代號': '5202', '收盤價': '21', '漲跌幅': '0%', '成交價價差': '0', '5日線價差': '1'}])
+    original = rows.copy(deep=True)
+    display = ns['stock_close_display_rows'](rows, ns['saved_stock_closing_quotes'](day))
+    assert display.loc[0, ['收盤價', '成交價價差', '5日線價差']].tolist() == ['68.3', '2.3', '3.3']
+    assert '+3.48%' in display.at[0, '漲跌幅']
+    protected = ['_strategy_close', '_quote_time', '_ma5', '進出場預判', '戰略備註', '訊號狀態']
+    pd.testing.assert_frame_equal(display[protected], original[protected])
+    pd.testing.assert_series_equal(display.loc[1], original.loc[1])
+    pd.testing.assert_frame_equal(rows, original)
+
+
+def test_stock_close_sync_preserves_both_devices_and_newer_trade_date():
+    ns = helpers('normalize_stock_display_settings', '_parse_roc_trade_date')
+    normalize = ns['normalize_stock_display_settings']
+    merge = ns['merge_stock_preferences']
+    earlier = '2026-11-11T14:00:00+08:00'
+    later = '2026-11-11T15:00:00+08:00'
+    today = '2026-11-11'
+    local = {'display_settings': {'updated_at': earlier, 'limit_rows': 6, 'stock_closing_quotes': {
+        'updated_at': later, 'values': {
+            '2468': {'date': '2026-11-10', 'price': 66, 'change': 0},
+            '1815': {'date': today, 'price': 140.5, 'change': 12.5},
+        },
+    }}}
+    remote = {'display_settings': {'updated_at': later, 'limit_rows': 8, 'stock_closing_quotes': {
+        'updated_at': earlier, 'values': {
+            '2468': {'date': today, 'price': 68.3, 'change': 2.3},
+            '5202': {'date': today, 'price': 21.1, 'change': None},
+        },
+    }}}
+    merged = normalize(merge(remote, local)['display_settings'])
+    assert merged['limit_rows'] == 8
+    assert merged['stock_closing_quotes']['values'] == {
+        '2468': {'date': today, 'price': 68.3, 'change': 2.3},
+        '1815': {'date': today, 'price': 140.5, 'change': 12.5},
+        '5202': {'date': today, 'price': 21.1, 'change': None},
+    }
+
+
+def test_auto_status_prioritizes_current_window_over_stale_worker_status():
+    ns = helpers('intraday_auto_status_text', 'intraday_auto_interval', 'intraday_auto_settings',
+                 'intraday_auto_window_open')
+    ns['is_market_closed_func'] = lambda day: False
+    real_datetime = ns['datetime']
+    after_close = real_datetime(2026, 11, 11, 13, 45, 3)
+    ns['datetime'] = SimpleNamespace(now=lambda tz: tz.localize(after_close))
+    ns['load_config'] = lambda: {'stock_auto_start': '08:55', 'stock_auto_end': '13:45'}
+    state = {'sj_logged_in': True, 'sj_api': object(), 'stock_auto_status': '伺服器背景更新啟動中'}
+    ns['st'] = SimpleNamespace(session_state=state)
+    status = ns['intraday_auto_status_text']
+    assert status('stock', True).startswith('自動更新：開啟｜目前不在更新時段')
+    state['sj_logged_in'] = False
+    assert status('stock', True).startswith('自動更新：開啟｜等待 Shioaji')
+    assert status('stock', False) == '自動更新：關閉'

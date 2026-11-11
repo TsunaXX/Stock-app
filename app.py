@@ -10564,9 +10564,9 @@ def _is_turnover_security_code(value):
     return bool(re.fullmatch(r"(?:\d{4}|00[0-9A-Z]{4})", code))
 
 
-def official_model_stock_closes(day, codes):
-    """Independently validate each exchange's regular-session closing data."""
-    codes = set(codes)
+def fetch_official_stock_closes(day, codes=None):
+    """Read each exchange's official regular-session close for the requested date."""
+    codes = set(codes) if codes is not None else None
     closes = {}
     try:
         response = requests.get(_TWSE_DAILY_QUOTES_URL, params={
@@ -10583,12 +10583,18 @@ def official_model_stock_closes(day, codes):
                     row = dict(zip(fields, values))
                     code = str(row.get('證券代號', '')).strip()
                     close = _official_number(row.get('收盤價'))
-                    if code in codes and close and close > 0:
-                        closes[code] = close
+                    if code and (codes is None or code in codes) and close and close > 0:
+                        sign = re.sub(r'<[^>]*>', '', str(row.get('漲跌(+/-)', ''))).strip()
+                        change = _safe_number(row.get('漲跌價差'))
+                        if change is not None and sign == '-':
+                            change = -abs(change)
+                        elif sign not in ('+', '') or (not sign and change != 0):
+                            change = None
+                        closes[code] = {'price': close, 'change': change}
                 break
     except (requests.RequestException, ValueError):
         pass
-    if codes.difference(closes):
+    if codes is None or codes.difference(closes):
         try:
             with _tpex_verified_session() as session:
                 response = session.get(_TPEX_DAILY_QUOTES_URL, timeout=(3, 8))
@@ -10598,11 +10604,16 @@ def official_model_stock_closes(day, codes):
                         continue
                     code = str(row.get('SecuritiesCompanyCode', '')).strip()
                     close = _official_number(row.get('Close'))
-                    if code in codes and code not in closes and close and close > 0 and _parse_roc_trade_date(row.get('Date')) == day:
-                        closes[code] = close
+                    if (code and (codes is None or code in codes) and code not in closes
+                            and close and close > 0 and _parse_roc_trade_date(row.get('Date')) == day):
+                        closes[code] = {'price': close, 'change': _safe_number(row.get('Change'))}
         except (requests.RequestException, ValueError):
             pass
     return closes
+
+
+def official_model_stock_closes(day, codes):
+    return {code: quote['price'] for code, quote in fetch_official_stock_closes(day, codes).items()}
 
 
 def check_model_stock_closes(tracker=None):
@@ -13464,7 +13475,7 @@ def normalize_stock_display_settings(value):
         'allow_warrant_search': bool(source.get('allow_warrant_search', False)),
         'show_3d_hilo': bool(source.get('show_3d_hilo', False)),
     }
-    for key in ('auto_update_settings', 'model_tracking_costs', 'independent_analysis'):
+    for key in ('auto_update_settings', 'model_tracking_costs', 'independent_analysis', 'stock_closing_quotes'):
         if key not in source:
             continue
         saved_group = source.get(key)
@@ -13491,6 +13502,17 @@ def normalize_stock_display_settings(value):
                     'seconds': seconds, **times,
                     'restricted': bool(setting.get('restricted', str(room).startswith('stock'))),
                 }
+        elif key == 'stock_closing_quotes':
+            normalized = {}
+            for code, quote in values.items():
+                if not isinstance(quote, dict):
+                    continue
+                day = _parse_roc_trade_date(quote.get('date'))
+                price = _safe_number(quote.get('price'))
+                if day is not None and price is not None and price > 0:
+                    normalized[str(code)] = {
+                        'date': day.isoformat(), 'price': price, 'change': _safe_number(quote.get('change')),
+                    }
         elif key == 'independent_analysis':
             normalized = {
                 room: snapshot for room, snapshot in values.items()
@@ -13544,7 +13566,7 @@ def merge_stock_preferences(remote, local):
     remote_settings = remote.get('display_settings') if isinstance(remote.get('display_settings'), dict) else {}
     local_settings = local.get('display_settings') if isinstance(local.get('display_settings'), dict) else {}
     settings = _newer_timestamped_state(remote_settings, local_settings)
-    for key in ('auto_update_settings', 'model_tracking_costs', 'independent_analysis'):
+    for key in ('auto_update_settings', 'model_tracking_costs', 'independent_analysis', 'stock_closing_quotes'):
         remote_group = remote_settings.get(key) if isinstance(remote_settings.get(key), dict) else {}
         local_group = local_settings.get(key) if isinstance(local_settings.get(key), dict) else {}
         remote_values = remote_group.get('values', {}) if isinstance(remote_group.get('values'), dict) else {}
@@ -13558,6 +13580,14 @@ def merge_stock_preferences(remote, local):
             local_item = {'updated_at': local_times.get(item_key, local_group.get('updated_at', '')),
                           'value': local_values.get(item_key)}
             selected = _newer_timestamped_state(remote_item, local_item)
+            if key == 'stock_closing_quotes':
+                remote_quote, local_quote = remote_item['value'], local_item['value']
+                remote_day = (_parse_roc_trade_date(remote_quote.get('date')) or date.min
+                              if isinstance(remote_quote, dict) else date.min)
+                local_day = (_parse_roc_trade_date(local_quote.get('date')) or date.min
+                             if isinstance(local_quote, dict) else date.min)
+                if remote_day != local_day:
+                    selected = local_item if local_day > remote_day else remote_item
             if 'value' in selected:
                 merged_values[item_key] = selected['value']
                 merged_times[item_key] = selected.get('updated_at', '')
@@ -13615,7 +13645,8 @@ def persist_shared_display_setting(group, values, updated_keys=None):
     settings[group] = {
         'values': _json_safe(values), 'updated_at': now, 'field_updated_at': field_times,
     }
-    settings['updated_at'] = now
+    if group != 'stock_closing_quotes':
+        settings['updated_at'] = now
     settings = normalize_stock_display_settings(settings)
     cloud_url = get_app_secret('gsheet_api_url') or ''
     try:
@@ -13624,7 +13655,8 @@ def persist_shared_display_setting(group, values, updated_keys=None):
             latest_settings = normalize_stock_display_settings(local_payload.get('display_settings'))
             merged_settings = dict(latest_settings)
             merged_settings[group] = settings[group]
-            merged_settings['updated_at'] = now
+            if group != 'stock_closing_quotes':
+                merged_settings['updated_at'] = now
             settings = merge_stock_preferences(
                 {'display_settings': latest_settings}, {'display_settings': merged_settings},
             )['display_settings']
@@ -21568,6 +21600,7 @@ def intraday_auto_window_open(now_tw, start=None, end=None, stock=False):
 def intraday_auto_status_text(room, enabled):
     if not enabled:
         return '自動更新：關閉'
+    intraday_auto_interval(room, enabled, *intraday_auto_settings(room)[1:])
     status = st.session_state.get(f'{room}_auto_status', '等待更新時段與 Shioaji 連線。')
     return '自動更新：開啟｜' + status
 
@@ -24714,10 +24747,56 @@ def restore_stock_source():
             )
 
 
+def stock_close_display_day(now):
+    if now.time() < dt_time(9) or is_market_closed_func(now.date()):
+        return latest_completed_stock_trading_date(now)
+    # The closing auction may be extended to 13:33 for individual securities.
+    return now.date() if now.time() >= dt_time(13, 33) else None
+
+
+def saved_stock_closing_quotes(day):
+    values = get_stock_display_settings().get('stock_closing_quotes', {}).get('values', {})
+    return {code: quote for code, quote in values.items() if quote['date'] == day.isoformat()}
+
+
+def check_stock_table_closes(now):
+    codes = set(st.session_state.get('stock_main_visible_codes', ()))
+    if not codes or (day := stock_close_display_day(now)) is None:
+        return False
+    missing = codes.difference(saved_stock_closing_quotes(day))
+    if not missing:
+        return False
+    quotes = get_public_maintenance_jobs().poll(
+        ('stock-table-closes', day), lambda: fetch_official_stock_closes(day), interval=180,
+    ) or {}
+    verified = {code: {**quotes[code], 'date': day.isoformat()} for code in missing & quotes.keys()}
+    return bool(verified and persist_shared_display_setting('stock_closing_quotes', verified))
+
+
+def stock_close_display_rows(rows, quotes):
+    """Overlay official prices on the rendered copy, after every strategy and model decision."""
+    display = rows.copy()
+    for index, row in rows.iterrows():
+        quote = quotes.get(str(row['代號']))
+        if quote is None:
+            continue
+        price, change = quote['price'], quote['change']
+        display.at[index, '收盤價'] = fmt_price(price)
+        display.at[index, '成交價價差'] = fmt_price(change) if change is not None else ''
+        reference = price - change if change is not None else None
+        display.at[index, '漲跌幅'] = _signed_percent(change / reference * 100) if reference and reference > 0 else ''
+        ma5 = _safe_number(row.get('_ma5'))
+        if ma5 is not None:
+            display.at[index, '5日線價差'] = fmt_price(price - ma5)
+    return display
+
+
 @st.fragment(run_every=60)
-def render_postclose_maintenance():
+def render_postclose_maintenance(stock_open=False):
     restore_stock_quick_search()
     check_model_stock_closes()
+    if stock_open and check_stock_table_closes(datetime.now(pytz.timezone('Asia/Taipei'))):
+        st.rerun()
     if st.session_state.get('_stock_source_restore_needed'):
         restore_stock_source()
     # Reuse this minute tick to resume paused tables; no extra polling fragment.
@@ -25846,7 +25925,22 @@ if tab1.open and stock_strategy_tab.open:
                     if col not in ["移除", "信心分"]:
                         df_display[col] = df_display[col].map(_blank_display_text)
 
-                styled_df = df_display[input_cols].style.apply(style_tab1_df, axis=1, source_frame=df_display.copy())
+                table_display = df_display
+                close_day = stock_close_display_day(datetime.now(pytz.timezone('Asia/Taipei')))
+                if close_day is not None and not df_display.empty:
+                    quotes = saved_stock_closing_quotes(close_day)
+                    pending = sorted(set(df_display['代號'].astype(str)).difference(quotes))
+                    verified_count = df_display['代號'].astype(str).isin(quotes).sum()
+                    message = f'{close_day:%Y/%m/%d} 正式收盤價已核對 {verified_count}/{len(df_display)} 檔'
+                    if pending:
+                        symbols = '、'.join(pending[:5]) + ('等' if len(pending) > 5 else '')
+                        message += f'｜{symbols} 等待官方收盤價，暫保留上次報價'
+                    st.caption(message)
+                    if verified_count:
+                        table_display = stock_close_display_rows(df_display, quotes)
+                styled_df = table_display[input_cols].style.apply(
+                    style_tab1_df, axis=1, source_frame=table_display.copy(),
+                )
 
                 def stock_content_width(column, minimum, maximum=520, full_content=False):
                     return _content_column_width(
@@ -29324,4 +29418,4 @@ with tab_company:
 
 if tab1.open:
     with tab1:
-        render_postclose_maintenance()
+        render_postclose_maintenance(stock_open=stock_strategy_tab.open)
