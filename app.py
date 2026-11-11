@@ -24794,10 +24794,11 @@ def stock_close_display_rows(rows, quotes):
 
 
 @st.fragment(run_every=60)
-def render_postclose_maintenance(stock_open=False):
+def render_postclose_maintenance():
     restore_stock_quick_search()
     check_model_stock_closes()
-    if stock_open and check_stock_table_closes(datetime.now(pytz.timezone('Asia/Taipei'))):
+    if (st.session_state.get('strategy_room_active_tab') == '📈 股票戰略室'
+            and check_stock_table_closes(datetime.now(pytz.timezone('Asia/Taipei')))):
         st.rerun()
     if st.session_state.get('_stock_source_restore_needed'):
         restore_stock_source()
@@ -29420,4 +29421,4 @@ with tab_company:
 
 if tab1.open:
     with tab1:
-        render_postclose_maintenance(stock_open=stock_strategy_tab.open)
+        render_postclose_maintenance()
