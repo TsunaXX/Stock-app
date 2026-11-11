@@ -3877,8 +3877,8 @@ def poll_replacement(key, loader, interval):
     assert key[0] == 'stock-replacements' and interval == 60
     return loader() if st.session_state.get('refill_ready') else None
 get_public_maintenance_jobs = lambda: SimpleNamespace(poll=poll_replacement)
-def fixture_replacement(*args, include_live_quote):
-    assert not include_live_quote
+def fixture_replacement(*args, include_live_quote, background):
+    assert background and not include_live_quote
     return st.session_state.refill_row
 fetch_stock_data_raw = fixture_replacement
 API_REQUEST_GAP_SECONDS = 0

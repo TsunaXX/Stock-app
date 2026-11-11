@@ -21050,7 +21050,7 @@ def completed_stock_strategy_history(history, now_value=None):
 def fetch_stock_data_raw(
     code, name_hint="", extra_data=None, futures_set=None,
     saved_notes_dict=None, name_map_dict=None, sj_logged_in=False,
-    sj_api=None, include_live_quote=True, strategy_target_date=None,
+    sj_api=None, include_live_quote=True, strategy_target_date=None, background=False,
 ):
     code = str(code).strip()
     hist = pd.DataFrame()
@@ -21060,7 +21060,7 @@ def fetch_stock_data_raw(
     
     # 優先使用永豐 API 擷取昨日/歷史日 K 線資料
     if sj_logged_in and sj_api is not None:
-        sj_df = fetch_shioaji_data(sj_api, code, interval='1d', lookback_days=180)
+        sj_df = fetch_shioaji_data(sj_api, code, interval='1d', lookback_days=180, background=background)
         if not sj_df.empty:
             hist = sj_df
             source_used = "shioaji"
@@ -25970,7 +25970,8 @@ if tab1.open and stock_strategy_tab.open:
                                     code, name, _, extra = cand
                                     return fetch_stock_data_raw(
                                         code, name, extra, futures_copy, notes_copy, code_map_copy,
-                                        worker_sj_logged_in, worker_sj_api, include_live_quote=not auto_refill,
+                                        worker_sj_logged_in, worker_sj_api,
+                                        include_live_quote=not auto_refill, background=auto_refill,
                                     )
 
                                 if auto_refill:
