@@ -3750,7 +3750,9 @@ def update_futures_live_rows(rows, *args, **kwargs):
 def test_auto_status_marks_switch_and_hides_waiting_when_disabled():
     ns = load_app_symbols('intraday_auto_status_text')
     waiting = '等待新串流或背景分 K 資料；保留上次資料與來源時間。'
-    ns['st'] = SimpleNamespace(session_state={'stock_auto_status':waiting})
+    ns['st'] = SimpleNamespace(session_state={'stock_auto_status': waiting})
+    ns['intraday_auto_settings'] = lambda room: (True, 5, None, None)
+    ns['intraday_auto_interval'] = lambda *args: 5
     text = ns['intraday_auto_status_text']
     assert text('stock', True) == '自動更新：開啟｜' + waiting
     assert text('stock', False) == '自動更新：關閉'
