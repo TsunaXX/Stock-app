@@ -3876,6 +3876,8 @@ def fixture_auto_timer(room):
 configure_intraday_auto_timer = fixture_auto_timer
 check_intraday_auto_timer = lambda room: None
 def poll_replacement(key, loader, interval):
+    if key[0] == 'stock-table-closes':
+        return None
     assert key[0] == 'stock-replacements' and interval == 60
     return loader() if st.session_state.get('refill_ready') else None
 get_public_maintenance_jobs = lambda: SimpleNamespace(poll=poll_replacement)
