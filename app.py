@@ -13464,7 +13464,7 @@ def normalize_stock_display_settings(value):
         'allow_warrant_search': bool(source.get('allow_warrant_search', False)),
         'show_3d_hilo': bool(source.get('show_3d_hilo', False)),
     }
-    for key in ('auto_update_settings', 'model_tracking_costs'):
+    for key in ('auto_update_settings', 'model_tracking_costs', 'independent_analysis'):
         if key not in source:
             continue
         saved_group = source.get(key)
@@ -13491,6 +13491,14 @@ def normalize_stock_display_settings(value):
                     'seconds': seconds, **times,
                     'restricted': bool(setting.get('restricted', str(room).startswith('stock'))),
                 }
+        elif key == 'independent_analysis':
+            normalized = {
+                room: snapshot for room, snapshot in values.items()
+                if room in ('stock', 'futures') and isinstance(snapshot, dict)
+                and isinstance(snapshot.get('rows'), list)
+                and all(isinstance(row, dict) and row.get('代號' if room == 'stock' else '契約鍵')
+                        for row in snapshot['rows'])
+            }
         else:
             normalized = normalize_costs(values)
             try:
@@ -13536,7 +13544,7 @@ def merge_stock_preferences(remote, local):
     remote_settings = remote.get('display_settings') if isinstance(remote.get('display_settings'), dict) else {}
     local_settings = local.get('display_settings') if isinstance(local.get('display_settings'), dict) else {}
     settings = _newer_timestamped_state(remote_settings, local_settings)
-    for key in ('auto_update_settings', 'model_tracking_costs'):
+    for key in ('auto_update_settings', 'model_tracking_costs', 'independent_analysis'):
         remote_group = remote_settings.get(key) if isinstance(remote_settings.get(key), dict) else {}
         local_group = local_settings.get(key) if isinstance(local_settings.get(key), dict) else {}
         remote_values = remote_group.get('values', {}) if isinstance(remote_group.get('values'), dict) else {}
@@ -13641,6 +13649,16 @@ def persist_shared_display_setting(group, values, updated_keys=None):
     st.session_state['_shared_preference_sync_status'] = 'pending'
     dispatch_postclose_sync()
     return True
+
+def saved_independent_analysis(room):
+    return get_stock_display_settings().get('independent_analysis', {}).get('values', {}).get(room, {})
+
+
+def save_independent_analysis(room, snapshot):
+    values = dict(get_stock_display_settings().get('independent_analysis', {}).get('values', {}))
+    values[room] = snapshot
+    return persist_shared_display_setting('independent_analysis', values, updated_keys=[room])
+
 
 def normalize_stock_quick_search_state(value):
     """Keep portable stock selector values and their cross-device timestamp."""
@@ -14717,7 +14735,7 @@ def save_data_cache(
 
         return False
 
-def load_data_cache():
+def load_data_cache(remote_result=None):
     """
     只讀取股票戰略室 scope。
 
@@ -14808,7 +14826,9 @@ def load_data_cache():
     remote_payload = None
     remote_error = None
 
-    if gsheet_api_url:
+    if remote_result is not None:
+        remote_payload, remote_error = remote_result
+    elif gsheet_api_url:
         remote_payload, remote_error = (
             _fetch_remote_scope_cached(
                 gsheet_api_url,
@@ -14841,7 +14861,11 @@ def load_data_cache():
         )
 
         if (
+            not isinstance(remote_payload.get('stock_data'), list)
+            and isinstance(local_payload.get('stock_data'), list)
+        ) or (
             local_payload
+            and isinstance(local_payload.get('stock_data'), list)
             and local_timestamp is not None
             and remote_timestamp is not None
             and local_timestamp
@@ -14949,7 +14973,7 @@ def load_data_cache():
     data['quick_search_state'] = quick_search_state
     if local_payload.get('postclose_sync_pending'):
         data['postclose_sync_pending'] = True
-    if data:
+    if remote_payload or local_payload:
         try:
             with _RUNTIME_FILE_LOCK:
                 latest = _read_json_cache_file(STOCK_STRATEGY_CACHE_FILE)
@@ -15294,43 +15318,20 @@ def render_stock_quick_search(section):
         placeholder='輸入 2330 或 台積電...',
     )
 
-if 'stock_data' not in st.session_state:
-    (
-        cached_df,
-        cached_ignored,
-        cached_candidates,
-        cached_saved_notes,
-        cached_note_dict,
-        cached_market_risk_data,
-    ) = load_data_cache()
-
-    st.session_state.stock_data = cached_df
-
+def restore_stock_cache_to_session(remote_result=None):
+    rows, ignored, candidates, notes, note_cache, risk = load_data_cache(remote_result)
+    st.session_state.update(
+        stock_data=rows, ignored_stocks=ignored, all_candidates=candidates,
+        saved_notes=notes, cached_notes=note_cache,
+        risk_filter_market_data=risk if isinstance(risk, dict) else {},
+    )
     # 新工作階段先顯示最後成功快照，不在手機重連或切換分頁時
     # 對整張表重新抓行情。使用者按「執行分析」才更新並寫回快取。
-    st.session_state._stock_cache_refresh_pending = False
+    st.session_state['_stock_cache_refresh_pending'] = False
 
-    st.session_state.ignored_stocks = (
-        cached_ignored
-    )
 
-    st.session_state.all_candidates = (
-        cached_candidates
-    )
-
-    st.session_state.saved_notes = (
-        cached_saved_notes
-    )
-
-    st.session_state.cached_notes = (
-        cached_note_dict
-    )
-
-    st.session_state.risk_filter_market_data = (
-        cached_market_risk_data
-        if isinstance(cached_market_risk_data, dict)
-        else {}
-    )
+if 'stock_data' not in st.session_state:
+    restore_stock_cache_to_session()
 
 if 'stock_strategy_editor_revision' not in st.session_state:
     st.session_state.stock_strategy_editor_revision = 0
@@ -15913,6 +15914,8 @@ def render_stock_strategy_controls():
                 st.session_state.saved_notes = {}
                 st.session_state.cached_notes = {}
                 st.session_state.pop('stock_independent_raw_results', None)
+                save_independent_analysis('stock', {'rows': []})
+                mark_stock_data_updated()
                 st.session_state['_stock_quick_search_state'] = {
                     'main': [], 'independent': [],
                     'updated_at': datetime.now(pytz.timezone('Asia/Taipei')).isoformat(),
@@ -24104,6 +24107,21 @@ def render_futures_strategy_room():
 
     st.markdown("---")
     st.markdown("### ⚡ 獨立計算")
+    saved_independent = saved_independent_analysis('futures')
+    current_trade_date = get_futures_trading_date(datetime.now(pytz.timezone('Asia/Taipei'))).date().isoformat()
+    if 'futures_independent_result' not in st.session_state and saved_independent.get('rows'):
+        if saved_independent.get('trading_date') == current_trade_date:
+            restored = dict(saved_independent)
+            restored['rows'] = [row for row in restored['rows']
+                                if str(row.get('契約鍵')) in valid_contract_keys]
+            st.session_state.futures_independent_result = restored
+            if 'futures_independent_search' not in st.session_state:
+                restored_keys = {str(row.get('契約鍵')) for row in restored['rows']}
+                st.session_state.futures_independent_search = [
+                    label for label, key in option_map.items() if key in restored_keys
+                ]
+        else:
+            st.info('上次期貨獨立分析已跨交易日，請重新執行分析取得本場資料。')
     independent_labels = st.multiselect(
         "快速查詢（中文名稱／期貨代碼）", list(option_map),
         key='futures_independent_search', placeholder='選擇一檔或多檔期貨'
@@ -24118,10 +24136,6 @@ def render_futures_strategy_room():
     run_futures_independent = st.button(
         "🚀 執行期貨獨立分析", key='run_futures_independent'
     )
-    if 'futures_independent_result' not in st.session_state:
-        st.session_state.futures_independent_result = {
-            'strategy_mode': '', 'rows': [],
-        }
     if run_futures_independent and not independent_labels:
         st.warning("請先選擇至少一檔期貨。")
     if run_futures_independent and independent_labels:
@@ -24140,9 +24154,11 @@ def render_futures_strategy_room():
         if enhanced_layer:
             independent_rows = enrich_futures_strategy_rows(independent_rows, strategy_mode, market_bias)
         st.session_state.futures_independent_result = {
-            'strategy_mode': strategy_mode,
+            'strategy_mode': strategy_mode, 'trading_date': current_trade_date,
             'rows': _json_safe(independent_rows.to_dict(orient='records')),
         }
+        if not independent_rows.empty:
+            save_independent_analysis('futures', st.session_state.futures_independent_result)
 
     @st.fragment(run_every=configure_intraday_auto_timer('futures_independent'))
     def render_futures_independent_table():
@@ -24172,10 +24188,11 @@ def render_futures_strategy_room():
         for _, row in independent_rows.iterrows():
             for index in all_independent_rows.index[all_independent_rows['契約鍵'].astype(str) == str(row['契約鍵'])]:
                 set_futures_row_values(all_independent_rows, index, row.to_dict())
-        st.session_state.futures_independent_result = {
-            'strategy_mode': strategy_mode,
-            'rows': _json_safe(all_independent_rows.to_dict(orient='records')),
-        }
+        if not all_independent_rows.empty:
+            st.session_state.futures_independent_result = {
+                'strategy_mode': strategy_mode,
+                'rows': _json_safe(all_independent_rows.to_dict(orient='records')),
+            }
         st.caption(intraday_auto_status_text('futures_independent', independent_auto[0]))
         if st.session_state.get('futures_independent_auto_updated_at'):
             st.caption('自動更新時間：' + st.session_state['futures_independent_auto_updated_at'])
@@ -24438,6 +24455,12 @@ def merge_postclose_scope(remote, local, asset):
         key: _newer_timestamped_state(first.get(key), second.get(key)) for key in set(first) | set(second)
     }
     if asset == 'stock':
+        if isinstance(local.get('stock_data'), list):
+            selected, _ = _prefer_newer_cache_payload(remote, local)
+            if selected is local or not isinstance(remote.get('stock_data'), list):
+                for key in ('stock_data', 'stock_data_updated_at', 'ignored_stocks', 'saved_notes', 'cached_notes'):
+                    if key in local:
+                        merged[key] = local[key]
         merged.update(merge_stock_preferences(remote, local))
         merged['quick_search_state'] = _newer_timestamped_state(
             remote.get('quick_search_state'), local.get('quick_search_state'),
@@ -24592,6 +24615,14 @@ def restore_stock_quick_search():
         try:
             remote, error = task.result()
             if error:
+                return
+            stock_rows = st.session_state.get('stock_data')
+            if (isinstance(stock_rows, pd.DataFrame) and stock_rows.empty
+                    and not st.session_state.get('_stock_data_updated_at')
+                    and st.session_state.get('_stock_source_kind') != 'none'
+                    and isinstance((remote or {}).get('stock_data'), list)):
+                restore_stock_cache_to_session((remote, None))
+                st.rerun()
                 return
             with _RUNTIME_FILE_LOCK:
                 latest = _read_json_cache_file(STOCK_STRATEGY_CACHE_FILE)
@@ -24851,6 +24882,132 @@ def render_postclose_maintenance():
     state['future'] = worker['executor'].submit(run_postclose_job, worker, build_postclose_job, row_sets, target,
                                                need_turnover, need_risk, risk, None, stock_modes)
 
+
+# 定義上色邏輯
+def style_tab1_df(row, source_frame):
+    styles = [''] * len(row)
+    note = str(row.get('戰略備註', ''))
+    # 精簡主表不顯示「狀態」，名稱底色必須以目前成交價與漲跌停價
+    # 重新比對；不能沿用可能是上一輪報價留下的「漲停／跌停」文字。
+    st_val = str(row.get('狀態', ''))
+    frame = source_frame
+    if not st_val and row.name in frame.index:
+        st_val = str(frame.loc[row.name].get('狀態', ''))
+    source_row = frame.loc[row.name] if row.name in frame.index else row
+    limit_state = strategy_row_limit_state(source_row)
+    risk_val = str(row.get('風險', ''))
+    vwap_val = str(row.get('VWAP 狀態', ''))
+    signal_state = str(row.get('訊號狀態', ''))
+    data_health = str(row.get('資料狀態', ''))
+    market_alignment = str(row.get('市場一致', ''))
+
+    if limit_state == 'up':
+        name_c = 'background-color: #ff4b4b; color: #ffffff; font-weight: bold;'
+    elif limit_state == 'down':
+        name_c = 'background-color: #00e676; color: #ffffff; font-weight: bold;'
+    elif has_trade_prediction_signal(source_row.get('進出場預判')) and (
+        source_row.get('訊號狀態') != '⚪ 開盤參考'
+    ):
+        name_c = 'background-color: #ffeb3b; color: #000000; font-weight: bold;'
+    else:
+        name_c = (
+            'color: #ff4b4b; font-weight: bold;' if "多" in note
+            else ('color: #00e676; font-weight: bold;' if "空" in note else 'font-weight: bold;')
+        )
+
+    price_c = ''
+    try:
+        c_val = float(
+            str(row.get('漲跌幅', '0')).replace('%', '').replace('+', '')
+            .replace('↑', '').replace('↓', '').replace('→', '').strip()
+        )
+        price_c = 'color: #ff4b4b;' if c_val > 0 else ('color: #00e676;' if c_val < 0 else '')
+    except Exception: pass
+
+    status_c = 'color: #ff4b4b;' if st_val in ["漲停", "強"] else ('color: #00e676;' if st_val in ["跌停", "弱"] else ('color: #ffeb3b;' if st_val == "命中" else ''))
+
+    for idx, col in enumerate(row.index):
+        if col == "名稱": styles[idx] = name_c
+        elif col in ["收盤價", "漲跌幅"]: styles[idx] = price_c
+        elif col == "狀態": styles[idx] = status_c
+        elif col == "建議方向":
+            direction_text = str(row.get('建議方向', ''))
+            if '多' in direction_text:
+                styles[idx] = 'color:#ff4b4b;font-weight:bold;'
+            elif '空' in direction_text:
+                styles[idx] = 'color:#00e676;font-weight:bold;'
+        elif col == "方向依據":
+            direction_text = str(row.get('建議方向', ''))
+            styles[idx] = (
+                'color:#ff6b6b;' if '多' in direction_text
+                else ('color:#35d07f;' if '空' in direction_text else 'color:#cbd5e1;')
+            )
+        elif col == "支撐壓力":
+            styles[idx] = 'color:#4fc3f7;font-weight:600;'
+        elif col in ("盤中觸發", "隔日規則", "進出場預判"):
+            value = str(row.get(col, ''))
+            if col == '進出場預判' and (status_style := trade_plan_text_style(value)):
+                styles[idx] = status_style
+            elif any(keyword in value for keyword in ('資料不足', '不建立', '觀察：', '等待')):
+                styles[idx] = 'color:#ffd166;'
+            elif '多' in str(row.get('建議方向', '')):
+                styles[idx] = 'color:#ff6b6b;'
+            elif '空' in str(row.get('建議方向', '')):
+                styles[idx] = 'color:#35d07f;'
+        elif col == "當日漲停價":
+            styles[idx] = 'color:#ff4b4b;font-weight:bold;'
+        elif col == "當日跌停價":
+            styles[idx] = 'color:#00e676;font-weight:bold;'
+        elif col in ["成交價價差", "5日線價差"]:
+            val = row[col]
+            try:
+                f_val = float(val)
+                if f_val > 0: styles[idx] = 'color: #ff4b4b;'
+                elif f_val < 0: styles[idx] = 'color: #00e676;'
+                else: styles[idx] = 'color: white;'
+            except Exception: pass
+        elif col == "風險":
+            if risk_val.startswith('🚫') or risk_val.startswith('🔴'):
+                styles[idx] = 'color: #ff4b4b; font-weight: bold;'
+            elif risk_val.startswith('🔶'):
+                styles[idx] = 'color: #ff9800; font-weight: bold;'
+            elif risk_val.startswith('🟡'):
+                styles[idx] = 'color: #ffeb3b; font-weight: bold;'
+            elif risk_val.startswith('🟢'):
+                styles[idx] = 'color: #00e676;'
+        elif col == "VWAP 狀態":
+            if vwap_val.startswith('偏多'):
+                styles[idx] = 'color: #ff4b4b; font-weight: bold;'
+            elif vwap_val.startswith('偏空'):
+                styles[idx] = 'color: #00e676; font-weight: bold;'
+            elif vwap_val.startswith('中性'):
+                styles[idx] = 'color: #ffeb3b;'
+        elif col == "訊號狀態":
+            if signal_state.startswith('✅'):
+                styles[idx] = 'color:#ff4b4b;font-weight:bold;'
+            elif signal_state.startswith('🔵'):
+                styles[idx] = 'color:#29b6f6;font-weight:bold;'
+            elif signal_state.startswith('⛔'):
+                styles[idx] = 'color:#ff9800;font-weight:bold;'
+            elif signal_state.startswith('🟡'):
+                styles[idx] = 'color:#ffeb3b;'
+        elif col in ["資料狀態", "市場一致"]:
+            value = data_health if col == "資料狀態" else market_alignment
+            if value.startswith('🟢'):
+                styles[idx] = 'color:#00e676;'
+            elif value.startswith(('🔴', '⛔')):
+                styles[idx] = 'color:#ff4b4b;font-weight:bold;'
+            elif value.startswith('🟡'):
+                styles[idx] = 'color:#ffeb3b;'
+        elif col == "信心判讀":
+            confidence = str(row.get('信心判讀', ''))
+            if confidence.startswith('🟢'):
+                styles[idx] = 'color:#00e676;font-weight:bold;'
+            elif confidence.startswith(('🟡', '🟠')):
+                styles[idx] = 'color:#ffb300;font-weight:bold;'
+            elif confidence.startswith('🔴'):
+                styles[idx] = 'color:#ff4b4b;font-weight:bold;'
+    return styles
 
 # ==========================================
 # 主介面 (Tabs)
@@ -25167,13 +25324,17 @@ if tab1.open and stock_strategy_tab.open:
 
         # 即使資料在本輪重整時被篩成空表，原表欄位設定仍有可用的安全欄寬。
         note_width_px = 160
+        market_bias = str(st.session_state.get('strategy_market_environment', {}).get('bias', '盤整'))
+        if st.session_state.stock_data.empty:
+            st.info('正在背景還原股票快照；完成後會自動顯示主表。' if st.session_state.get('_stock_query_restore_pending')
+                    else '目前沒有主表快照，可選擇資料來源執行分析，或使用下方獨立計算。')
+        risk_preview_enabled = st.checkbox(
+            "🛡️ 啟用附加分析層（可隨時關閉回到原表）",
+            value=True,
+            key="risk_filter_preview_enabled",
+            help="加入支撐壓力、進出場點位、訊號、信心、資料品質與成效紀錄；不改動週轉率排序或原始戰略備註。"
+        )
         if not st.session_state.stock_data.empty:
-            risk_preview_enabled = st.checkbox(
-                "🛡️ 啟用附加分析層（可隨時關閉回到原表）",
-                value=True,
-                key="risk_filter_preview_enabled",
-                help="加入支撐壓力、進出場點位、訊號、信心、資料品質與成效紀錄；不改動週轉率排序或原始戰略備註。"
-            )
             strategy_settings_open = st.toggle(
                 "🧭 選股條件與進場信心設定",
                 key='stock_strategy_settings_open', persist_state='session',
@@ -25685,132 +25846,6 @@ if tab1.open and stock_strategy_tab.open:
                     if col not in ["移除", "信心分"]:
                         df_display[col] = df_display[col].map(_blank_display_text)
 
-                # 定義上色邏輯
-                def style_tab1_df(row, source_frame=None):
-                    styles = [''] * len(row)
-                    note = str(row.get('戰略備註', ''))
-                    # 精簡主表不顯示「狀態」，名稱底色必須以目前成交價與漲跌停價
-                    # 重新比對；不能沿用可能是上一輪報價留下的「漲停／跌停」文字。
-                    st_val = str(row.get('狀態', ''))
-                    frame = source_frame if isinstance(source_frame, pd.DataFrame) else df_display
-                    if not st_val and row.name in frame.index:
-                        st_val = str(frame.loc[row.name].get('狀態', ''))
-                    source_row = frame.loc[row.name] if row.name in frame.index else row
-                    limit_state = strategy_row_limit_state(source_row)
-                    risk_val = str(row.get('風險', ''))
-                    vwap_val = str(row.get('VWAP 狀態', ''))
-                    signal_state = str(row.get('訊號狀態', ''))
-                    data_health = str(row.get('資料狀態', ''))
-                    market_alignment = str(row.get('市場一致', ''))
-
-                    if limit_state == 'up':
-                        name_c = 'background-color: #ff4b4b; color: #ffffff; font-weight: bold;'
-                    elif limit_state == 'down':
-                        name_c = 'background-color: #00e676; color: #ffffff; font-weight: bold;'
-                    elif has_trade_prediction_signal(source_row.get('進出場預判')) and (
-                        source_row.get('訊號狀態') != '⚪ 開盤參考'
-                    ):
-                        name_c = 'background-color: #ffeb3b; color: #000000; font-weight: bold;'
-                    else:
-                        name_c = (
-                            'color: #ff4b4b; font-weight: bold;' if "多" in note
-                            else ('color: #00e676; font-weight: bold;' if "空" in note else 'font-weight: bold;')
-                        )
-
-                    price_c = ''
-                    try:
-                        c_val = float(
-                            str(row.get('漲跌幅', '0')).replace('%', '').replace('+', '')
-                            .replace('↑', '').replace('↓', '').replace('→', '').strip()
-                        )
-                        price_c = 'color: #ff4b4b;' if c_val > 0 else ('color: #00e676;' if c_val < 0 else '')
-                    except Exception: pass
-
-                    status_c = 'color: #ff4b4b;' if st_val in ["漲停", "強"] else ('color: #00e676;' if st_val in ["跌停", "弱"] else ('color: #ffeb3b;' if st_val == "命中" else ''))
-
-                    for idx, col in enumerate(row.index):
-                        if col == "名稱": styles[idx] = name_c
-                        elif col in ["收盤價", "漲跌幅"]: styles[idx] = price_c
-                        elif col == "狀態": styles[idx] = status_c
-                        elif col == "建議方向":
-                            direction_text = str(row.get('建議方向', ''))
-                            if '多' in direction_text:
-                                styles[idx] = 'color:#ff4b4b;font-weight:bold;'
-                            elif '空' in direction_text:
-                                styles[idx] = 'color:#00e676;font-weight:bold;'
-                        elif col == "方向依據":
-                            direction_text = str(row.get('建議方向', ''))
-                            styles[idx] = (
-                                'color:#ff6b6b;' if '多' in direction_text
-                                else ('color:#35d07f;' if '空' in direction_text else 'color:#cbd5e1;')
-                            )
-                        elif col == "支撐壓力":
-                            styles[idx] = 'color:#4fc3f7;font-weight:600;'
-                        elif col in ("盤中觸發", "隔日規則", "進出場預判"):
-                            value = str(row.get(col, ''))
-                            if col == '進出場預判' and (status_style := trade_plan_text_style(value)):
-                                styles[idx] = status_style
-                            elif any(keyword in value for keyword in ('資料不足', '不建立', '觀察：', '等待')):
-                                styles[idx] = 'color:#ffd166;'
-                            elif '多' in str(row.get('建議方向', '')):
-                                styles[idx] = 'color:#ff6b6b;'
-                            elif '空' in str(row.get('建議方向', '')):
-                                styles[idx] = 'color:#35d07f;'
-                        elif col == "當日漲停價":
-                            styles[idx] = 'color:#ff4b4b;font-weight:bold;'
-                        elif col == "當日跌停價":
-                            styles[idx] = 'color:#00e676;font-weight:bold;'
-                        elif col in ["成交價價差", "5日線價差"]:
-                            val = row[col]
-                            try:
-                                f_val = float(val)
-                                if f_val > 0: styles[idx] = 'color: #ff4b4b;'
-                                elif f_val < 0: styles[idx] = 'color: #00e676;'
-                                else: styles[idx] = 'color: white;'
-                            except Exception: pass
-                        elif col == "風險":
-                            if risk_val.startswith('🚫') or risk_val.startswith('🔴'):
-                                styles[idx] = 'color: #ff4b4b; font-weight: bold;'
-                            elif risk_val.startswith('🔶'):
-                                styles[idx] = 'color: #ff9800; font-weight: bold;'
-                            elif risk_val.startswith('🟡'):
-                                styles[idx] = 'color: #ffeb3b; font-weight: bold;'
-                            elif risk_val.startswith('🟢'):
-                                styles[idx] = 'color: #00e676;'
-                        elif col == "VWAP 狀態":
-                            if vwap_val.startswith('偏多'):
-                                styles[idx] = 'color: #ff4b4b; font-weight: bold;'
-                            elif vwap_val.startswith('偏空'):
-                                styles[idx] = 'color: #00e676; font-weight: bold;'
-                            elif vwap_val.startswith('中性'):
-                                styles[idx] = 'color: #ffeb3b;'
-                        elif col == "訊號狀態":
-                            if signal_state.startswith('✅'):
-                                styles[idx] = 'color:#ff4b4b;font-weight:bold;'
-                            elif signal_state.startswith('🔵'):
-                                styles[idx] = 'color:#29b6f6;font-weight:bold;'
-                            elif signal_state.startswith('⛔'):
-                                styles[idx] = 'color:#ff9800;font-weight:bold;'
-                            elif signal_state.startswith('🟡'):
-                                styles[idx] = 'color:#ffeb3b;'
-                        elif col in ["資料狀態", "市場一致"]:
-                            value = data_health if col == "資料狀態" else market_alignment
-                            if value.startswith('🟢'):
-                                styles[idx] = 'color:#00e676;'
-                            elif value.startswith(('🔴', '⛔')):
-                                styles[idx] = 'color:#ff4b4b;font-weight:bold;'
-                            elif value.startswith('🟡'):
-                                styles[idx] = 'color:#ffeb3b;'
-                        elif col == "信心判讀":
-                            confidence = str(row.get('信心判讀', ''))
-                            if confidence.startswith('🟢'):
-                                styles[idx] = 'color:#00e676;font-weight:bold;'
-                            elif confidence.startswith(('🟡', '🟠')):
-                                styles[idx] = 'color:#ffb300;font-weight:bold;'
-                            elif confidence.startswith('🔴'):
-                                styles[idx] = 'color:#ff4b4b;font-weight:bold;'
-                    return styles
-
                 styled_df = df_display[input_cols].style.apply(style_tab1_df, axis=1, source_frame=df_display.copy())
 
                 def stock_content_width(column, minimum, maximum=520, full_content=False):
@@ -26004,6 +26039,7 @@ if tab1.open and stock_strategy_tab.open:
                                 st.session_state.stock_data = append_replacement_stock_rows(
                                     st.session_state.stock_data, ready_results,
                                 )
+                                mark_stock_data_updated()
                                 save_data_cache(st.session_state.stock_data, st.session_state.ignored_stocks, st.session_state.all_candidates, st.session_state.saved_notes, sync_cloud=False)
                                 st.rerun()
 
@@ -26099,11 +26135,16 @@ if tab1.open and stock_strategy_tab.open:
                      st.session_state.stock_strategy_editor_revision += 1
                      st.rerun()
 
-                return risk_preview_enabled, note_width_px, market_bias, style_tab1_df
+                return note_width_px, market_bias
 
-            risk_preview_enabled, note_width_px, market_bias, style_tab1_df = render_stock_main_table()
+            note_width_px, market_bias = render_stock_main_table()
 
+        with st.container():
             st.markdown("### ⚡獨立計算")
+            saved_independent = saved_independent_analysis('stock')
+            if ('indep_strategy_mode' not in st.session_state
+                    and saved_independent.get('strategy_mode') in ('當沖', '隔日／波段')):
+                st.session_state.indep_strategy_mode = saved_independent['strategy_mode']
             indep_strategy_mode = None
             indep_compact_table = False
             if risk_preview_enabled:
@@ -26169,6 +26210,9 @@ if tab1.open and stock_strategy_tab.open:
             with st.expander('獨立分析自動更新設定'):
                 independent_auto = render_intraday_auto_controls('stock_independent')
 
+            if 'stock_independent_raw_results' not in st.session_state:
+                if saved_independent.get('rows'):
+                    st.session_state.stock_independent_raw_results = saved_independent['rows']
             expected_indep_date = latest_completed_stock_trading_date().strftime('%Y/%m/%d')
             cached_indep_data = [
                 row for row in st.session_state.get('stock_independent_raw_results', [])
@@ -26178,7 +26222,6 @@ if tab1.open and stock_strategy_tab.open:
                 st.session_state.get('stock_independent_raw_results')
                 and not cached_indep_data
             ):
-                st.session_state.pop('stock_independent_raw_results', None)
                 st.info("上一份獨立分析不是最新完整交易日，已停止顯示舊戰略備註。")
             if btn_indep_run and not indep_selection:
                 st.warning("請先選擇至少一檔股票再執行獨立分析。")
@@ -26243,6 +26286,10 @@ if tab1.open and stock_strategy_tab.open:
                     if indep_data:
                         st.session_state.stock_independent_raw_results = indep_data
                         st.session_state.stock_independent_visible_codes = [row['代號'] for row in indep_data]
+                        if btn_indep_run:
+                            save_independent_analysis('stock', {
+                                'strategy_mode': indep_strategy_mode, 'rows': indep_data,
+                            })
                     else:
                         st.warning(
                             f"本次未取得截至 {expected_indep_date} 的完整日 K；"
