@@ -17,7 +17,9 @@ def harness():
                           'get_stable_index_trade_plan', 'index_operation_model_specs', 'calculate_hourly_index_plan')
     api = object()
     state = {'lock': threading.RLock()}
-    session = {'sj_api': api, 'sj_logged_in': True}
+    recording = threading.Event()
+    recording.set()
+    session = {'sj_api': api, 'sj_logged_in': True, '_index_model_recording': recording}
     worker = IntradayBackground(lambda: True)
     builds, records, subscriptions = [], [], {}
     def forbidden(*args, **kwargs):
@@ -78,9 +80,13 @@ def test_first_visit_hidden_updates_return_and_repeated_visits_do_not_duplicate(
         ns['index_operation_snapshot'](seed, .02)
         first = wait_result(worker, 'index_plan', lambda r:r['rows'].get('live_price') == 20100.)
         job = worker.jobs['index_plan']
+        session['_index_model_recording'].clear()
+        recorded = len(records)
         price[0] = 20200.
-        # No page/fragment call during this wait: hidden page continues server-side.
+        # Hidden analysis still advances without publishing fresh model plans.
         latest = wait_result(worker, 'index_plan', lambda r:r['rows'].get('live_price') == 20200.)
+        assert len(records) == recorded
+        session['_index_model_recording'].set()
         def no_recalculation(*args, **kwargs):
             raise AssertionError('Returning must read the snapshot')
         ns['calculate_operation_snapshot'] = no_recalculation

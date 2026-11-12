@@ -1011,7 +1011,12 @@ class ModelTracker:
     def submit(self, signals, quotes):
         self.last_activity = time.monotonic()
         for key, quote in quotes.items():
-            self.leases[key] = (self.last_activity, max(30, float(quote.get('更新秒數',5)) * 3))
+            lease = (self.last_activity, max(30, float(quote.get('更新秒數',5)) * 3))
+            if '僅追蹤持倉' in quote:
+                for trade_id in quote['僅追蹤持倉']:
+                    self.leases[(key, trade_id)] = lease
+            else:
+                self.leases[key] = lease
         try:
             self.queue.put_nowait((signals, quotes))
             return True
@@ -1129,6 +1134,33 @@ class ModelTracker:
             rows = db.execute("SELECT body FROM trades WHERE month=? AND state IN ('等待進場','模擬持倉','監控中斷','資料不足') AND json_extract(body,'$.計畫來源')=? AND json_extract(body,'$.交易日')=?", (month, source, day)).fetchall()
         return [row for raw in rows if (row := json.loads(raw[0])).get('計畫來源') == source and row.get('交易日') == day]
 
+    def open_stock_positions(self, codes, day):
+        positions = {}
+        with closing(self.db()) as db:
+            for code in codes:
+                prefix = code + '|股票|'
+                for trade_id, mode, stream, seq, source in db.execute("""SELECT id,json_extract(body,'$.策略'),
+                    json_extract(body,'$.串流識別'),json_extract(body,'$.最後序號'),json_extract(body,'$.來源時間')
+                    FROM trades WHERE slot>=? AND slot<? AND state IN ('模擬持倉','監控中斷','資料不足')
+                    AND json_extract(body,'$.模擬進場價') IS NOT NULL
+                    AND json_extract(body,'$.模擬出場價') IS NULL
+                    AND (json_extract(body,'$.策略')='波段' OR json_extract(body,'$.交易日')=?)
+                    """, (prefix, prefix + '\uffff', day)):
+                    positions[trade_id] = {'商品鍵': code, '策略': mode, '市場': '股票', '交易日': day,
+                                           '串流識別': stream, '最後序號': seq, '來源時間': source}
+        return positions
+
+    def still_held(self, ids):
+        if not ids:
+            return set()
+        with closing(self.db()) as db:
+            return {trade_id for (trade_id,) in db.execute("""SELECT id FROM trades
+                WHERE id IN (SELECT value FROM json_each(?))
+                AND state IN ('模擬持倉','監控中斷','資料不足')
+                AND json_extract(body,'$.模擬進場價') IS NOT NULL
+                AND json_extract(body,'$.模擬出場價') IS NULL
+                AND NOT COALESCE(json_extract(body,'$.到期未確認'),0)""", (json.dumps(list(ids)),))}
+
     def settle_stock_closes(self, day, official_closes):
         """Settle still-open stock day trades from date-verified exchange closes."""
         if not official_closes:
@@ -1229,12 +1261,18 @@ class ModelTracker:
             primary = self.primary_streams.get(key, stream)
             if primary.split(':')[0] == stream.split(':')[0] and primary != stream:
                 primary = stream  # Same connection has a new transport/buffer epoch.
+            holding_only = '僅追蹤持倉' in quote
             chosen = sources.get(primary)
+            if not holding_only and chosen and '僅追蹤持倉' in chosen[1]:
+                primary, chosen = stream, sources[stream]
             if chosen is None or not chosen[1].get('有效') or now - chosen[0] > 30:
-                candidates = [(name, value) for name,value in sources.items() if value[1].get('有效') and now-value[0] <= 30]
+                candidates = [(name, value) for name, value in sources.items() if value[1].get('有效')
+                              and now-value[0] <= 30 and (holding_only or '僅追蹤持倉' not in value[1])]
                 if candidates:
                     primary, chosen = max(candidates, key=lambda item: str(item[1][1].get('來源時間','')))
             self.primary_streams[key] = primary
+            if holding_only and chosen and chosen[1] is not quote:
+                continue  # A hidden producer cannot replay another producer's entry permissions.
             selected[key] = chosen[1] if chosen else quote
         quotes = selected
         with self.write_db() as db:
@@ -1273,6 +1311,9 @@ class ModelTracker:
                 row = json.loads(raw[0])
                 quote = quotes.get(row['市場'] + '|' + row['商品鍵'])
                 if quote is None or (quote.get('休市') and not quote.get('收盤確認')) or row['狀態'] not in ACTIVE:
+                    continue
+                held_ids = quote.get('僅追蹤持倉')
+                if held_ids is not None and (row['交易ID'] not in held_ids or row.get('模擬進場價') is None):
                     continue
                 if quote.get('策略') and quote['策略'] != row['策略'] and row.get('模擬進場價') is None:
                     continue
@@ -1323,10 +1364,11 @@ class ModelTracker:
                 if updated != row:
                     self.store(db, updated)
                     self.revision += 1
-            self.reenter(db, quotes)
-            self.replan(db, quotes)
-            self.record_diagnostics(db, signals, quotes)
-        for key, quote in quotes.items():
+            entry_quotes = {key: quote for key, quote in quotes.items() if '僅追蹤持倉' not in quote}
+            self.reenter(db, entry_quotes)
+            self.replan(db, entry_quotes)
+            self.record_diagnostics(db, signals, entry_quotes)
+        for key, quote in entry_quotes.items():
             if quote.get('策略') and quote.get('進場品質時間'):
                 identity = (key, quote['策略'])
                 previous_time = stamp(self.entry_permissions.get(identity, {}).get('進場品質時間'))
@@ -1626,13 +1668,18 @@ class ModelTracker:
                 row = json.loads(raw[0])
                 if row['策略'] == '波段' and not self.market_open(row):
                     continue
-                lease = self.leases.get(row['市場'] + '|' + row['商品鍵'])
-                if lease is not None and now - lease[0] <= lease[1]:
+                key = row['市場'] + '|' + row['商品鍵']
+                leases = (self.leases.get(key), self.leases.get((key, row['交易ID'])))
+                if any(lease is not None and now - lease[0] <= lease[1] for lease in leases):
                     continue
                 row['資料缺口'] = True
                 event(row, '監控中斷', datetime.now(TZ).isoformat(), '監控停止、登入中斷或頁面離開；未確認區間不回填')
                 self.store(db,row)
                 self.revision += 1
+
+        for key, lease in list(self.leases.items()):
+            if isinstance(key, tuple) and now - lease[0] > lease[1] and self.leases.get(key) == lease:
+                self.leases.pop(key, None)
 
     def remote_get(self, scope, trade_ids=None):
         for attempt in range(3):
