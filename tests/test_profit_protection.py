@@ -161,7 +161,7 @@ def test_shared_stock_and_futures_projection_and_compact_history_apptest():
     functions = '\n\n'.join(ast.unparse(n) for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names)
     script = '''
 import streamlit as st
-import re
+import html, re
 from model_tracking import trade_display
 import pandas as pd
 import json
