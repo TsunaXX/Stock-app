@@ -111,7 +111,7 @@ def test_closed_projection_releases_both_tables_for_new_plan_apptest():
     tree=ast.parse(Path('app.py').read_text(encoding='utf-8'))
     function=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='apply_model_protection')
     script="""import streamlit as st
-import re
+import html, re
 from model_tracking import trade_display
 import pandas as pd, pytz
 from datetime import datetime

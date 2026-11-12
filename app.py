@@ -286,8 +286,12 @@ def _stream_payload(api, payload, security_type):
         if buffer is not None and trade_evidence and close is not None and getattr(payload, 'datetime', None) is not None:
             sequence = state.setdefault('model_tick_sequences', {}).get(code, 0) + 1
             state['model_tick_sequences'][code] = sequence
+            identity = f"{id(api)}:{state.get('model_stream_epoch', 0)}:{state.get('model_buffer_epochs', {}).get(code, 0)}"
             buffer.append({'價格': close, '來源時間': pytz.timezone('Asia/Taipei').localize(updated_at).isoformat(),
-                           '序號': sequence, '串流識別': f"{id(api)}:{state.get('model_stream_epoch', 0)}:{state.get('model_buffer_epochs', {}).get(code, 0)}", '有效': True})
+                           '序號': sequence, '串流識別': identity, '有效': True})
+            auction = state.get('stock_auction_closes', {}).get(code) if security_type == 'STK' else None
+            if auction and auction['time'] == updated_at and auction['price'] == close:
+                auction.update(sequence=sequence, stream=identity)
         for requested, target in list(state['aliases'].items()):
             if target == code:
                 state['quotes'][requested] = previous
@@ -10631,30 +10635,51 @@ def fetch_official_stock_closes(day, codes=None):
     return closes
 
 
-def official_model_stock_closes(day, codes):
-    return {code: quote['price'] for code, quote in fetch_official_stock_closes(day, codes).items()}
+def stock_stream_auction_closes(api, day):
+    if api is None:
+        return {}
+    state = _stream_state(api)
+    with state['lock']:
+        quotes = {code: {**quote, 'time': pytz.timezone('Asia/Taipei').localize(quote['time']).isoformat()}
+                  for code, quote in state.get('stock_auction_closes', {}).items()
+                  if quote['time'].date() == day}
+        return {**quotes, **{code: quotes[target] for code, target in state.get('aliases', {}).items()
+                             if target in quotes}}
 
 
 def check_model_stock_closes(tracker=None):
-    """Use the shared maintenance pool to reconcile once official data is available."""
+    """Settle against the broker immediately and share the official feed with the stock table."""
     now = datetime.now(pytz.timezone('Asia/Taipei'))
     if model_market_open({'市場': '股票'}, now):
         return
-    day = latest_completed_stock_trading_date(now)
+    day = (now.date() if now.time() >= dt_time(13, 30) and not is_market_closed_func(now.date())
+           else latest_completed_stock_trading_date(now))
     if tracker is None:
         url = get_app_secret('gsheet_api_url') or ''
         if not url and not st.session_state.get('sj_logged_in', False):
             return
         tracker = get_model_tracker(url)
     tracker.last_activity = time.monotonic()
+    broker = stock_stream_auction_closes(st.session_state.get('sj_api'), day)
+    jobs = get_public_maintenance_jobs()
+    official_ready = day != now.date() or now.time() >= dt_time(13, 33)
 
     def settle():
         codes = {row['商品鍵'] for row in tracker.active_plans('股期戰略室', day.isoformat())
                  if row.get('市場') == '股票' and row.get('策略') == '當沖' and row.get('模擬進場價') is not None}
-        if codes:
-            tracker.settle_stock_closes(day.isoformat(), official_model_stock_closes(day, codes))
+        if not codes:
+            return
+        official = jobs.poll(('stock-table-closes', day), lambda: fetch_official_stock_closes(day),
+                             interval=180) if official_ready else None
+        prices = {code: quote['price'] for code, quote in (official or {}).items() if code in codes}
+        streamed = {code: broker[code] for code in codes & broker.keys()}
+        if streamed and 'broker_closes' in inspect.signature(tracker.settle_stock_closes).parameters:
+            tracker.settle_stock_closes(day.isoformat(), prices, broker_closes=streamed)
+        elif prices:
+            tracker.settle_stock_closes(day.isoformat(), prices)
 
-    get_public_maintenance_jobs().poll(('model-stock-closes', id(tracker), day), settle, interval=180)
+    if broker or official_ready:
+        jobs.poll(('model-stock-closes', id(tracker), day), settle, interval=5 if broker else 60)
 
 
 def _build_official_turnover_ranking(
@@ -13534,6 +13559,8 @@ def normalize_stock_display_settings(value):
                         'date': day.isoformat(), 'price': price,
                         'change': change if change is not None and math.isfinite(change) else None,
                     }
+                    if quote.get('source') == 'shioaji':
+                        normalized[str(code)]['source'] = 'shioaji'
         elif key == 'independent_analysis':
             normalized = {
                 room: snapshot for room, snapshot in values.items()
@@ -13609,6 +13636,11 @@ def merge_stock_preferences(remote, local):
                              if isinstance(local_quote, dict) else date.min)
                 if remote_day != local_day:
                     selected = local_item if local_day > remote_day else remote_item
+                elif isinstance(remote_quote, dict) and isinstance(local_quote, dict):
+                    remote_official = remote_quote.get('source') != 'shioaji'
+                    local_official = local_quote.get('source') != 'shioaji'
+                    if remote_official != local_official:
+                        selected = local_item if local_official else remote_item
             if 'value' in selected:
                 merged_values[item_key] = selected['value']
                 merged_times[item_key] = selected.get('updated_at', '')
@@ -20338,7 +20370,15 @@ def calculate_daytrade_metrics(intraday_df, live_snapshot=None, now_tw=None, int
     average_prior_volume = np.mean(daily_volume_to_cutoff[-2:]) if daily_volume_to_cutoff else np.nan
     volume_ratio = float(current_volume / average_prior_volume) if average_prior_volume and average_prior_volume > 0 else None
 
+    completed = data[(data.index.normalize() == latest_day) & (data.index.time < cutoff_time.replace(second=0, microsecond=0))
+                     & (data['Volume'] > 0)].tail(2) if not data.empty else data
+    recent = (len(completed) == 2 and completed.index[-1] - completed.index[-2] == timedelta(minutes=1)
+              and (datetime.combine(latest_day.date(), cutoff_time)
+                   - completed.index[-2].replace(tzinfo=None)).total_seconds() <= 180)
+    confirmation = ('多頭' if recent and (completed['Close'] > vwap).all()
+                    else '空頭' if recent and (completed['Close'] < vwap).all() else '')
     return {
+        '_daytrade_confirmation': confirmation,
         '_daytrade_vwap': round(vwap, 2),
         '_daytrade_or_high': round(opening_high, 2),
         '_daytrade_or_low': round(opening_low, 2),
@@ -20434,6 +20474,10 @@ def calculate_daytrade_filter_result(row, direction, attention_counts=None, disp
     guard_reason = guard_value if isinstance(guard_value, str) else ''
     if row.get('_daytrade_guard_ready') is False or guard_reason:
         eligible = False
+    confirmation = row.get('_daytrade_confirmation')
+    confirmation_missing = '_daytrade_confirmation' in row and confirmation != direction
+    if confirmation_missing:
+        eligible = False
     direction_text = '站上' if is_long else '跌破'
     range_text = ('目前開盤高檔' if is_long else '目前開盤低檔') if is_opening_micro else ('開盤區間高' if is_long else '開盤區間低')
     if risk_blocked:
@@ -20449,6 +20493,8 @@ def calculate_daytrade_filter_result(row, direction, attention_counts=None, disp
         )
     elif volume_ratio is not None and volume_ratio < minimum_volume_ratio:
         rule = '觀察：量能未達近期同時段平均'
+    elif confirmation_missing:
+        rule = f'觀察：等待最近兩根完成的 1 分 K 收盤{direction_text} VWAP'
     else:
         rule = (
             f'觸發：開盤動能{direction_text} VWAP＋接近{range_text}'
@@ -22350,13 +22396,23 @@ def apply_model_protection(rows, stock, mode, room=None):
                     f"保 {protection}｜目 {fmt_price(record['目標價'])}"
                 )
             if entered or record.get('狀態') == '訊號失效':
-                source_time = record.get('結案時間') or record.get('訊號失效時間') or record.get('進場時間') or record.get('來源時間')
+                source_time = view.get('結案時間') or record.get('訊號失效時間') or record.get('進場時間') or record.get('來源時間')
                 time_text, sort_time = notice_time(source_time)
                 name = f"{row.get('名稱', key)}（{key}）"
-                note = f"{time_text} {name} {state}{suffix}：{view['狀態說明']}"
+                headline = html.escape(f"{name} {state}{suffix}")
+                color = '#ffb74d' if '⚠' in state or record.get('暫定收盤') else '#64b5f6'
+                detail = html.escape(view['狀態說明'])
+                def color_pnl(match):
+                    amount = match[1]
+                    pnl_color = '#ff5252' if amount.startswith('+') else '#00c853' if amount.startswith('-') else '#90a4ae'
+                    return f'模擬淨損益 <strong style="color:{pnl_color}">{amount}</strong>'
+                detail = re.sub(r'模擬淨損益 ([+\-]?[\d,.]+)', color_pnl, detail)
+                note = f'{time_text} <strong style="color:{color}">{headline}</strong>：{detail}'
+                if stock and mode == '當沖' and record.get('出場原因') == '停損' and record.get('資料缺口'):
+                    note += '｜前次行情有缺口，原計畫無法接續二次進場'
                 parent = record.get('_前次出場')
                 if parent and parent.get('狀態') == '已平倉':
-                    note += f"｜前次 {trade_display(parent)['交易狀態']} {notice_time(parent.get('結案時間'))[0]}"
+                    note += html.escape(f"｜前次 {trade_display(parent)['交易狀態']} {notice_time(parent.get('結案時間'))[0]}")
                 elif record.get('前次執行ID'):
                     note += '｜前次出場紀錄待同步'
                 notes.append((sort_time, note))
@@ -22386,7 +22442,7 @@ def apply_model_protection(rows, stock, mode, room=None):
         suffix = f'（另 {len(changes)-3} 檔）' if len(changes) > 3 else ''
         st.toast('交易狀態：' + '；'.join(changes[:3]) + suffix, icon='🔔')
     if notes:
-        st.caption('交易提醒：' + '；'.join(note for _, note in sorted(notes, reverse=True)[:3]))
+        st.caption('交易提醒：' + '；'.join(note for _, note in sorted(notes, reverse=True)[:3]), unsafe_allow_html=True)
 
 
 @st.cache_resource(max_entries=4)
@@ -24962,14 +25018,21 @@ def check_stock_table_closes(now):
     codes.update(st.session_state.get('stock_independent_visible_codes', ()))
     if not codes or (day := stock_close_display_day(now)) is None:
         return False
-    missing = codes.difference(saved_stock_closing_quotes(day))
+    saved = saved_stock_closing_quotes(day)
+    missing = codes - {code for code, quote in saved.items() if quote.get('source') != 'shioaji'}
     if not missing:
         return False
-    quotes = get_public_maintenance_jobs().poll(
+    official = get_public_maintenance_jobs().poll(
         ('stock-table-closes', day), lambda: fetch_official_stock_closes(day), interval=180,
     ) or {}
-    verified = {code: {**quotes[code], 'date': day.isoformat()} for code in missing & quotes.keys()}
-    return bool(verified and persist_shared_display_setting('stock_closing_quotes', verified))
+    updates = {code: {**official[code], 'date': day.isoformat()} for code in missing & official.keys()}
+    broker = stock_stream_auction_closes(st.session_state.get('sj_api'), day) if st.session_state.get('sj_api') is not None else {}
+    for code in (missing - official.keys()) & broker.keys():
+        provisional = {key: broker[code][key] for key in ('price', 'change')}
+        provisional.update(date=day.isoformat(), source='shioaji')
+        if provisional != saved.get(code):
+            updates[code] = provisional
+    return bool(updates and persist_shared_display_setting('stock_closing_quotes', updates))
 
 
 def stock_close_display_rows(rows, quotes):
@@ -24997,9 +25060,10 @@ def render_stock_auction_prices(rows, room):
     codes = set(rows['代號'].astype(str))
     clock = now.time()
     day = stock_close_display_day(now)
-    official = saved_stock_closing_quotes(day) if day is not None else {}
+    saved = saved_stock_closing_quotes(day) if day is not None else {}
+    official = {code: quote for code, quote in saved.items() if quote.get('source') != 'shioaji'}
     if is_market_closed_func(now.date()):
-        return stock_close_display_rows(rows, official) if official else rows
+        return stock_close_display_rows(rows, saved) if saved else rows
     api = st.session_state.get('sj_api')
     trial = clock < dt_time(9) and bool(st.session_state.get(f'{room}_auto_timer_seconds'))
     streamed = {}
@@ -25020,8 +25084,9 @@ def render_stock_auction_prices(rows, room):
             st.caption(f'永豐試撮 {latest:%H:%M:%S}｜{len(streamed)}/{len(codes)} 檔，其餘保留前次報價')
         elif trial:
             st.caption('等待永豐試撮，暫保留前次報價')
-        quotes = {**official, **streamed}
+        quotes = {**saved, **streamed}
     elif clock >= dt_time(13, 30):
+        streamed = {**{code: quote for code, quote in saved.items() if quote.get('source') == 'shioaji'}, **streamed}
         verified = codes & official.keys()
         pending = codes - verified
         mismatch = sorted(code for code in verified & streamed.keys()

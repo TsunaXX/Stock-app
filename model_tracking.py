@@ -8,7 +8,7 @@ import sqlite3
 import threading
 import time
 from contextlib import closing, contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP, ROUND_CEILING, ROUND_FLOOR
 from zoneinfo import ZoneInfo
 
@@ -258,6 +258,9 @@ def trade_display(record):
     state, entered = row.get('狀態'), row.get('模擬進場價') is not None
     gap = bool(row.get('資料缺口') or row.get('到期未確認') or state in ('監控中斷', '資料不足'))
     reason = row.get('訊號失效原因') or row.get('異常原因', '')
+    preview = row.get('暫定收盤') or {}
+    pnl = number(preview.get('模擬損益') if preview else row.get('模擬損益'))
+    amount = f'{pnl:+,.2f}'.rstrip('0').rstrip('.') if pnl else '0'
     if not entered and reason == '未進場前已越過停損或交易日已結束':
         row['訊號失效原因'], row['未進場分類'] = invalidation_detail(row, reason)
     if state == '已平倉':
@@ -265,8 +268,11 @@ def trade_display(record):
         status = '已出場（' + cause + '）' + ('⚠' if gap else '')
         confirmed = not gap and (row.get('識別版本') != 2 or row.get('同步確認')) and number(row.get('模擬損益')) is not None
         result = '已納入績效' if confirmed else ('績效未確認，不納入勝率與累積損益' if gap else '待同步確認，暫不納入績效')
-        pnl = number(row.get('模擬損益'))
-        detail = cause + '出場｜' + (f'模擬淨損益 {pnl:+,.2f} 元；' if pnl is not None else '') + result
+        detail = cause + '出場｜' + (f'模擬淨損益 {amount} 元；' if pnl is not None else '') + result
+    elif entered and preview:
+        status = '已收盤（待核對）'
+        detail = '永豐收盤成交｜' + (f'模擬淨損益 {amount} 元；' if pnl is not None else '') + '待官方收盤價核對'
+        row.update({key: preview[key] for key in ('模擬出場價', '模擬損益', '結案時間') if key in preview})
     elif entered:
         status = '已進場' + ('⚠' if gap or state == '訊號失效' else '')
         detail = '已確認模擬進場，尚未確認出場' if not gap and state != '訊號失效' else '已確認模擬進場；行情證據有缺口，持倉／出場待確認'
@@ -279,7 +285,7 @@ def trade_display(record):
                   row.get('最後進場等待原因') or row.get('進場等待原因') or '等待有效進場條件及成交證據')
     reference = gap_reference_trade(row)
     category = ('缺口參考' if reference else '完整驗證' if state == '已平倉' and confirmed else
-                '待確認' if state == '已平倉' else '未結案')
+                '待確認' if state == '已平倉' or row.get('暫定收盤') else '未結案')
     if reference:
         detail = detail.replace('績效未確認，不納入勝率與累積損益', '行情有缺口，已列入缺口參考績效')
     if entered:
@@ -563,7 +569,8 @@ def advance(record, quote):
         return row
     ts, prior = stamp(quote.get('來源時間')), stamp(row.get('來源時間'))
     price = number(quote.get('價格'))
-    if ts is None:
+    pending_close = stamp((row.get('暫定收盤') or {}).get('結案時間'))
+    if ts is None or (pending_close is not None and ts >= pending_close):
         return row
     if prior is not None and ts < prior:
         stream, seq = quote.get('串流識別'), quote.get('序號')
@@ -753,6 +760,7 @@ def advance(record, quote):
         row.update({**pnl, '模擬出場價': exit_price, '結案時間': text,
                     '結果(R)': round(sign * (price - trigger_fill) / risk, 4) if option_legs else round(sign * (exit_price - fill) / risk, 4),
                     '出場原因': '保利' if protected else ('停損' if stopped else ('停利' if targeted else '收盤'))})
+        row.pop('暫定收盤', None)
         event(row, '已平倉', text)
     elif row.get('保利規則') == PROTECTION_POLICY:
         update_profit_protection(row, price, text, pnl)
@@ -1161,9 +1169,10 @@ class ModelTracker:
                 AND json_extract(body,'$.模擬出場價') IS NULL
                 AND NOT COALESCE(json_extract(body,'$.到期未確認'),0)""", (json.dumps(list(ids)),))}
 
-    def settle_stock_closes(self, day, official_closes):
-        """Settle still-open stock day trades from date-verified exchange closes."""
-        if not official_closes:
+    def settle_stock_closes(self, day, official_closes, broker_closes=None):
+        """Show the closing print provisionally, then book the exchange-confirmed result."""
+        broker_closes = broker_closes or {}
+        if not official_closes and not broker_closes:
             return 0
         month = day[:7].replace('-', '')
         close_time = f'{day}T13:30:00+08:00'
@@ -1176,15 +1185,45 @@ class ModelTracker:
                 AND json_extract(body,'$.交易日')=?""", (month, day)).fetchall()
             for raw, in rows:
                 row = json.loads(raw)
-                close = number(official_closes.get(row.get('商品鍵')))
+                code = row.get('商品鍵')
+                close = number(official_closes.get(code))
                 entry = number(row.get('模擬進場價'))
                 entered = stamp(row.get('進場時間'))
-                if (close is None or close <= 0 or entry is None or entry <= 0 or entered is None
-                        or entered >= cutoff or entered.date().isoformat() != day or row.get('模擬出場價') is not None):
+                if (entry is None or entry <= 0 or entered is None or entered >= cutoff
+                        or entered.date().isoformat() != day or row.get('模擬出場價') is not None):
                     continue
                 last = stamp(row.get('來源時間'))
-                verified = (row['狀態'] == '模擬持倉' and last == cutoff and row.get('最後序號') is not None
-                            and number(row.get('最新價')) == close)
+                prior = row.get('暫定收盤') or {}
+                broker = broker_closes.get(code) or {}
+                observed = stamp(broker.get('time'))
+                price = number(broker.get('price'))
+                if (observed is not None and cutoff <= observed < cutoff + timedelta(minutes=4)
+                        and price is not None and price > 0):
+                    seq = broker.get('sequence')
+                    last_seq = row.get('最後序號')
+                    continuous = (row['狀態'] == '模擬持倉' and not row.get('資料缺口')
+                                  and seq is not None and last_seq is not None and last is not None
+                                  and broker.get('stream') == row.get('串流識別')
+                                  and ((seq == last_seq and observed == last)
+                                       or (seq == last_seq + 1 and 0 <= (observed-last).total_seconds() <= 30)))
+                    preview = {**trade_pnl(row, price), '模擬出場價': price,
+                               '結案時間': observed.isoformat(), '連續證據': continuous}
+                    if not prior or preview['結案時間'] > prior['結案時間']:
+                        prior = preview
+                if close is None or close <= 0:
+                    if prior and prior != row.get('暫定收盤'):
+                        row['暫定收盤'] = prior
+                        event(row, row['狀態'], prior['結案時間'], '已收到永豐收盤成交，待官方核對')
+                        if last is not None:
+                            row['來源時間'] = last.isoformat()
+                        self.store(db, row)
+                        self.revision += 1
+                        count += 1
+                    continue
+                row.pop('暫定收盤', None)
+                verified = ((row['狀態'] == '模擬持倉' and last == cutoff and row.get('最後序號') is not None
+                             and number(row.get('最新價')) == close)
+                            or (prior.get('連續證據') and prior.get('模擬出場價') == close))
                 if not verified:
                     row['資料缺口'] = True
                     causes = row.setdefault('資料缺口原因', [])
@@ -1193,11 +1232,15 @@ class ModelTracker:
                         causes.append(reason)
                 risk = abs(entry - row['停損價'])
                 sign = 1 if row['方向'] in ('多頭', '偏多') else -1
+                settled_at = prior.get('結案時間', close_time)
                 row.update({**trade_pnl(row, close), '模擬出場價': close, '最新價': close,
-                            '結案時間': close_time, '出場原因': '收盤',
+                            '結案時間': settled_at, '出場原因': '收盤',
                             '結果(R)': round(sign * (close - entry) / risk, 4) if risk else None})
-                event(row, '已平倉', close_time, '依交易所同日正式收盤價結算')
-                if last is not None and last > cutoff:
+                reason = '依交易所同日正式收盤價結算'
+                if prior and prior['模擬出場價'] != close:
+                    reason += f"；永豐暫估 {prior['模擬出場價']:g}，已更正為 {close:g}"
+                event(row, '已平倉', settled_at, reason)
+                if last is not None and last > stamp(settled_at):
                     row['來源時間'] = last.isoformat()
                 if self.url:
                     row['同步確認'] = False
@@ -1666,7 +1709,7 @@ class ModelTracker:
         with self.write_db() as db:
             for raw in db.execute("SELECT body FROM trades WHERE state IN ('等待進場','模擬持倉')").fetchall():
                 row = json.loads(raw[0])
-                if row['策略'] == '波段' and not self.market_open(row):
+                if row.get('暫定收盤') or (row['策略'] == '波段' and not self.market_open(row)):
                     continue
                 key = row['市場'] + '|' + row['商品鍵']
                 leases = (self.leases.get(key), self.leases.get((key, row['交易ID'])))

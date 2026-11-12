@@ -483,7 +483,7 @@ def test_sync_follows_up_settings_changed_during_first_write(tmp_path):
 
 
 def test_official_closing_quotes_validate_dates_and_preserve_model_prices():
-    ns = helpers('fetch_official_stock_closes', 'official_model_stock_closes',
+    ns = helpers('fetch_official_stock_closes',
                  '_official_number', '_parse_roc_trade_date')
     day = date(2026, 11, 11)
     twse = {'date': '20261111', 'tables': [{
@@ -520,7 +520,8 @@ def test_official_closing_quotes_validate_dates_and_preserve_model_prices():
         '1815': {'price': 140.5, 'change': 12.5},
         '6925': {'price': 104.5, 'change': 0.0},
     }
-    assert ns['official_model_stock_closes'](day, ('2468', '1815', '6538')) == {'2468': 68.3, '1815': 140.5}
+    selected = ns['fetch_official_stock_closes'](day, ('2468', '1815', '6538'))
+    assert {code: quote['price'] for code, quote in selected.items()} == {'2468': 68.3, '1815': 140.5}
     twse['date'] = '20261110'
     assert set(ns['fetch_official_stock_closes'](day)) == {'1815', '6925'}
 
@@ -672,3 +673,51 @@ def test_shioaji_auctions_display_before_official_without_recording_trial_trades
     assert result.iloc[0]['收盤價'] == '102.5'
     assert result.iloc[0]['_strategy_close'] == 100
     assert '已依官方更正：2330' in shown[-1]
+
+
+def test_snapshot_persists_today_broker_until_official_close_replaces_it():
+    ns = helpers('stock_close_display_day', 'latest_completed_stock_trading_date',
+                 'saved_stock_closing_quotes', 'check_stock_table_closes', 'stock_stream_auction_closes')
+    day = date(2026, 11, 12)
+    now = pd.Timestamp('2026-11-12 13:33', tz='Asia/Taipei')
+    saved = {'4526': {'date': '2026-11-11', 'price': 55.0, 'change': 1.0}}
+    official = {}
+    ns.update(st=SimpleNamespace(session_state={'stock_main_visible_codes': ['4526'], 'sj_api': object()}),
+              is_market_closed_func=lambda day: False,
+              get_stock_display_settings=lambda: {'stock_closing_quotes': {'values': saved}},
+              get_public_maintenance_jobs=lambda: SimpleNamespace(poll=lambda key, fetch, **kw: fetch()),
+              fetch_official_stock_closes=lambda _: official,
+              stock_stream_auction_closes=lambda api, day: {'4526': {'price': 58.2, 'change': 3.2}},
+              persist_shared_display_setting=lambda group, values: saved.update(values) or True)
+    check = ns['check_stock_table_closes']
+    assert check(now)
+    assert saved['4526'] == {'date': day.isoformat(), 'price': 58.2, 'change': 3.2, 'source': 'shioaji'}
+    assert not check(now)
+    official['4526'] = {'price': 58.4, 'change': 3.4}
+    assert check(now + pd.Timedelta(minutes=5))
+    assert saved['4526'] == {'date': day.isoformat(), 'price': 58.4, 'change': 3.4}
+    assert not check(now + pd.Timedelta(minutes=6))
+
+
+def test_model_settlement_uses_today_while_daily_strategy_still_uses_yesterday():
+    from datetime import datetime
+    import inspect
+    ns = helpers('check_model_stock_closes', 'latest_completed_stock_trading_date')
+    now = pd.Timestamp('2026-11-12 13:31', tz='Asia/Taipei').to_pydatetime()
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now
+    calls = []
+    def settle(day, prices, broker_closes=None):
+        calls.append((day, prices, broker_closes))
+    tracker = SimpleNamespace(settle_stock_closes=settle,
+                              active_plans=lambda *args: [{'市場': '股票', '策略': '當沖', '模擬進場價': 57.1, '商品鍵': '4526'}])
+    broker = {'4526': {'price': 58.2}}
+    ns.update(datetime=Clock, st=SimpleNamespace(session_state={'sj_api': object()}), inspect=inspect,
+              model_market_open=lambda row, now: False, is_market_closed_func=lambda day: False,
+              stock_stream_auction_closes=lambda api, day: broker,
+              get_public_maintenance_jobs=lambda: SimpleNamespace(poll=lambda key, fetch, **kw: fetch()))
+    assert ns['latest_completed_stock_trading_date'](now).isoformat() == '2026-11-11'
+    ns['check_model_stock_closes'](tracker)
+    assert calls == [('2026-11-12', {}, broker)]

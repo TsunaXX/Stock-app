@@ -104,7 +104,7 @@ def test_table_shows_position_exit_and_fresh_waiting_plan_without_stale_exit_ove
     before = copy.deepcopy(plans)
     notes,toasts = [],[]
     ns.update(trade_display=trade_display,
-              st=SimpleNamespace(session_state={'sj_logged_in':True},caption=notes.append,
+              st=SimpleNamespace(session_state={'sj_logged_in':True},caption=lambda text, **kw: notes.append(text),
                                  toast=lambda text,**kw:toasts.append(text)),
               get_app_secret=lambda key:'',get_model_tracker=lambda url:SimpleNamespace(protection_plans=lambda *a:plans),
               get_futures_trading_date=lambda day:day)
@@ -119,6 +119,7 @@ def test_table_shows_position_exit_and_fresh_waiting_plan_without_stale_exit_ove
     assert values[3].startswith('多·待進場｜進 112') and '停 107' in values[3]
     assert values[4].startswith('多·已進場⚠2次｜') and values[5].startswith('多·已出場(利)⚠｜')
     assert plans == before and not toasts and any('商品D（D）' in value for value in notes)
+    assert 'color:#00c853' in notes[-1] and '>-100</strong>' in notes[-1] and '-100.00' not in notes[-1]
     show(frame,stock,'當沖',room)
     assert frame[column].tolist() == values and not toasts
     plans['B'] = {**closed,'交易ID':plans['B']['交易ID']}
@@ -192,7 +193,7 @@ def test_same_update_close_and_reentry_reports_both_saved_transitions(tmp_path,c
     ns['datetime'] = Clock
     messages = []
     ns.update(trade_display=trade_display, st=SimpleNamespace(
-        session_state={'sj_logged_in':True},caption=lambda text:None,toast=lambda text,**kw:messages.append(text)),
+        session_state={'sj_logged_in':True},caption=lambda text, **kw:None,toast=lambda text,**kw:messages.append(text)),
         get_app_secret=lambda key:'',get_model_tracker=lambda url:tracker,get_futures_trading_date=lambda day:day)
     frame = pd.DataFrame([{'代號':'2330','名稱':'測試商品','_系統方向':'多頭','進出場預判':'進 100｜停 95｜目 110'}])
     ns['apply_model_protection'](frame,True,'當沖')
@@ -258,7 +259,7 @@ def test_old_target_touch_and_stale_quotes_are_not_fresh_reentry_candidates():
     row={**record(),'狀態':'已平倉','模擬進場價':100.,'出場原因':'停利',
          '結案時間':'2026-11-05T09:22:57+08:00','同步確認':True}
     ns.update(trade_display=trade_display,st=SimpleNamespace(session_state={'sj_logged_in':True},
-              caption=lambda text:None,toast=lambda *a,**kw:None),get_app_secret=lambda key:'',
+              caption=lambda text, **kw:None,toast=lambda *a,**kw:None),get_app_secret=lambda key:'',
               get_model_tracker=lambda url:SimpleNamespace(protection_plans=lambda *a:{'2330':row}))
     for text,health in [('目標觸價｜進 100｜停 95｜目 110',''),('進 112｜停 107｜目 124','🔴 報價過期')]:
         frame=pd.DataFrame([{'代號':'2330','名稱':'測試商品','_系統方向':'多頭','進出場預判':text,'資料狀態':health}])
