@@ -548,7 +548,7 @@ def test_apps_script_full_read_write_lock_and_partial_commit_recovery():
     program=r"""
 const fs=require('fs'),vm=require('vm'),assert=require('assert');
 const rows=[['scope','part','data','updated_at']];
-let held=false,fail=false,busy=false;const reads=[],deletions=[];
+let held=false,fail=false,busy=false;const reads=[],deletions=[],waits=[];
 const sheet={getLastRow:()=>rows.length,getMaxRows:()=>1000,
   getRange:(start,col,count,width)=>({
     getDisplayValues:()=>{reads.push({start,col,count,width});return Array.from({length:count},(_,i)=>Array.from({length:width},(_,j)=>String((rows[start+i-1]||[])[col+j-1]||'')));},
@@ -556,13 +556,17 @@ const sheet={getLastRow:()=>rows.length,getMaxRows:()=>1000,
     setValues(values){assert(held); for(let i=0;i<values.length;i++) {rows[start+i-1]=values[i]; if(fail && values.length>1) {fail=false; throw Error('partial write');}} return this;}
   }),deleteRows:(r,n)=>{assert(held);deletions.push(n);rows.splice(r-1,n);},clearContents:()=>rows.splice(0)};
 global.SpreadsheetApp={getActiveSpreadsheet:()=>({getSheetByName:()=>sheet}),flush:()=>{}};
-global.LockService={getScriptLock:()=>({waitLock:(ms)=>{assert.equal(ms,3000);if(busy)throw Error('locked');assert(!held);held=true;},releaseLock:()=>{assert(held);held=false;}})};
+global.LockService={getScriptLock:()=>({waitLock:(ms)=>{waits.push(ms);if(busy)throw Error('locked');assert(!held);held=true;},releaseLock:()=>{assert(held);held=false;}})};
 global.ContentService={MimeType:{JSON:'json'},createTextOutput:(body)=>({setMimeType:()=>JSON.parse(body)})};
 vm.runInThisContext(fs.readFileSync('google_apps_script.gs','utf8'));
 function post(scope,data){return doPost({postData:{contents:JSON.stringify({scope,data,updated_at:new Date().toISOString()})}});}
 const a={'交易ID':'a'.repeat(64),'交易日':'2026-10-08','市場':'股票','商品鍵':'2330','策略':'當沖','策略版本':'V1.0','方向':'多頭','進場價':100,'停損價':95,'目標價':110,'建立時間':'2026-10-08T09:00:00+08:00','來源時間':'2026-10-08T09:00:00+08:00','狀態':'等待進場','事件':[]};
 assert(post('strategy_signals',{strategy_signal_log:[{dedupe_key:'manual'}]}).success);
+assert.equal(waits.at(-1),3000);
+reads.length=0;
 const firstCommit=post('strategy_signals:202610',{model_trades:[a]});
+assert.equal(waits.at(-1),10000);
+assert.equal(reads.filter(r=>r.start===2 && r.col===1 && r.width===2).length,1);
 assert(firstCommit.success && /^\d+$/.test(firstCommit.model_version));
 assert.equal(firstCommit.model_previous_version,'');
 const stale={model_trades:[{...a,'交易ID':'b'.repeat(64)}]};
@@ -604,6 +608,9 @@ assert(post('company_events',{title:'new'}).success);
 assert.equal(doGet({parameter:{scope:'company_events'}}).data.title,'new');
 busy=true;
 assert.equal(doGet({parameter:{scope:'company_events'}}).error_code,'busy');
+assert.equal(waits.at(-1),3000);
+assert.equal(doGet({parameter:{scope:'strategy_signals',model_sync:'1'}}).error_code,'busy');
+assert.equal(waits.at(-1),10000);
 assert.equal(post('company_events',{title:'lost'}).error_code,'busy');
 busy=false;
 assert.equal(doGet({parameter:{scope:'company_events'}}).data.title,'new');

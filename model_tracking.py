@@ -1734,7 +1734,7 @@ class ModelTracker:
     def remote_get(self, scope, trade_ids=None):
         for attempt in range(3):
             try:
-                params = {'scope': scope, '_ts': time.time_ns()}
+                params = {'scope': scope, 'model_sync': '1', '_ts': time.time_ns()}
                 if trade_ids is not None:
                     params['trade_ids'] = ','.join(trade_ids)
                 response = requests.get(self.url, params=params,

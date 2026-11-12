@@ -118,14 +118,15 @@ function getScopeRowMap_(sheet) {
 
 
 function doGet(e) {
+  const params = e && e.parameter || {};
+  const requested = normalizeScope_(params.scope);
   const lock = LockService.getScriptLock();
   try {
-    lock.waitLock(3000);
+    lock.waitLock(/^strategy_(signals|events):/.test(requested) || (requested === 'strategy_signals' && params.model_sync === '1') ? 10000 : 3000);
   } catch (_) {
     return jsonResponse_({success: false, error_code: 'busy', error: 'Google Sheet 服務忙碌，請稍後重試'});
   }
   try {
-    const requested = normalizeScope_(e && e.parameter ? e.parameter.scope : '');
     const sheet = getStoreSheet_();
     const rows = getScopeRowMap_(sheet);
 
@@ -207,15 +208,15 @@ function readScopeData_(sheet, scope, row) {
 
 
 function doPost(e) {
+  const body = parseRequestBody_(e) || {};
+  const scope = normalizeScope_(body.scope);
   const lock = LockService.getScriptLock();
   try {
-    lock.waitLock(3000);
+    lock.waitLock(/^strategy_signals:\d{6}$/.test(scope) ? 10000 : 3000);
   } catch (_) {
     return jsonResponse_({success: false, error_code: 'busy', error: 'Google Sheet 服務忙碌，請稍後重試'});
   }
   try {
-    const body = parseRequestBody_(e);
-    const scope = normalizeScope_(body.scope);
     if (body.action === 'archive_model_events') {
       if (!/^strategy_signals:\d{6}$/.test(scope)) throw new Error('封存月份無效');
       return jsonResponse_(archiveModelEvents_(scope));
@@ -278,6 +279,19 @@ function deleteScopeRows_(sheet, rows) {
 
 
 function saveScopeData_(scope, data, updatedAt, commit, internalArchive) {
+  const sheet = getStoreSheet_();
+  const rows = getScopeRowMap_(sheet);
+  const obsoleteRows = [];
+  const row = appendScopeGeneration_(sheet, rows, obsoleteRows, scope, data, updatedAt, commit, internalArchive);
+  // A failed cleanup leaves complete generations available for reads.
+  if (obsoleteRows.length) {
+    try { deleteScopeRows_(sheet, obsoleteRows); } catch (_) {}
+  }
+  return row;
+}
+
+
+function appendScopeGeneration_(sheet, rows, obsoleteRows, scope, data, updatedAt, commit, internalArchive) {
   if (/^strategy_signals:\d{6}$/.test(scope)) {
     if (!Array.isArray(data.model_trades) || data.model_trades.some(function(r) {
       return !r || !/^[a-f0-9]{64}$/.test(r['交易ID'] || '') || typeof r['商品鍵'] !== 'string' || !r['商品鍵'] ||
@@ -290,8 +304,6 @@ function saveScopeData_(scope, data, updatedAt, commit, internalArchive) {
         ['等待進場','模擬持倉','已平倉','訊號失效','資料不足','監控中斷'].indexOf(r['狀態']) < 0;
     })) throw new Error('模型交易資料格式或月份無效');
   }
-  const sheet = getStoreSheet_();
-  const rows = getScopeRowMap_(sheet);
   const existing = rows[scope] || null;
   if (scope === 'strategy_signals' || /^strategy_signals:\d{6}$/.test(scope)) {
     const prior = readScopeData_(sheet, scope, existing);
@@ -345,19 +357,16 @@ function saveScopeData_(scope, data, updatedAt, commit, internalArchive) {
   sheet.getRange(row, 1, values.length, HEADER.length).setNumberFormat('@').setValues(values);
   SpreadsheetApp.flush();
   if (commit) commit.version = String(generation);
-  // Preserve the last complete generation until the new one has been written in full.
-  if (existing && existing.rows.length) {
-    try {
-      deleteScopeRows_(sheet, existing.rows);
-    } catch (_) {} // A leftover generation is harmless; reads select the newest complete one.
-  }
+  if (existing) existing.rows.forEach(function(row) {obsoleteRows.push(row);});
   if (/^strategy_signals:\d{6}$/.test(scope)) {
     const month = scope.split(':')[1];
     const versions = {};
     versions[month] = String(generation);
     const active = {};
     active[month] = data.model_trades.some(function(r) {return ['等待進場','模擬持倉','監控中斷','資料不足'].indexOf(r['狀態']) >= 0;});
-    saveScopeData_('strategy_signals', {model_schema: 1, model_months: [month], model_versions: versions, model_active_months: active}, incomingUpdatedAt);
+    // Row indices remain valid until both the month and catalog are committed.
+    appendScopeGeneration_(sheet, rows, obsoleteRows, 'strategy_signals',
+      {model_schema: 1, model_months: [month], model_versions: versions, model_active_months: active}, incomingUpdatedAt);
   }
   return row;
 }
