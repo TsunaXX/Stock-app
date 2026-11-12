@@ -548,15 +548,15 @@ def test_apps_script_full_read_write_lock_and_partial_commit_recovery():
     program=r"""
 const fs=require('fs'),vm=require('vm'),assert=require('assert');
 const rows=[['scope','part','data','updated_at']];
-let held=false,fail=false;const reads=[],deletions=[];
-const sheet={getLastRow:()=>rows.length,
+let held=false,fail=false,busy=false;const reads=[],deletions=[];
+const sheet={getLastRow:()=>rows.length,getMaxRows:()=>1000,
   getRange:(start,col,count,width)=>({
     getDisplayValues:()=>{reads.push({start,col,count,width});return Array.from({length:count},(_,i)=>Array.from({length:width},(_,j)=>String((rows[start+i-1]||[])[col+j-1]||'')));},
     setNumberFormat(){return this;},
-    setValues(values){assert(held); for(let i=0;i<values.length;i++) {rows[start+i-1]=values[i]; if(fail && values[i][0].includes(':')) {fail=false; throw Error('partial write');}} return this;}
+    setValues(values){assert(held); for(let i=0;i<values.length;i++) {rows[start+i-1]=values[i]; if(fail && values.length>1) {fail=false; throw Error('partial write');}} return this;}
   }),deleteRows:(r,n)=>{assert(held);deletions.push(n);rows.splice(r-1,n);},clearContents:()=>rows.splice(0)};
 global.SpreadsheetApp={getActiveSpreadsheet:()=>({getSheetByName:()=>sheet}),flush:()=>{}};
-global.LockService={getScriptLock:()=>({waitLock:()=>{assert(!held);held=true;},releaseLock:()=>held=false})};
+global.LockService={getScriptLock:()=>({waitLock:(ms)=>{assert.equal(ms,3000);if(busy)throw Error('locked');assert(!held);held=true;},releaseLock:()=>{assert(held);held=false;}})};
 global.ContentService={MimeType:{JSON:'json'},createTextOutput:(body)=>({setMimeType:()=>JSON.parse(body)})};
 vm.runInThisContext(fs.readFileSync('google_apps_script.gs','utf8'));
 function post(scope,data){return doPost({postData:{contents:JSON.stringify({scope,data,updated_at:new Date().toISOString()})}});}
@@ -595,6 +595,18 @@ deletions.length=0;
 assert(post('strategy_signals:202610',{model_trades:[a]}).success);
 assert(deletions.some(n=>n>=93) && deletions.length<=3); // Whole generation, not 93 remote delete calls.
 assert.equal(doGet({parameter:{scope:'strategy_signals:202610'}}).data.model_trades.length,4);
+assert(!held);
+assert(post('company_events',{title:'old'}).success);
+fail=true;
+assert(!post('company_events',{title:'x'.repeat(60000)}).success);
+assert.equal(doGet({parameter:{scope:'company_events'}}).data.title,'old');
+assert(post('company_events',{title:'new'}).success);
+assert.equal(doGet({parameter:{scope:'company_events'}}).data.title,'new');
+busy=true;
+assert.equal(doGet({parameter:{scope:'company_events'}}).error_code,'busy');
+assert.equal(post('company_events',{title:'lost'}).error_code,'busy');
+busy=false;
+assert.equal(doGet({parameter:{scope:'company_events'}}).data.title,'new');
 assert(!held);
 """
     result=subprocess.run(['node','-e',program],cwd=ROOT,capture_output=True,text=True)
@@ -864,7 +876,7 @@ def test_cloud_readback_does_not_reuse_cached_reads_and_keeps_pending_on_timeout
         assert kwargs['timeout'][1] > 30
         raise requests.ReadTimeout('slow shared storage')
     tracker.remote_get=lambda scope:{'model_schema':1, 'model_months':[], 'model_versions':{}}
-    with patch('model_tracking.requests.post', side_effect=post), pytest.raises(requests.ReadTimeout):
+    with patch('model_tracking.requests.post', side_effect=post), pytest.raises(ValueError, match='交易事件回讀不一致'):
         tracker.sync()
     with tracker.db() as db:
         assert db.execute('SELECT dirty FROM trades').fetchone()[0] == 1
@@ -988,3 +1000,66 @@ def test_broker_stock_close_is_provisional_until_official_price(tmp_path, offici
     assert settled['資料缺口'] is (official_price != 58.2)
     assert merge_trades([pending], [settled])[0]['模擬出場價'] == official_price
     assert tracker.settle_stock_closes(day, {'4526': 58.5}) == 0
+
+
+@pytest.mark.parametrize('result', ['committed', 'missing_index', 'missing_trade'])
+def test_write_timeout_confirms_trade_and_month_index_before_clearing_dirty(tmp_path, result):
+    import requests
+
+    tracker = ModelTracker(tmp_path/'write-timeout.sqlite', 'https://example.test/exec', start=False)
+    tracker.process([signal()], {'股票|2330':quote(100)})
+    record, = tracker.records()
+    posted = []
+    scope = 'strategy_signals:202610'
+
+    def post(url, **kwargs):
+        assert kwargs['timeout'][0] == 12
+        posted.append(json.loads(kwargs['json']['data']))
+        raise requests.ConnectionError('Connection aborted.', TimeoutError('The write operation timed out'))
+
+    def get(requested, ids=None):
+        if requested == 'strategy_signals':
+            indexed = posted and result != 'missing_index'
+            return {'model_schema':1, 'model_sync':2, 'model_months':['202610'] if indexed else [],
+                    'model_versions':{'202610':'101'} if indexed else {}}
+        assert requested == scope
+        if posted:
+            assert ids == [record['交易ID']]
+            return {'model_schema':1, 'model_version':'101',
+                    'model_trades':[] if result == 'missing_trade' else [record]}
+        return {}
+
+    tracker.remote_get = get
+    with patch('model_tracking.requests.post', side_effect=post):
+        if result == 'committed':
+            tracker.sync()
+        else:
+            with pytest.raises(ValueError, match='保留待同步'):
+                tracker.sync()
+    assert len(posted) == 1 and tracker.month_versions.get('202610') != '101'
+    with tracker.db() as db:
+        assert db.execute('SELECT dirty FROM trades').fetchone()[0] == int(result != 'committed')
+
+
+def test_scoped_sheet_read_retries_busy_and_ambiguous_write_requires_matching_data():
+    import logging
+    import requests
+    from test_core_calculations import load_app_symbols
+
+    cleared = []
+    ns = load_app_symbols('_fetch_remote_scope', '_save_remote_scope', '_remote_scope_payload_matches')
+    ns.update(requests=requests, logger=logging.getLogger(__name__), _json_safe=lambda value: dict(value),
+              GOOGLE_SCOPE_FIBO='fibo_strategy', _fetch_remote_scope_cached=SimpleNamespace(clear=lambda: cleared.append(True)))
+    url = 'https://example.test/exec'
+    data = {'name':'test'}
+    response = lambda body: SimpleNamespace(raise_for_status=lambda: None, json=lambda: body)
+    busy = response({'success':False, 'error_code':'busy'})
+    good = response({'success':True, 'data':data.copy()})
+    error = requests.ConnectionError('Connection aborted.', TimeoutError('The write operation timed out'))
+    with patch('requests.post', side_effect=error) as post, patch('requests.get', side_effect=[busy, good]) as get:
+        assert ns['_save_remote_scope'](url, 'stock_strategy', data) == (True, data)
+    assert post.call_count == 1 and get.call_count == 2 and len(cleared) == 1
+    assert get.call_args_list[0].kwargs['params']['_ts'] != get.call_args_list[1].kwargs['params']['_ts']
+    with patch('requests.post', side_effect=error), patch('requests.get', return_value=response({'success':True, 'data':None})):
+        assert ns['_save_remote_scope'](url, 'stock_strategy', data) == (False, {})
+    assert len(cleared) == 1
