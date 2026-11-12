@@ -4010,3 +4010,28 @@ def test_calendar_hides_company_disclosures_but_preserves_stored_history():
     assert len(snapshot['disclosures']['events']) == 7
     snapshot['taiwan_revenue']['events'] = []
     assert ns['selected_company_calendar_snapshot'](snapshot)['disclosures']['events'] == []
+
+
+@pytest.mark.parametrize('direction, closes, price, expected', [
+    ('多頭', [101., 102.], 106., True),
+    ('多頭', [99., 102.], 106., False),
+    ('空頭', [99., 98.], 94., True),
+    ('空頭', [101., 98.], 94., False),
+])
+def test_stock_daytrade_rejects_first_vwap_cross_without_two_completed_bars(direction, closes, price, expected):
+    ns = load_app_symbols('calculate_daytrade_metrics', 'calculate_daytrade_filter_result',
+                          '_is_opening_micro_window', '_safe_number', '_as_float', '_stream_datetime',
+                          'fmt_price', '_to_number', '_format_compact_number')
+    now = pd.Timestamp('2026-11-12 09:18:05', tz='Asia/Taipei')
+    bars = pd.DataFrame({'Close': [100., *closes, price], 'High': [105., 104., 104., price],
+                         'Low': [95., 96., 96., price], 'Volume': [10., 10., 10., 10.]},
+                        index=pd.to_datetime(['2026-11-12 09:00', '2026-11-12 09:16',
+                                              '2026-11-12 09:17', '2026-11-12 09:18']))
+    quote = SimpleNamespace(close=price, avg_price=100., updated_at=now, source='stream')
+    ns.update(vwap_guard=lambda *args: {'ready': True}, get_tick_size=lambda price: .5,
+              move_tick=lambda price, steps: price + .5 * steps)
+    result = ns['calculate_daytrade_metrics'](bars, quote, now_tw=now)
+    outcome = ns['calculate_daytrade_filter_result'](result, direction)
+    assert outcome['eligible'] is expected
+    if not expected:
+        assert '兩根完成的 1 分 K' in outcome['rule']

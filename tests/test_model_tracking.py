@@ -629,7 +629,7 @@ def stock_rows_with_evidence(ns, count=6):
                      '_risk_ma20':98.,'_risk_ma20_slope':.5,'_risk_atr14':4.,'_risk_close_position':80.,
                      '_risk_prev_high':99.,'_risk_prev_low':96.,'_daytrade_vwap':99.,
                      '_daytrade_or_high':100.,'_daytrade_or_low':98.,'_daytrade_close':100.5,
-                     '_daytrade_volume_ratio':2.,'_daytrade_data_time':stamp,'_daytrade_phase':'開盤區間完成',
+                     '_daytrade_confirmation':'多頭','_daytrade_volume_ratio':2.,'_daytrade_data_time':stamp,'_daytrade_phase':'開盤區間完成',
                      '當日漲停價':110.,'當日跌停價':90.})
         buffers[code]=deque([{'來源時間':stamp,'價格':100.5,'序號':1,'串流識別':'desktop:0','有效':True}],maxlen=4096)
     state={'lock':threading.RLock(),'model_tick_buffers':buffers}
@@ -955,3 +955,36 @@ def test_cached_model_performance_handles_legacy_metric_dict():
     assert summary['含資料缺口的執行紀錄數'] == 2
     assert summary['有效交易數'] == 0
     assert len(data) == 4 and groups.empty
+
+
+@pytest.mark.parametrize('official_price', [58.2, 58.4])
+def test_broker_stock_close_is_provisional_until_official_price(tmp_path, official_price):
+    from model_tracking import trade_display
+    day = '2026-10-08'
+    tracker = ModelTracker(tmp_path / 'provisional.sqlite', start=False)
+    plan = signal(商品鍵='4526', 名稱='東台', 進場價=57.0, 停損價=55.0, 目標價=62.0, 跳動點=.1)
+    held = advance(new_trade(plan), quote(57.0, 序號=1, 串流識別='regular'))
+    held.update(來源時間=f'{day}T13:29:59+08:00', 最後序號=20)
+    with tracker.write_db() as db:
+        tracker.store(db, held)
+    broker = {'4526': {'price': 58.2, 'time': f'{day}T13:30:00.123+08:00',
+                       'sequence': 21, 'stream': 'regular'}}
+    assert tracker.settle_stock_closes('2026-10-09', {}, broker) == 0
+    assert tracker.settle_stock_closes(day, {}, broker) == 1
+    pending, = tracker.records()
+    assert pending['交易ID'] == held['交易ID']
+    assert pending.get('模擬出場價') is None
+    assert pending['暫定收盤']['連續證據']
+    assert trade_display(pending)['交易狀態'] == '已收盤（待核對）'
+    assert trade_display(pending)['模擬出場價'] == 58.2
+    assert performance([pending])[0]['有效交易數'] == 0
+    assert tracker.settle_stock_closes(day, {}, broker) == 0
+    tracker.mark_gaps()
+    assert not tracker.records()[0]['資料缺口']
+    assert tracker.settle_stock_closes(day, {'4526': official_price}) == 1
+    settled, = tracker.records()
+    assert settled['出場原因'] == '收盤' and settled['模擬出場價'] == official_price
+    assert '暫定收盤' not in settled
+    assert settled['資料缺口'] is (official_price != 58.2)
+    assert merge_trades([pending], [settled])[0]['模擬出場價'] == official_price
+    assert tracker.settle_stock_closes(day, {'4526': 58.5}) == 0
