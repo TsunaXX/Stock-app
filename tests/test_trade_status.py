@@ -94,7 +94,7 @@ def test_record_counts_plan_counts_and_verified_first_reentries_have_distinct_me
 @pytest.mark.parametrize('stock,room', [(True,'stock'),(True,'stock_independent'),
                                       (False,'futures'),(False,'futures_independent')])
 def test_table_shows_position_exit_and_fresh_waiting_plan_without_stale_exit_override(stock,room):
-    ns = load_app_symbols('apply_model_protection','parse_trade_plan_numbers','fmt_price')
+    ns = load_app_symbols('apply_model_protection','parse_trade_plan_numbers','fmt_price','_model_notice_amount_text')
     closed = {**record(),'模擬進場價':100.,'狀態':'已平倉','出場原因':'停損',
               '模擬出場價':94.,'模擬損益':-100.,'結案時間':'2026-11-05T09:22:57+08:00','同步確認':True}
     plans = {'B':{**record(),'狀態':'模擬持倉','模擬進場價':100.,'進場時間':'2026-11-05T09:10:00+08:00'},
@@ -184,7 +184,7 @@ def test_same_update_close_and_reentry_reports_both_saved_transitions(tmp_path,c
     first_id = first['交易ID']
     with tracker.write_db() as db:
         tracker.store(db,first)
-    ns = load_app_symbols('apply_model_protection','parse_trade_plan_numbers','fmt_price')
+    ns = load_app_symbols('apply_model_protection','parse_trade_plan_numbers','fmt_price','_model_notice_amount_text')
     class Clock(ns['datetime']):
         @classmethod
         def now(cls,tz=None):
@@ -255,7 +255,7 @@ def test_futures_wave_exit_uses_display_day_without_changing_trading_day(tmp_pat
 
 
 def test_old_target_touch_and_stale_quotes_are_not_fresh_reentry_candidates():
-    ns=load_app_symbols('apply_model_protection','parse_trade_plan_numbers','fmt_price')
+    ns=load_app_symbols('apply_model_protection','parse_trade_plan_numbers','fmt_price','_model_notice_amount_text')
     row={**record(),'狀態':'已平倉','模擬進場價':100.,'出場原因':'停利',
          '結案時間':'2026-11-05T09:22:57+08:00','同步確認':True}
     ns.update(trade_display=trade_display,st=SimpleNamespace(session_state={'sj_logged_in':True},

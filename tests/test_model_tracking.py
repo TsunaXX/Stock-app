@@ -340,12 +340,12 @@ def test_new_home_tab_lazy_ui_and_excel(tmp_path):
     functions = {'render_model_tracking_room','cached_model_performance','model_performance_state', '_model_column_config',
                  '_model_market_version_key','_model_version_first_date','model_version_display_labels',
                  '_model_time_text','_model_display_value','_model_display_frame',
-                  '_model_number_text','_model_history_overview','set_model_period_today'}
+                  '_model_number_text','_model_history_overview','_model_metric_card_html','_model_notice_amount_text','set_model_period_today'}
     defs = '\n'.join(ast.unparse(n) for n in ast.parse(source).body if isinstance(n,ast.FunctionDef) and n.name in functions)
     tracker = ModelTracker(tmp_path/'ui.sqlite',start=False)
     script = '''
 import streamlit as st
-import pandas as pd, numpy as np, json, pytz, threading, time
+import pandas as pd, numpy as np, json, pytz, threading, time, html
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import date,datetime,timedelta
 from model_tracking import ModelTracker,DEFAULT_COSTS,VERSION as MODEL_VERSION,performance,plan_performance,excel_report,event_message,normalize_costs
@@ -404,8 +404,8 @@ with outer:
     assert str(app.date_input(key='model_period').value[-1]) == '2026-10-12'
     assert any(e.label == '候選與未進場診斷' for e in app.expander)
     assert len(app.get('download_button')) == 1
-    assert any(metric.label == '追蹤執行紀錄數' for metric in app.metric)
-    assert any(metric.label == '含資料缺口的執行紀錄數' for metric in app.metric)
+    assert any('追蹤執行紀錄數' in element.value for element in app.markdown)
+    assert any('含資料缺口的執行紀錄數' in element.value for element in app.markdown)
     assert any(button.label == '今天' for button in app.button)
     assert app.selectbox(key='model_plan_source').options == ['全部','股期戰略室','指數操作計畫','選擇權操作計畫']
     assert '2330｜台積電' in app.selectbox(key='model_code').options

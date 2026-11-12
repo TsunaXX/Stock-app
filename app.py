@@ -22340,6 +22340,13 @@ def model_protection_text(row):
     return f"保 {unit}{fmt_price(value) if value is not None else '—'}·{status}"
 
 
+def _model_notice_amount_text(value):
+    text = str(value)
+    if '.' in text:
+        text = text.rstrip('0').rstrip('.')
+    return '0' if text in ('-0', '+0') else text
+
+
 def apply_model_protection(rows, stock, mode, room=None):
     """Show confirmed model state and price plans without advancing the simulator."""
     if rows.empty or not st.session_state.get('sj_logged_in', False):
@@ -22401,7 +22408,7 @@ def apply_model_protection(rows, stock, mode, room=None):
                 color = '#ffb74d' if '⚠' in state or record.get('暫定收盤') else '#64b5f6'
                 detail = html.escape(view['狀態說明'])
                 def color_pnl(match):
-                    amount = match[1]
+                    amount = _model_notice_amount_text(match[1])
                     pnl_color = '#ff5252' if amount.startswith('+') else '#00c853' if amount.startswith('-') else '#90a4ae'
                     return f'模擬淨損益 <strong style="color:{pnl_color}">{amount}</strong>'
                 detail = re.sub(r'模擬淨損益 ([+\-]?[\d,.]+)', color_pnl, detail)
@@ -22959,6 +22966,26 @@ def _model_number_text(value):
     return value
 
 
+def _model_metric_card_html(label, value):
+    if value is None:
+        text = '—（無有效樣本）' if label.endswith('勝率(%)') else '未確認'
+        number = None
+    else:
+        number = Decimal(str(value)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        if number == 0:
+            number = Decimal(0)
+        text = f'{number:,.2f}'.rstrip('0').rstrip('.')
+    value_color = '#dbeafe'
+    if label in {'累積模擬損益', '平均獲利', '平均虧損', '每筆期望值'} and number is not None:
+        value_color = '#ff7373' if number > 0 else ('#55d6a8' if number < 0 else '#dbeafe')
+    return (
+        "<div style='min-height:4.25rem;padding:.6rem .7rem;border:1px solid rgba(148,163,184,.28);"
+        "border-radius:.65rem;background:rgba(148,163,184,.07)'>"
+        f"<div style='color:#93c5fd;font-size:.78rem;font-weight:650'>{html.escape(str(label))}</div>"
+        f"<div style='color:{value_color};font-size:1.22rem;font-weight:750'>{html.escape(text)}</div></div>"
+    )
+
+
 def _model_history_overview(frame):
     """Keep key trade fields first; the full dataframe remains available separately."""
     result = frame.copy()
@@ -23080,7 +23107,7 @@ def _model_display_frame(frame, color=True):
         neutral = 'color: #dbeafe'
         try:
             number_value = float(value)
-            if column in ('模擬損益', '毛損益', '結果(R)', '累積模擬損益', '平均獲利', '平均虧損', '每筆期望值', '缺口參考損益', '合併參考損益'):
+            if column in ('模擬損益', '毛損益', '結果(R)', '累積模擬損益', '平均獲利', '平均虧損', '每筆期望值', '計畫累積損益', '缺口參考損益', '合併參考損益'):
                 return 'color: #ff7373' if number_value > 0 else ('color: #55d6a8' if number_value < 0 else neutral)
             if column in ('勝率(%)', '可計入績效比例(%)', '資料完整率(%)'):
                 return 'color: #5eead4'
@@ -23299,12 +23326,13 @@ def render_model_tracking_room():
                    and (plan_source == '全部' or row.get('計畫來源', '股期戰略室') == plan_source)
                    and (not query or query in ''.join(str(row.get(key, '') or '') for key in ('代碼', '名稱', '商品鍵')).replace(' ', '').casefold())]
         metrics, groups, frame = cached_model_performance(json.dumps(records, ensure_ascii=False), str((period, market, mode, direction, version, code, plan_source)))
-        st.markdown('##### 完整驗證績效（每次進場獨立計算）')
-        st.caption('追蹤執行紀錄包含尚未成交與二次以上執行；原始計畫數另列。只有證據完整且已同步確認的結案交易納入正式績效。')
-        for col, key in zip(st.columns(3), ('追蹤執行紀錄數', '有效交易數', '含資料缺口的執行紀錄數')):
-            col.metric(key, str(metrics[key]))
-        for col, key in zip(st.columns(4), ('勝率(%)', '累積模擬損益', '獲利因子', '最大回撤')):
-            col.metric(key, ('—（無有效樣本）' if key.endswith('勝率(%)') else '未確認') if metrics[key] is None else f'{metrics[key]:,.2f}'.rstrip('0').rstrip('.'))
+        with st.container(border=True):
+            st.markdown("<div style='color:#67e8f9;font-size:1rem;font-weight:750'>📊 完整驗證績效（每次進場獨立計算）</div>", unsafe_allow_html=True)
+            st.caption('追蹤執行紀錄包含尚未成交與二次以上執行；原始計畫數另列。只有證據完整且已同步確認的結案交易納入正式績效。')
+            for col, key in zip(st.columns(3), ('追蹤執行紀錄數', '有效交易數', '含資料缺口的執行紀錄數')):
+                col.markdown(_model_metric_card_html(key, metrics[key]), unsafe_allow_html=True)
+            for col, key in zip(st.columns(4), ('勝率(%)', '累積模擬損益', '獲利因子', '最大回撤')):
+                col.markdown(_model_metric_card_html(key, metrics[key]), unsafe_allow_html=True)
         from model_tracking import reference_performance_rows
         st.markdown('##### 缺口與合併參考績效')
         st.caption('缺口參考保留已記錄的進出場、成本及損益，不推算中斷期間的成交；合併參考＝完整驗證＋缺口參考，不代表行情缺口已補齊。成交／成本衝突或資料不完整仍待確認。')
@@ -23403,20 +23431,21 @@ def render_model_tracking_room():
                     st.caption(f"本頁事件發生 {int(view.get('事件數', pd.Series(dtype=float)).sum())} 次（重複診斷可能合併為區間）；畫面最多顯示 500 列，Excel 保留完整內容。")
                     if event_rows:
                         st.dataframe(_model_display_frame(pd.DataFrame(event_rows[:500])), hide_index=True, width='stretch')
-            st.markdown('##### 原始計畫績效')
-            plan_history = tracker.plan_records([row['原始計畫ID'] for row in records if row.get('原始計畫ID')], period[1])
-            plan_metrics, plan_rows = plan_performance(plan_history)
-            st.caption('以目前篩選觸及的原始計畫歸組，合計至所選結束日的各次執行；缺少父紀錄時等待舊月份載入。舊制不推測共同計畫。平均R沿用保存的結果(R)，選擇權為標的觸發R，與金額保利R不同。')
-            items = list(plan_metrics.items())
-            for offset in range(0, len(items), 3):
-                for column, (label, value) in zip(st.columns(3), items[offset:offset+3]):
-                    column.metric(label, ('—（無有效樣本）' if label.endswith('勝率(%)') else '未確認') if value is None else f'{value:,.2f}'.rstrip('0').rstrip('.'))
-            if not plan_rows.empty:
-                st.dataframe(_model_display_frame(plan_rows), hide_index=True, width='stretch')
-                reasons = plan_rows.loc[~plan_rows['已觸發'], ['未進場分類', '訊號失效原因']]
-                if not reasons.empty:
-                    st.caption('尚未進場計畫的原因分布')
-                    st.dataframe(_model_display_frame(reasons.groupby(['未進場分類', '訊號失效原因'], dropna=False).size().reset_index(name='計畫數')), hide_index=True, width='stretch')
+            with st.container(border=True):
+                st.markdown("<div style='color:#fbbf24;font-size:1rem;font-weight:750'>🧭 原始計畫績效</div>", unsafe_allow_html=True)
+                plan_history = tracker.plan_records([row['原始計畫ID'] for row in records if row.get('原始計畫ID')], period[1])
+                plan_metrics, plan_rows = plan_performance(plan_history)
+                st.caption('以目前篩選觸及的原始計畫歸組，合計至所選結束日的各次執行；缺少父紀錄時等待舊月份載入。舊制不推測共同計畫。平均R沿用保存的結果(R)，選擇權為標的觸發R，與金額保利R不同。')
+                items = list(plan_metrics.items())
+                for offset in range(0, len(items), 3):
+                    for column, (label, value) in zip(st.columns(3), items[offset:offset+3]):
+                        column.markdown(_model_metric_card_html(label, value), unsafe_allow_html=True)
+                if not plan_rows.empty:
+                    st.dataframe(_model_display_frame(plan_rows), hide_index=True, width='stretch')
+                    reasons = plan_rows.loc[~plan_rows['已觸發'], ['未進場分類', '訊號失效原因']]
+                    if not reasons.empty:
+                        st.caption('尚未進場計畫的原因分布')
+                        st.dataframe(_model_display_frame(reasons.groupby(['未進場分類', '訊號失效原因'], dropna=False).size().reset_index(name='計畫數')), hide_index=True, width='stretch')
             st.markdown('##### 策略、方向與指標分析')
             st.caption('指標分組代表進場當時有該指標證據的交易，不代表單一指標造成結果。')
             if groups.empty:
