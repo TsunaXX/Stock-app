@@ -120,7 +120,11 @@ function getScopeRowMap_(sheet) {
 function doGet(e) {
   const lock = LockService.getScriptLock();
   try {
-    lock.waitLock(30000);
+    lock.waitLock(3000);
+  } catch (_) {
+    return jsonResponse_({success: false, error_code: 'busy', error: 'Google Sheet 服務忙碌，請稍後重試'});
+  }
+  try {
     const requested = normalizeScope_(e && e.parameter ? e.parameter.scope : '');
     const sheet = getStoreSheet_();
     const rows = getScopeRowMap_(sheet);
@@ -205,7 +209,11 @@ function readScopeData_(sheet, scope, row) {
 function doPost(e) {
   const lock = LockService.getScriptLock();
   try {
-    lock.waitLock(30000);
+    lock.waitLock(3000);
+  } catch (_) {
+    return jsonResponse_({success: false, error_code: 'busy', error: 'Google Sheet 服務忙碌，請稍後重試'});
+  }
+  try {
     const body = parseRequestBody_(e);
     const scope = normalizeScope_(body.scope);
     if (body.action === 'archive_model_events') {
@@ -326,20 +334,19 @@ function saveScopeData_(scope, data, updatedAt, commit, internalArchive) {
     }
   }
 
-  const signalScope = scope === 'strategy_signals' || /^strategy_(signals|events):\d{6}$/.test(scope);
-  if (!signalScope && existing && existing.rows.length) {
-    deleteScopeRows_(sheet, existing.rows);
-  }
   const row = Math.max(sheet.getLastRow() + 1, 2);
+  const capacity = sheet.getMaxRows();
+  const required = row + chunks.length - 1;
+  if (required > capacity) sheet.insertRowsAfter(capacity, required - capacity);
   const generation = Math.max(Date.now() * 1000, existing ? existing.parts.reduce(function(n,p) {return Math.max(n, p.generation + 1);}, 0) : 0);
   const values = chunks.map(function(chunk, part) {
-    return [scope, signalScope ? generation + '|' + part + '|' + chunks.length : part, chunk, incomingUpdatedAt];
+    return [scope, generation + '|' + part + '|' + chunks.length, chunk, incomingUpdatedAt];
   });
   sheet.getRange(row, 1, values.length, HEADER.length).setNumberFormat('@').setValues(values);
   SpreadsheetApp.flush();
   if (commit) commit.version = String(generation);
   // Preserve the last complete generation until the new one has been written in full.
-  if (signalScope && existing && existing.rows.length) {
+  if (existing && existing.rows.length) {
     try {
       deleteScopeRows_(sheet, existing.rows);
     } catch (_) {} // A leftover generation is harmless; reads select the newest complete one.

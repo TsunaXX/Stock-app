@@ -11864,21 +11864,23 @@ def save_futures_strategy_state(
         gsheet_api_url = get_app_secret('gsheet_api_url')
         if gsheet_api_url and sync_cloud:
             with get_data_cache_sync_lock():
-                remote_state, _ = _fetch_remote_scope(
+                remote_state, read_error = _fetch_remote_scope(
                     gsheet_api_url, GOOGLE_SCOPE_FUTURES, timeout=8,
                 )
-                cloud_state = _merge_futures_strategy_state(remote_state, saved_state)
-                sync_ok, _ = _save_remote_scope(
-                    gsheet_api_url,
-                    GOOGLE_SCOPE_FUTURES,
-                    cloud_state,
-                    updated_at=cloud_state.get('updated_at'),
-                    timeout=8,
-                    verify=True,
-                )
-                if sync_ok:
-                    saved_state = cloud_state
-                    _write_json_atomic(FUTURES_STATE_CACHE_FILE, saved_state, indent=2)
+                sync_ok = False
+                if not read_error:
+                    cloud_state = _merge_futures_strategy_state(remote_state, saved_state)
+                    sync_ok, _ = _save_remote_scope(
+                        gsheet_api_url,
+                        GOOGLE_SCOPE_FUTURES,
+                        cloud_state,
+                        updated_at=cloud_state.get('updated_at'),
+                        timeout=8,
+                        verify=True,
+                    )
+                    if sync_ok:
+                        saved_state = cloud_state
+                        _write_json_atomic(FUTURES_STATE_CACHE_FILE, saved_state, indent=2)
         st.session_state['_cached_futures_strategy_state'] = saved_state
         if sync_cloud:
             st.session_state['_futures_cloud_loaded'] = True
@@ -13820,101 +13822,57 @@ def _fetch_remote_data_cache(gsheet_api_url, timeout=5):
         return payload, None
     except (requests.RequestException, ValueError, TypeError) as exc:
         return None, f'{type(exc).__name__}'
-def _fetch_remote_scope(
-    gsheet_api_url,
-    scope,
-    timeout=8,
-):
-    """只讀取 Google Sheet 指定 scope。"""
+def _fetch_remote_scope(gsheet_api_url, scope, timeout=8):
+    """Read one scope, retrying transient failures within the original time budget."""
+    from model_tracking import sheet_transport_is_retryable
+
     if not gsheet_api_url:
         return None, '未設定 Google Sheet 同步'
-
     scope = str(scope or '').strip()
-
     if not scope:
         return None, '未指定 Google Sheet scope'
 
-    try:
-        response = requests.get(
-            gsheet_api_url,
-            params={
-                'scope': scope,
-                '_ts': int(time.time() * 1000),
-            },
-            headers={
-                'Cache-Control': 'no-cache, no-store, max-age=0',
-                'Pragma': 'no-cache',
-            },
-            timeout=timeout,
-        )
-
-        response.raise_for_status()
-
-        payload = response.json()
-
-        if not isinstance(
-            payload,
-            dict
-        ):
-            return None, 'Google Sheet scope 回傳格式無法辨識'
-
-        if payload.get(
-            'success'
-        ) is False:
-            return None, str(
-                payload.get(
-                    'error'
-                ) or 'Google Sheet 讀取失敗'
+    deadline = time.monotonic() + timeout
+    for attempt in range(2):
+        try:
+            response = requests.get(
+                gsheet_api_url, params={'scope': scope, '_ts': time.time_ns()},
+                headers={'Cache-Control': 'no-cache, no-store, max-age=0', 'Pragma': 'no-cache'},
+                timeout=timeout if attempt == 0 else max(0.1, deadline - time.monotonic()),
             )
+            response.raise_for_status()
+            payload = response.json()
+        except requests.RequestException as exc:
+            error = type(exc).__name__
+            if not sheet_transport_is_retryable(exc):
+                return None, error
+        except (ValueError, TypeError):
+            return None, 'Google Sheet scope 回傳格式錯誤'
+        else:
+            if not isinstance(payload, dict):
+                return None, 'Google Sheet scope 回傳格式無法辨識'
+            if payload.get('error_code') != 'busy':
+                break
+            error = 'Google Sheet 服務忙碌'
+        if attempt == 1 or deadline - time.monotonic() < 1.25:
+            return None, error
+        time.sleep(0.25)
 
-        data = payload.get(
-            'data'
-        )
-
-        if data is None:
-            return {}, None
-
-        if isinstance(
-            data,
-            str
-        ):
-            try:
-                data = json.loads(
-                    data
-                )
-            except (
-                ValueError,
-                TypeError,
-            ):
-                return None, 'Google Sheet scope JSON 無法解析'
-
-        if not isinstance(
-            data,
-            dict
-        ):
-            return None, 'Google Sheet scope 資料不是物件'
-
-        if payload.get(
-            'updated_at'
-        ):
-            data[
-                '_scope_updated_at'
-            ] = str(
-                payload.get(
-                    'updated_at'
-                )
-            )
-
-        return data, None
-
-    except requests.RequestException as exc:
-        return None, type(exc).__name__
-
-    except (
-        ValueError,
-        TypeError,
-    ):
-        return None, 'Google Sheet scope 回傳格式錯誤'
+    if payload.get('success') is not True or 'data' not in payload:
+        return None, str(payload.get('error') or 'Google Sheet 讀取失敗')
+    data = payload['data']
+    if data is None:
+        return {}, None
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except (ValueError, TypeError):
+            return None, 'Google Sheet scope JSON 無法解析'
+    if not isinstance(data, dict):
+        return None, 'Google Sheet scope 資料不是物件'
+    if payload.get('updated_at'):
+        data['_scope_updated_at'] = str(payload['updated_at'])
+    return data, None
 
 
 @st.cache_data(ttl=60, max_entries=24, show_spinner=False)
@@ -13924,57 +13882,46 @@ def _fetch_remote_scope_cached(gsheet_api_url, scope, timeout=6):
 
 
 def _save_remote_scope(gsheet_api_url, scope, payload, updated_at=None, timeout=8, verify=True):
+    from model_tracking import sheet_transport_is_retryable
+
     if not gsheet_api_url or not scope:
         return True, payload
 
-    updated_at = updated_at or datetime.now(
-        pytz.timezone('Asia/Taipei')
-    ).isoformat()
-
+    updated_at = updated_at or datetime.now(pytz.timezone('Asia/Taipei')).isoformat()
     request_payload = {
         'action': 'save',
         'scope': scope,
         'data': json.dumps(_json_safe(payload), ensure_ascii=False),
         'updated_at': updated_at,
     }
-
     try:
-        response = requests.post(
-            gsheet_api_url,
-            json=request_payload,
-            timeout=timeout,
-        )
+        response = requests.post(gsheet_api_url, json=request_payload, timeout=timeout)
         response.raise_for_status()
         result = response.json()
-
+    except requests.RequestException as exc:
+        if not sheet_transport_is_retryable(exc):
+            return False, None
+        # A lost response is not a failed commit. Read once before leaving the write pending.
+        attempts = 1
+    except (ValueError, TypeError):
+        return False, None
+    else:
         if not isinstance(result, dict) or result.get('success') is not True:
             return False, None
+        if not verify:
+            _fetch_remote_scope_cached.clear()
+            return True, payload
+        attempts = 2
 
-        # A successful write makes every cached startup read stale.
-        _fetch_remote_scope_cached.clear()
-
-        if verify:
-            for attempt in range(2):
-                saved_payload, read_error = _fetch_remote_scope(
-                    gsheet_api_url,
-                    scope,
-                    timeout=timeout,
-                )
-                if _remote_scope_payload_matches(scope, payload, saved_payload):
-                    return True, saved_payload
-                if attempt == 0:
-                    time.sleep(0.25)
-            logger.warning(
-                'Google Sheet scope verification failed: %s (%s)',
-                scope,
-                read_error or 'payload mismatch',
-            )
-            return False, saved_payload
-
-        return True, payload
-
-    except (requests.RequestException, ValueError, TypeError):
-        return False, None
+    for attempt in range(attempts):
+        saved_payload, read_error = _fetch_remote_scope(gsheet_api_url, scope, timeout=timeout)
+        if _remote_scope_payload_matches(scope, payload, saved_payload):
+            _fetch_remote_scope_cached.clear()
+            return True, saved_payload
+        if attempt + 1 < attempts:
+            time.sleep(0.25)
+    logger.warning('Google Sheet scope verification failed: %s (%s)', scope, read_error or 'payload mismatch')
+    return False, saved_payload
 
 
 def _remote_scope_payload_matches(scope, expected, actual):
