@@ -61,5 +61,5 @@ def test_performance_metric_cards_color_pnl_and_plan_table():
         pd.DataFrame({"計畫累積損益": [100.0, -100.0]})
     )
     frame._compute()
-    assert "color: #ff7373" in " ".join(style for _, style in frame.ctx[(0, 0)])
-    assert "color: #55d6a8" in " ".join(style for _, style in frame.ctx[(1, 0)])
+    assert ("color", "#ff7373") in frame.ctx[(0, 0)]
+    assert ("color", "#55d6a8") in frame.ctx[(1, 0)]
