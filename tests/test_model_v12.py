@@ -244,7 +244,7 @@ def test_archive_roundtrip_partial_write_and_stale_writer_keep_all_evidence(tmp_
     program = '''const assert=require('node:assert/strict'),crypto=require('node:crypto');
 global.Utilities={DigestAlgorithm:{SHA_256:'sha256'},Charset:{UTF_8:'utf8'},computeDigest:(a,t)=>Array.from(crypto.createHash(a).update(t).digest())};
 const values=[['scope','part','data','updated_at']];let held=false,fail=false;
-const sheet={getLastRow:()=>values.length,getRange:(r,c,n,w)=>({
+const sheet={getLastRow:()=>values.length,getMaxRows:()=>1000,getRange:(r,c,n,w)=>({
 getDisplayValues:()=>Array.from({length:n},(_,i)=>Array.from({length:w},(_,j)=>String((values[r+i-1]||[])[c+j-1]||''))),
 setNumberFormat(){return this;},setValues(rows){assert(held);for(let i=0;i<rows.length;i++){values[r+i-1]=rows[i];if(fail && rows[i][0].startsWith('strategy_events:')){fail=false;throw Error('partial cold write');}}return this;}
 }),deleteRows:(r,n)=>{assert(held);values.splice(r-1,n);}};
