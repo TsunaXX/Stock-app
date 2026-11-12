@@ -3397,7 +3397,12 @@ def test_stream_refresh_only_visible_stocks_preserves_daily_strategy_and_quote_a
         'merge_realtime_stock_snapshots', 'fresh_strategy_stream_quote', '_stream_datetime',
         '_safe_number', '_stream_number', 'snapshot_change_rate', 'price_change_amount', 'get_tick_size',
     )
-    now = datetime.now(pytz.timezone('Asia/Taipei'))
+    now = pytz.timezone('Asia/Taipei').localize(datetime(2026, 11, 12, 10))
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now.astimezone(tz) if tz else now.replace(tzinfo=None)
+    ns['datetime'] = Clock
     rows = pd.DataFrame([{'代號': c, '收盤價': 100, '_ma5': 98, '_strategy_close': 100,
                           '戰略備註': '固定備註', '_points': [{'val': 99}], '漲跌幅': 0}
                          for c in ('2330', '2317', '0050', '9999')])
@@ -3407,7 +3412,8 @@ def test_stream_refresh_only_visible_stocks_preserves_daily_strategy_and_quote_a
     ns['fetch_stock_snapshot_map'] = lambda api, codes, snapshot_fallback: (
         calls.append((codes, snapshot_fallback)) or {c: quotes[c] for c in codes})
     ns['ANALYSIS_MAX_WORKERS'] = 2
-    ns['sync_strategy_stream_scope'] = lambda *args: None
+    subscriptions = []
+    ns['sync_strategy_stream_scope'] = lambda api, contracts, room: subscriptions.append([c.code for c in contracts])
     ns['_is_opening_micro_window'] = lambda now: False
     ns['get_strategy_intraday_history'] = lambda api, contract, wait: pd.DataFrame()
     ns['calculate_daytrade_metrics'] = lambda *args, **kwargs: {'_daytrade_close': 101, '_daytrade_vwap': 100}
@@ -3430,6 +3436,16 @@ def test_stream_refresh_only_visible_stocks_preserves_daily_strategy_and_quote_a
     )
     assert (metrics, count) == (0, 0)
     assert result['收盤價'].tolist() == [100] * 4
+
+    for hour, minute in ((8, 55), (13, 45)):
+        now = now.replace(hour=hour, minute=minute)
+        calls.clear()
+        result, metrics, count = ns['refresh_daytrade_metrics_for_codes'](
+            rows, True, api, visible_codes=['2330'], stream_only=True,
+        )
+        assert subscriptions[-1] == ['2330']
+        assert not calls and (metrics, count) == (0, 0)
+        pd.testing.assert_frame_equal(result, rows)
 
 
 def test_stream_cumulative_volume_is_not_counted_twice():

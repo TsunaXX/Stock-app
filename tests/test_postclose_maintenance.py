@@ -622,3 +622,53 @@ def test_auto_status_prioritizes_current_window_over_stale_worker_status():
     state['sj_logged_in'] = False
     assert status('stock', True).startswith('自動更新：開啟｜等待 Shioaji')
     assert status('stock', False) == '自動更新：關閉'
+
+
+def test_shioaji_auctions_display_before_official_without_recording_trial_trades():
+    from collections import deque
+    from datetime import datetime
+    import threading
+
+    ns = load_app_symbols('_stream_payload', '_stream_datetime', '_stream_number',
+                          'render_stock_auction_prices', 'stock_close_display_rows', 'fmt_price',
+                          '_signed_percent', '_to_number', '_format_compact_number', '_safe_number')
+    state = {'lock': threading.RLock(), 'quotes': {}, 'aliases': {}, 'model_tick_buffers': {'2330': deque()}}
+    api = object()
+    shown = []
+    now = pd.Timestamp('2026-11-12 08:55:00', tz='Asia/Taipei')
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now.to_pydatetime()
+    official = {'2330': {'price': 100., 'change': 0.}}
+    ns.update(datetime=Clock, _stream_state=lambda _: state, is_market_closed_func=lambda _: False,
+              stock_close_display_day=lambda moment: moment.date() if moment.minute >= 33 or moment.hour < 9 else None,
+              saved_stock_closing_quotes=lambda _: official,
+              st=SimpleNamespace(session_state={'sj_api': api, 'stock_auto_timer_seconds': 5}, caption=shown.append))
+    rows = pd.DataFrame([{'代號': '2330', '收盤價': '100', '漲跌幅': '0%', '_strategy_close': 100}])
+
+    def push(price, when, **kwargs):
+        ns['_stream_payload'](api, SimpleNamespace(code='2330', close=price, price_chg=price-100,
+                                                  datetime=datetime.fromisoformat(when), volume=3, **kwargs), 'STK')
+
+    push(101, '2026-11-12T08:54:59', simtrade=True)
+    assert not state['quotes'] and not state['model_tick_buffers']['2330']
+    render = ns['render_stock_auction_prices']
+    assert render(rows, 'stock').iloc[0]['收盤價'] == '101'
+    assert render(rows, 'stock_independent').iloc[0]['收盤價'] == '100'  # Its timer is paused.
+    assert rows.iloc[0]['收盤價'] == '100'
+
+    now = pd.Timestamp('2026-11-12 13:30:07', tz='Asia/Taipei')
+    push(103, '2026-11-12T13:29:58', simtrade=True)
+    push(102, '2026-11-12T13:30:00.100')
+    push(110, '2026-11-12T13:30:05', intraday_odd=True)
+    assert render(rows, 'stock').iloc[0]['收盤價'] == '102'
+    assert '待官方核對' in shown[-1]
+    assert len(state['model_tick_buffers']['2330']) == 1
+
+    now = pd.Timestamp('2026-11-12 13:45:00', tz='Asia/Taipei')
+    official = {'2330': {'price': 102.5, 'change': 2.5}}
+    result = render(rows, 'stock')
+    assert result.iloc[0]['收盤價'] == '102.5'
+    assert result.iloc[0]['_strategy_close'] == 100
+    assert '已依官方更正：2330' in shown[-1]

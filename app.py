@@ -261,6 +261,20 @@ def _stream_payload(api, payload, security_type):
     with state['lock']:
         if state.get('retired'):
             return
+        if security_type == 'STK':
+            if getattr(payload, 'intraday_odd', False):
+                return
+            trial = bool(getattr(payload, 'simtrade', False))
+            clock = updated_at.time()
+            slot = ('stock_trial_quotes' if trial and clock < dt_time(9)
+                    else 'stock_auction_closes' if not trial and dt_time(13, 30) <= clock < dt_time(13, 34)
+                    and (values.get('volume') or 0) > 0 else None)
+            if slot and close is not None and close > 0 and getattr(payload, 'datetime', None) is not None:
+                cache = state.setdefault(slot, {})
+                if code not in cache or updated_at >= cache[code]['time']:
+                    cache[code] = {'time': updated_at, 'price': close, 'change': change}
+            if trial:
+                return  # Indicative prices never enter regular quotes or model evidence.
         previous = state['quotes'].get(code, {})
         previous.update(values)
         state['quotes'][code] = previous
@@ -23519,6 +23533,8 @@ def refresh_daytrade_metrics_for_codes(stock_data, sj_logged_in=False, sj_api=No
                 continue
         sync_strategy_stream_scope(sj_api, contracts, stream_room)
     now_tw = datetime.now(pytz.timezone('Asia/Taipei'))
+    if stream_only and not dt_time(9) <= now_tw.time() <= dt_time(13, 30):
+        return stock_data, 0, 0  # Keep subscriptions live for the display-only auctions.
     interval_label = '快取 1 分 K'
     snapshot_map = fetch_stock_snapshot_map(sj_api, codes, snapshot_fallback=not stream_only)
     if stream_only:
@@ -24943,6 +24959,7 @@ def saved_stock_closing_quotes(day):
 
 def check_stock_table_closes(now):
     codes = set(st.session_state.get('stock_main_visible_codes', ()))
+    codes.update(st.session_state.get('stock_independent_visible_codes', ()))
     if not codes or (day := stock_close_display_day(now)) is None:
         return False
     missing = codes.difference(saved_stock_closing_quotes(day))
@@ -24971,6 +24988,56 @@ def stock_close_display_rows(rows, quotes):
         if ma5 is not None:
             display.at[index, '5日線價差'] = fmt_price(price - ma5)
     return display
+
+
+def render_stock_auction_prices(rows, room):
+    now = datetime.now(pytz.timezone('Asia/Taipei'))
+    if rows.empty:
+        return rows
+    codes = set(rows['代號'].astype(str))
+    clock = now.time()
+    day = stock_close_display_day(now)
+    official = saved_stock_closing_quotes(day) if day is not None else {}
+    if is_market_closed_func(now.date()):
+        return stock_close_display_rows(rows, official) if official else rows
+    api = st.session_state.get('sj_api')
+    trial = clock < dt_time(9) and bool(st.session_state.get(f'{room}_auto_timer_seconds'))
+    streamed = {}
+    if api is not None and (trial or clock >= dt_time(13, 30)):
+        stream = _stream_state(api)
+        local = now.replace(tzinfo=None)
+        with stream['lock']:
+            cache = stream.get('stock_trial_quotes' if trial else 'stock_auction_closes', {})
+            for code in codes:
+                quote = cache.get(stream.get('aliases', {}).get(code, code), cache.get(code))
+                if (quote is not None and quote['time'].date() == now.date() and quote['time'] <= local
+                        and (not trial or (not stream.get('connection_down') and
+                                           (local - quote['time']).total_seconds() <= 30))):
+                    streamed[code] = quote
+    if clock < dt_time(9):
+        if streamed:
+            latest = max(quote['time'] for quote in streamed.values())
+            st.caption(f'永豐試撮 {latest:%H:%M:%S}｜{len(streamed)}/{len(codes)} 檔，其餘保留前次報價')
+        elif trial:
+            st.caption('等待永豐試撮，暫保留前次報價')
+        quotes = {**official, **streamed}
+    elif clock >= dt_time(13, 30):
+        verified = codes & official.keys()
+        pending = codes - verified
+        mismatch = sorted(code for code in verified & streamed.keys()
+                          if abs(official[code]['price'] - streamed[code]['price']) > 1e-6)
+        message = f'{now:%Y/%m/%d} 正式收盤價已核對 {len(verified)}/{len(codes)} 檔'
+        if pending & streamed.keys():
+            message += f'｜{len(pending & streamed.keys())} 檔採永豐收盤成交，待官方核對'
+        if pending - streamed.keys():
+            message += '｜其餘暫保留前次報價'
+        if mismatch:
+            message += '｜已依官方更正：' + '、'.join(mismatch)
+        st.caption(message)
+        quotes = {**streamed, **official}
+    else:
+        return rows
+    return stock_close_display_rows(rows, quotes) if quotes else rows
 
 
 @st.fragment(run_every=60)
@@ -26112,19 +26179,7 @@ if tab1.open and stock_strategy_tab.open:
                     if col not in ["移除", "信心分"]:
                         df_display[col] = df_display[col].map(_blank_display_text)
 
-                table_display = df_display
-                close_day = stock_close_display_day(datetime.now(pytz.timezone('Asia/Taipei')))
-                if close_day is not None and not df_display.empty:
-                    quotes = saved_stock_closing_quotes(close_day)
-                    pending = sorted(set(df_display['代號'].astype(str)).difference(quotes))
-                    verified_count = df_display['代號'].astype(str).isin(quotes).sum()
-                    message = f'{close_day:%Y/%m/%d} 正式收盤價已核對 {verified_count}/{len(df_display)} 檔'
-                    if pending:
-                        symbols = '、'.join(pending[:5]) + ('等' if len(pending) > 5 else '')
-                        message += f'｜{symbols} 等待官方收盤價，暫保留上次報價'
-                    st.caption(message)
-                    if verified_count:
-                        table_display = stock_close_display_rows(df_display, quotes)
+                table_display = render_stock_auction_prices(df_display, 'stock')
                 styled_df = table_display[input_cols].style.apply(
                     style_tab1_df, axis=1, source_frame=table_display.copy(),
                 )
@@ -26765,6 +26820,7 @@ if tab1.open and stock_strategy_tab.open:
                             if col != "信心分":
                                 df_indep[col] = df_indep[col].map(_blank_display_text)
 
+                        df_indep = render_stock_auction_prices(df_indep, 'stock_independent')
                         # 套用與主表格完全一致的顏色邏輯
                         styled_indep = df_indep[input_cols].style.apply(
                             lambda row: style_tab1_df(row, df_indep), axis=1,
