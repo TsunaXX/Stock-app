@@ -340,12 +340,12 @@ def test_new_home_tab_lazy_ui_and_excel(tmp_path):
     functions = {'render_model_tracking_room','cached_model_performance','model_performance_state', '_model_column_config',
                  '_model_market_version_key','_model_version_first_date','model_version_display_labels',
                  '_model_time_text','_model_display_value','_model_display_frame',
-                  '_model_number_text','_model_history_overview','set_model_period_today'}
+                  '_model_number_text','_model_history_overview','_model_metric_card_html','_model_notice_amount_text','set_model_period_today'}
     defs = '\n'.join(ast.unparse(n) for n in ast.parse(source).body if isinstance(n,ast.FunctionDef) and n.name in functions)
     tracker = ModelTracker(tmp_path/'ui.sqlite',start=False)
     script = '''
 import streamlit as st
-import pandas as pd, numpy as np, json, pytz, threading, time
+import pandas as pd, numpy as np, json, pytz, threading, time, html
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import date,datetime,timedelta
 from model_tracking import ModelTracker,DEFAULT_COSTS,VERSION as MODEL_VERSION,performance,plan_performance,excel_report,event_message,normalize_costs
