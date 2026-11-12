@@ -404,8 +404,8 @@ with outer:
     assert str(app.date_input(key='model_period').value[-1]) == '2026-10-12'
     assert any(e.label == '候選與未進場診斷' for e in app.expander)
     assert len(app.get('download_button')) == 1
-    assert any(metric.label == '追蹤執行紀錄數' for metric in app.metric)
-    assert any(metric.label == '含資料缺口的執行紀錄數' for metric in app.metric)
+    assert any('追蹤執行紀錄數' in element.value for element in app.markdown)
+    assert any('含資料缺口的執行紀錄數' in element.value for element in app.markdown)
     assert any(button.label == '今天' for button in app.button)
     assert app.selectbox(key='model_plan_source').options == ['全部','股期戰略室','指數操作計畫','選擇權操作計畫']
     assert '2330｜台積電' in app.selectbox(key='model_code').options
