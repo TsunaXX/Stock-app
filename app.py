@@ -22340,6 +22340,13 @@ def model_protection_text(row):
     return f"保 {unit}{fmt_price(value) if value is not None else '—'}·{status}"
 
 
+def _model_notice_amount_text(value):
+    text = str(value)
+    if '.' in text:
+        text = text.rstrip('0').rstrip('.')
+    return '0' if text in ('-0', '+0') else text
+
+
 def apply_model_protection(rows, stock, mode, room=None):
     """Show confirmed model state and price plans without advancing the simulator."""
     if rows.empty or not st.session_state.get('sj_logged_in', False):
@@ -22957,13 +22964,6 @@ def _model_number_text(value):
         text = format(Decimal(str(value)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP), 'f')
         return text.rstrip('0').rstrip('.') if '.' in text else text
     return value
-
-
-def _model_notice_amount_text(value):
-    text = str(value)
-    if '.' in text:
-        text = text.rstrip('0').rstrip('.')
-    return '0' if text in ('-0', '+0') else text
 
 
 def _model_metric_card_html(label, value):
