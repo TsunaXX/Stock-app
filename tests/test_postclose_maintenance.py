@@ -590,12 +590,13 @@ def test_stock_close_sync_preserves_both_devices_and_newer_trade_date():
     local = {'display_settings': {'updated_at': earlier, 'limit_rows': 6, 'stock_closing_quotes': {
         'updated_at': later, 'values': {
             '2468': {'date': '2026-11-10', 'price': 66, 'change': 0},
-            '1815': {'date': today, 'price': 140.5, 'change': 12.5},
+            '1815': {'date': today, 'price': 140, 'change': 12, 'source': 'shioaji'},
         },
     }}}
     remote = {'display_settings': {'updated_at': later, 'limit_rows': 8, 'stock_closing_quotes': {
         'updated_at': earlier, 'values': {
             '2468': {'date': today, 'price': 68.3, 'change': 2.3},
+            '1815': {'date': today, 'price': 140.5, 'change': 12.5},
             '5202': {'date': today, 'price': 21.1, 'change': None},
         },
     }}}

@@ -629,7 +629,7 @@ def stock_rows_with_evidence(ns, count=6):
                      '_risk_ma20':98.,'_risk_ma20_slope':.5,'_risk_atr14':4.,'_risk_close_position':80.,
                      '_risk_prev_high':99.,'_risk_prev_low':96.,'_daytrade_vwap':99.,
                      '_daytrade_or_high':100.,'_daytrade_or_low':98.,'_daytrade_close':100.5,
-                     '_daytrade_volume_ratio':2.,'_daytrade_data_time':stamp,'_daytrade_phase':'開盤區間完成',
+                     '_daytrade_confirmation':'多頭','_daytrade_volume_ratio':2.,'_daytrade_data_time':stamp,'_daytrade_phase':'開盤區間完成',
                      '當日漲停價':110.,'當日跌停價':90.})
         buffers[code]=deque([{'來源時間':stamp,'價格':100.5,'序號':1,'串流識別':'desktop:0','有效':True}],maxlen=4096)
     state={'lock':threading.RLock(),'model_tick_buffers':buffers}

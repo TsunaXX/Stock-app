@@ -10650,8 +10650,6 @@ def stock_stream_auction_closes(api, day):
 def check_model_stock_closes(tracker=None):
     """Settle against the broker immediately and share the official feed with the stock table."""
     now = datetime.now(pytz.timezone('Asia/Taipei'))
-    if model_market_open({'市場': '股票'}, now):
-        return
     day = (now.date() if now.time() >= dt_time(13, 30) and not is_market_closed_func(now.date())
            else latest_completed_stock_trading_date(now))
     if tracker is None:
@@ -20475,7 +20473,7 @@ def calculate_daytrade_filter_result(row, direction, attention_counts=None, disp
     if row.get('_daytrade_guard_ready') is False or guard_reason:
         eligible = False
     confirmation = row.get('_daytrade_confirmation')
-    confirmation_missing = '_daytrade_confirmation' in row and confirmation != direction
+    confirmation_missing = confirmation != direction
     if confirmation_missing:
         eligible = False
     direction_text = '站上' if is_long else '跌破'

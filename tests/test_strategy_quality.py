@@ -35,7 +35,7 @@ def test_fixed_opening_range_preview_still_requires_breakout_and_guards():
     ns = load_app_symbols('calculate_daytrade_filter_result', 'build_trade_plan', '_as_float', '_safe_number',
                           'get_tick_size', 'get_taiwan_tick_size', 'move_tick', 'round_to_tick', 'fmt_price')
     row = {'_daytrade_close': 99.9, '_daytrade_vwap': 99, '_daytrade_or_high': 100,
-           '_daytrade_or_low': 98, '_daytrade_phase': '開盤區間完成', '_daytrade_volume_ratio': 1.1,
+           '_daytrade_or_low': 98, '_daytrade_confirmation': '多頭', '_daytrade_phase': '開盤區間完成', '_daytrade_volume_ratio': 1.1,
            '_交易日漲停價': 110, '_交易日跌停價': 90}
     result = ns['calculate_daytrade_filter_result'](row, '多頭')
     assert result['eligible'] and '等待突破價' in result['rule']
