@@ -23,6 +23,13 @@ DEFAULT_COSTS = {'stock_shares': 1000, 'stock_discount': 2.8, 'stock_min_fee': 2
                  'futures_contracts': 1, 'futures_fee': 10, 'slippage_ticks': 1}
 
 
+def sheet_transport_is_retryable(error):
+    if isinstance(error, (requests.ConnectionError, requests.Timeout, requests.exceptions.ChunkedEncodingError)):
+        return True
+    return (isinstance(error, requests.HTTPError) and error.response is not None
+            and error.response.status_code in (408, 429, 500, 502, 503, 504))
+
+
 def normalize_costs(values):
     values = values if isinstance(values,dict) else {}
     result = {}
@@ -1734,40 +1741,66 @@ class ModelTracker:
                                         headers={'Cache-Control': 'no-cache, no-store, max-age=0', 'Pragma': 'no-cache'},
                                         timeout=(5, 35))
                 response.raise_for_status()
-                break
-            except (requests.ConnectionError, requests.Timeout, requests.HTTPError) as exc:
-                status = exc.response.status_code if exc.response is not None else None
-                if status is not None and status not in (429, 500, 502, 503, 504):
+                payload = response.json()
+            except requests.RequestException as exc:
+                if not sheet_transport_is_retryable(exc):
                     raise
-                if attempt == 2:
-                    reason = f'HTTP {status}' if status else type(exc).__name__
-                    raise RuntimeError(f'Google Sheet 暫時無法讀取（{scope}／{reason}，已嘗試 3 次）；保留待同步並自動重試') from exc
-                time.sleep(2 ** attempt)
-        payload = response.json()
+                reason = f'HTTP {exc.response.status_code}' if exc.response is not None else type(exc).__name__
+            else:
+                if not isinstance(payload, dict):
+                    raise ValueError('Google Sheet 儲存格式不符，保留待同步')
+                if payload.get('error_code') != 'busy':
+                    break
+                reason = '服務忙碌'
+            if attempt == 2:
+                raise RuntimeError(f'Google Sheet 暫時無法讀取（{scope}／{reason}，已嘗試 3 次）；保留待同步並自動重試')
+            time.sleep(2 ** attempt)
         if payload.get('success') is not True:
             raise ValueError(payload.get('error', 'Google Sheet 讀取失敗'))
-        data = payload.get('data') or {}
+        if 'data' in payload and payload['data'] is None:
+            return {}
+        data = payload.get('data')
         if not isinstance(data, dict):
             raise ValueError('Google Sheet 儲存格式不符，保留待同步')
         return data
 
     def remote_save(self, scope, data, delta=False):
-        response = requests.post(self.url, json={'scope': scope, 'data': json.dumps(data, ensure_ascii=False),
-                                                'updated_at': datetime.now(TZ).isoformat()}, timeout=(5, 35))
-        response.raise_for_status()
-        payload = response.json()
-        if payload.get('success') is not True:
-            raise ValueError(payload.get('error', 'Google Sheet 寫入失敗'))
-        actual = self.remote_get(scope, [r['交易ID'] for r in data['model_trades']]) if delta else self.remote_get(scope)
+        ids = [r['交易ID'] for r in data['model_trades']] if delta else None
+        try:
+            response = requests.post(self.url, json={'scope': scope, 'data': json.dumps(data, ensure_ascii=False),
+                                                    'updated_at': datetime.now(TZ).isoformat()}, timeout=(12, 35))
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            if not sheet_transport_is_retryable(exc):
+                raise
+            # The server may have committed before the connection dropped. Let sync verify the evidence.
+            payload = None
+        else:
+            payload = response.json()
+            if not isinstance(payload, dict) or payload.get('success') is not True:
+                raise ValueError(payload.get('error', 'Google Sheet 寫入失敗') if isinstance(payload, dict)
+                                 else 'Google Sheet 寫入回應格式無效')
+        actual = self.remote_get(scope, ids) if delta else self.remote_get(scope)
         if actual.get('model_schema') != 1:
             raise ValueError('Apps Script 尚未部署策略追蹤原子合併 V1.0；資料保留待同步')
         if delta:
-            version = str(payload.get('model_version', ''))
-            previous = str(payload.get('model_previous_version', ''))
             read_version = str(actual.get('model_version', ''))
-            if not version.isdigit() or not read_version.isdigit() or int(read_version) < int(version) or (previous and not previous.isdigit()):
-                raise ValueError('交易同步版本回讀無效；保留待同步')
-            actual['_committed_version'], actual['_previous_version'] = version, previous
+            if payload is None:
+                # The month can be written before its catalog. Require both before clearing dirty rows.
+                catalog = self.remote_get('strategy_signals')
+                month = scope.split(':', 1)[1]
+                versions = catalog.get('model_versions', {})
+                indexed = str(versions.get(month, '')) if isinstance(versions, dict) else ''
+                if (catalog.get('model_schema') != 1 or month not in catalog.get('model_months', [])
+                        or not indexed.isdigit() or not read_version.isdigit() or int(indexed) < int(read_version)):
+                    raise ValueError('Google Sheet 寫入逾時，月份索引尚未確認；保留待同步')
+                actual['_committed_version'], actual['_previous_version'] = read_version, None
+            else:
+                version = str(payload.get('model_version', ''))
+                previous = str(payload.get('model_previous_version', ''))
+                if not version.isdigit() or not read_version.isdigit() or int(read_version) < int(version) or (previous and not previous.isdigit()):
+                    raise ValueError('交易同步版本回讀無效；保留待同步')
+                actual['_committed_version'], actual['_previous_version'] = version, previous
         return actual
 
     def sync(self):
