@@ -31,11 +31,10 @@ seed = [('加權','^TWII',frame,'synthetic',{'score':50.}), ('期貨','TWF=F',fr
 st.session_state['sj_api'], st.session_state['sj_logged_in'] = f['api'], True
 
 def live(*args, **kw):
+    key = threading.get_ident()
+    f['updates'][key] = f['updates'].get(key,0)+1
     return {'price':20100 + int(time.monotonic()-f['started']), 'change':100.,
             'contract_code':'TMFJ6', 'updated':pd.Timestamp.now(tz='Asia/Taipei')}
-def record(*args, **kw):
-    key = id(st.session_state) if threading.current_thread() is threading.main_thread() else threading.get_ident()
-    f['updates'][key] = f['updates'].get(key,0)+1
 ns.update(st=st, weakref=weakref, IntradayBackground=IntradayBackground,
     get_public_maintenance_jobs=lambda:f['jobs'], refresh_index_background_history=lambda api,seed:seed,
     _stream_state=lambda api:f['stream'], get_model_tracker=lambda url:object(), get_app_secret=lambda k:'',
@@ -52,7 +51,7 @@ ns.update(st=st, weakref=weakref, IntradayBackground=IntradayBackground,
     evaluate_trade_entry_state=lambda plan,price,*a:{'can_enter':True,'entry_level':20000.,'invalidation':19900.,'target':20500.},
     resolve_short_wave_direction=lambda *a:('偏多','fixture'),get_cached_short_wave_plan=lambda *a,**kw:None,
     get_cached_index_minutes=lambda api, interval:pd.DataFrame(),
-    operation_model_spec=lambda *a,**kw:None,record_operation_models=record)
+    operation_model_spec=lambda *a,**kw:None)
 
 st.title('指數操作計畫背景工作驗證')
 st.caption('模擬行情；沿用正式 session worker 與 snapshot adapter，沒有外部 API 或交易紀錄寫入。')

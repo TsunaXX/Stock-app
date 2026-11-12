@@ -8260,8 +8260,9 @@ def index_operation_snapshot(seed_data, seconds):
     if api is None or not st.session_state.get('sj_logged_in', False):
         return calculate_operation_snapshot(seed_data, None, profile,
             st.session_state.setdefault('_index_operation_state', {}))
-    costs, version = load_model_tracking_costs(), get_operation_model_version('指數操作計畫')
-    tracker = get_model_tracker(get_app_secret('gsheet_api_url') or '')
+    recording = st.session_state.setdefault('_index_model_recording', threading.Event())
+    costs, version = (load_model_tracking_costs(), get_operation_model_version('指數操作計畫')) if recording.is_set() else ({}, None)
+    tracker = get_model_tracker(get_app_secret('gsheet_api_url') or '') if version else None
     worker = get_intraday_background()
     signature = data_version([id(api), seconds, profile, quantity, costs, version,
                               st.session_state.get('_index_refresh_generation', 0)])
@@ -8302,7 +8303,8 @@ def index_operation_snapshot(seed_data, seconds):
             # A failed daily refresh cannot publish a newly calculated plan from old history.
             specs = [{**spec, '新訊號': False, '進場許可': False}
                      for spec in previous.get('model_specs', []) if spec]
-            record_operation_models('指數操作計畫', specs, api, seconds, tracker=tracker, cursors=cursors)
+            if tracker is not None and recording.is_set():
+                record_operation_models('指數操作計畫', specs, api, seconds, tracker=tracker, cursors=cursors)
             raise RuntimeError('index history refresh failed')
         snapshot = calculate_operation_snapshot(seed_data, api, profile, state, background=True)
         state['initialized'] = bool(snapshot.get('plan'))
@@ -8310,9 +8312,11 @@ def index_operation_snapshot(seed_data, seconds):
             if previous.get('plan'):
                 raise RuntimeError('index plan unavailable')
             return snapshot, 0
-        specs = index_operation_model_specs(snapshot, quantity, profile, costs, version)
-        record_operation_models('指數操作計畫', specs, api, seconds, tracker=tracker, cursors=cursors)
-        snapshot['model_specs'] = specs
+        if tracker is not None and recording.is_set():
+            specs = index_operation_model_specs(snapshot, quantity, profile, costs, version)
+            if recording.is_set():
+                record_operation_models('指數操作計畫', specs, api, seconds, tracker=tracker, cursors=cursors)
+            snapshot['model_specs'] = specs
         return snapshot, int(snapshot['fresh'])
     stream = _stream_state(api)
     def ready():
@@ -8362,7 +8366,7 @@ def index_operation_snapshot(seed_data, seconds):
     return snapshot
 
 
-def render_operation_plan(seed_data, option_page=False, seconds=5, snapshot=None):
+def render_operation_plan(seed_data, option_page=False, seconds=5, snapshot=None, record_enabled=False):
     """Render the latest snapshot; only the option page keeps its existing foreground flow."""
     api = st.session_state.get('sj_api')
     option_model_specs = []
@@ -8378,7 +8382,7 @@ def render_operation_plan(seed_data, option_page=False, seconds=5, snapshot=None
         snapshot = index_operation_snapshot(seed_data, seconds)
     plan = snapshot.get('plan')
     if plan is None:
-        if option_page:
+        if option_page and record_enabled:
             record_operation_models('選擇權操作計畫', [], api, seconds)
         st.info('⏳ 正在載入加權與期貨日 K；資料足夠後會直接顯示操作計畫。')
         if option_page and time.monotonic() - st.session_state.get('_index_trade_plan_auto_retry', 0) >= 180:
@@ -8882,7 +8886,7 @@ def render_operation_plan(seed_data, option_page=False, seconds=5, snapshot=None
                 {'模型機率': (option_quote or {}).get('model_probability'),
                  '模型波動率': (option_quote or {}).get('model_volatility')},
                 strategy_view['reason'], option_quote=option_quote, spread=display_spread,
-            ) if option_ready else None
+            ) if option_ready and record_enabled else None
             option_model_specs = [model_spec]
             if option_quote and option_quote.get('quote_time'):
                 st.caption('本組報價來源時間：' + _stream_datetime(option_quote['quote_time']).strftime('%Y/%m/%d %H:%M:%S'))
@@ -9035,8 +9039,9 @@ def render_operation_plan(seed_data, option_page=False, seconds=5, snapshot=None
                     )
                 else:
                     st.info("即時權利金或淨收權利金不足，暫時無法繪製可驗證的損益曲線。")
-        record_operation_models('選擇權操作計畫', option_model_specs, api, st.session_state.get('option_auto_seconds_saved', 5))
-        render_operation_protection('選擇權操作計畫', option_model_specs)
+        if record_enabled:
+            record_operation_models('選擇權操作計畫', option_model_specs, api, seconds)
+            render_operation_protection('選擇權操作計畫', option_model_specs)
 
 
 
@@ -21725,14 +21730,18 @@ def set_futures_row_values(rows, index, values):
         rows.at[index, column] = value
 
 
-def sync_strategy_stream_scope(api, contracts, room):
+def sync_strategy_stream_scope(api, contracts, room, retained_codes=()):
     """Cancel removed pending jobs and subscriptions created by this auto room."""
     state = _stream_state(api)
-    selected = {str(contract.code) for contract in contracts}
+    selected = {str(contract.code) for contract in contracts} | set(retained_codes)
     with state['lock']:
         scopes = state.setdefault('strategy_stream_scopes', {})
-        scopes[room] = selected
-        owned = state.setdefault('strategy_owned_subscriptions', {}).setdefault(room, {})
+        if selected:
+            scopes[room] = selected
+        else:
+            scopes.pop(room, None)
+        owners = state.setdefault('strategy_owned_subscriptions', {})
+        owned = owners.setdefault(room, {})
         removed = []
         for code in list(owned):
             if code not in selected:
@@ -21742,11 +21751,15 @@ def sync_strategy_stream_scope(api, contracts, room):
                     removed.append((code, metadata))
                 else:
                     state['strategy_owned_subscriptions'].setdefault(other, {})[code] = metadata
+        if not selected and not owned:
+            owners.pop(room, None)
         asset = room.split('_', 1)[0]
         retained = set().union(*(codes for scope, codes in scopes.items() if scope.split('_', 1)[0] == asset))
         all_retained = set().union(*scopes.values())
         # Ordinary subscriptions also own their evidence; removing another scope must not reset it.
         all_retained.update(set(state.get('subscriptions', {})) - {code for code, _ in removed})
+        aliases = state.get('aliases', {})
+        all_retained.update(aliases.get(code, code) for code in tuple(all_retained))
         for code in list(state.get('model_tick_buffers', {})):
             if code not in all_retained:
                 state['model_tick_buffers'].pop(code, None)
@@ -21816,6 +21829,168 @@ def stop_intraday_background(room):
     if worker is not None:
         worker.remove(room)
         worker.remove(room + '_model')
+
+
+def retain_open_model_positions(api, source, stock=False):
+    """Transfer already-subscribed evidence before leaving a page that can publish entries."""
+    worker = st.session_state.get('_intraday_background')
+    if not st.session_state.get('sj_logged_in', False):
+        return
+    state = _stream_state(api)
+    with state['lock']:
+        scopes = state.get('strategy_stream_scopes', {})
+        if stock:
+            rooms = ('stock', 'stock_independent')
+            names = set(rooms) | {f'{room}{suffix}_{id(worker)}' for room in rooms for suffix in ('', '_model')}
+        elif source == '指數操作計畫':
+            names = {scope for scope in scopes if scope.startswith(f'index_{id(worker)}_')}
+        else:
+            names = {'index', 'options', 'options_models'}
+        available = set().union(*(scopes.get(name, set()) for name in names))
+        available &= state.get('subscriptions', {}).keys()
+        aliases = dict(state.get('aliases', {}))
+    if not available:
+        return
+    tracker = get_model_tracker(get_app_secret('gsheet_api_url') or '')
+    if not hasattr(tracker, 'still_held'):
+        return  # A Streamlit hot reload can retain the pre-deployment tracker.
+    subscribed_codes = {aliases.get(code, code): code for code in available}
+    now = datetime.now(pytz.timezone('Asia/Taipei'))
+    day = now.date().isoformat() if stock else get_futures_trading_date(now).date().isoformat()
+    try:
+        positions = tracker.open_stock_positions(available | subscribed_codes.keys(), day) if stock else {
+            row['交易ID']: row for row in tracker.active_plans(source, day)
+            if row.get('模擬進場價') is not None and row.get('模擬出場價') is None and not row.get('到期未確認')
+        }
+    except OperationalError:
+        return  # A temporarily busy model database must not interrupt navigation.
+
+    def codes_for(row):
+        codes = [row['商品鍵']] if stock else [row.get('觸發商品'), *(leg['代碼'] for leg in row.get('選擇權腿', []))]
+        return {code if code in available else subscribed_codes.get(code, code) for code in codes}
+
+    if not positions:
+        return
+    worker = get_intraday_background()
+    if worker is None:
+        return
+    prefix = 'stock_held_' if stock else 'operation_held_'
+    with worker.lock:
+        existing = set().union(*(job['signature'] for name, job in worker.jobs.items() if name.startswith(prefix)))
+        positions = {trade_id: row for trade_id, row in positions.items()
+                     if trade_id not in existing and codes_for(row) <= available}
+        if not positions or worker.closed:
+            return
+        room = prefix + next(iter(positions))
+        scope = f'model_{room}_{id(worker)}'
+        cursors = {}
+        for row in positions.values():
+            stream = row.get('串流識別')
+            if stream and row.get('最後序號') is not None:
+                if row.get('選擇權腿'):
+                    stream = stream.rsplit(':', 1)[0]
+                key = row['商品鍵']
+                cursor = {'stream': stream, 'sequence': row['最後序號'], 'time': row['來源時間'],
+                          'allowed': False, 'direction': row.get('方向')}
+                # Several modes can share a stock buffer. Start at the earliest position cursor.
+                if key not in cursors or cursor['time'] < cursors[key]['time']:
+                    cursors[key] = cursor
+        held = set(positions)
+        checked_revision = None
+        retained = set().union(*(codes_for(row) for row in positions.values()))
+        # Register the new owner before the visible scope can unsubscribe or clear its buffer.
+        with state['lock']:
+            if not retained <= state.get('subscriptions', {}).keys() or state.get('retired'):
+                return
+            state.setdefault('strategy_stream_scopes', {})[scope] = retained
+            state.setdefault('intraday_background_workers', weakref.WeakSet()).add(worker)
+
+        def update(seed):
+            nonlocal held, retained, checked_revision
+            now_tw = datetime.now(pytz.timezone('Asia/Taipei'))
+            today = now_tw.date().isoformat() if stock else get_futures_trading_date(now_tw).date().isoformat()
+            revision = tracker.revision
+            if revision != checked_revision:
+                held = tracker.still_held(held)
+                checked_revision = revision
+            active = {trade_id: positions[trade_id] for trade_id in held
+                      if positions[trade_id]['策略'] == '波段' or positions[trade_id]['交易日'] == today}
+            if not active:
+                worker.remove(room)
+                return seed, 0
+            current = set().union(*(codes_for(row) for row in active.values()))
+            if current != retained:
+                sync_strategy_stream_scope(api, [], scope, retained_codes=current)
+                retained = current
+            if model_market_open({'市場': '股票' if stock else '期貨'}, now_tw):
+                with state['lock']:
+                    subscriptions = [state['subscriptions'][code] for code in current if code in state['subscriptions']]
+                    for subscription in subscriptions:
+                        if subscription.get('status') == 'active':
+                            subscription['last_used'] = time.monotonic()
+                    retry = [sub['contract'] for sub in subscriptions if sub.get('status') in ('reconnect', 'error')]
+                if retry:
+                    sync_strategy_stream_scope(api, retry, scope, retained_codes=current)
+            quotes = held_model_quotes(active, state, api, stock, today, now_tw, cursors)
+            if quotes and tracker.submit([], quotes):
+                for quote in quotes.values():
+                    code = quote['持倉成交代碼']
+                    cursors[code] = quote['持倉成交游標']
+            return seed, len(quotes)
+
+        worker.configure(room, frozenset(positions), {}, 5, update, lambda: True,
+                         lambda: sync_strategy_stream_scope(api, [], scope), low_priority=True)
+
+
+def held_model_quotes(positions, state, api, stock, day, now, cursors):
+    if not (model_market_open({'市場': '股票' if stock else '期貨'}, now)
+            or model_market_open({'市場': '股票' if stock else '期貨'}, now - timedelta(seconds=30))):
+        return {}
+    grouped = {}
+    for trade_id, row in positions.items():
+        grouped.setdefault(row['商品鍵'], {})[trade_id] = row
+    quotes = {}
+    for key, trades in grouped.items():
+        row = next(iter(trades.values()))
+        code = key if stock else row['觸發商品']
+        with state['lock']:
+            if state.get('connection_down') or state.get('auth_error') or state.get('retired'):
+                return {}
+            code = state.get('aliases', {}).get(code, code)
+            buffer = state.get('model_tick_buffers', {}).get(code)
+            if not buffer:
+                continue
+            # Keep the previous tick as a bridge and submit only when the stream has advanced.
+            after = cursors.get(key)
+            observed = []
+            for tick in reversed(buffer):
+                if stock and (tick['來源時間'][:10] != day or not '09:00:00' <= tick['來源時間'][11:19] <= '13:30:00'):
+                    continue
+                observed.append(tick)
+                if not stock or (after and tick['串流識別'] == after['stream'] and tick['序號'] <= after['sequence']):
+                    break
+        if not observed:
+            continue
+        last = observed[0]
+        source = datetime.fromisoformat(last['來源時間'])
+        if not 0 <= (now - source).total_seconds() <= 30:
+            continue
+        cursor = {'stream': last['串流識別'], 'sequence': last['序號'], 'time': last['來源時間'],
+                  'allowed': False, 'direction': row.get('方向')}
+        if cursor == after:
+            continue
+        if stock:
+            quote = {**last, '成交證據': list(reversed(observed)), '交易日': day, '更新秒數': 5,
+                     '休市銜接': bool(after and after['time'][:10] != day)}
+        else:
+            spec = {**row, '新訊號': False, '進場許可': False}
+            _, sampled = operation_model_samples([spec], api, 5, now_value=now, after=cursors)
+            quote = sampled.get('期貨|' + key)
+            if not quote or (quote['休市'] and not quote['收盤確認']):
+                continue
+        quotes[row['市場'] + '|' + key] = {**quote, '僅追蹤持倉': tuple(trades),
+                                             '持倉成交代碼': key, '持倉成交游標': cursor}
+    return quotes
 
 
 def model_tracking_config(room, stock, direction_choice='自動'):
@@ -22358,6 +22533,11 @@ def record_operation_models(source, specs, api, seconds, tracker=None, cursors=N
         sync_strategy_stream_scope(api, contracts, 'options_models')
     cursors = st.session_state.setdefault('_operation_model_cursors', {}) if cursors is None else cursors
     signals, quotes = operation_model_samples(specs, api, seconds, after=cursors)
+    if (since := cursors.get('_record_from')):
+        # Reopening a page must not replay prices from when entry recording was paused.
+        signals = [signal for signal in signals if signal['來源時間'] >= since]
+        quotes = {key: {**quote, '成交證據': [tick for tick in quote['成交證據'] if tick['來源時間'] >= since]}
+                  for key, quote in quotes.items() if quote['來源時間'] >= since}
     if signals or quotes:
         if tracker.submit(signals, quotes):
             for spec in specs:
@@ -25103,6 +25283,9 @@ tab1, tab_fibo, tab2, tab_db, tab_company, tab3 = st.tabs([
     "📅 股市行事曆",
 ], key="main_workspace_active_tab", on_change="rerun")
 
+if not tab_fibo.open and (recording := st.session_state.get('_index_model_recording')) is not None:
+    recording.clear()
+
 with tab1:
     st.session_state.pop('_postclose_stock_tables', None)
     st.session_state.pop('_postclose_futures_tables', None)
@@ -25119,6 +25302,7 @@ with tab1:
     )
     if st.session_state.get('sj_api') is not None:
         if not tab1.open or not stock_strategy_tab.open:
+            retain_open_model_positions(st.session_state.sj_api, '股期戰略室', stock=True)
             stop_intraday_background('stock')
             sync_strategy_stream_scope(st.session_state.sj_api, [], 'stock')
             stop_intraday_background('stock_independent')
@@ -27823,6 +28007,37 @@ with tab_fibo:
         ("臺股期貨", "TWF=F"),
     ]
     thermometer_data = []
+    active_plan = tab_fibo.open and (tab_trade_plan.open or tab_option_plan.open)
+    option_page = tab_fibo.open and tab_option_plan.open
+    record_enabled = False
+    if active_plan:
+        page = tab_option_plan if option_page else tab_trade_plan
+        source = '選擇權操作計畫' if option_page else '指數操作計畫'
+        record_key = 'option_model_record' if option_page else 'index_model_record'
+        with page:
+            st.subheader(source)
+            record_enabled = st.toggle('記錄新交易', value=st.session_state.get(record_key + '_saved', False),
+                key=record_key, help='開啟後才記錄此頁的新交易計畫。切離分頁或關閉後，伺服器仍會追蹤已進場的部位至出場。')
+        st.session_state[record_key + '_saved'] = record_enabled
+    previous_source = st.session_state.get('_operation_record_source')
+    next_source = source if record_enabled else None
+    st.session_state['_operation_record_source'] = next_source
+    if next_source and next_source != previous_source:
+        cursor_key = '_operation_model_cursors' if option_page else '_index_operation_cursors'
+        st.session_state.setdefault(cursor_key, {})['_record_from'] = datetime.now(pytz.timezone('Asia/Taipei')).isoformat()
+    recording = st.session_state.setdefault('_index_model_recording', threading.Event())
+    if active_plan and not option_page and record_enabled:
+        recording.set()
+    else:
+        recording.clear()
+    if st.session_state.get('sj_api') is not None:
+        if previous_source and previous_source != next_source:
+            retain_open_model_positions(st.session_state.sj_api, previous_source)
+        if not option_page:
+            sync_strategy_stream_scope(st.session_state.sj_api, [], 'index')
+            sync_strategy_stream_scope(st.session_state.sj_api, [], 'options')
+        if not option_page or not record_enabled:
+            sync_strategy_stream_scope(st.session_state.sj_api, [], 'options_models')
     # Streamlit tabs 仍會執行隱藏分頁程式；只在實際開啟需要的分頁時下載兩組溫度資料。
     if tab_fibo.open and (
         tab_option_plan.open or tab_fibo_thermometer.open or
@@ -27833,20 +28048,9 @@ with tab_fibo:
             result = calculate_market_temperature(temp_df)
             thermometer_data.append((label, code, temp_df, source, result))
 
-    active_plan = tab_fibo.open and (tab_trade_plan.open or tab_option_plan.open)
-    if st.session_state.get('sj_api') is not None:
-        if not (tab_fibo.open and tab_option_plan.open):
-            sync_strategy_stream_scope(st.session_state.sj_api, [], 'index')
-        if not (tab_fibo.open and tab_option_plan.open):
-            sync_strategy_stream_scope(st.session_state.sj_api, [], 'options')
-            sync_strategy_stream_scope(st.session_state.sj_api, [], 'options_models')
     if active_plan:
-        option_page = tab_option_plan.open
-        page = tab_option_plan if option_page else tab_trade_plan
         timer_key = 'option_auto_seconds' if option_page else 'index_scenario_seconds'
         with page:
-            st.subheader('選擇權操作計畫' if option_page else '指數操作計畫')
-            st.caption('模型勝率追蹤：自動監控此分頁計畫；依原進場條件記錄，成交證據不足不計入勝率。')
             seconds = st.number_input(
                 '自動更新間隔（秒）', 2, 300,
                 value=int(st.session_state.get(timer_key + '_saved', 5)), key=timer_key,
@@ -27872,7 +28076,7 @@ with tab_fibo:
                 )
                 if snapshot and (snapshot.get('outside') or snapshot.get('error') or not snapshot.get('fresh', True)):
                     st.caption('等待最新串流或更新時段；保留最近完整分析與來源時間。')
-                render_operation_plan(thermometer_data, option_page, seconds, snapshot)
+                render_operation_plan(thermometer_data, option_page, seconds, snapshot, record_enabled)
             render_active_operation_plan()
 
     with tab_fibo_thermometer:

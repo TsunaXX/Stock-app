@@ -463,7 +463,7 @@ snapshot['taiwan_revenue']['events'] = [
     assert len(app.dataframe) == 2  # Latest company row plus the unchanged public events.
 
 
-def test_full_index_option_pages_update_all_analysis_without_toggles(tmp_path):
+def test_full_index_option_pages_update_analysis_with_opt_in_model_recording(tmp_path):
     from unittest.mock import patch
     import requests
     from streamlit.testing.v1 import AppTest
@@ -540,8 +540,8 @@ def record_operation_models(source, specs, api, seconds, **kw):
         assert not app.exception
         assert all(t.key not in ('option_auto_enabled','index_scenario_auto') for t in app.toggle)
         assert app.session_state['analysis_price'] == 20110.
-        assert app.session_state['model_plan_source'] == '選擇權操作計畫'
-        assert any('模型勝率追蹤：自動監控' in c.value for c in app.caption)
+        assert 'model_plan_source' not in app.session_state
+        assert not app.toggle(key='option_model_record').value
         assert any('全頁自動更新' in c.value and '自動更新時間：' in c.value for c in app.caption)
         assert not any('盤中情境' in c.value for c in [*app.caption, *app.info])
         app.number_input(key='option_auto_seconds').set_value(7).run()
@@ -553,10 +553,17 @@ def record_operation_models(source, specs, api, seconds, **kw):
         assert app.session_state['analysis_direction'] == '偏空'
         assert app.session_state['quote_reads'] == [False, True]
         assert app.session_state['_option_plan_quote_cache']['signature'][0] == '最近到期'
+        app.toggle(key='option_model_record').set_value(True).run()
+        assert not app.exception
+        assert app.session_state['model_plan_source'] == '選擇權操作計畫'
         app.session_state['_test_page'] = '🧭 指數操作計畫'
         app.run()
         assert not app.exception
         assert any('19,970' in m.value for m in app.markdown)
+        assert not app.toggle(key='index_model_record').value
+        assert app.session_state['model_plan_source'] == '選擇權操作計畫'
+        app.toggle(key='index_model_record').set_value(True).run()
+        assert not app.exception
         assert app.session_state['model_plan_source'] == '指數操作計畫'
         sections = [m.value for m in app.markdown]
         short = next(i for i, value in enumerate(sections) if '短波風險點數' in value)
