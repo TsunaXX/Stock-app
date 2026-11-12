@@ -117,7 +117,9 @@ def test_operation_handoff_keeps_original_contracts_and_real_exit_evidence(tmp_p
         tick(state, 'P2', 12., 0, epoch='api:0:1')
     else:
         own(state, scope, ['TMFJ6', 'TXF'])
-    tick(state, 'TMFJ6', 20000., 0, epoch='api:0:1')
+    stream_code = 'TMFJ6' if use_option else 'TMF202610'
+    state['aliases']['TMFJ6'] = stream_code
+    tick(state, stream_code, 20000., 0, epoch='api:0:1')
     tracker.process(*sample(operation, [plan], 0))
     entered = tracker.records()[0]
     assert entered['狀態'] == '模擬持倉'
@@ -134,7 +136,7 @@ def test_operation_handoff_keeps_original_contracts_and_real_exit_evidence(tmp_p
         assert set(state['subscriptions']) == {'TMFJ6'}
 
     now[0] += timedelta(seconds=1)
-    tick(state, 'TMFJ6', 20201., 1, epoch='api:0:1')
+    tick(state, stream_code, 20201., 1, epoch='api:0:1')
     job = next(iter(worker.jobs.values()))
     assert job['update']({}) == ({}, 1)
     signals, quotes = tracker.queue.get_nowait()

@@ -21736,8 +21736,12 @@ def sync_strategy_stream_scope(api, contracts, room, retained_codes=()):
     selected = {str(contract.code) for contract in contracts} | set(retained_codes)
     with state['lock']:
         scopes = state.setdefault('strategy_stream_scopes', {})
-        scopes[room] = selected
-        owned = state.setdefault('strategy_owned_subscriptions', {}).setdefault(room, {})
+        if selected:
+            scopes[room] = selected
+        else:
+            scopes.pop(room, None)
+        owners = state.setdefault('strategy_owned_subscriptions', {})
+        owned = owners.setdefault(room, {})
         removed = []
         for code in list(owned):
             if code not in selected:
@@ -21747,11 +21751,15 @@ def sync_strategy_stream_scope(api, contracts, room, retained_codes=()):
                     removed.append((code, metadata))
                 else:
                     state['strategy_owned_subscriptions'].setdefault(other, {})[code] = metadata
+        if not selected and not owned:
+            owners.pop(room, None)
         asset = room.split('_', 1)[0]
         retained = set().union(*(codes for scope, codes in scopes.items() if scope.split('_', 1)[0] == asset))
         all_retained = set().union(*scopes.values())
         # Ordinary subscriptions also own their evidence; removing another scope must not reset it.
         all_retained.update(set(state.get('subscriptions', {})) - {code for code, _ in removed})
+        aliases = state.get('aliases', {})
+        all_retained.update(aliases.get(code, code) for code in tuple(all_retained))
         for code in list(state.get('model_tick_buffers', {})):
             if code not in all_retained:
                 state['model_tick_buffers'].pop(code, None)
@@ -21844,10 +21852,13 @@ def retain_open_model_positions(api, source, stock=False):
     if not available:
         return
     tracker = get_model_tracker(get_app_secret('gsheet_api_url') or '')
+    if not hasattr(tracker, 'still_held'):
+        return  # A Streamlit hot reload can retain the pre-deployment tracker.
+    subscribed_codes = {aliases.get(code, code): code for code in available}
     now = datetime.now(pytz.timezone('Asia/Taipei'))
     day = now.date().isoformat() if stock else get_futures_trading_date(now).date().isoformat()
     try:
-        positions = tracker.open_stock_positions(available, day) if stock else {
+        positions = tracker.open_stock_positions(available | subscribed_codes.keys(), day) if stock else {
             row['交易ID']: row for row in tracker.active_plans(source, day)
             if row.get('模擬進場價') is not None and row.get('模擬出場價') is None and not row.get('到期未確認')
         }
@@ -21856,7 +21867,7 @@ def retain_open_model_positions(api, source, stock=False):
 
     def codes_for(row):
         codes = [row['商品鍵']] if stock else [row.get('觸發商品'), *(leg['代碼'] for leg in row.get('選擇權腿', []))]
-        return {aliases.get(code, code) for code in codes}
+        return {code if code in available else subscribed_codes.get(code, code) for code in codes}
 
     if not positions:
         return
@@ -21871,7 +21882,7 @@ def retain_open_model_positions(api, source, stock=False):
         if not positions or worker.closed:
             return
         room = prefix + next(iter(positions))
-        scope = f'{room}_{id(worker)}'
+        scope = f'model_{room}_{id(worker)}'
         cursors = {}
         for row in positions.values():
             stream = row.get('串流識別')
