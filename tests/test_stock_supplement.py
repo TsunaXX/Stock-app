@@ -75,8 +75,8 @@ def test_supplement_discards_delayed_results_and_retries_failures_without_changi
     ns = load_app_symbols('supplement_frozen_stock_rankings', 'postclose_scope', 'strategy_ranking_weights')
     old = {'daytrade': {'target_date': '2026-10-05', 'updated_at': 'a', 'entries': []}}
     state = State(stock_strategy_ranking_snapshots=old, _postclose_visible_stock=pd.DataFrame([{'代號':'2330'}]))
-    reruns = []
-    ns['st'] = SimpleNamespace(session_state=state, rerun=lambda: reruns.append(True))
+    reruns, captions = [], []
+    ns['st'] = SimpleNamespace(session_state=state, rerun=lambda: reruns.append(True), caption=captions.append)
     now = pd.Timestamp('2026-10-06 10:00')
     ns['is_market_closed_func'] = lambda day: False
     ns['_post_close_target_date'] = lambda *a: (now, date(2026, 10, 5))
@@ -87,7 +87,8 @@ def test_supplement_discards_delayed_results_and_retries_failures_without_changi
     ns['supplement_frozen_stock_rankings'](now, maintenance)
     assert state['stock_strategy_ranking_snapshots'] is old
     assert state['_stock_ranking_waiting'] == ['法人缺項']
-    assert state['_stock_daytrade_ranking_waiting'] == ['法人缺項'] and reruns == [True]
+    assert state['_stock_daytrade_ranking_waiting'] == ['法人缺項'] and not reruns
+    assert '法人缺項' in captions[0]
     assert maintenance['supplement_retry'][0] == signature
     state['stock_strategy_ranking_snapshots'] = {'daytrade': dict(old['daytrade'], updated_at='manual-new')}
     maintenance['supplement'] = {'signature':signature, 'future':pending}
