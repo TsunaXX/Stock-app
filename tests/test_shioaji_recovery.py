@@ -223,6 +223,7 @@ def init_shioaji_connection(*args):
         raise ConnectionError('temporary')
     return 'restored'
 _stream_state = lambda api: {'lock': __import__('threading').RLock()}
+get_cached_shioaji_usage = lambda api: None
 st.session_state.setdefault('remember_sj', True)
 st.session_state.setdefault('sj_key', 'fake')
 st.session_state.setdefault('sj_secret', 'fake')
@@ -238,3 +239,22 @@ st.write('主表保留')
     app.run()
     assert not app.exception and app.session_state['sj_api'] == 'restored'
     assert app.session_state['sj_logged_in'] and app.markdown[-1].value == '主表保留'
+
+
+def test_shioaji_quota_uses_background_poll_and_accepts_zero_without_logging_out():
+    from test_core_calculations import load_app_symbols
+
+    ns = load_app_symbols('get_cached_shioaji_usage', '_safe_number')
+    state, calls = {}, []
+    def usage(*, timeout):
+        calls.append(timeout)
+        return SimpleNamespace(remaining_bytes=0)
+    def poll(key, loader, interval):
+        assert key[0] == 'shioaji-usage' and interval == 60
+        callbacks.append(loader)
+        return None
+    callbacks = []
+    api = SimpleNamespace(usage=usage)
+    ns.update(_stream_state=lambda api: state, get_public_maintenance_jobs=lambda: SimpleNamespace(poll=poll))
+    assert ns['get_cached_shioaji_usage'](api) is None and calls == []
+    assert callbacks[0]()[0] == 0 and calls == [5000]

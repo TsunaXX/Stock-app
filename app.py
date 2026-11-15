@@ -15537,23 +15537,28 @@ def invalidate_shioaji_connection(exc=None, clear_resource=True):
         pass
 
 
-def get_cached_shioaji_usage(api, max_age_seconds=60):
-    """Avoid two broker network calls on every Streamlit widget rerun."""
-    if api is None:
-        return None
-    shared, cache_lock = get_shared_market_data_cache()
-    cache = shared['shioaji_usage']
-    cache_key = id(api)
-    now_mono = time.monotonic()
-    with cache_lock:
-        cached = cache.get(cache_key)
-    if cached and now_mono - cached['saved_at'] <= max_age_seconds:
-        return cached['value']
-    usage = api.usage()
-    with cache_lock:
-        cache.clear()
-        cache[cache_key] = {'saved_at': now_mono, 'value': usage}
-    return usage
+def get_cached_shioaji_usage(api):
+    """Share one quota request per connection; a failed update keeps today's last value."""
+    day = datetime.now(pytz.timezone('Asia/Taipei')).date()
+    state = _stream_state(api)
+    api_ref = state.setdefault('usage_identity', object())
+
+    def load_usage():
+        try:
+            usage = api.usage(timeout=5000)
+            remaining = _safe_number(getattr(usage, 'remaining_bytes', None))
+            if remaining is None or remaining < 0:
+                raise ValueError('永豐未回傳流量數值')
+        except BaseException as exc:
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
+            if _is_shioaji_auth_error(exc):
+                remember_shioaji_auth_error(api, exc)
+            raise RuntimeError('永豐流量查詢失敗') from exc
+        return remaining, datetime.now(pytz.timezone('Asia/Taipei'))
+
+    return get_public_maintenance_jobs().poll(('shioaji-usage', api_ref, day), load_usage, interval=60)
+
 
 if 'font_size' not in st.session_state: st.session_state.font_size = saved_config.get('font_size', 15)
 if 'limit_rows' not in st.session_state:
@@ -15584,21 +15589,6 @@ if 'sj_secret' not in st.session_state:
 if 'remember_sj' not in st.session_state: 
     st.session_state.remember_sj = secret_remember_sj
 
-# 自動更新／Reboot 後，session_state 可能仍指向已被券商中斷的舊物件。
-# 只在明確的 AuthError 時失效；一般暫時性網路錯誤仍保留目前連線。
-if st.session_state.get('sj_logged_in', False):
-    current_sj_api = st.session_state.get('sj_api')
-    if current_sj_api is None:
-        invalidate_shioaji_connection(clear_resource=False)
-    else:
-        try:
-            get_cached_shioaji_usage(current_sj_api, max_age_seconds=30)
-        except BaseException as exc:
-            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
-                raise
-            if _is_shioaji_auth_error(exc):
-                invalidate_shioaji_connection(exc)
-
 def restore_shioaji_login():
     """Recover an established session without polling quotes or rerunning a healthy page."""
     if st.session_state.get('manual_logout', False) or sj is None:
@@ -15614,6 +15604,8 @@ def restore_shioaji_login():
             return False
         invalidate_shioaji_connection()
         st.session_state.sj_connection_error = '行情連線待恢復'
+    if st.session_state.get('sj_logged_in', False):
+        invalidate_shioaji_connection(clear_resource=False)
     if not (st.session_state.get('remember_sj') or st.session_state.get('_sj_recovering')):
         return False
     if not st.session_state.get('sj_key') or not st.session_state.get('sj_secret'):
@@ -15645,13 +15637,23 @@ restore_shioaji_login()
 @st.fragment(run_every=5 if sj and not st.session_state.get('manual_logout', False) and (
     st.session_state.get('sj_logged_in') or st.session_state.get('remember_sj') or st.session_state.get('_sj_recovering')) else None)
 def render_shioaji_recovery():
-    if restore_shioaji_login():
+    was_logged_in = bool(st.session_state.get('sj_logged_in'))
+    if restore_shioaji_login() or was_logged_in != bool(st.session_state.get('sj_logged_in')):
         st.rerun()
     api = st.session_state.get('sj_api')
     if api is not None and _stream_state(api).get('connection_down'):
         st.caption('行情暫時中斷；自動重連中，保留監控範圍。')
     elif st.session_state.get('sj_connection_error'):
         st.caption('連線恢復待重試；使用既有登入資料，最長五分鐘退避。')
+    if api is not None and st.session_state.get('sj_logged_in'):
+        st.success('✅ 永豐 API 已登入')
+        sample = get_cached_shioaji_usage(api)
+        if sample:
+            remaining, checked_at = sample
+            st.caption(f'📊 API 今日剩餘流量：{_format_compact_number(remaining / (1024 * 1024), 2)} MB'
+                       f'（{checked_at:%H:%M:%S} 查詢）')
+        else:
+            st.caption('📊 API 今日剩餘流量：等待永豐回傳，將自動重試。')
 
 
 @st.cache_data(ttl=300, max_entries=512)
@@ -15681,15 +15683,6 @@ with st.sidebar:
         if st.session_state.get('sj_connection_error'):
             st.warning('永豐 API 已斷線需重新連線。')
         if st.session_state.get('sj_logged_in', False):
-            st.success("✅ 永豐 API 已登入")
-            
-            try:
-                usage = get_cached_shioaji_usage(st.session_state.sj_api)
-                rem_mb = usage.remaining_bytes / (1024 * 1024)
-                st.caption(f"📊 API 今日剩餘流量: {_format_compact_number(rem_mb, 2)} MB")
-            except Exception:
-                st.caption("📊 API 今日剩餘流量: 暫時無法獲取 (連線讀取中)")
-
             stream_status = get_market_stream_status(st.session_state.sj_api)
             st.caption(
                 f"📡 串流已訂閱 {stream_status['subscriptions']} 項｜"
@@ -19839,7 +19832,10 @@ def render_strategy_ranking(rows, strategy_mode, room_label, allow_refresh=True,
     if asset_type == 'stock' and snapshot_key == 'daytrade' and snapshot.get('weights') != strategy_ranking_weights('stock', '當沖'):
         snapshot = {}  # Never label a legacy 55/35/10 score as the new 60/40 ranking.
     if snapshot.get('target_date'):
-        target_date = date.fromisoformat(snapshot['target_date'])
+        saved_date = date.fromisoformat(snapshot['target_date'])
+        if asset_type == 'stock' and snapshot_key == 'daytrade' and saved_date < target_date:
+            st.caption(f'目標盤後資料日 {target_date:%Y/%m/%d}，補齊前沿用 {saved_date:%Y/%m/%d} 排名。')
+        target_date = saved_date
     code_column = '契約鍵' if asset_type == 'futures' else '代號'
     codes = set(rows[code_column].astype(str))
     entries = []
@@ -21105,6 +21101,17 @@ def fetch_stock_data_raw(
     live_quote_price = live_quote_rate = live_quote_bid = live_quote_ask = None
     live_quote_time = None
     
+    def history_ready(frame):
+        if frame.empty:
+            return False
+        if not strategy_target_date:
+            return True
+        # A non-empty provider response may still be one trading day behind.
+        index = pd.DatetimeIndex(frame.index)
+        if index.tz is not None:
+            index = index.tz_convert('Asia/Taipei')
+        return pd.Timestamp(strategy_target_date).date() in index.date
+
     # 優先使用永豐 API 擷取昨日/歷史日 K 線資料
     if sj_logged_in and sj_api is not None:
         sj_df = fetch_shioaji_data(sj_api, code, interval='1d', lookback_days=180, background=background)
@@ -21126,7 +21133,7 @@ def fetch_stock_data_raw(
                 pass
 
     # 若永豐未登入或沒抓到，退回使用 twstock 擷取
-    if hist.empty:
+    if not history_ready(hist):
         try:
             stock = twstock.Stock(code)
             history_start = datetime.now() - timedelta(days=180)
@@ -21144,7 +21151,7 @@ def fetch_stock_data_raw(
                     source_used = "twstock"
         except Exception: pass
 
-    if hist.empty and si is not None:
+    if not history_ready(hist) and si is not None:
         try:
             try: df_yf = si.get_data(f"{code}.TW", start_date=(datetime.now() - timedelta(days=40)))
             except Exception:
@@ -21160,16 +21167,14 @@ def fetch_stock_data_raw(
                     source_used = "yahoo_fin"
         except Exception: pass
 
-    if hist.empty:
+    if not history_ready(hist):
         try:
-            ticker_obj = yf.Ticker(f"{code}.TW")
-            hist_yf = ticker_obj.history(period="6mo", auto_adjust=False)
-            if hist_yf.empty:
-                ticker_obj = yf.Ticker(f"{code}.TWO")
-                hist_yf = ticker_obj.history(period="6mo", auto_adjust=False)
-            if not hist_yf.empty:
-                hist = hist_yf
-                source_used = "yfinance"
+            for suffix in ('TW', 'TWO'):
+                hist_yf = yf.Ticker(f"{code}.{suffix}").history(period="6mo", auto_adjust=False)
+                if history_ready(hist_yf):
+                    hist = hist_yf
+                    source_used = "yfinance"
+                    break
         except Exception: 
             pass
 
@@ -21193,7 +21198,7 @@ def fetch_stock_data_raw(
                 live_quote_time = rt_time_str
         except Exception: pass
 
-    if hist.empty: return None
+    if not history_ready(hist): return None
     if hist.index.tzinfo is not None: hist.index = hist.index.tz_localize(None)
     hist['High'] = hist[['High', 'Close']].max(axis=1)
     hist['Low'] = hist[['Low', 'Close']].min(axis=1)
@@ -21806,7 +21811,14 @@ def configure_intraday_auto_timer(room):
 
 def check_intraday_auto_timer(room):
     key = f'{room}_auto_timer_seconds'
-    if key in st.session_state and st.session_state[key] != intraday_auto_interval(room, *intraday_auto_settings(room)):
+    if key not in st.session_state:
+        return
+    settings = intraday_auto_settings(room)
+    if not settings[0]:
+        return
+    interval = intraday_auto_interval(room, *settings)
+    if st.session_state[key] != interval:
+        st.session_state[key] = interval
         st.rerun()
 
 
@@ -24614,9 +24626,7 @@ def build_postclose_job(row_sets, target, need_turnover, need_risk, previous_ris
             continue
         try:
             if asset == 'stock':
-                records = []
-                for _, original in visible.iterrows():
-                    row = original.to_dict()
+                def prepare_stock_row(row):
                     if (_ranking_market_date(row.get('_strategy_data_as_of')) != target_text
                             or _ranking_number(row.get('_strategy_change_rate')) is None):
                         row = fetch_postclose_stock_row(str(row['代號']), str(row.get('名稱', '')), target_text)
@@ -24632,7 +24642,10 @@ def build_postclose_job(row_sets, target, need_turnover, need_risk, previous_ris
                     code = str(row['代號'])
                     row['風險'] = ('處置' if code in set(risk.get('disposition', [])) | set(risk.get('disposition_tomorrow', []))
                                    else '注意' if risk.get('attention', {}).get(code, 0) else '')
-                    records.append(row)
+                    return row
+
+                with ThreadPoolExecutor(max_workers=3) as executor:
+                    records = list(executor.map(prepare_stock_row, visible.to_dict('records')))
                 rows = pd.DataFrame(records)
             else:
                 official, metadata = fetch_postclose_futures_rows(target_text)
@@ -24831,7 +24844,10 @@ def supplement_frozen_stock_rankings(current, state):
             if get_app_secret('gsheet_api_url'):
                 state.setdefault('pending_sync', {})['stock'] = time.monotonic()
                 state['sync_retry_at'] = 0
-        st.rerun()
+        if completed or risk_changed:
+            st.rerun()
+        elif waiting:
+            st.caption('股票排名待補：' + '、'.join(waiting[:4]))
         return
     if job:
         return
@@ -25136,7 +25152,7 @@ def render_postclose_maintenance():
         labels = {'stock': '股票', 'futures': '期貨', 'stock:daytrade': '股票當沖', 'stock:swing': '股票波段',
                   'futures:daytrade': '期貨當沖', 'futures:swing': '期貨波段'}
         state['status'] = '；'.join(f'{labels.get(key, key)}：{value}' for key, value in result['errors'].items()) or '盤後資料檢查完成'
-        stock_dirty = futures_dirty = False
+        stock_dirty = futures_dirty = rankings_changed = False
         if state.get('target') == target.isoformat() and sources_open:
             if 'turnover' in result:
                 ranking, source_date = result['turnover']
@@ -25167,6 +25183,7 @@ def render_postclose_maintenance():
                     if visible is not None and postclose_scope(visible, asset) != next(iter(snapshots.values()))['scope']:
                         continue
                     st.session_state[key] = {**previous, **snapshots}
+                    rankings_changed = True
                     state['retry_at'] = 0  # Check remaining modes/assets on the next maintenance tick.
                     st.session_state[f'_{asset}_ranking_waiting'] = []
                     for mode in ('daytrade', 'swing'):
@@ -25187,11 +25204,20 @@ def render_postclose_maintenance():
                     if dirty:
                         state.setdefault('pending_sync', {})[asset] = time.monotonic()
                 state['sync_retry_at'] = 0
-            st.rerun()
+            if rankings_changed:
+                st.rerun()
     if not sources_open:
         st.caption('盤後自動檢查：排名凍結中；21:00 後檢查完整資料。')
         return
-    if ranking_open and not state.get('seed_loaded') and not state.get('seed_task') and time.monotonic() >= state.get('seed_retry_at', 0):
+    stock = st.session_state.get('_postclose_visible_stock')
+    stock_snapshots = st.session_state.get('stock_strategy_ranking_snapshots', {})
+    stale_daytrade = (
+        ranking_open and stock is not None and not stock.empty
+        and stock_snapshots.get('daytrade', {}).get('target_date') != target.isoformat()
+    )
+    if (ranking_open and (not stale_daytrade or state.get('ranking_asset') == 'stock')
+            and not state.get('seed_loaded') and not state.get('seed_task')
+            and time.monotonic() >= state.get('seed_retry_at', 0)):
         # This read shares the single worker but never waits on the browser thread.
         worker = get_postclose_worker()
         if worker['slot'].acquire(blocking=False):
@@ -25222,8 +25248,11 @@ def render_postclose_maintenance():
     need_turnover = _ranking_market_date(st.session_state.get('turnover_ranking_date')) != target.strftime('%Y%m%d')
     need_risk = state.get('risk_done') != phase
     if len(row_sets) > 1:
-        asset = 'futures' if state.get('ranking_asset') == 'stock' else 'stock'
-        row_sets = {asset: row_sets[asset]}  # Separate jobs; a failed stock feed cannot starve futures.
+        previous_asset = state.get('ranking_asset')
+        asset = 'stock' if stale_daytrade and previous_asset is None else (
+            'futures' if previous_asset == 'stock' else 'stock'
+        )
+        row_sets = {asset: row_sets[asset]}  # Separate jobs so either market can recover independently.
     if not row_sets and not need_turnover and not need_risk:
         return
     worker = get_postclose_worker()
@@ -25247,8 +25276,10 @@ def render_postclose_maintenance():
         modes=('daytrade',),
     ):
         stock_modes = ('波段',)
-    state['future'] = worker['executor'].submit(run_postclose_job, worker, build_postclose_job, row_sets, target,
-                                               need_turnover, need_risk, risk, None, stock_modes)
+    state['future'] = worker['executor'].submit(
+        run_postclose_job, worker, build_postclose_job, row_sets, target,
+        need_turnover and not (stale_daytrade and stock_rows is not None), need_risk, risk, None, stock_modes,
+    )
 
 
 # 定義上色邏輯
@@ -29289,7 +29320,7 @@ with tab3:
         except (KeyError, TypeError, ValueError):
             continue
 
-    def is_market_closed_func(d_date):
+    def is_calendar_market_closed(d_date):
         if d_date.weekday() >= 5: return True
         if d_date in temporary_closures: return True
         name = current_holidays.get((d_date.month, d_date.day), "")
@@ -29314,7 +29345,7 @@ with tab3:
         real_monthly_date = None
         if monthly_raw:
             check = monthly_raw
-            while is_market_closed_func(check): check += timedelta(days=1)
+            while is_calendar_market_closed(check): check += timedelta(days=1)
             real_monthly_date = check
         
         local_results = []
@@ -29334,7 +29365,7 @@ with tab3:
     
     for raw_date, s_type, s_code, m_date in all_raw_data:
         check_date = raw_date
-        while is_market_closed_func(check_date):
+        while is_calendar_market_closed(check_date):
             check_date += timedelta(days=1)
             if (check_date - raw_date).days > 30: break
         
@@ -29468,7 +29499,7 @@ with tab3:
                 continue
             curr_date = date(sel_year, sel_month, day)
             day_content = calendar_day_content(curr_date)
-            bg_class = "cal-closed" if is_market_closed_func(curr_date) else "cal-open"
+            bg_class = "cal-closed" if is_calendar_market_closed(curr_date) else "cal-open"
             today_class = "today-border" if curr_date == now_tw.date() else ""
             desktop_cells.append(
                 f"<div class='cal-box {bg_class} {today_class}'><div class='cal-date'>{day}</div>{day_content}</div>"

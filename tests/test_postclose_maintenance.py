@@ -722,3 +722,39 @@ def test_model_settlement_uses_today_while_daily_strategy_still_uses_yesterday()
     assert ns['latest_completed_stock_trading_date'](now).isoformat() == '2026-11-11'
     ns['check_model_stock_closes'](tracker)
     assert calls == [('2026-11-12', {}, broker)]
+
+
+def test_sunday_rebuild_targets_friday_and_daily_history_falls_back_when_nonempty_but_stale():
+    ns = helpers('_post_close_target_date', 'postclose_maintenance_window', 'fetch_stock_data_raw')
+    ns['is_market_closed_func'] = lambda day: day.weekday() >= 5
+    _, target, sources_open, ranking_open = ns['postclose_maintenance_window']('2026-11-15T10:00:00+08:00')
+    assert (target, sources_open, ranking_open) == (date(2026, 11, 13), True, True)
+    assert ns['_post_close_target_date']('2026-11-16T08:29:00+08:00')[1] == target
+    stale = SimpleNamespace(date=pd.Timestamp('2026-11-12'), open=10, high=11, low=9, close=10, capacity=50)
+    history = pd.DataFrame({'Open':[10], 'High':[11], 'Low':[9], 'Close':[10], 'Volume':[50]},
+                           index=pd.to_datetime(['2026-11-13']))
+    calls = []
+    def ticker(symbol):
+        calls.append(symbol)
+        return SimpleNamespace(history=lambda **kwargs: history if symbol.endswith('.TWO') else history.iloc[:0])
+    ns.update(twstock=SimpleNamespace(Stock=lambda code: SimpleNamespace(fetch_from=lambda *a: [vars(stale)])),
+              si=None, yf=SimpleNamespace(Ticker=ticker))
+    def expect_history(frame, asof):
+        assert frame.index[-1].date() == asof.date() == target
+        return pd.DataFrame(), target  # End the fixture after provider selection.
+    ns['completed_stock_strategy_history'] = expect_history
+    ns['fetch_stock_data_raw']('3441', include_live_quote=False, strategy_target_date='20261113')
+    assert calls == ['3441.TW','3441.TWO']
+
+
+def test_disabled_timer_does_not_rerun_from_a_stale_inactive_table():
+    ns = helpers('check_intraday_auto_timer')
+    calls = []
+    ns.update(st=SimpleNamespace(session_state={'stock_auto_timer_seconds':5}, rerun=lambda: calls.append('rerun')),
+              intraday_auto_settings=lambda room: (False, 5, None, None),
+              intraday_auto_interval=lambda *args: None)
+    ns['check_intraday_auto_timer']('stock')
+    assert calls == []
+    ns['intraday_auto_settings'] = lambda room: (True, 5, None, None)
+    ns['check_intraday_auto_timer']('stock')
+    assert calls == ['rerun']
