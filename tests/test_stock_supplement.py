@@ -184,7 +184,7 @@ def test_six_visible_stocks_rebuild_stale_three_stock_snapshot_from_one_closed_d
     state = State(stock_strategy_ranking_snapshots={'daytrade': old}, _postclose_visible_stock=rows,
                   stock_data=rows, ignored_stocks=[], all_candidates=[], saved_notes={},
                   risk_filter_market_data={'updated': '2026/10/20', 'errors': []})
-    ns.update(st=SimpleNamespace(session_state=state, rerun=lambda: None),
+    ns.update(st=SimpleNamespace(session_state=state, rerun=lambda: None, caption=lambda _: None),
               is_market_closed_func=lambda _: False, _post_close_target_date=lambda *a: (now, date(2026, 10, 20)),
               save_data_cache=lambda *a, **kw: None, get_app_secret=lambda _: '')
     fetched, scored = [], []
