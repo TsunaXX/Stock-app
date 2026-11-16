@@ -275,6 +275,8 @@ def _stream_payload(api, payload, security_type):
                     cache[code] = {'time': updated_at, 'price': close, 'change': change}
             if trial:
                 return  # Indicative prices never enter regular quotes or model evidence.
+        if close is not None and close > 0 and getattr(payload, 'datetime', None) is not None:
+            state['last_stream_activity'] = time.monotonic()
         previous = state['quotes'].get(code, {})
         previous.update(values)
         state['quotes'][code] = previous
@@ -359,12 +361,7 @@ def _install_stream_callbacks(api):
                     state['connection_event_code'] = event_code
 
                 if event_code in (1, 2, 12):
-                    if not state.get('connection_down'):
-                        state['model_stream_epoch'] = state.get('model_stream_epoch', 0) + 1
-                    state.setdefault('connection_down_since', time.monotonic())
-                    state['connection_down'] = True
-                    for quote in state['quotes'].values():
-                        quote['source'] = 'stream_stale'
+                    mark_shioaji_transport_down(state)
                 elif event_code in (0, 13):
                     state['connection_down'] = False
                     state.pop('connection_down_since', None)
@@ -474,7 +471,7 @@ def ensure_market_stream_subscription(api, contract):
     try:
         method(contract, quote_type=_shioaji_quote_type())
         with state['lock']:
-            state['subscriptions'][subscription_key]['status'] = 'active'
+            state['subscriptions'][subscription_key].update(status='active', subscribed_at=time.monotonic())
         return True
     except BaseException as exc:
         if isinstance(exc, (KeyboardInterrupt, SystemExit)):
@@ -483,8 +480,7 @@ def ensure_market_stream_subscription(api, contract):
             state['subscriptions'][subscription_key].update({
                 'status': 'error', 'retry_after': now_mono + 60
             })
-        if _is_shioaji_auth_error(exc):
-            remember_shioaji_auth_error(api, exc)
+        report_shioaji_stream_failure(api, exc)
         _remember_stream_error(state, f'{requested}: {exc}')
         return False
 
@@ -719,22 +715,18 @@ def get_market_stream_status(api):
 
 
 def clear_market_stream(api):
-    """Unsubscribe and forget one disconnected API object's quote cache."""
+    """Retire the quote cache before touching workers; API logout releases the subscriptions."""
     if api is None:
         return
     registry, registry_lock = get_market_stream_registry()
     with registry_lock:
         state = registry.get(id(api))
+    workers, pool = [], None
     if state is not None:
-        for worker in list(state.get('intraday_background_workers', ())):
-            worker.close()
-        pool = state.get('strategy_history_pool')
-        if pool is not None:
-            pool.shutdown(wait=False, cancel_futures=True)
         with state['lock']:
-            subscriptions = list(state['subscriptions'].items())
-        for subscription_key, metadata in subscriptions:
-            _unsubscribe_market_stream(api, state, subscription_key, metadata)
+            state['retired'] = True
+            workers = list(state.get('intraday_background_workers', ()))
+            pool = state.get('strategy_history_pool')
     try:
         retired_ref = weakref.ref(api)
     except TypeError:
@@ -743,11 +735,15 @@ def clear_market_stream(api):
         registry[id(api)] = {'api_ref':retired_ref, 'lock':threading.RLock(), 'quotes':{}, 'subscriptions':{}, 'aliases':{},
             'callbacks_installed':True, 'errors':[], 'retired':True, 'connection_down':True,
             'auth_error':'RetiredConnection'}
-        if state is not None:
-            state['retired'] = True
         retired = [key for key,value in registry.items() if value.get('retired')]
         for key in retired[:-32]:
             registry.pop(key, None)
+    for worker in workers:
+        worker.close()
+    if pool is not None:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
 # ==========================================
 # 新增: 全域行事曆與權證判斷函數
 # ==========================================
@@ -5417,12 +5413,33 @@ def _is_shioaji_auth_error(exc):
     )
 
 
+def mark_shioaji_transport_down(state):
+    if state.get('retired') or state.get('connection_down'):
+        return
+    state['model_stream_epoch'] = state.get('model_stream_epoch', 0) + 1
+    state.setdefault('connection_down_since', time.monotonic())
+    state['connection_down'] = True
+    for quote in state.get('quotes', {}).values():
+        if quote.get('source') == 'stream':
+            quote['source'] = 'stream_stale'
+
+
 def remember_shioaji_auth_error(api, exc):
     """Worker reports transport failure; only the UI clears login/session state."""
     state = _stream_state(api)
     with state['lock']:
-        state['auth_error'] = type(exc).__name__
-        state['connection_down'] = True
+        if not state.get('retired'):
+            state['auth_error'] = type(exc).__name__
+            state['connection_down'] = True
+
+
+def report_shioaji_stream_failure(api, exc):
+    if _is_shioaji_auth_error(exc):
+        remember_shioaji_auth_error(api, exc)
+    elif re.search(r'sessionnotestablished|unable to wait for session', str(exc), re.IGNORECASE):
+        state = _stream_state(api)
+        with state['lock']:
+            mark_shioaji_transport_down(state)
 
 
 def get_shioaji_stock_contract(api, code):
@@ -15493,15 +15510,16 @@ if 'cal_year' not in st.session_state: st.session_state.cal_year = now_tw.year
 if 'cal_month' not in st.session_state: st.session_state.cal_month = now_tw.month
 
 @st.cache_resource
-def init_shioaji_connection(api_key, secret_key):
+def init_shioaji_connection(api_key, secret_key, _force_refresh=False):
     api = sj.Shioaji(simulation=False)
     try:
-        api.login(api_key, secret_key)
+        api.login(api_key, secret_key, force_refresh=_force_refresh)
     except BaseException:
         try:
             api.logout()
-        except Exception:
-            pass
+        except BaseException as exc:
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
         raise
     return api
 
@@ -15525,8 +15543,9 @@ def invalidate_shioaji_connection(exc=None, clear_resource=True):
     if old_api is not None and not retired:
         try:
             old_api.logout()
-        except Exception:
-            pass
+        except BaseException as logout_error:
+            if isinstance(logout_error, (KeyboardInterrupt, SystemExit)):
+                raise
     if exc is not None:
         st.session_state.sj_connection_error = type(exc).__name__
     try:
@@ -15552,8 +15571,7 @@ def get_cached_shioaji_usage(api):
         except BaseException as exc:
             if isinstance(exc, (KeyboardInterrupt, SystemExit)):
                 raise
-            if _is_shioaji_auth_error(exc):
-                remember_shioaji_auth_error(api, exc)
+            report_shioaji_stream_failure(api, exc)
             raise RuntimeError('永豐流量查詢失敗') from exc
         return remaining, datetime.now(pytz.timezone('Asia/Taipei'))
 
@@ -15589,6 +15607,28 @@ if 'sj_secret' not in st.session_state:
 if 'remember_sj' not in st.session_state: 
     st.session_state.remember_sj = secret_remember_sj
 
+def shioaji_auto_stream_stalled(state):
+    """Detect silence only when auto is on and an active market benchmark was subscribed."""
+    settings = st.session_state
+    if not any(settings.get(f'{room}_auto_timer_seconds') is not None for room in
+               ('stock', 'stock_independent', 'futures', 'futures_independent')):
+        return False
+    now_mono = time.monotonic()
+    if now_mono < state.get('silent_reconnect_after', 0):
+        return False
+    now_tw = datetime.now(pytz.timezone('Asia/Taipei'))
+    session_day = now_tw.date() - timedelta(days=1) if now_tw.time() < dt_time(5) else now_tw.date()
+    if is_market_closed_func(session_day):
+        return False
+    benchmark_since = [
+        sub['subscribed_at'] for code, sub in state['subscriptions'].items()
+        if re.fullmatch(r'(?:TXF|MXF|TMF)[A-L]\d|IX0001', code)
+        and sub.get('status') == 'active' and 'subscribed_at' in sub
+        and _is_contract_stream_session(sub['contract'], now_tw)
+    ]
+    return bool(benchmark_since and now_mono - max(*benchmark_since, state.get('last_stream_activity', 0)) >= 120)
+
+
 def restore_shioaji_login():
     """Recover an established session without polling quotes or rerunning a healthy page."""
     if st.session_state.get('manual_logout', False) or sj is None:
@@ -15600,6 +15640,10 @@ def restore_shioaji_login():
             since = state.get('connection_down_since')
             failed = state.get('auth_error') or state.get('retired') or (
                 state.get('connection_down') and since is not None and time.monotonic()-since >= 120)
+            if not failed and not state.get('connection_down') and shioaji_auto_stream_stalled(state):
+                mark_shioaji_transport_down(state)
+                failed = True
+                logger.warning('Shioaji auto quote stream silent for 120s; reconnecting')
         if not failed:
             return False
         invalidate_shioaji_connection()
@@ -15613,7 +15657,12 @@ def restore_shioaji_login():
     if time.monotonic() < float(st.session_state.get('sj_auto_login_retry_after', 0) or 0):
         return False
     try:
-        api_obj = init_shioaji_connection(st.session_state.sj_key, st.session_state.sj_secret)
+        recovering = bool(st.session_state.get('_sj_recovering'))
+        api_obj = init_shioaji_connection(st.session_state.sj_key, st.session_state.sj_secret, _force_refresh=recovering)
+        if recovering:
+            state = _stream_state(api_obj)
+            with state['lock']:
+                state['silent_reconnect_after'] = time.monotonic() + 300
         st.session_state.sj_api = api_obj
         st.session_state.sj_logged_in = True
         for key in ('sj_connection_error','sj_auto_login_retry_after','sj_auto_login_failures','_sj_recovering'):
@@ -15698,14 +15747,8 @@ with st.sidebar:
             col_logout, col_relogin = st.columns(2)
             with col_logout:
                 if st.button("登出", key="btn_logout_sj", width='stretch'):
-                    st.session_state.sj_logged_in = False
-                    st.session_state.manual_logout = True # 標記為手動登出，阻擋重整時自動登入
-                    
-                    try:
-                        clear_market_stream(st.session_state.sj_api)
-                        st.session_state.sj_api.logout()
-                        init_shioaji_connection.clear() 
-                    except Exception: pass
+                    st.session_state.manual_logout = True
+                    invalidate_shioaji_connection()
                     
                     # 保持儲存現有的 Key 與記住狀態
                     save_config(
@@ -15719,29 +15762,12 @@ with st.sidebar:
             with col_relogin:
                 relogin_clicked = st.button("快速重新登入", key="btn_relogin_sj", width='stretch')
                 
-            msg_placeholder = st.empty()
-            
             if relogin_clicked:
-                st.session_state['_sj_recovering'] = True
-                try:
-                    clear_market_stream(st.session_state.sj_api)
-                    st.session_state.sj_api.logout()
-                    init_shioaji_connection.clear() # 必須清除快取，否則只會拿到舊的連線物件
-                    time.sleep(0.5)
-                    
-                    st.session_state.sj_api = init_shioaji_connection(st.session_state.sj_key, st.session_state.sj_secret)
-                    st.session_state.sj_logged_in = True
-                    st.session_state.pop('sj_connection_error', None)
-                    st.session_state.pop('sj_auto_login_retry_after', None)
-                    st.session_state.pop('sj_auto_login_failures', None)
-                    st.session_state.pop('_sj_recovering', None)
-                    msg_placeholder.success("✅ 重新登入成功！")
-                    time.sleep(0.5)
-                    st.rerun()
-                except Exception as e:
-                    msg_placeholder.error(f"❌ 重新登入失敗: {e}")
-                    st.session_state.sj_logged_in = False
-                    st.rerun()
+                invalidate_shioaji_connection()
+                st.session_state.pop('sj_auto_login_retry_after', None)
+                st.session_state.pop('sj_auto_login_failures', None)
+                restore_shioaji_login()
+                st.rerun()
         else:
             if sj_credential_source == 'runtime_secret':
                 st.caption("Streamlit Secrets 已保存 API 資訊；登入失敗時可按下方按鈕重試。")
@@ -21745,6 +21771,8 @@ def sync_strategy_stream_scope(api, contracts, room, retained_codes=()):
     state = _stream_state(api)
     selected = {str(contract.code) for contract in contracts} | set(retained_codes)
     with state['lock']:
+        if state.get('retired'):
+            return
         scopes = state.setdefault('strategy_stream_scopes', {})
         if selected:
             scopes[room] = selected
@@ -23517,11 +23545,12 @@ def get_strategy_intraday_history(api, contract, asset='stock', wait=False, copy
     if entry['data'] is None and (wait or future.done()):
         try:
             entry['data'] = future.result(timeout=15 if wait else 0)
-        except TimeoutError:
-            return pd.DataFrame()
-        except Exception as exc:
-            if _is_shioaji_auth_error(exc):
-                remember_shioaji_auth_error(api, exc)
+        except BaseException as exc:
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
+            if isinstance(exc, TimeoutError) and not future.done():
+                return pd.DataFrame()
+            report_shioaji_stream_failure(api, exc)
             _remember_stream_error(state, f'分 K {contract.code}: {exc}')
             entry['data'] = pd.DataFrame()
             entry['failed'] = True

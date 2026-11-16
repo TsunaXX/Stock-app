@@ -1,8 +1,10 @@
 """Recover transport/authentication without losing scopes or inventing fills."""
 import ast
+import logging
 import threading
 import weakref
 from concurrent.futures import Future
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -19,17 +21,21 @@ class Session(dict):
 
 def recovery_context():
     ns = load_app_symbols('restore_shioaji_login', 'invalidate_shioaji_connection',
-                          '_stream_state', 'clear_market_stream')
+                          '_stream_state', 'clear_market_stream', 'shioaji_auto_stream_stalled',
+                          'mark_shioaji_transport_down', 'report_shioaji_stream_failure',
+                          '_is_shioaji_auth_error', '_is_contract_stream_session', '_stream_contract_codes')
     registry, clock, logouts, logins, clears = {}, [0.], [], [], []
     registry_lock = threading.RLock()
     session = Session(sj_logged_in=True, sj_key='test-key', sj_secret='test-secret', remember_sj=False)
     ns.update(st=SimpleNamespace(session_state=session), sj=object(), weakref=weakref,
+              logger=logging.getLogger(__name__), is_market_closed_func=lambda day: day.weekday() >= 5,
               time=SimpleNamespace(monotonic=lambda: clock[0]),
               get_market_stream_registry=lambda: (registry, registry_lock),
               get_shared_market_data_cache=lambda: ({'shioaji_usage': {}}, threading.RLock()))
     old = SimpleNamespace(logout=lambda: logouts.append('old'))
     new = SimpleNamespace(logout=lambda: logouts.append('new'))
-    def login(*credentials):
+    def login(*credentials, _force_refresh):
+        assert _force_refresh
         logins.append(credentials)
         return new
     login.clear = lambda: clears.append(True)
@@ -80,7 +86,7 @@ def test_second_device_adopts_recovered_cached_api_without_clearing_it_again():
 def test_recovery_retry_is_bounded_and_manual_logout_disables_it():
     ns, session, clock, old, new, logins, _, _ = recovery_context()
     ns['_stream_state'](old)['auth_error'] = 'AuthError'
-    def fail(*args):
+    def fail(*args, **kwargs):
         logins.append(args)
         raise ConnectionError('private broker response')
     fail.clear = lambda: None
@@ -96,7 +102,7 @@ def test_recovery_retry_is_bounded_and_manual_logout_disables_it():
     session.manual_logout = True
     assert not ns['restore_shioaji_login']() and len(logins) == 6
     session.manual_logout = False
-    ns['init_shioaji_connection'] = lambda *args: new
+    ns['init_shioaji_connection'] = lambda *args, **kwargs: new
     assert ns['restore_shioaji_login']() and session.sj_logged_in
     assert not session.get('sj_auto_login_retry_after') and not session.get('sj_auto_login_failures')
 
@@ -108,7 +114,7 @@ def test_failed_initial_login_closes_partial_connection():
     ns = {}
     exec(compile(ast.Module(body=[node], type_ignores=[]), 'app.py', 'exec'), ns)
     closed = []
-    def fail(*args):
+    def fail(*args, **kwargs):
         raise ConnectionError('login failed')
     ns['sj'] = SimpleNamespace(Shioaji=lambda **kw: SimpleNamespace(login=fail, logout=lambda: closed.append(True)))
     with pytest.raises(ConnectionError):
@@ -210,7 +216,7 @@ def test_transient_disconnect_preserves_jobs_but_disabled_auto_still_removes_the
 def test_recovery_sidebar_fragment_restores_login_and_keeps_table_visible_in_app_test():
     from streamlit.testing.v1 import AppTest
     source = (Path(__file__).parents[1] / 'app.py').read_text(encoding='utf-8')
-    names = {'restore_shioaji_login', 'render_shioaji_recovery'}
+    names = {'restore_shioaji_login', 'render_shioaji_recovery', 'shioaji_auto_stream_stalled'}
     definitions = '\n'.join(ast.unparse(node) for node in ast.parse(source).body
                             if isinstance(node, ast.FunctionDef) and node.name in names)
     setup = '''
@@ -218,7 +224,7 @@ import streamlit as st
 from types import SimpleNamespace
 sj = object()
 time = SimpleNamespace(monotonic=lambda: st.session_state.get('clock', 0))
-def init_shioaji_connection(*args):
+def init_shioaji_connection(*args, **kwargs):
     if st.session_state.get('clock', 0) < 30:
         raise ConnectionError('temporary')
     return 'restored'
@@ -258,3 +264,52 @@ def test_shioaji_quota_uses_background_poll_and_accepts_zero_without_logging_out
     ns.update(_stream_state=lambda api: state, get_public_maintenance_jobs=lambda: SimpleNamespace(poll=poll))
     assert ns['get_cached_shioaji_usage'](api) is None and calls == []
     assert callbacks[0]()[0] == 0 and calls == [5000]
+
+
+def test_unestablished_transport_recovers_even_if_broker_logout_fails():
+    ns, session, clock, old, new, logins, clears, _ = recovery_context()
+    state = ns['_stream_state'](old)
+    state['quotes']['2330'] = {'source': 'stream', 'updated_at': 'original'}
+
+    def failed_logout():
+        assert clears == [True]
+        raise RuntimeError('logout error: SessionNotEstablished')
+
+    old.logout = failed_logout
+    ns['report_shioaji_stream_failure'](old, TimeoutError('quota timed out'))
+    assert not state.get('connection_down')
+    ns['report_shioaji_stream_failure'](old, RuntimeError('SolClient NotReady (SessionNotEstablished)'))
+    assert not state.get('auth_error') and state['model_stream_epoch'] == 1
+    assert state['quotes']['2330'] == {'source': 'stream_stale', 'updated_at': 'original'}
+    clock[0] = 119
+    assert not ns['restore_shioaji_login']() and not logins
+    clock[0] = 120
+    assert ns['restore_shioaji_login']() and session.sj_api is new and len(logins) == 1
+
+
+def test_silent_live_benchmark_reconnects_once_and_only_with_active_auto_timer():
+    ns, session, clock, old, new, logins, _, _ = recovery_context()
+    now = [datetime(2026, 11, 16, 11)]
+    ns['datetime'] = SimpleNamespace(now=lambda tz: tz.localize(now[0]))
+    state = ns['_stream_state'](old)
+    state['subscriptions']['2330'] = {'status': 'active', 'subscribed_at': 0,
+                                      'contract': SimpleNamespace(code='2330')}
+    session['stock_auto_timer_seconds'] = 5
+    clock[0] = 125
+    assert not ns['restore_shioaji_login']()  # A quiet individual stock is normal.
+    benchmark = {'status': 'active', 'subscribed_at': 5,
+                 'contract': SimpleNamespace(code='TXFK6', delivery_month='202611')}
+    state['subscriptions']['TXFK6'] = benchmark
+    session['stock_auto_timer_seconds'] = None
+    assert not ns['restore_shioaji_login']()
+    session['stock_auto_timer_seconds'] = 5
+    now[0] = datetime(2026, 11, 16, 14)
+    assert not ns['restore_shioaji_login']()
+    now[0] = datetime(2026, 11, 16, 11)
+    state['last_stream_activity'] = 6
+    assert not ns['restore_shioaji_login']()
+    clock[0] = 126
+    assert ns['restore_shioaji_login']() and session.sj_api is new
+    ns['_stream_state'](new)['subscriptions']['TXFK6'] = {**benchmark, 'subscribed_at': 126}
+    clock[0] = 246
+    assert not ns['restore_shioaji_login']() and len(logins) == 1

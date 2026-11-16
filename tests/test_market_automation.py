@@ -616,7 +616,7 @@ def test_background_sheet_merge_preserves_remote_selection_dates_and_own_timesta
 
 def test_stream_disconnect_restores_subscriptions_without_polling():
     ns = load_app_symbols('_install_stream_callbacks', 'ensure_market_stream_subscription',
-                          '_stream_contract_codes', '_shioaji_quote_type')
+                          '_stream_contract_codes', '_shioaji_quote_type', 'mark_shioaji_transport_down')
     state = {'lock': threading.RLock(), 'callbacks_installed': False, 'subscriptions': {},
              'aliases': {}, 'quotes': {'2330': {'source': 'stream', 'updated_at': 'original'}}}
     ns['_stream_state'] = lambda api: state
@@ -646,9 +646,11 @@ def test_stream_disconnect_restores_subscriptions_without_polling():
     assert 'failed' not in state['strategy_histories']['pending']
 
 
-def test_failed_background_seed_retries_after_backoff_and_then_reuses_success():
+@pytest.mark.parametrize('error', [ConnectionError, TimeoutError, BaseException])
+def test_failed_background_seed_retries_after_backoff_and_then_reuses_success(error):
     from concurrent.futures import Future
-    ns = load_app_symbols('get_strategy_intraday_history', '_is_shioaji_auth_error')
+    ns = load_app_symbols('get_strategy_intraday_history')
+    ns['report_shioaji_stream_failure'] = lambda *args: None
     state = {'lock': threading.RLock()}
     clock, attempts = [0.], []
     ns['time'] = SimpleNamespace(monotonic=lambda: clock[0], sleep=lambda _: None)
@@ -662,7 +664,7 @@ def test_failed_background_seed_retries_after_backoff_and_then_reuses_success():
             attempts.append(1)
             future = Future()
             if len(attempts) == 1:
-                future.set_exception(ConnectionError('temporary'))
+                future.set_exception(error('temporary'))
             else:
                 future.set_result(bars([100, 101]))
             return future
