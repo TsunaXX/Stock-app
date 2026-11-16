@@ -15747,14 +15747,8 @@ with st.sidebar:
             col_logout, col_relogin = st.columns(2)
             with col_logout:
                 if st.button("登出", key="btn_logout_sj", width='stretch'):
-                    st.session_state.sj_logged_in = False
-                    st.session_state.manual_logout = True # 標記為手動登出，阻擋重整時自動登入
-                    
-                    try:
-                        clear_market_stream(st.session_state.sj_api)
-                        st.session_state.sj_api.logout()
-                        init_shioaji_connection.clear() 
-                    except Exception: pass
+                    st.session_state.manual_logout = True
+                    invalidate_shioaji_connection()
                     
                     # 保持儲存現有的 Key 與記住狀態
                     save_config(
@@ -15768,8 +15762,6 @@ with st.sidebar:
             with col_relogin:
                 relogin_clicked = st.button("快速重新登入", key="btn_relogin_sj", width='stretch')
                 
-            msg_placeholder = st.empty()
-            
             if relogin_clicked:
                 invalidate_shioaji_connection()
                 st.session_state.pop('sj_auto_login_retry_after', None)
