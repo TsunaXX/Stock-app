@@ -15543,8 +15543,8 @@ def invalidate_shioaji_connection(exc=None, clear_resource=True):
     if old_api is not None and not retired:
         try:
             old_api.logout()
-        except BaseException as exc:
-            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+        except BaseException as logout_error:
+            if isinstance(logout_error, (KeyboardInterrupt, SystemExit)):
                 raise
     if exc is not None:
         st.session_state.sj_connection_error = type(exc).__name__
