@@ -10675,6 +10675,46 @@ def fetch_official_stock_closes(day, codes=None):
     return closes
 
 
+def fetch_tpex_stock_close(day, code):
+    """Read one security's date-pinned official regular close, without a whole-market download."""
+    try:
+        with _tpex_verified_session() as session:
+            response = session.get('https://www.tpex.org.tw/www/zh-tw/afterTrading/tradingStock',
+                                   params={'date': day.strftime('%Y/%m/01'), 'code': code, 'response': 'json'},
+                                   timeout=(3, 6))
+            response.raise_for_status()
+            payload = response.json()
+        if not isinstance(payload, dict) or str(payload.get('code')) != code:
+            return None
+        for table in payload.get('tables', []):
+            fields = [str(field).replace(' ', '') for field in table.get('fields', ())]
+            if not {'日期', '收盤', '漲跌'}.issubset(fields):
+                continue
+            for values in table.get('data', []):
+                row = dict(zip(fields, values))
+                if _parse_roc_trade_date(row.get('日期')) == day:
+                    price = _official_number(row.get('收盤'))
+                    if price is not None and price > 0:
+                        return {'price': price, 'change': _safe_number(row.get('漲跌'))}
+    except (requests.RequestException, ValueError) as exc:
+        logger.info('TPEx closing quote %s %s: %s', day, code, type(exc).__name__)
+    return None
+
+
+def fetch_targeted_stock_closes(day, codes):
+    codes = set(codes)
+    otc = sorted(code for code in codes if getattr(twstock.codes.get(code), 'market', '') == '上櫃')
+    closes = {}
+    if len(otc) <= 12 and otc:
+        with ThreadPoolExecutor(max_workers=min(3, len(otc))) as pool:
+            closes = {code: quote for code, quote in zip(otc, pool.map(lambda code: fetch_tpex_stock_close(day, code), otc))
+                      if quote is not None}
+    missing = codes - closes.keys()
+    if missing:
+        closes.update(fetch_official_stock_closes(day, missing))
+    return closes
+
+
 def stock_stream_auction_closes(api, day):
     if api is None:
         return {}
@@ -10785,7 +10825,9 @@ def check_model_stock_closes(tracker=None):
             close_day = date.fromisoformat(target)
             broker, checked = broker_stock_closes(api, close_day, codes, now, jobs)
             official_ready = checked and (close_day != now.date() or now.time() >= dt_time(13, 33))
-            official = jobs.poll(('stock-table-closes', close_day), lambda d=close_day: fetch_official_stock_closes(d),
+            scope = tuple(sorted(codes))
+            official = jobs.poll(('stock-table-closes', close_day, scope),
+                                 lambda d=close_day, subset=scope: fetch_targeted_stock_closes(d, subset),
                                  interval=180) if official_ready else None
             prices = {code: quote['price'] for code, quote in (official or {}).items() if code in codes}
             streamed = {code: broker[code] for code in codes & broker.keys()}
@@ -25143,7 +25185,9 @@ def check_stock_table_closes(now, codes=None, notify=None):
     if checked:
         if notify and missing - broker.keys() - saved.keys():
             notify('部分標的未取得永豐收盤行情，改向證交所／櫃買中心核對。')
-        official = jobs.poll(('stock-table-closes', day), lambda: fetch_official_stock_closes(day), interval=180) or {}
+        scope = tuple(sorted(missing))
+        official = jobs.poll(('stock-table-closes', day, scope),
+                             lambda: fetch_targeted_stock_closes(day, scope), interval=180) or {}
     updates = {code: {**official[code], 'date': day.isoformat()} for code in missing & official.keys()}
     for code in (missing - official.keys()) & broker.keys():
         provisional = {key: broker[code][key] for key in ('price', 'change')}
@@ -26620,7 +26664,7 @@ if tab1.open and stock_strategy_tab.open:
                             warning = '部分標的未取得永豐收盤行情，已改用交易所收盤資料核對。'
                             st.warning(warning)
                         if missing - official.keys():
-                            official.update(fetch_official_stock_closes(day, missing - official.keys()))
+                            official.update(fetch_targeted_stock_closes(day, missing - official.keys()))
                             official = {code: quote for code, quote in official.items() if code in codes}
                         quotes = {**{code: stored[code] for code in missing & stored.keys()}, **quotes, **official}
                         if quotes:
