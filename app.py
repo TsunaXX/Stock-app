@@ -36,7 +36,6 @@ import tempfile
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import numpy as np
-import streamlit.components.v1 as components
 import pdfplumber
 import fitz  # PyMuPDF 用於將 PDF 轉為圖片
 from sec_financials import facts_revenue, release_revenue, sec_get
@@ -5447,23 +5446,14 @@ def get_shioaji_stock_contract(api, code):
     if api is None:
         return None
     try:
-        return api.Contracts.Stocks[str(code)]
+        getter = getattr(getattr(api, 'contracts', None), 'get', None)
+        return getter(str(code)) if callable(getter) else api.Contracts.Stocks[str(code)]
     except Exception as exc:
         if _is_shioaji_auth_error(exc):
             state = _stream_state(api)
             with state['lock']:
                 state['auth_error'] = type(exc).__name__
                 state['connection_down'] = True
-            return None
-        if isinstance(exc, (AttributeError, KeyError, TypeError)):
-            try:
-                return api.contracts.get(str(code))
-            except Exception as fallback_error:
-                if _is_shioaji_auth_error(fallback_error):
-                    state = _stream_state(api)
-                    with state['lock']:
-                        state['auth_error'] = type(fallback_error).__name__
-                        state['connection_down'] = True
         return None
 
 
@@ -9561,6 +9551,17 @@ def fibonacci_initial_y_range(low_price, high_price, padding_ratio=0.05):
     return low_value - padding, high_value + padding
 
 
+def taiwan_yahoo_candidates(code):
+    """Use the security's registered market before trying Yahoo."""
+    info = twstock.codes.get(code)
+    market = getattr(info, 'market', '')
+    if market == '上櫃':
+        return (f'{code}.TWO',)
+    if market == '上市':
+        return (f'{code}.TW',)
+    return f'{code}.TW', f'{code}.TWO'
+
+
 @st.cache_data(ttl=120, max_entries=32, show_spinner=False)
 def fetch_fibonacci_yahoo_history(ticker, interval, period):
     """Reuse Yahoo history across chart controls and browser sessions."""
@@ -9628,7 +9629,7 @@ def plot_fibonacci_chart(
                 else:
                     ticker_code = raw_input
 
-    ticker = ticker_code if (ticker_code.endswith(".TW") or ticker_code.endswith(".TWO") or ticker_code.startswith("^") or "=" in ticker_code) else f"{ticker_code}.TW"
+    ticker = ticker_code if (ticker_code.endswith(".TW") or ticker_code.endswith(".TWO") or ticker_code.startswith("^") or "=" in ticker_code) else taiwan_yahoo_candidates(ticker_code)[0]
     period_map = {"1m": "7d", "5m": "30d", "15m": "60d", "60m": "730d", "1d": "2y", "1wk": "2y", "1mo": "5y"}
     is_index = ticker.startswith('^') or 'TWF' in ticker or 'TMF' in ticker
     
@@ -17817,18 +17818,9 @@ def fetch_shioaji_tx_night_signal(api, now_tw):
     """取得歸屬今日交易日的臺指期夜盤，避免 08:45 後混入日盤價格。"""
     if api is None:
         return None
-    try:
-        contracts = [
-            contract for contract in api.Contracts.Futures.TXF
-            if str(getattr(contract, 'code', ''))[-2:] not in ('R1', 'R2')
-            and '/' not in str(getattr(contract, 'code', ''))
-        ]
-        contract = min(contracts, key=lambda item: getattr(item, 'delivery_date', '999999'))
-    except Exception:
-        try:
-            contract = api.Contracts.Futures.TXF.TXFR1
-        except Exception:
-            return None
+    contract = get_near_futures_contract(api, 'TXF')
+    if contract is None:
+        return None
 
     kbars = fetch_futures_contract_kbars(api, contract, 4)
     if kbars.empty or 'Close' not in kbars.columns:
@@ -21177,32 +21169,28 @@ def fetch_stock_data_raw(
                     source_used = "twstock"
         except Exception: pass
 
-    if not history_ready(hist) and si is not None:
-        try:
-            try: df_yf = si.get_data(f"{code}.TW", start_date=(datetime.now() - timedelta(days=40)))
-            except Exception:
-                try: df_yf = si.get_data(f"{code}.TWO", start_date=(datetime.now() - timedelta(days=40)))
-                except Exception: df_yf = pd.DataFrame()
-            
-            if not df_yf.empty:
-                rename_map = {'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'}
-                df_yf = df_yf.rename(columns=rename_map)
+    yahoo_tickers = taiwan_yahoo_candidates(code) if not history_ready(hist) else ()
+    if si is not None:
+        for ticker in yahoo_tickers:
+            try:
+                df_yf = si.get_data(ticker, start_date=(datetime.now() - timedelta(days=40)))
                 cols = ['Open', 'High', 'Low', 'Close', 'Volume']
-                if all(c in df_yf.columns for c in cols):
-                    hist = df_yf[cols]
-                    source_used = "yahoo_fin"
-        except Exception: pass
+                df_yf = df_yf.rename(columns={column.lower(): column for column in cols})
+                if history_ready(df_yf) and all(column in df_yf.columns for column in cols):
+                    hist, source_used = df_yf[cols], "yahoo_fin"
+                    break
+            except Exception:
+                continue
 
     if not history_ready(hist):
-        try:
-            for suffix in ('TW', 'TWO'):
-                hist_yf = yf.Ticker(f"{code}.{suffix}").history(period="6mo", auto_adjust=False)
+        for ticker in yahoo_tickers:
+            try:
+                hist_yf = yf.Ticker(ticker).history(period="6mo", auto_adjust=False)
                 if history_ready(hist_yf):
-                    hist = hist_yf
-                    source_used = "yfinance"
+                    hist, source_used = hist_yf, "yfinance"
                     break
-        except Exception: 
-            pass
+            except Exception:
+                continue
 
     # 備援即時報價只更新行情欄位，不能補成一根完整日 K。
     if include_live_quote and source_used != "shioaji" and live_quote_price is None:
@@ -27218,10 +27206,15 @@ with tab2:
                 "交易選項", ["個股", "融資(多)", "融券(空)"], key="swing_type",
                 on_change=sync_swing_credit_defaults,
             )
+        if any(key not in st.session_state for key in ('margin_ratio', 'annual_rate', 'short_fee_rate')):
+            saved_credit_values = {key: st.session_state[key] for key in ('margin_ratio', 'annual_rate', 'short_fee_rate')
+                                   if key in st.session_state}
+            sync_swing_credit_defaults()
+            st.session_state.update(saved_credit_values)
         with c2_margin:
-            margin_ratio = st.number_input("融資/券成數(%)", min_value=0.0, max_value=100.0, value=60.0 if swing_type == "融資(多)" else (90.0 if swing_type == "融券(空)" else 0.0), step=10.0, key="margin_ratio")
+            margin_ratio = st.number_input("融資/券成數(%)", min_value=0.0, max_value=100.0, step=10.0, key="margin_ratio")
         with c2_rate:
-            annual_rate = st.number_input("年利率(%)", min_value=0.0, value=6.25 if swing_type == "融資(多)" else (0.2 if swing_type == "融券(空)" else 0.0), step=0.1, key="annual_rate")
+            annual_rate = st.number_input("年利率(%)", min_value=0.0, step=0.1, key="annual_rate")
         with c2_days:
             swing_date_range = st.date_input("選擇區間", value=(datetime.now(tz_tw).date(), datetime.now(tz_tw).date() + timedelta(days=1)), key="swing_date_range")
             if isinstance(swing_date_range, tuple) and len(swing_date_range) == 2:
@@ -27231,7 +27224,7 @@ with tab2:
                 swing_days = 1
             st.caption(f"總天數: {swing_days} 天")
         with c2_fee_rate:
-            short_fee_rate = st.number_input("借券費率(‱)", min_value=0.0, value=8.0 if swing_type == "融券(空)" else 0.0, step=1.0, key="short_fee_rate")
+            short_fee_rate = st.number_input("借券費率(‱)", min_value=0.0, step=1.0, key="short_fee_rate")
 
         swing_stop_col1, swing_stop_col2, _ = st.columns([1, 1, 3])
         with swing_stop_col1:
@@ -28591,21 +28584,21 @@ with tab_db:
         )
         with inst_tabs[0]:
             if database_institutional_active and inst_tabs[0].open:
-                components.html(
+                st.iframe(
                     fetch_fubon_html("https://fubon-ebrokerdj.fbs.com.tw/Z/ZG/ZGK_D.djhtm"),
-                    height=1185, width=800, scrolling=True,
+                    height=1185, width=800,
                 )
         with inst_tabs[1]:
             if database_institutional_active and inst_tabs[1].open:
-                components.html(
+                st.iframe(
                     fetch_fubon_html("https://fubon-ebrokerdj.fbs.com.tw/Z/ZG/ZGK_DD.djhtm"),
-                    height=1185, width=800, scrolling=True,
+                    height=1185, width=800,
                 )
         with inst_tabs[2]:
             if database_institutional_active and inst_tabs[2].open:
-                components.html(
+                st.iframe(
                     fetch_fubon_html("https://fubon-ebrokerdj.fbs.com.tw/Z/ZG/ZGK_DB.djhtm"),
-                    height=1185, width=800, scrolling=True,
+                    height=1185, width=800,
                 )
         
     with sub_tab2:
