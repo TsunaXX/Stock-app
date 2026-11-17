@@ -1176,6 +1176,21 @@ class ModelTracker:
                 AND json_extract(body,'$.模擬出場價') IS NULL
                 AND NOT COALESCE(json_extract(body,'$.到期未確認'),0)""", (json.dumps(list(ids)),))}
 
+    def stock_close_candidates(self, through):
+        """Only already-entered stock day trades still missing an exit."""
+        with closing(self.db()) as db:
+            rows = db.execute("""SELECT DISTINCT json_extract(body,'$.交易日'), json_extract(body,'$.商品鍵')
+                FROM trades WHERE state IN ('模擬持倉','監控中斷','資料不足')
+                AND json_extract(body,'$.市場')='股票' AND json_extract(body,'$.策略')='當沖'
+                AND json_extract(body,'$.交易日')<=? AND json_extract(body,'$.進場時間') IS NOT NULL
+                AND json_extract(body,'$.模擬進場價')>0 AND json_extract(body,'$.模擬出場價') IS NULL
+                ORDER BY 1 DESC""", (through,)).fetchall()
+        days = {}
+        for day, code in rows:
+            if code and stamp(day) is not None:
+                days.setdefault(day, set()).add(code)
+        return days
+
     def settle_stock_closes(self, day, official_closes, broker_closes=None):
         """Show the closing print provisionally, then book the exchange-confirmed result."""
         broker_closes = broker_closes or {}
@@ -1228,6 +1243,8 @@ class ModelTracker:
                         count += 1
                     continue
                 row.pop('暫定收盤', None)
+                if row.pop('到期未確認', False):
+                    row['資料缺口'] = True
                 verified = ((row['狀態'] == '模擬持倉' and last == cutoff and row.get('最後序號') is not None
                              and number(row.get('最新價')) == close)
                             or (prior.get('連續證據') and prior.get('模擬出場價') == close))
