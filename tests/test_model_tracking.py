@@ -789,11 +789,12 @@ def test_official_stock_close_settles_entered_daytrade_as_gap_reference(tmp_path
     day = '2026-10-08'
     seed = signal(方向='空頭', 進場價=63.6, 停損價=66.5, 目標價=59.3, 跳動點=.1)
     entered = advance(new_trade(seed), quote(63.6, 序號=1, 串流識別='regular'))
-    entered.update(狀態='監控中斷', 資料缺口=True, 來源時間=f'{day}T13:30:32+08:00')
+    entered.update(狀態='監控中斷', 資料缺口=True, 到期未確認=True, 來源時間=f'{day}T13:30:32+08:00')
     waiting = new_trade(signal(商品鍵='2469'))
     with tracker.write_db() as db:
         tracker.store(db, entered)
         tracker.store(db, waiting)
+    assert tracker.stock_close_candidates('2026-10-09') == {day: {'2330'}}
     assert tracker.settle_stock_closes('2026-10-09', {'2330': 66}) == 0
     assert tracker.settle_stock_closes(day, {'2330': 66, '2469': 70}) == 1
     rows = {r['商品鍵']: r for r in tracker.records()}
@@ -802,6 +803,8 @@ def test_official_stock_close_settles_entered_daytrade_as_gap_reference(tmp_path
     assert row['模擬進場價'] == 63.5 and row['模擬出場價'] == 66
     assert row['毛損益'] == -2500 and row['模擬損益'] == -2646
     assert row['資料缺口'] and performance([row])[0]['有效交易數'] == 0
+    from model_tracking import gap_reference_trade
+    assert gap_reference_trade(row) and not tracker.stock_close_candidates('2026-10-09')
     assert rows['2469']['狀態'] == '等待進場'
     assert tracker.settle_stock_closes(day, {'2330': 67}) == 0
 

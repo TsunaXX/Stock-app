@@ -9690,6 +9690,8 @@ def plot_fibonacci_chart(
 
         # 若永豐未登入或其他商品的永豐資料不足，才退回使用 yfinance。
         if not sj_kbars_used and not twse_taiex_used:
+            if ticker.endswith(('.TW', '.TWO')):
+                st.caption('永豐未提供此區間行情，以下查詢 Yahoo 備援。')
             df = fetch_fibonacci_yahoo_history(
                 ticker, interval, period_map.get(interval, "max")
             )
@@ -10638,6 +10640,26 @@ def fetch_official_stock_closes(day, codes=None):
     if codes is None or codes.difference(closes):
         try:
             with _tpex_verified_session() as session:
+                try:
+                    historical = session.get('https://www.tpex.org.tw/www/zh-tw/afterTrading/dailyQuotes',
+                                             params={'date': day.strftime('%Y/%m/%d'), 'type': 'DailyClose',
+                                                     'response': 'json'}, timeout=(3, 8))
+                    historical.raise_for_status()
+                    payload = historical.json()
+                    if isinstance(payload, dict) and _parse_roc_trade_date(payload.get('date')) == day:
+                        for table in payload.get('tables', []):
+                            fields = table.get('fields', ())
+                            if not {'代號', '收盤', '漲跌'}.issubset(fields):
+                                continue
+                            for values in table.get('data', []):
+                                row = dict(zip(fields, values))
+                                code = str(row.get('代號', '')).strip()
+                                close = _official_number(row.get('收盤'))
+                                if code and code not in closes and (codes is None or code in codes) and close and close > 0:
+                                    closes[code] = {'price': close, 'change': _safe_number(row.get('漲跌'))}
+                        return closes
+                except (requests.RequestException, ValueError):
+                    pass
                 response = session.get(_TPEX_DAILY_QUOTES_URL, timeout=(3, 8))
                 response.raise_for_status()
                 for row in response.json():
@@ -10665,8 +10687,75 @@ def stock_stream_auction_closes(api, day):
                              if target in quotes}}
 
 
+def fetch_broker_stock_display_quotes(api, codes, now, closing_day=None):
+    """One bounded Shioaji batch; a request timestamp never becomes a market timestamp."""
+    if api is None:
+        return {}
+    state = _stream_state(api)
+    if state.get('retired') or state.get('connection_down') or state.get('auth_error'):
+        return {}
+    try:
+        contracts = [contract for code in codes if (contract := get_shioaji_stock_contract(api, code)) is not None]
+        snapshots = api.snapshots(contracts, timeout=5000) if contracts else ()
+    except BaseException as exc:
+        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            raise
+        report_shioaji_stream_failure(api, exc)
+        return {}
+    quotes = {}
+    for quote in snapshots or ():
+        code = str(quote.code)
+        price = _safe_number(getattr(quote, 'close', None))
+        source_time = pd.to_datetime(getattr(quote, 'ts', None), utc=True, errors='coerce')
+        if code not in codes or price is None or price <= 0 or pd.isna(source_time):
+            continue
+        source_time = source_time.tz_convert('Asia/Taipei')
+        if source_time > now or source_time.date() != (closing_day or now.date()):
+            continue
+        if closing_day is not None and not dt_time(13, 30) <= source_time.time() < dt_time(13, 34):
+            continue
+        rate = snapshot_change_rate(quote, price)
+        quotes[code] = {'price': price, 'change': price_change_amount(price, rate),
+                        'time': source_time.isoformat(), 'source': 'shioaji'}
+    return quotes
+
+
+def fetch_stock_display_fallback(codes, now):
+    """Exchange quotes from the existing Taiwan quote adapter, for display only."""
+    try:
+        rows = twstock.realtime.get(sorted(codes), retry=0)
+    except Exception:
+        return {}
+    result = {}
+    for code in codes & rows.keys():
+        row = rows[code]
+        price = _safe_number(row.get('realtime', {}).get('latest_trade_price'))
+        raw_time = _safe_number(row.get('timestamp'))
+        if price is None or price <= 0 or raw_time is None or raw_time <= 0:
+            continue
+        observed = pd.to_datetime(raw_time, unit='s', utc=True, errors='coerce')
+        if pd.isna(observed):
+            continue
+        observed = observed.tz_convert('Asia/Taipei')
+        if observed.date() == now.date() and observed <= now:
+            result[code] = {'price': price, 'change': None, 'time': observed.isoformat()}
+    return result
+
+
+def broker_stock_closes(api, day, codes, now, jobs):
+    streamed = stock_stream_auction_closes(api, day)
+    missing = tuple(sorted(set(codes) - streamed.keys()))
+    if api is not None and missing and now.date() == day and now.time() >= dt_time(13, 33):
+        polled = jobs.poll(('broker-stock-closes', id(api), day, missing),
+                           lambda: fetch_broker_stock_display_quotes(api, missing, now, closing_day=day), interval=180)
+        if polled is None:
+            return streamed, False
+        streamed.update(polled)
+    return streamed, True
+
+
 def check_model_stock_closes(tracker=None):
-    """Settle against the broker immediately and share the official feed with the stock table."""
+    """Recover confirmed entries that survived a browser or process interruption."""
     now = datetime.now(pytz.timezone('Asia/Taipei'))
     day = (now.date() if now.time() >= dt_time(13, 30) and not is_market_closed_func(now.date())
            else latest_completed_stock_trading_date(now))
@@ -10676,26 +10765,36 @@ def check_model_stock_closes(tracker=None):
             return
         tracker = get_model_tracker(url)
     tracker.last_activity = time.monotonic()
-    broker = stock_stream_auction_closes(st.session_state.get('sj_api'), day)
+    api = st.session_state.get('sj_api')
     jobs = get_public_maintenance_jobs()
-    official_ready = day != now.date() or now.time() >= dt_time(13, 33)
 
     def settle():
-        codes = {row['商品鍵'] for row in tracker.active_plans('股期戰略室', day.isoformat())
-                 if row.get('市場') == '股票' and row.get('策略') == '當沖' and row.get('模擬進場價') is not None}
-        if not codes:
-            return
-        official = jobs.poll(('stock-table-closes', day), lambda: fetch_official_stock_closes(day),
-                             interval=180) if official_ready else None
-        prices = {code: quote['price'] for code, quote in (official or {}).items() if code in codes}
-        streamed = {code: broker[code] for code in codes & broker.keys()}
-        if streamed and 'broker_closes' in inspect.signature(tracker.settle_stock_closes).parameters:
-            tracker.settle_stock_closes(day.isoformat(), prices, broker_closes=streamed)
-        elif prices:
-            tracker.settle_stock_closes(day.isoformat(), prices)
+        if hasattr(tracker, 'stock_close_candidates'):
+            pending = tracker.stock_close_candidates(day.isoformat())
+        else:
+            pending = {day.isoformat(): {row['商品鍵'] for row in tracker.active_plans('股期戰略室', day.isoformat())
+                if row.get('市場') == '股票' and row.get('策略') == '當沖' and row.get('模擬進場價') is not None}}
+        # Keep the current day first and rotate through older pending dates in bounded batches.
+        older = [target for target in pending if target != day.isoformat()]
+        offset = int(now.timestamp() // 60) % max(1, len(older))
+        targets = [day.isoformat(), *(older[offset:] + older[:offset])[:2]]
+        for target in targets:
+            codes = pending.get(target)
+            if not codes:
+                continue
+            close_day = date.fromisoformat(target)
+            broker, checked = broker_stock_closes(api, close_day, codes, now, jobs)
+            official_ready = checked and (close_day != now.date() or now.time() >= dt_time(13, 33))
+            official = jobs.poll(('stock-table-closes', close_day), lambda d=close_day: fetch_official_stock_closes(d),
+                                 interval=180) if official_ready else None
+            prices = {code: quote['price'] for code, quote in (official or {}).items() if code in codes}
+            streamed = {code: broker[code] for code in codes & broker.keys()}
+            if streamed and 'broker_closes' in inspect.signature(tracker.settle_stock_closes).parameters:
+                tracker.settle_stock_closes(target, prices, broker_closes=streamed)
+            elif prices:
+                tracker.settle_stock_closes(target, prices)
 
-    if broker or official_ready:
-        jobs.poll(('model-stock-closes', id(tracker), day), settle, interval=5 if broker else 60)
+    jobs.poll(('model-stock-closes', id(tracker), day), settle, interval=15)
 
 
 def _build_official_turnover_ranking(
@@ -13579,6 +13678,8 @@ def normalize_stock_display_settings(value):
                     }
                     if quote.get('source') == 'shioaji':
                         normalized[str(code)]['source'] = 'shioaji'
+                        if quote.get('time'):
+                            normalized[str(code)]['time'] = str(quote['time'])
         elif key == 'independent_analysis':
             normalized = {
                 room: snapshot for room, snapshot in values.items()
@@ -21353,6 +21454,7 @@ def fetch_stock_data_raw(
         "_risk_close_position": risk_close_position, "_risk_prev_high": risk_prev_high, "_risk_prev_low": risk_prev_low,
         "_plan_prev_high": plan_prev_high, "_plan_prev_low": plan_prev_low,
         "_quote_bid": live_quote_bid, "_quote_ask": live_quote_ask, "_quote_time": live_quote_time,
+        "_stock_history_source": source_used,
         "_data_as_of": live_quote_time or pd.Timestamp(hist.index[-1]).strftime('%Y/%m/%d'),
         "_strategy_data_as_of": strategy_data_date.strftime('%Y/%m/%d'),
         "_data_stale": False,
@@ -21633,6 +21735,10 @@ def intraday_auto_status_text(room, enabled):
         return '自動更新：關閉'
     intraday_auto_interval(room, enabled, *intraday_auto_settings(room)[1:])
     status = st.session_state.get(f'{room}_auto_status', '等待更新時段與 Shioaji 連線。')
+    if (room.startswith('stock') and st.session_state.get(f'{room}_auto_timer_seconds')
+            and not status.startswith('目前不在更新時段')
+            and datetime.now(pytz.timezone('Asia/Taipei')).time() >= dt_time(13, 30)):
+        status = '收盤行情依表格上方來源顯示。'
     return '自動更新：開啟｜' + status
 
 
@@ -23201,7 +23307,6 @@ def render_model_tracking_room():
         )
     tracker = get_model_tracker(get_app_secret('gsheet_api_url') or '')
     tracker.last_activity = time.monotonic()
-    check_model_stock_closes(tracker)
     cols = st.columns(4)
     with cols[0]:
         now_tw = datetime.now(pytz.timezone('Asia/Taipei'))
@@ -23286,6 +23391,7 @@ def render_model_tracking_room():
 
     @st.fragment(run_every=30)
     def render_model_report():
+        check_model_stock_closes(tracker)
         st.caption(f"資料狀態：{tracker.status}｜同步時間：{tracker.synced_at or '尚未完成'}")
         if tracker.error:
             st.warning(tracker.error)
@@ -25020,23 +25126,30 @@ def saved_stock_closing_quotes(day):
     return {code: quote for code, quote in values.items() if quote['date'] == day.isoformat()}
 
 
-def check_stock_table_closes(now):
-    codes = set(st.session_state.get('stock_main_visible_codes', ()))
-    codes.update(st.session_state.get('stock_independent_visible_codes', ()))
+def check_stock_table_closes(now, codes=None, notify=None):
+    if codes is None:
+        codes = set(st.session_state.get('stock_main_visible_codes', ()))
+        codes.update(st.session_state.get('stock_independent_visible_codes', ()))
     if not codes or (day := stock_close_display_day(now)) is None:
         return False
     saved = saved_stock_closing_quotes(day)
-    missing = codes - {code for code, quote in saved.items() if quote.get('source') != 'shioaji'}
+    missing = set(codes) - {code for code, quote in saved.items() if quote.get('source') != 'shioaji'}
     if not missing:
         return False
-    official = get_public_maintenance_jobs().poll(
-        ('stock-table-closes', day), lambda: fetch_official_stock_closes(day), interval=180,
-    ) or {}
+    api = st.session_state.get('sj_api')
+    jobs = get_public_maintenance_jobs()
+    broker, checked = broker_stock_closes(api, day, missing - saved.keys(), now, jobs)
+    official = {}
+    if checked:
+        if notify and missing - broker.keys() - saved.keys():
+            notify('部分標的未取得永豐收盤行情，改向證交所／櫃買中心核對。')
+        official = jobs.poll(('stock-table-closes', day), lambda: fetch_official_stock_closes(day), interval=180) or {}
     updates = {code: {**official[code], 'date': day.isoformat()} for code in missing & official.keys()}
-    broker = stock_stream_auction_closes(st.session_state.get('sj_api'), day) if st.session_state.get('sj_api') is not None else {}
     for code in (missing - official.keys()) & broker.keys():
         provisional = {key: broker[code][key] for key in ('price', 'change')}
         provisional.update(date=day.isoformat(), source='shioaji')
+        if broker[code].get('time'):
+            provisional['time'] = broker[code]['time']
         if provisional != saved.get(code):
             updates[code] = provisional
     return bool(updates and persist_shared_display_setting('stock_closing_quotes', updates))
@@ -25067,6 +25180,8 @@ def render_stock_auction_prices(rows, room):
     codes = set(rows['代號'].astype(str))
     clock = now.time()
     day = stock_close_display_day(now)
+    if day is not None and clock >= dt_time(13, 33) and st.session_state.get(f'{room}_auto_timer_seconds'):
+        check_stock_table_closes(now, codes, notify=st.caption)
     saved = saved_stock_closing_quotes(day) if day is not None else {}
     official = {code: quote for code, quote in saved.items() if quote.get('source') != 'shioaji'}
     if is_market_closed_func(now.date()):
@@ -25098,11 +25213,11 @@ def render_stock_auction_prices(rows, room):
         pending = codes - verified
         mismatch = sorted(code for code in verified & streamed.keys()
                           if abs(official[code]['price'] - streamed[code]['price']) > 1e-6)
-        message = f'{now:%Y/%m/%d} 正式收盤價已核對 {len(verified)}/{len(codes)} 檔'
+        message = f'{now:%Y/%m/%d} 13:30 正常盤收盤｜正式收盤價已核對 {len(verified)}/{len(codes)} 檔'
         if pending & streamed.keys():
             message += f'｜{len(pending & streamed.keys())} 檔採永豐收盤成交，待官方核對'
         if pending - streamed.keys():
-            message += '｜其餘暫保留前次報價'
+            message += '｜其餘等待永豐或交易所收盤價，暫保留前次報價'
         if mismatch:
             message += '｜已依官方更正：' + '、'.join(mismatch)
         st.caption(message)
@@ -25117,7 +25232,7 @@ def render_postclose_maintenance():
     restore_stock_quick_search()
     check_model_stock_closes()
     if (st.session_state.get('strategy_room_active_tab') == '📈 股票戰略室'
-            and check_stock_table_closes(datetime.now(pytz.timezone('Asia/Taipei')))):
+            and check_stock_table_closes(datetime.now(pytz.timezone('Asia/Taipei')), notify=st.caption)):
         st.rerun()
     if st.session_state.get('_stock_source_restore_needed'):
         restore_stock_source()
@@ -26266,6 +26381,10 @@ if tab1.open and stock_strategy_tab.open:
                     if col not in ["移除", "信心分"]:
                         df_display[col] = df_display[col].map(_blank_display_text)
 
+                if '_stock_history_source' in df_display:
+                    fallback = df_display['_stock_history_source'].isin(('twstock', 'yahoo_fin', 'yfinance')).sum()
+                    if fallback:
+                        st.caption(f'{fallback} 檔的分析日 K 未由永豐取得，採備援歷史資料。')
                 table_display = render_stock_auction_prices(df_display, 'stock')
                 styled_df = table_display[input_cols].style.apply(
                     style_tab1_df, axis=1, source_frame=table_display.copy(),
@@ -26481,44 +26600,61 @@ if tab1.open and stock_strategy_tab.open:
                 with col_clear: btn_clear_notes = st.button("🧹 清除手動備註", width='stretch', help="清除所有記憶的戰略備註內容")
 
                 if btn_rt_update:
-                    if st.session_state.get('sj_logged_in', False) and st.session_state.get('sj_api'):
-                        sj_api = st.session_state.sj_api
-                        total_count = len(st.session_state.stock_data)
-                        with st.spinner("正在更新最新成交價..."):
-                            refreshed_rows, updated_count = refresh_stock_quotes_for_codes(
-                                st.session_state.stock_data,
-                                True,
-                                sj_api,
-                                price_only=True,
-                            )
-                        if updated_count:
-                            st.session_state.stock_data = refreshed_rows
-                            tz_tw = pytz.timezone('Asia/Taipei')
-                            st.session_state.last_rt_update_time = datetime.now(tz_tw).strftime("%Y/%m/%d %H:%M:%S")
-                            st.session_state['_stock_data_updated_at'] = datetime.now(tz_tw).isoformat()
-                            save_data_cache(
-                                st.session_state.stock_data,
-                                st.session_state.ignored_stocks,
-                                st.session_state.all_candidates,
-                                st.session_state.saved_notes,
-                            )
-                            st.session_state.stock_strategy_editor_revision += 1
-                            if updated_count < total_count:
-                                st.session_state.stock_strategy_refresh_warning = (
-                                    f"本次 {total_count} 檔中有 {total_count - updated_count} 檔未取得最新成交價；"
-                                    "原資料維持不變。"
-                                )
-                            else:
-                                st.session_state.pop('stock_strategy_refresh_warning', None)
-                            st.toast(
-                                f"已更新 {updated_count} 檔最新成交價。",
-                                icon="⏱️",
-                            )
-                            st.rerun()
-                        else:
-                            st.warning("目前未取得任何最新成交價，原資料維持不變。")
+                    now = datetime.now(pytz.timezone('Asia/Taipei'))
+                    codes = set(df_display['代號'].astype(str))
+                    api = st.session_state.get('sj_api') if st.session_state.get('sj_logged_in') else None
+                    day = stock_close_display_day(now)
+                    with st.spinner('正在向永豐取得最新報價...'):
+                        quotes = {code: quote for code, quote in stock_stream_auction_closes(api, day).items()
+                                  if code in codes} if day is not None else {}
+                        missing = codes - quotes.keys()
+                        if missing and (day is None or day == now.date()):
+                            quotes.update(fetch_broker_stock_display_quotes(api, missing, now, closing_day=day))
+                    missing = codes - quotes.keys()
+                    warning = ''
+                    if day is not None:
+                        stored = saved_stock_closing_quotes(day)
+                        official = {code: quote for code, quote in stored.items()
+                                    if code in codes and quote.get('source') != 'shioaji'}
+                        if missing:
+                            warning = '部分標的未取得永豐收盤行情，已改用交易所收盤資料核對。'
+                            st.warning(warning)
+                        if missing - official.keys():
+                            official.update(fetch_official_stock_closes(day, missing - official.keys()))
+                            official = {code: quote for code, quote in official.items() if code in codes}
+                        quotes = {**{code: stored[code] for code in missing & stored.keys()}, **quotes, **official}
+                        if quotes:
+                            persist_shared_display_setting('stock_closing_quotes',
+                                {code: {**quote, 'date': day.isoformat()} for code, quote in quotes.items() if code in codes})
+                    elif missing:
+                        warning = '部分標的未取得永豐報價，已嘗試交易所即時報價備援。'
+                        st.warning(warning)
+                        quotes.update(fetch_stock_display_fallback(missing, now))
+                    if warning:
+                        st.session_state.stock_strategy_refresh_warning = warning
+                    if not (codes & quotes.keys()):
+                        st.warning('本次未取得可核對的最新報價，暫保留上次資料與來源時間。')
                     else:
-                        st.warning("⚠️ 請先登入永豐 API 才能更新最新成交價。")
+                        if day is None:
+                            snapshot_map = {code: SimpleNamespace(close=quote['price'], change_price=quote['change'])
+                                            for code, quote in quotes.items()}
+                            refreshed_rows, _ = merge_realtime_stock_snapshots(
+                                st.session_state.stock_data, snapshot_map, price_only=True,
+                            )
+                            st.session_state.stock_data = refreshed_rows
+                            mark_stock_data_updated()
+                            save_data_cache(refreshed_rows, st.session_state.ignored_stocks,
+                                            st.session_state.all_candidates, st.session_state.saved_notes)
+                        source_times = [parse_strategy_data_time(quote['time']) for code, quote in quotes.items()
+                                        if code in codes and quote.get('time')]
+                        observed = max((value for value in source_times if value is not None), default=None)
+                        st.session_state.last_rt_update_time = (
+                            f'{day:%Y/%m/%d} 正常盤收盤' if day is not None
+                            else observed.strftime('%Y/%m/%d %H:%M:%S') if observed is not None else '來源時間未提供'
+                        )
+                        st.session_state.stock_strategy_editor_revision += 1
+                        st.toast(f'已取得 {len(codes & quotes.keys())} 檔報價。', icon='⏱️')
+                        st.rerun()
 
                 if btn_clear_notes:
                     st.session_state.saved_notes = {}
@@ -26540,7 +26676,7 @@ if tab1.open and stock_strategy_tab.open:
                     st.warning(refresh_warning)
 
                 if 'last_rt_update_time' in st.session_state:
-                    st.markdown(f"<div style='text-align: left; color: #888; font-size: 14px; margin-top: 5px; margin-bottom: 10px;'>透過永豐 API 更新最新成交價（更新時間：{st.session_state.last_rt_update_time}）</div>", unsafe_allow_html=True)
+                    st.markdown(f"<div style='text-align: left; color: #888; font-size: 14px; margin-top: 5px; margin-bottom: 10px;'>最新成交價（{st.session_state.last_rt_update_time}）</div>", unsafe_allow_html=True)
 
                 if btn_update:
                      update_map = edited_df.set_index('代號')[['戰略備註']].to_dict('index')
