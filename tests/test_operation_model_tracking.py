@@ -119,6 +119,55 @@ def test_short_index_point_and_protection_use_actual_tmf_trades(tmp_path, direct
     assert closed['出場原因'] == '保利' and closed['模擬損益'] >= 0 and not closed.get('資料缺口')
 
 
+@pytest.mark.parametrize('direction, sign, exit_reason', [
+    ('偏多', 1, '停利'), ('偏空', -1, '停損'),
+])
+def test_index_short_wave_records_both_touches_between_refreshes(tmp_path, direction, sign, exit_reason):
+    from model_tracking import entry_economics
+    ns, state = adapter()
+    ns['entry_economics'] = entry_economics
+    tracker = ModelTracker(tmp_path / 'between-refreshes.sqlite', start=False)
+    class Recorder:
+        active_plans = tracker.active_plans
+
+        def submit(self, signals, quotes):
+            tracker.process(signals, quotes)
+            return True
+
+    now = NOW
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now.astimezone(tz) if tz else now.replace(tzinfo=None)
+    ns['datetime'] = Clock
+    wave = {'entry': 20000, 'stop': 20000 - sign * 50, 'target': 20000 + sign * 100,
+            'trigger': '逐筆觸價', 'momentum_ready': False, 'tracking_ready': True}
+    snapshot = {'plan': {'direction': direction, 'trigger': '日線計畫'}, 'live_snapshot': {'contract_code': 'TMFJ6'},
+                'trade_state': {'entry_level': 0, 'invalidation': 0, 'target': 0, 'can_enter': False},
+                'intraday_state': {}, 'short_wave': wave, 'short_wave_direction': direction}
+    cursors = {'_record_from': NOW.isoformat()}
+    api = object()
+    recorder = Recorder()
+    def refresh():
+        plans = ns['index_operation_model_specs'](snapshot, 1, 'default', cost_settings={**DEFAULT_COSTS})
+        ns['record_operation_models']('指數操作計畫', plans, api, 5, tracker=recorder, cursors=cursors)
+
+    tick(state, 'TMFJ6', wave['entry'] - sign, 0)
+    refresh()
+    assert tracker.records()[0]['狀態'] == '等待進場'
+    tick(state, 'TMFJ6', wave['entry'], 1)
+    tick(state, 'TMFJ6', wave['target' if exit_reason == '停利' else 'stop'], 2)
+    tick(state, 'TMFJ6', wave['entry'] - sign, 4)
+    snapshot['short_wave'] = None  # Even if the next refresh no longer publishes the plan.
+    now = NOW + timedelta(seconds=5)
+    refresh()
+    refresh()
+    row, = tracker.records()
+    assert row['狀態'] == '已平倉' and row['出場原因'] == exit_reason and not row.get('資料缺口')
+    assert pd.Timestamp(row['進場時間']) == NOW + timedelta(seconds=1)
+    assert pd.Timestamp(row['結案時間']) == NOW + timedelta(seconds=2)
+
+
 def test_index_plan_permission_direction_freeze_replay_and_costs(tmp_path):
     ns, state = adapter()
     waiting = spec(ns, allowed=False)

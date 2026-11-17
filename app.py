@@ -8190,8 +8190,14 @@ def calculate_operation_snapshot(seed_data, api, entry_profile, state, backgroun
     )
     short_wave = get_cached_short_wave_plan(api, short_wave_direction, max_age_seconds=0,
                                            precise=state.get('include_hourly', False))
-    if short_wave and not fresh:
-        short_wave = {**short_wave, 'momentum_ready': False}
+    if short_wave:
+        if state.get('include_hourly'):
+            # TXF bars set the point; the subscribed TMF trade proves the touch.
+            sign = 1 if short_wave_direction == '偏多' else -1
+            short_wave = {**short_wave, 'tracking_ready': fresh,
+                          'momentum_ready': fresh and sign * (live_price - short_wave['entry']) >= 0}
+        elif not fresh:
+            short_wave = {**short_wave, 'momentum_ready': False}
     if state.get('include_hourly') and api is not None and time.monotonic() >= state.get('hourly_retry', 0):
         state['hourly_retry'] = time.monotonic() + 30
         try:
@@ -8222,7 +8228,8 @@ def index_operation_model_specs(snapshot, quantity, profile, cost_settings=None,
     if wave:
         short = operation_model_spec(
             '指數操作計畫', '短波5分K', live, snapshot['short_wave_direction'],
-            wave['entry'], wave['stop'], wave['target'], wave['momentum_ready'], quantity, profile,
+            wave['entry'], wave['stop'], wave['target'],
+            wave.get('tracking_ready', wave['momentum_ready']), quantity, profile,
             {'EMA5': wave.get('ema_fast'), '量比': wave.get('volume_ratio')}, wave['trigger'],
             cost_settings=cost_settings, version=version)
         if short:
@@ -8334,6 +8341,8 @@ def index_operation_snapshot(seed_data, seconds):
         snapshot = calculate_operation_snapshot(seed_data, api, profile, state, background=True)
         state['initialized'] = bool(snapshot.get('plan'))
         if not snapshot.get('plan'):
+            if tracker is not None and recording.is_set():
+                record_operation_models('指數操作計畫', [], api, seconds, tracker=tracker, cursors=cursors)
             if previous.get('plan'):
                 raise RuntimeError('index plan unavailable')
             return snapshot, 0
@@ -8361,7 +8370,7 @@ def index_operation_snapshot(seed_data, seconds):
                     'permission': '等待最新串流', 'color': '#ffc107',
                     'reason': '行情尚未更新；保留原點位，等待最新串流後再判斷進場。'}}
             if previous.get('short_wave'):
-                snapshot['short_wave'] = {**previous['short_wave'], 'momentum_ready': False}
+                snapshot['short_wave'] = {**previous['short_wave'], 'momentum_ready': False, 'tracking_ready': False}
             return snapshot
         st.session_state['_index_operation_fallback'] = snapshot
         return snapshot
@@ -8387,7 +8396,7 @@ def index_operation_snapshot(seed_data, seconds):
         snapshot['trade_state'].update(can_enter=False, permission='等待最新串流', color='#ffc107',
                                       reason='行情尚未更新；保留原點位，等待最新串流後再判斷進場。')
         if snapshot.get('short_wave'):
-            snapshot['short_wave']['momentum_ready'] = False
+            snapshot['short_wave'].update(momentum_ready=False, tracking_ready=False)
     return snapshot
 
 
@@ -8511,7 +8520,10 @@ def render_operation_plan(seed_data, option_page=False, seconds=5, snapshot=None
             else:
                 reason = next((spec.get('未建立原因') for spec in snapshot.get('model_specs', [])
                                if spec and spec.get('計畫類型') == '短波5分K'), '')
-                momentum_label = reason or ('同向動能已確認，等待模型成交' if short_wave['momentum_ready'] else '等待同向動能')
+                if short_wave.get('tracking_ready') and record_enabled:
+                    momentum_label = reason or '等待微台逐筆成交觸價'
+                else:
+                    momentum_label = reason or ('已達觸發點位' if short_wave['momentum_ready'] else '等待微台觸價')
             momentum_color = '#ff4b4b' if short_wave_direction == '偏多' else '#00c853'
             st.markdown(
                 f"<div style='font-size:14px;font-weight:700;color:{momentum_color}'>即時狀態：{html.escape(momentum_label)}｜"
@@ -8659,6 +8671,15 @@ def render_operation_plan(seed_data, option_page=False, seconds=5, snapshot=None
         st.caption("以日線費波支撐／壓力與 15 分 K 確認；保＝達1R後移動保利，保留1R回撤，最低保護成本。")
         st.info(f"**進場確認：** {plan['trigger']}")
         execution_direction = trade_state.get('execution_direction') or plan.get('direction')
+        if (main_model and main_model.get('狀態') in ('等待進場', '模擬持倉', '監控中斷', '資料不足')
+                and (main_model.get('模擬進場價') is not None or main_model.get('方向') == execution_direction)):
+            execution_direction = main_model['方向']
+            entry, stop, target = (main_model[key] for key in ('進場價', '停損價', '目標價'))
+            risk, reward = abs(entry - stop), abs(target - entry)
+            trade_state = {**trade_state, 'entry_level': entry, 'invalidation': stop, 'target': target,
+                           'risk_points': risk, 'reward_points': reward, 'rr_ratio': reward / risk if risk else None}
+        entry_round, stop_round = ((math.floor, math.ceil) if execution_direction == '偏空'
+                                  else (math.ceil, math.floor))
         execution_color = (
             '#ff4b4b' if execution_direction == '偏多'
             else ('#00c853' if execution_direction == '偏空' else '#ffc107')
@@ -8669,17 +8690,17 @@ def render_operation_plan(seed_data, option_page=False, seconds=5, snapshot=None
         render_index_plan_metric_cards([
             {
                 'label': '觀察進場區', 'label_color': '#40c4ff',
-                'value': _format_compact_number(trade_state['entry_level'], 0),
+                'value': _format_compact_number(entry_round(trade_state['entry_level']), 0),
                 'color': execution_color,
             },
             {
                 'label': '失效／停損', 'label_color': '#ffc107',
-                'value': _format_compact_number(trade_state['invalidation'], 0),
+                'value': _format_compact_number(stop_round(trade_state['invalidation']), 0),
                 'color': '#ffc107',
             },
             {
                 'label': '第一目標', 'label_color': '#40c4ff',
-                'value': _format_compact_number(trade_state['target'], 0),
+                'value': _format_compact_number(entry_round(trade_state['target']), 0),
                 'color': execution_color,
             },
             {
