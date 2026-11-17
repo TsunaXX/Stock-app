@@ -528,7 +528,7 @@ def test_official_closing_quotes_validate_dates_and_preserve_model_prices():
 
 def test_stock_table_reconciles_missing_closes_after_auction_and_keeps_strategy_rows_intact():
     ns = helpers('stock_close_display_day', 'latest_completed_stock_trading_date',
-                 'saved_stock_closing_quotes', 'check_stock_table_closes', 'stock_close_display_rows',
+                 'saved_stock_closing_quotes', 'check_stock_table_closes', 'stock_close_display_rows', 'broker_stock_closes',
                  'fmt_price', '_signed_percent', '_to_number', '_format_compact_number')
     ns['is_market_closed_func'] = lambda day: day.weekday() >= 5
     state = {'stock_main_visible_codes': ['2468', '1815']}
@@ -539,6 +539,7 @@ def test_stock_table_reconciles_missing_closes_after_auction_and_keeps_strategy_
     calls = []
     feed = {'2468': {'price': 68.3, 'change': 2.3}, '5202': {'price': 21.1, 'change': None}}
     ns['fetch_official_stock_closes'] = lambda day: feed
+    ns['stock_stream_auction_closes'] = lambda api, day: {}
 
     def poll(key, fetch, interval):
         calls.append((key, interval))
@@ -645,7 +646,7 @@ def test_shioaji_auctions_display_before_official_without_recording_trial_trades
     official = {'2330': {'price': 100., 'change': 0.}}
     ns.update(datetime=Clock, _stream_state=lambda _: state, is_market_closed_func=lambda _: False,
               stock_close_display_day=lambda moment: moment.date() if moment.minute >= 33 or moment.hour < 9 else None,
-              saved_stock_closing_quotes=lambda _: official,
+              saved_stock_closing_quotes=lambda _: official, check_stock_table_closes=lambda *a, **k: False,
               st=SimpleNamespace(session_state={'sj_api': api, 'stock_auto_timer_seconds': 5}, caption=shown.append))
     rows = pd.DataFrame([{'代號': '2330', '收盤價': '100', '漲跌幅': '0%', '_strategy_close': 100}])
 
@@ -678,7 +679,7 @@ def test_shioaji_auctions_display_before_official_without_recording_trial_trades
 
 def test_snapshot_persists_today_broker_until_official_close_replaces_it():
     ns = helpers('stock_close_display_day', 'latest_completed_stock_trading_date',
-                 'saved_stock_closing_quotes', 'check_stock_table_closes', 'stock_stream_auction_closes')
+                 'saved_stock_closing_quotes', 'check_stock_table_closes', 'stock_stream_auction_closes', 'broker_stock_closes')
     day = date(2026, 11, 12)
     now = pd.Timestamp('2026-11-12 13:33', tz='Asia/Taipei')
     saved = {'4526': {'date': '2026-11-11', 'price': 55.0, 'change': 1.0}}
@@ -703,7 +704,7 @@ def test_snapshot_persists_today_broker_until_official_close_replaces_it():
 def test_model_settlement_uses_today_while_daily_strategy_still_uses_yesterday():
     from datetime import datetime
     import inspect
-    ns = helpers('check_model_stock_closes', 'latest_completed_stock_trading_date')
+    ns = helpers('check_model_stock_closes', 'latest_completed_stock_trading_date', 'broker_stock_closes')
     now = pd.Timestamp('2026-11-12 13:31', tz='Asia/Taipei').to_pydatetime()
     class Clock(datetime):
         @classmethod
@@ -770,3 +771,42 @@ def test_yahoo_candidates_use_the_registered_taiwan_market():
     assert candidates('2221') == ('2221.TWO',)
     assert candidates('2330') == ('2330.TW',)
     assert candidates('0000') == ('0000.TW', '0000.TWO')
+
+
+
+def test_date_pinned_tpex_close_recovers_6234_after_the_latest_feed_has_moved_on():
+    ns = helpers('fetch_official_stock_closes', '_official_number', '_parse_roc_trade_date')
+    day = date(2026, 11, 17)
+    calls = []
+    def get(url, **kwargs):
+        calls.append((url, kwargs.get('params', {})))
+        payload = {'date': '20261117', 'tables': [{'fields': ['代號', '名稱', '收盤', '漲跌'],
+                   'data': [['6234', '高僑', '52.00', '-3.20']]}]} if 'dailyQuotes' in url else {'date': '20261117'}
+        return SimpleNamespace(raise_for_status=lambda: None, json=lambda: payload)
+    class Market:
+        def __enter__(self):
+            return SimpleNamespace(get=get)
+        def __exit__(self, *_):
+            return False
+    ns.update(requests=SimpleNamespace(get=get, RequestException=OSError),
+              _TWSE_DAILY_QUOTES_URL='twse', _tpex_verified_session=Market)
+    assert ns['fetch_official_stock_closes'](day, ['6234']) == {'6234': {'price': 52.0, 'change': -3.2}}
+    assert calls[1][1]['date'] == '2026/11/17'
+
+
+def test_broker_snapshot_accepts_same_day_auction_only_using_source_time():
+    ns = helpers('fetch_broker_stock_display_quotes', 'snapshot_change_rate', 'price_change_amount', '_safe_number')
+    now = pd.Timestamp('2026-11-17 14:48:00', tz='Asia/Taipei')
+    calls = []
+    def snapshots(contracts, timeout):
+        calls.append(timeout)
+        return [SimpleNamespace(code=code, close=52., change_price=-3.2, ts=pd.Timestamp(when).value)
+                for code, when in [('6234', '2026-11-17 13:30:00+08:00'),
+                                   ('2221', '2026-11-16 13:30:00+08:00'),
+                                   ('2330', '2026-11-17 14:30:00+08:00')]]
+    ns.update(_stream_state=lambda api: {}, get_shioaji_stock_contract=lambda api, code: code)
+    result = ns['fetch_broker_stock_display_quotes'](
+        SimpleNamespace(snapshots=snapshots), {'6234','2221','2330'}, now, closing_day=now.date())
+    assert calls == [5000]
+    assert set(result) == {'6234'} and result['6234']['price'] == 52
+    assert result['6234']['time'] == '2026-11-17T13:30:00+08:00'
