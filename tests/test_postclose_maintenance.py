@@ -538,7 +538,7 @@ def test_stock_table_reconciles_missing_closes_after_auction_and_keeps_strategy_
     ns['get_stock_display_settings'] = lambda: {'stock_closing_quotes': {'values': saved}}
     calls = []
     feed = {'2468': {'price': 68.3, 'change': 2.3}, '5202': {'price': 21.1, 'change': None}}
-    ns['fetch_official_stock_closes'] = lambda day: feed
+    ns['fetch_targeted_stock_closes'] = lambda day, scope: feed
     ns['stock_stream_auction_closes'] = lambda api, day: {}
 
     def poll(key, fetch, interval):
@@ -563,7 +563,7 @@ def test_stock_table_reconciles_missing_closes_after_auction_and_keeps_strategy_
     feed = {'1815': {'price': 140.5, 'change': 12.5}}
     assert check(now + pd.Timedelta(minutes=12))
     assert not check(now + pd.Timedelta(minutes=13))
-    assert calls == [(('stock-table-closes', day), 180)] * 2
+    assert calls == [(('stock-table-closes', day, ('1815',)), 180)] * 2
     assert ns['stock_close_display_day'](pd.Timestamp('2026-11-12 08:55', tz='Asia/Taipei')) == day
     assert ns['stock_close_display_day'](pd.Timestamp('2026-11-12 09:00', tz='Asia/Taipei')) is None
 
@@ -688,7 +688,7 @@ def test_snapshot_persists_today_broker_until_official_close_replaces_it():
               is_market_closed_func=lambda day: False,
               get_stock_display_settings=lambda: {'stock_closing_quotes': {'values': saved}},
               get_public_maintenance_jobs=lambda: SimpleNamespace(poll=lambda key, fetch, **kw: fetch()),
-              fetch_official_stock_closes=lambda _: official,
+              fetch_targeted_stock_closes=lambda *_: official,
               stock_stream_auction_closes=lambda api, day: {'4526': {'price': 58.2, 'change': 3.2}},
               persist_shared_display_setting=lambda group, values: saved.update(values) or True)
     check = ns['check_stock_table_closes']
@@ -810,3 +810,37 @@ def test_broker_snapshot_accepts_same_day_auction_only_using_source_time():
     assert calls == [5000]
     assert set(result) == {'6234'} and result['6234']['price'] == 52
     assert result['6234']['time'] == '2026-11-17T13:30:00+08:00'
+
+
+
+def test_tpex_individual_close_validates_security_and_exact_day():
+    ns = helpers('fetch_tpex_stock_close', '_official_number', '_parse_roc_trade_date')
+    day = date(2026, 11, 17)
+    payload = {'code': '6234', 'tables': [{'fields': ['日 期', '收盤', '漲跌'],
+               'data': [['115/11/16', '55.20', '-3.20'], ['115/11/17', '52.00', '-3.20']]}]}
+    class Market:
+        def __enter__(self):
+            def get(url, params, timeout):
+                assert url.endswith('/tradingStock')
+                assert params == {'date': '2026/11/01', 'code': '6234', 'response': 'json'}
+                return SimpleNamespace(raise_for_status=lambda: None, json=lambda: payload)
+            return SimpleNamespace(get=get)
+        def __exit__(self, *_):
+            return False
+    ns.update(requests=SimpleNamespace(RequestException=OSError), _tpex_verified_session=Market)
+    take = ns['fetch_tpex_stock_close']
+    assert take(day, '6234') == {'price': 52, 'change': -3.2}
+    assert take(day.replace(day=18), '6234') is None
+    payload['code'] = '2221'
+    assert take(day, '6234') is None
+
+
+def test_targeted_close_keeps_verified_otc_when_full_market_is_unavailable():
+    ns = helpers('fetch_targeted_stock_closes')
+    day = date(2026, 11, 17)
+    calls = []
+    ns.update(twstock=SimpleNamespace(codes={'6234': SimpleNamespace(market='上櫃')}),
+              fetch_tpex_stock_close=lambda d, code: {'price': 52.0, 'change': -3.2},
+              fetch_official_stock_closes=lambda d, codes: calls.append((d, codes)) or {})
+    assert ns['fetch_targeted_stock_closes'](day, ['6234', '2330']) == {'6234': {'price': 52.0, 'change': -3.2}}
+    assert calls == [(day, {'2330'})]
