@@ -725,7 +725,7 @@ def test_model_settlement_uses_today_while_daily_strategy_still_uses_yesterday()
 
 
 def test_sunday_rebuild_targets_friday_and_daily_history_falls_back_when_nonempty_but_stale():
-    ns = helpers('_post_close_target_date', 'postclose_maintenance_window', 'fetch_stock_data_raw')
+    ns = helpers('_post_close_target_date', 'postclose_maintenance_window', 'fetch_stock_data_raw', 'taiwan_yahoo_candidates')
     ns['is_market_closed_func'] = lambda day: day.weekday() >= 5
     _, target, sources_open, ranking_open = ns['postclose_maintenance_window']('2026-11-15T10:00:00+08:00')
     assert (target, sources_open, ranking_open) == (date(2026, 11, 13), True, True)
@@ -737,7 +737,7 @@ def test_sunday_rebuild_targets_friday_and_daily_history_falls_back_when_nonempt
     def ticker(symbol):
         calls.append(symbol)
         return SimpleNamespace(history=lambda **kwargs: history if symbol.endswith('.TWO') else history.iloc[:0])
-    ns.update(twstock=SimpleNamespace(Stock=lambda code: SimpleNamespace(fetch_from=lambda *a: [vars(stale)])),
+    ns.update(twstock=SimpleNamespace(codes={}, Stock=lambda code: SimpleNamespace(fetch_from=lambda *a: [vars(stale)])),
               si=None, yf=SimpleNamespace(Ticker=ticker))
     def expect_history(frame, asof):
         assert frame.index[-1].date() == asof.date() == target
@@ -758,3 +758,15 @@ def test_disabled_timer_does_not_rerun_from_a_stale_inactive_table():
     ns['intraday_auto_settings'] = lambda room: (True, 5, None, None)
     ns['check_intraday_auto_timer']('stock')
     assert calls == ['rerun']
+
+
+
+def test_yahoo_candidates_use_the_registered_taiwan_market():
+    ns = helpers('taiwan_yahoo_candidates')
+    ns['twstock'] = SimpleNamespace(codes={code: SimpleNamespace(market=market) for code, market in
+                                           [('6234', '上櫃'), ('2221', '上櫃'), ('2330', '上市')]})
+    candidates = ns['taiwan_yahoo_candidates']
+    assert candidates('6234') == ('6234.TWO',)
+    assert candidates('2221') == ('2221.TWO',)
+    assert candidates('2330') == ('2330.TW',)
+    assert candidates('0000') == ('0000.TW', '0000.TWO')

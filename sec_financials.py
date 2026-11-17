@@ -4,22 +4,31 @@ import re
 import threading
 import time
 from datetime import datetime, timedelta
+from urllib.parse import urlsplit
 
 import requests
 from bs4 import BeautifulSoup
 
 _HTTP_LOCK = threading.Lock()
 _LAST_REQUEST = 0.0
+_SEC_FORBIDDEN = {}
 _MONTH_DATE = r"(?:January|February|March|April|May|June|July|August|September|October|November|December) \d{1,2}, \d{4}"
 
 
 def sec_get(url, user_agent):
     global _LAST_REQUEST
+    host = urlsplit(url).hostname
     with _HTTP_LOCK:
+        blocked = _SEC_FORBIDDEN.get(host)
+        if blocked and time.monotonic() < blocked[0]:
+            raise requests.HTTPError('SEC 來源仍在退避期間', response=blocked[1])
+        _SEC_FORBIDDEN.pop(host, None)
         time.sleep(max(0, .12 - (time.monotonic() - _LAST_REQUEST)))
         _LAST_REQUEST = time.monotonic()
         response = requests.get(url, headers={'User-Agent': user_agent, 'Accept-Encoding': 'gzip, deflate'},
                                 timeout=(4, 10))
+        if response.status_code == 403:
+            _SEC_FORBIDDEN[host] = (time.monotonic() + 300, response)
         response.raise_for_status()
         return response
 
