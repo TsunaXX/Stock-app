@@ -28,15 +28,15 @@ frame = pd.DataFrame({'Open':close-20,'High':close+100,'Low':close-100,'Close':c
 minutes = pd.date_range(end=now.floor('min'), periods=9000, freq='min')
 price = 21000+np.sin(np.arange(9000)/30)*40
 bars = pd.DataFrame({'Open':price-2,'High':price+10,'Low':price-10,'Close':price,'Volume':100.},index=minutes)
-def resample(api,interval):
+def resample(api,interval,product):
     return bars.resample(interval,origin='start_day').agg({'Open':'first','High':'max','Low':'min','Close':'last','Volume':'sum'})
 ns.update(merge_market_temperature_snapshot=lambda data,*a,**kw:data,
     _post_close_target_date=lambda:(now,index[-1].date()),get_cached_index_minutes=resample,
-    get_cached_futures_intraday_state=lambda api,direction,**kw:ns['get_futures_intraday_state'](api,direction,logged_in=True),
-    get_cached_short_wave_plan=lambda api,direction,**kw:ns['calculate_short_wave_plan'](api,direction),
+    get_cached_futures_intraday_state=lambda api,direction,**kw:ns['get_futures_intraday_state'](api,direction,logged_in=True,product=kw['product']),
+    get_cached_short_wave_plan=lambda api,direction,**kw:ns['calculate_short_wave_plan'](api,direction,precise=kw['precise']),
     get_live_futures_snapshot=lambda *a,**kw:{'price':float(price[-1]),'change':10.,'contract_code':'TMF-test','updated':now})
 seed = [('加權','^TWII',frame,'synthetic',ns['calculate_market_temperature'](frame)),
-        ('期貨','TWF=F',frame+10,'synthetic',ns['calculate_market_temperature'](frame+10))]
+        ('期貨','TMF=F',frame+10,'synthetic',ns['calculate_market_temperature'](frame+10))]
 state = {}
 def calculate():
     return ns['calculate_operation_snapshot'](seed,api,'積極（提早確認）',state,background=True)

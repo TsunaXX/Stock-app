@@ -523,7 +523,8 @@ def protection_plans(market, keys, mode, day, source):
     assert source == '指數操作計畫' and keys == ['TMF|短波5分K','TMF|日線／15分K']
     return {keys[0]:{'資料缺口':True,'狀態':'資料不足','方向':'偏空',
                     '進場價':19985.4,'停損價':20035.2,'目標價':19875.3},
-            keys[1]:{'保利狀態':'保利中','保利價':19876,'狀態':'模擬持倉','模擬進場價':20000}}
+            keys[1]:{'保利狀態':'保利中','保利價':19876,'狀態':'模擬持倉','模擬進場價':20000,
+                         '方向':'偏空','進場價':19995.4,'停損價':20035.2,'目標價':19875.3}}
 get_model_tracker = lambda *a: SimpleNamespace(protection_plans=protection_plans)
 def record_operation_models(source, specs, api, seconds, **kw):
     st.session_state['model_plan_source'] = source
@@ -574,6 +575,8 @@ def record_operation_models(source, specs, api, seconds, **kw):
         assert '移動保利' in sections[main] and '保 19876' in sections[main] and '保利中' in sections[main]
         assert any('日線費波撐壓 × 15 分 K 確認' in value for value in sections)
         assert any('日線費波撐壓 × 60 分 K 趨勢' in value for value in sections)
+        assert any('觀察進場區' in value and all(point in value for point in ('19,995', '20,036', '19,875'))
+                   for value in sections)
         assert any('短波進場點' in value and '19,985' in value and '±' not in value for value in sections)
         assert any('color:#00c853' in value and '完成 K 棒' in value and 'EMA5' in value for value in sections)
         assert all(value in sections[hourly] for value in ('50 點','100 點','1 口最大風險','$500','1 口預估收益','$1,000'))
