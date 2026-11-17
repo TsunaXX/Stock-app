@@ -186,3 +186,37 @@ def test_manual_company_sync_clears_source_caches_and_keeps_prior_report_on_tota
     assert saved[0]['us_revenue']['events'] == [event]
     assert saved[0]['calendar_companies'] == ['MU']
     assert {'fetch_sec_submissions','fetch_sec_facts','fetch_micron_revenue','fetch_yahoo_revenue'} <= set(cleared)
+
+
+
+def test_sec_forbidden_backs_off_only_the_affected_host(monkeypatch):
+    import pytest
+    import requests
+    import sec_financials
+
+    hits = []
+    clock = [50]
+    monkeypatch.setattr(sec_financials, '_SEC_FORBIDDEN', {})
+    monkeypatch.setattr(sec_financials, '_LAST_REQUEST', 0.)
+    from types import SimpleNamespace
+    monkeypatch.setattr(sec_financials, 'time', SimpleNamespace(monotonic=lambda: clock[0], sleep=lambda _: None))
+
+    def get(url, **kwargs):
+        hits.append(url)
+        response = requests.Response()
+        response.url = url
+        response.status_code = 403 if clock[0] == 50 and 'www.sec.gov' in url else 200
+        return response
+
+    monkeypatch.setattr(sec_financials.requests, 'get', get)
+    www = 'https://www.sec.gov/files/company_tickers.json'
+    data = 'https://data.sec.gov/submissions/CIK0000000000.json'
+    for _ in range(2):
+        with pytest.raises(requests.HTTPError) as error:
+            sec_financials.sec_get(www, 'Stock-app test')
+        assert error.value.response.status_code == 403
+    assert sec_financials.sec_get(data, 'Stock-app test').ok
+    assert hits == [www, data]
+    clock[0] += 300
+    assert sec_financials.sec_get(www, 'Stock-app test').ok
+    assert hits == [www, data, www]
