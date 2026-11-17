@@ -563,7 +563,8 @@ def test_stock_table_reconciles_missing_closes_after_auction_and_keeps_strategy_
     feed = {'1815': {'price': 140.5, 'change': 12.5}}
     assert check(now + pd.Timedelta(minutes=12))
     assert not check(now + pd.Timedelta(minutes=13))
-    assert calls == [(('stock-table-closes', day, ('1815',)), 180)] * 2
+    assert calls == [(('stock-table-closes', day, ('1815', '2468')), 180),
+                     (('stock-table-closes', day, ('1815',)), 180)]
     assert ns['stock_close_display_day'](pd.Timestamp('2026-11-12 08:55', tz='Asia/Taipei')) == day
     assert ns['stock_close_display_day'](pd.Timestamp('2026-11-12 09:00', tz='Asia/Taipei')) is None
 
