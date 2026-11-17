@@ -75,9 +75,13 @@ def test_short_index_point_and_protection_use_actual_tmf_trades(tmp_path, direct
     from model_tracking import entry_economics
     ns, state = adapter()
     close = pd.Series([20000 + sign * i * 2 for i in range(30)], dtype=float)
-    ns['get_cached_index_minutes'] = lambda *a: pd.DataFrame({
-        'Open': close, 'Close': close, 'High': close + 25, 'Low': close - 25, 'Volume': 10,
-    })
+    def minute_bars(api, interval, product):
+        assert (interval, product) == ('5min', 'TMF')
+        return pd.DataFrame({
+            'Open': close, 'Close': close, 'High': close + 25, 'Low': close - 25, 'Volume': 10,
+        })
+
+    ns['get_cached_index_minutes'] = minute_bars
     ns['entry_economics'] = entry_economics
     wave = ns['calculate_short_wave_plan'](object(), direction, precise=True)
     assert all(isinstance(wave[key], int) for key in ('entry', 'stop', 'target'))

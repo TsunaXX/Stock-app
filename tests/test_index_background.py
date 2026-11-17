@@ -65,11 +65,11 @@ def harness():
         evaluate_trade_entry_state=lambda plan, price, *a:{'can_enter':True, 'entry_level':20000.,
             'invalidation':19900., 'target':20500., 'price':price},
         resolve_short_wave_direction=lambda *a:('偏多','原方向'), get_cached_short_wave_plan=lambda *a, **kw:None,
-        get_cached_index_minutes=lambda api, interval: pd.DataFrame(),
+        get_cached_index_minutes=lambda api, interval, product: pd.DataFrame(),
         operation_model_spec=lambda source, kind, *a, **kw:{'商品鍵':'TMFJ6|'+kind, '進場許可':a[5]},
         record_operation_models=record)
     data = pd.DataFrame({'Close':[20000.,20100.]}, index=pd.to_datetime(['2026-10-15','2026-10-16']))
-    seed = [('加權','^TWII',data,'快取',{'score':50.}), ('期貨','TWF=F',data,'快取',{'score':50.})]
+    seed = [('加權','^TWII',data,'快取',{'score':50.}), ('微台','TMF=F',data,'快取',{'score':50.})]
     return ns, worker, session, state, seed, price, connected, market, builds, records, subscriptions
 
 
@@ -95,7 +95,7 @@ def test_first_visit_hidden_updates_return_and_repeated_visits_do_not_duplicate(
             assert snapshot['live_price'] == 20200.
             assert worker.jobs['index_plan'] is job
         assert len(builds) == 1 and len(worker.jobs) == 1
-        assert len([scope for scope,codes in subscriptions.items() if codes]) == 1
+        assert [codes for codes in subscriptions.values() if codes] == [{'TMF', 'IX0001'}]
         assert records and session['_index_operation_cursors']['kept']
         assert latest['rows']['plan'] == first['rows']['plan']
     finally:
@@ -296,10 +296,10 @@ def test_shared_contract_ownership_survives_one_session_leaving():
     assert removed == ['TMFJ6']
 
 
-def test_background_daily_overlay_reads_owned_near_contract_without_extra_subscription():
+@pytest.mark.parametrize('code, product', [('TWF=F', 'TXF'), ('TMF=F', 'TMF')])
+def test_background_daily_overlay_reads_owned_near_contract_without_extra_subscription(code, product):
     ns = load_app_symbols('merge_market_temperature_snapshot')
-    contract = SimpleNamespace(code='TXFJ6',reference=20000.)
-    ns['get_near_futures_contract'] = lambda api,product:contract
+    ns['get_near_futures_contract'] = lambda api, requested: SimpleNamespace(code=requested + 'J6', reference=20000.)
     ns['get_futures_trading_date'] = lambda now:pd.Timestamp(now.date())
     ns['fresh_strategy_stream_quote'] = lambda quote:True
     calls = []
@@ -310,9 +310,9 @@ def test_background_daily_overlay_reads_owned_near_contract_without_extra_subscr
     ns['get_stream_quotes'] = quotes
     frame = pd.DataFrame({'Open':[20000.],'High':[20050.],'Low':[19900.],'Close':[20000.],'Volume':[99.]},
                          index=[pd.Timestamp.now(tz='Asia/Taipei').tz_localize(None).normalize()])
-    result = ns['merge_market_temperature_snapshot'](frame,object(),'TWF=F',stream_only=True,subscribe=False)
+    result = ns['merge_market_temperature_snapshot'](frame,object(),code,stream_only=True,subscribe=False)
     assert result['Close'].iloc[-1] == 20100.
-    assert calls == [('TXFJ6',{'snapshot_fallback':False,'subscribe':False})]
+    assert calls == [(product + 'J6',{'snapshot_fallback':False,'subscribe':False})]
 
 
 def test_failed_slow_source_preserves_snapshot_but_keeps_observing_existing_positions():

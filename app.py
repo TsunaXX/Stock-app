@@ -4709,7 +4709,7 @@ def merge_market_temperature_snapshot(df, api, code, stream_only=False, subscrib
         return df
 
     try:
-        is_future = code == "TWF=F"
+        is_future = code in ("TWF=F", "TMF=F")
         now_tw = datetime.now(pytz.timezone('Asia/Taipei'))
         if code == "^TWII":
             # Do not create a synthetic index bar from a stale snapshot before
@@ -4721,8 +4721,11 @@ def merge_market_temperature_snapshot(df, api, code, stream_only=False, subscrib
                 return df
             trading_date = pd.Timestamp(now_tw.date())
         elif is_future:
-            contract = (get_near_futures_contract(api, 'TXF') if not subscribe
-                        else api.Contracts.Futures.TXF.TXFR1)
+            if code == 'TMF=F':
+                contract = get_near_futures_contract(api, 'TMF')
+            else:
+                contract = (get_near_futures_contract(api, 'TXF') if not subscribe
+                            else api.Contracts.Futures.TXF.TXFR1)
             if contract is None:
                 return df
             trading_date = get_futures_trading_date(now_tw)
@@ -5005,8 +5008,8 @@ def calculate_market_temperature(df):
     }
 
 
-def get_cached_index_minutes(api, interval):
-    contract = get_near_futures_contract(api, 'TXF')
+def get_cached_index_minutes(api, interval, product='TXF'):
+    contract = get_near_futures_contract(api, product)
     if contract is None:
         return pd.DataFrame()
     ensure_market_stream_subscription(api, contract)
@@ -5112,7 +5115,7 @@ def render_hourly_index_plan(hourly, live_price, fresh, daily_atr, quantity):
     st.caption(('已觸及觀察價' if hit else '等待觸及觀察價' if fresh else '等待最新串流') + '｜綜合日線費波撐壓、最近完成 60 分 K 高低點及 ATR。')
 
 
-def get_futures_intraday_state(api, direction, logged_in=None):
+def get_futures_intraday_state(api, direction, logged_in=None, product='TXF'):
     """Return 15-minute confirmation, VWAP and active-session opening range."""
     empty_state = {
         'available': False, 'confirmation_text': "尚未取得 15 分 K；進場前請確認價格在費波區止跌／受壓。",
@@ -5123,7 +5126,7 @@ def get_futures_intraday_state(api, direction, logged_in=None):
     if api is None or not (st.session_state.get('sj_logged_in', False) if logged_in is None else logged_in):
         return empty_state
     try:
-        intraday = get_cached_index_minutes(api, '15min')
+        intraday = get_cached_index_minutes(api, '15min', product)
         intraday = intraday.dropna(subset=['Open', 'High', 'Low', 'Close']).sort_index()
         if len(intraday) < 2:
             return {**empty_state, 'confirmation_text': "15 分 K 資料不足，暫不觸發進場。"}
@@ -5181,18 +5184,17 @@ def get_futures_intraday_state(api, direction, logged_in=None):
         return empty_state
 
 
-def get_cached_futures_intraday_state(api, direction, max_age_seconds=8, logged_in=None):
+def get_cached_futures_intraday_state(api, direction, max_age_seconds=8, logged_in=None, product='TXF'):
     """Throttle the slower 15-minute K request; the streamed price remains live."""
     shared, cache_lock = get_shared_market_data_cache()
     cache = shared['intraday']
-    cache_key = (direction, id(api) if api is not None else None)
+    cache_key = (direction, id(api) if api is not None else None, product)
     with cache_lock:
         cached = cache.get(cache_key)
     now = time.monotonic()
     if cached and now - cached['saved_at'] <= max_age_seconds:
         return dict(cached['value'])
-    value = (get_futures_intraday_state(api, direction) if logged_in is None
-             else get_futures_intraday_state(api, direction, logged_in=logged_in))
+    value = get_futures_intraday_state(api, direction, logged_in=logged_in, product=product)
     with cache_lock:
         cache.clear()
         cache[cache_key] = {'saved_at': now, 'value': dict(value)}
@@ -5575,7 +5577,7 @@ def calculate_short_wave_plan(api, direction, precise=False):
     if api is None or direction not in ('偏多', '偏空'):
         return None
     try:
-        data = get_cached_index_minutes(api, '5min')
+        data = get_cached_index_minutes(api, '5min', 'TMF' if precise else 'TXF')
         data = data.dropna(subset=['Open', 'High', 'Low', 'Close']).tail(30)
         if len(data) < 15:
             return None
@@ -8146,6 +8148,8 @@ def render_index_scenario_tracking(plan):
 
 def calculate_operation_snapshot(seed_data, api, entry_profile, state, background=False):
     """Same published calculations, with explicit state and no rendering/session access."""
+    micro_plan = state.get('include_hourly', False)
+    futures_code = 'TMF=F' if micro_plan or any(item[1] == 'TMF=F' for item in seed_data) else 'TWF=F'
     thermometer_data = []
     for label, code, data, source, result in seed_data:
         live_data = merge_market_temperature_snapshot(data, api, code, stream_only=True,
@@ -8155,7 +8159,7 @@ def calculate_operation_snapshot(seed_data, api, entry_profile, state, backgroun
             result = calculate_market_temperature(live_data)
         thermometer_data.append((label, code, live_data, source, result))
     index_item = next((item for item in thermometer_data if item[1] == '^TWII'), None)
-    futures_item = next((item for item in thermometer_data if item[1] == 'TWF=F'), None)
+    futures_item = next((item for item in thermometer_data if item[1] == futures_code), None)
     plan = get_stable_index_trade_plan(
         index_item[2] if index_item else pd.DataFrame(), index_item[4] if index_item else None,
         futures_item[2] if futures_item else pd.DataFrame(), futures_item[4] if futures_item else None, cache=state,
@@ -8168,9 +8172,10 @@ def calculate_operation_snapshot(seed_data, api, entry_profile, state, backgroun
         state['quote'] = live_snapshot
     live_snapshot = state.get('quote')
     live_price = live_snapshot['price'] if live_snapshot else plan['latest']
-    live_change = live_snapshot['change'] if live_snapshot else float((futures_item[4] or {}).get('change', 0))
+    live_change = live_snapshot['change'] if live_snapshot else float((futures_item[4] if futures_item and futures_item[4] else {}).get('change', 0))
     intraday_state = get_cached_futures_intraday_state(
-        api, plan['direction'], max_age_seconds=0, **({'logged_in': True} if background else {}),
+        api, plan['direction'], max_age_seconds=0, product='TMF' if micro_plan else 'TXF',
+        **({'logged_in': True} if background else {}),
     )
     previous_temperature = None
     if futures_item is not None and len(futures_item[2]) > 20:
@@ -8189,10 +8194,14 @@ def calculate_operation_snapshot(seed_data, api, entry_profile, state, backgroun
         plan, trade_state, intraday_state,
     )
     short_wave = get_cached_short_wave_plan(api, short_wave_direction, max_age_seconds=0,
-                                           precise=state.get('include_hourly', False))
+                                           precise=micro_plan)
+    if micro_plan and (not futures_item or futures_item[4] is None or futures_item[2].empty):
+        trade_state = {**trade_state, 'can_enter': False, 'permission': '等待微台日 K',
+                       'reason': '目前為加權參考點位；微台日 K 就緒後才開放日線／15 分 K 進場。',
+                       'color': '#ffc107'}
     if short_wave:
-        if state.get('include_hourly'):
-            # TXF bars set the point; the subscribed TMF trade proves the touch.
+        if micro_plan:
+            # The published point can wait for a future TMF trade between refreshes.
             sign = 1 if short_wave_direction == '偏多' else -1
             short_wave = {**short_wave, 'tracking_ready': fresh,
                           'momentum_ready': fresh and sign * (live_price - short_wave['entry']) >= 0}
@@ -8201,7 +8210,7 @@ def calculate_operation_snapshot(seed_data, api, entry_profile, state, backgroun
     if state.get('include_hourly') and api is not None and time.monotonic() >= state.get('hourly_retry', 0):
         state['hourly_retry'] = time.monotonic() + 30
         try:
-            hourly = calculate_hourly_index_plan(get_cached_index_minutes(api, '60min'), plan)
+            hourly = calculate_hourly_index_plan(get_cached_index_minutes(api, '60min', 'TMF'), plan)
             if hourly is not None:
                 state['hourly'] = hourly
         except (TypeError, ValueError, KeyError, AttributeError):
@@ -8219,7 +8228,7 @@ def index_operation_model_specs(snapshot, quantity, profile, cost_settings=None,
     if not plan:
         return []
     trade, intraday, wave = snapshot['trade_state'], snapshot['intraday_state'], snapshot['short_wave']
-    specs = [operation_model_spec(
+    specs = [] if trade.get('permission') == '等待微台日 K' else [operation_model_spec(
         '指數操作計畫', '日線／15分K', live,
         trade.get('execution_direction') or plan.get('direction'),
         trade['entry_level'], trade['invalidation'], trade['target'], trade['can_enter'], quantity, profile,
@@ -8292,6 +8301,8 @@ def index_operation_snapshot(seed_data, seconds):
     if api is None or not st.session_state.get('sj_logged_in', False):
         return calculate_operation_snapshot(seed_data, None, profile,
             st.session_state.setdefault('_index_operation_state', {}))
+    seed_data = [('微型臺指期貨', 'TMF=F', pd.DataFrame(), '', None) if item[1] == 'TWF=F' else item
+                 for item in seed_data]
     recording = st.session_state.setdefault('_index_model_recording', threading.Event())
     costs, version = (load_model_tracking_costs(), get_operation_model_version('指數操作計畫')) if recording.is_set() else ({}, None)
     tracker = get_model_tracker(get_app_secret('gsheet_api_url') or '') if version else None
@@ -8322,10 +8333,9 @@ def index_operation_snapshot(seed_data, seconds):
         return result
     def update(previous):
         nonlocal seed_data
-        contracts = [get_near_futures_contract(api, product) for product in ('TMF', 'TXF')]
-        contracts.append(get_taiex_contract(api))
+        contracts = [get_near_futures_contract(api, 'TMF'), get_taiex_contract(api)]
         sync_strategy_stream_scope(api, [c for c in contracts if c is not None], scope)
-        refreshed = history_jobs.poll(('index_history', id(api)),
+        refreshed = history_jobs.poll(('index_history', 'TMF', id(api)),
             load_history, interval=30)
         if refreshed:
             seed_data = refreshed
@@ -8484,7 +8494,7 @@ def render_operation_plan(seed_data, option_page=False, seconds=5, snapshot=None
             f"#### ⚡ 短波當沖（5 分 K） <span style='font-size:15px;color:{short_color};font-weight:700'>　{short_recommendation}</span>",
             unsafe_allow_html=True,
         )
-        st.caption('短波沿用已成交的模擬計畫。' if held_short else f"{short_direction_note}。以 EMA5 與前根收盤確認同向動能。")
+        st.caption('短波沿用已成交的模擬計畫。' if held_short else f"{short_direction_note}。以微台 5 分 K 的 EMA5 與前根收盤設定觸發點。")
         if short_wave:
             short_rr_color = '#40c4ff' if (short_wave['rr'] or 0) >= 1.25 else '#ffc107'
             render_index_plan_metric_cards([
@@ -8668,7 +8678,7 @@ def render_operation_plan(seed_data, option_page=False, seconds=5, snapshot=None
             f"#### 🎯 日線費波撐壓 × 15 分 K 確認 <span style='font-size:15px;color:{position_color};font-weight:700'>　{position_recommendation}</span>",
             unsafe_allow_html=True,
         )
-        st.caption("以日線費波支撐／壓力與 15 分 K 確認；保＝達1R後移動保利，保留1R回撤，最低保護成本。")
+        st.caption("以微台日線費波支撐／壓力與微台 15 分 K 確認；保＝達1R後移動保利，保留1R回撤，最低保護成本。")
         st.info(f"**進場確認：** {plan['trigger']}")
         execution_direction = trade_state.get('execution_direction') or plan.get('direction')
         if (main_model and main_model.get('狀態') in ('等待進場', '模擬持倉', '監控中斷', '資料不足')
