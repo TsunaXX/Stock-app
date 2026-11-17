@@ -228,3 +228,38 @@ def test_swing_prediction_label_uses_supported_model_mode():
     rows['_系統方向'] = '多頭'
     records, _ = ns['model_tracking_samples'](rows, True, '隔日／波段', '多', config, 5, object())
     assert len(records) == 1 and records[0]['策略'] == '波段'
+
+
+
+def test_stock_contract_uses_new_shioaji_lookup_before_legacy_catalog():
+    ns = load_app_symbols('get_shioaji_stock_contract', '_is_shioaji_auth_error')
+    contract = SimpleNamespace(code='2330')
+    api = SimpleNamespace(contracts={'2330': contract}, Contracts=SimpleNamespace(Stocks={}))
+    assert ns['get_shioaji_stock_contract'](api, '2330') is contract
+    assert ns['get_shioaji_stock_contract'](api, 'missing') is None
+
+
+
+def test_swing_credit_inputs_use_session_defaults_without_widget_conflict(caplog):
+    import textwrap
+    from streamlit.testing.v1 import AppTest
+
+    source = (Path(__file__).parents[1] / 'app.py').read_text(encoding='utf-8')
+    start = source.index('        def sync_swing_credit_defaults():')
+    end = source.index('        swing_stop_col1,', start)
+    setup = """import streamlit as st
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+tz_tw = ZoneInfo('Asia/Taipei')
+"""
+    app = AppTest.from_string(setup + textwrap.dedent(source[start:end])).run()
+    app.selectbox(key='swing_type').select('融資(多)').run()
+    assert not app.exception
+    assert app.number_input(key='margin_ratio').value == 60.0
+    assert app.number_input(key='annual_rate').value == 6.25
+    app.number_input(key='margin_ratio').set_value(55.0).run()
+    assert app.number_input(key='margin_ratio').value == 55.0
+    app.selectbox(key='swing_type').select('融券(空)').run()
+    assert app.number_input(key='margin_ratio').value == 90.0
+    assert app.number_input(key='short_fee_rate').value == 8.0
+    assert 'was created with a default value' not in caplog.text
