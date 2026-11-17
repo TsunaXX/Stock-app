@@ -8681,10 +8681,14 @@ def render_operation_plan(seed_data, option_page=False, seconds=5, snapshot=None
         st.caption("以微台日線費波支撐／壓力與微台 15 分 K 確認；保＝達1R後移動保利，保留1R回撤，最低保護成本。")
         st.info(f"**進場確認：** {plan['trigger']}")
         execution_direction = trade_state.get('execution_direction') or plan.get('direction')
-        if (main_model and main_model.get('狀態') in ('等待進場', '模擬持倉', '監控中斷', '資料不足')
-                and (main_model.get('模擬進場價') is not None or main_model.get('方向') == execution_direction)):
-            execution_direction = main_model['方向']
-            entry, stop, target = (main_model[key] for key in ('進場價', '停損價', '目標價'))
+        if main_model and main_model.get('狀態') in ('等待進場', '模擬持倉', '監控中斷', '資料不足'):
+            recorded_direction = main_model.get('方向')
+            entry, stop, target = (_safe_number(main_model.get(key)) for key in ('進場價', '停損價', '目標價'))
+        else:
+            recorded_direction = entry = stop = target = None
+        if (None not in (entry, stop, target) and recorded_direction in ('偏多', '偏空')
+                and (main_model.get('模擬進場價') is not None or recorded_direction == execution_direction)):
+            execution_direction = recorded_direction
             risk, reward = abs(entry - stop), abs(target - entry)
             trade_state = {**trade_state, 'entry_level': entry, 'invalidation': stop, 'target': target,
                            'risk_points': risk, 'reward_points': reward, 'rr_ratio': reward / risk if risk else None}
