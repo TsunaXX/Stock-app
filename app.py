@@ -12803,10 +12803,24 @@ def strategy_market_environment_from_inputs(live_snapshot=None, futures_rows=Non
     }
 
 
-def resolve_strategy_market_environment(api=None, futures_rows=None, max_age_seconds=15):
-    """Resolve and briefly cache the shared market environment for both strategy rooms."""
+def resolve_strategy_market_environment(api=None, futures_rows=None, max_age_seconds=15, *, stream_only=False):
+    """Resolve the market bias; the stock timer reads the shared TXF stream on each render."""
+    if stream_only:
+        snapshot = get_live_futures_snapshot(api, 'TXF', stream_only=True) if api is not None else None
+        if snapshot is not None:
+            environment = strategy_market_environment_from_inputs(snapshot)
+            st.session_state['_stock_market_last_live'] = environment
+            st.session_state.strategy_market_environment = environment
+            return environment
+        if previous := st.session_state.get('_stock_market_last_live'):
+            source = previous['source'].removesuffix(' 即時')
+            environment = {**previous, 'source': f'{source} 行情延遲', 'bias': '未確認', 'confirmed': False}
+            st.session_state.strategy_market_environment = environment
+            return environment
+
     now_mono = time.monotonic()
-    cached = st.session_state.get('_strategy_market_environment_live', {})
+    cache_key = '_stock_market_environment_fallback' if stream_only else '_strategy_market_environment_live'
+    cached = st.session_state.get(cache_key, {})
     if (
         isinstance(cached, dict) and cached.get('environment')
         and now_mono - float(cached.get('loaded_at', 0) or 0) < max_age_seconds
@@ -12815,7 +12829,7 @@ def resolve_strategy_market_environment(api=None, futures_rows=None, max_age_sec
         st.session_state.strategy_market_environment = environment
         return environment
 
-    live_snapshot = get_live_futures_snapshot(api, 'TXF') if api is not None else None
+    live_snapshot = get_live_futures_snapshot(api, 'TXF') if api is not None and not stream_only else None
     fallback_rows = futures_rows
     if fallback_rows is None:
         local_state = st.session_state.get('_cached_futures_strategy_state', {})
@@ -12829,9 +12843,9 @@ def resolve_strategy_market_environment(api=None, futures_rows=None, max_age_sec
                 fallback_rows = []
     environment = strategy_market_environment_from_inputs(live_snapshot, fallback_rows)
     previous = st.session_state.get('strategy_market_environment', {})
-    if not environment.get('confirmed') and isinstance(previous, dict) and previous.get('confirmed'):
+    if not stream_only and not environment.get('confirmed') and isinstance(previous, dict) and previous.get('confirmed'):
         environment = dict(previous)
-    st.session_state['_strategy_market_environment_live'] = {
+    st.session_state[cache_key] = {
         'loaded_at': now_mono, 'environment': dict(environment),
     }
     st.session_state.strategy_market_environment = dict(environment)
@@ -26312,14 +26326,18 @@ if tab1.open and stock_strategy_tab.open:
                     market_lists_updated = bool(market_risk_data.get('updated')) and not market_risk_data.get('errors')
                     market_environment = resolve_strategy_market_environment(
                         st.session_state.get('sj_api')
-                        if st.session_state.get('sj_logged_in', False) and not stock_auto_enabled else None,
+                        if st.session_state.get('sj_logged_in', False) else None,
+                        stream_only=True,
                     )
                     market_bias = str(market_environment.get('bias', '盤整'))
                     market_source = str(market_environment.get('source', '臺指期資料不足'))
                     market_change = _safe_number(market_environment.get('change'))
+                    source_time = parse_strategy_data_time(market_environment.get('updated'))
+                    source_label = f'｜來源 {source_time:%m/%d %H:%M:%S}' if source_time is not None else ''
                     render_strategy_market_caption(
                         market_bias, market_source, market_change,
-                        '；只提供順逆勢標示，不改動原選股順位。｜' + intraday_auto_status_text('stock', stock_auto_enabled),
+                        source_label + '；只提供順逆勢標示，不改動原選股順位。｜'
+                        + intraday_auto_status_text('stock', stock_auto_enabled),
                     )
 
                     for i, row in df_display.iterrows():

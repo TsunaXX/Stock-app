@@ -459,6 +459,52 @@ def test_strategy_market_environment_distinguishes_sideways_and_unconfirmed():
     assert align("空頭", fallback["bias"]) == "🟢 同向"
 
 
+def test_stock_market_environment_updates_from_stream_and_labels_old_quotes():
+    symbols = load_app_symbols(
+        "_safe_number", "_stream_datetime", "fresh_strategy_stream_quote",
+        "get_live_futures_snapshot", "strategy_market_environment_from_inputs",
+        "resolve_strategy_market_environment",
+    )
+    now = datetime(2026, 11, 18, 10)
+    quote = SimpleNamespace(close=22000, change_rate=2.05, updated_at=now, source="stream")
+    clock = SimpleNamespace(now=lambda tz: tz.localize(now))
+
+    class State(dict):
+        __setattr__ = dict.__setitem__
+
+    state = State()
+    api = object()
+
+    def quotes(connection, contracts, *, snapshot_fallback):
+        assert connection is api and contracts[0].code == "TXFK6"
+        assert not snapshot_fallback
+        return [quote]
+
+    symbols.update(
+        st=SimpleNamespace(session_state=state), datetime=clock,
+        get_near_futures_contract=lambda connection, product: SimpleNamespace(code=product + "K6"),
+        get_stream_quotes=quotes,
+    )
+    resolve = symbols["resolve_strategy_market_environment"]
+    first = resolve(api, stream_only=True)
+    assert (first["bias"], first["change"], first["source"]) == ("偏多", 2.05, "TXFK6 即時")
+    now += timedelta(seconds=5)
+    quote.change_rate, quote.updated_at = -0.35, now
+    next_quote = resolve(api, stream_only=True)
+    assert (next_quote["bias"], next_quote["change"]) == ("偏空", -0.35)
+    assert next_quote["updated"] == "2026-11-18 10:00:05"
+
+    now += timedelta(seconds=31)
+    delayed = resolve(api, stream_only=True)
+    assert (delayed["bias"], delayed["source"], delayed["confirmed"]) == ("未確認", "TXFK6 行情延遲", False)
+    assert delayed["updated"] == next_quote["updated"]
+    quote.updated_at = now
+    quote.source = "snapshot_seed"
+    assert resolve(api, stream_only=True) == delayed
+    quote.source = "stream"
+    assert resolve(api, stream_only=True)["source"] == "TXFK6 即時"
+
+
 def test_futures_ticks_follow_product_specification():
     symbols = load_app_symbols("_safe_number", "FUTURES_FIXED_TICK_SIZES", "get_futures_tick_size")
     get_tick = symbols["get_futures_tick_size"]
