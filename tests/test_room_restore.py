@@ -159,3 +159,36 @@ fixture_snapshot = {'strategy_mode':'隔日／波段', 'rows': [{'代號':'2330'
             assert app.session_state['stock_independent_raw_results'][0]['代號'] == '2330'
             assert app.radio(key='indep_strategy_mode').value == '隔日／波段'
             assert len(app.dataframe) >= 1
+
+def test_company_cloud_restore_accepts_a_newer_empty_tracking_list_and_preserves_failed_read():
+    symbols = load_app_symbols(
+        'load_company_event_snapshot', 'restore_company_backup', 'empty_company_event_snapshot',
+        'normalize_company_event_snapshot', '_newer_company_event_snapshot', '_cache_payload_timestamp',
+    )
+
+    class State(dict):
+        __setattr__ = dict.__setitem__
+
+    old = {'updated_at': '2026-11-17T11:00:00+08:00', 'tickers': '2330, 6234'}
+    state = State(company_event_snapshot=old, company_data_tickers=old['tickers'],
+                  company_calendar_selection=['2330'])
+    disk = {'company': old}
+    remote = {'updated_at': '2026-11-18T09:00:00+08:00', 'tickers': '', 'calendar_companies': []}
+    result = (None, 'Google Sheet 服務忙碌')
+    symbols.update(st=SimpleNamespace(session_state=state), COMPANY_EVENT_SNAPSHOT_FILE='company',
+                   GOOGLE_SCOPE_COMPANY='company_events', get_app_secret=lambda name: 'https://example.test',
+                   _read_json_cache_file=disk.get, _json_safe=lambda value: value,
+                   _fetch_remote_scope=lambda *a, **kw: result,
+                   _fetch_remote_scope_cached=lambda *a, **kw: result,
+                   _write_json_atomic=lambda name, data, **kw: disk.update({name: data}))
+    symbols['restore_company_backup']()
+    assert state['company_event_snapshot'] == old and disk['company'] == old
+    assert state['_company_restore_error'] and not state['_company_event_cloud_loaded']
+
+    result = (remote, None)
+    assert symbols['load_company_event_snapshot']()['tickers'] == ''
+    symbols['restore_company_backup']()
+    assert state['company_event_snapshot']['tickers'] == ''
+    assert state['company_event_snapshot']['calendar_companies'] == []
+    assert 'company_data_tickers' not in state and 'company_calendar_selection' not in state
+    assert '_company_restore_error' not in state

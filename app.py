@@ -3427,218 +3427,63 @@ def parse_calendar_event_date(value):
         return None
 
 
-def load_company_event_snapshot(
-    force=False
-):
-    """
-    公司營收／財報／重大事件獨立快照。
+def load_company_event_snapshot(force=False):
+    """Restore the company snapshot, including saved selections with no events."""
+    local = normalize_company_event_snapshot(_read_json_cache_file(COMPANY_EVENT_SNAPSHOT_FILE))
+    if not force and st.session_state.get('_company_event_cloud_loaded'):
+        return local
+    url = get_app_secret('gsheet_api_url')
+    if not url:
+        return local
+    fetch = _fetch_remote_scope if force else _fetch_remote_scope_cached
+    remote, error = fetch(url, GOOGLE_SCOPE_COMPANY, timeout=15 if force else 6)
+    st.session_state['_company_event_cloud_loaded'] = error is None
+    if error or not isinstance(remote, dict) or not remote:
+        st.session_state['_company_restore_error'] = error or '雲端尚無公司備份'
+        return local
 
-    不再從股票 strategy scope 取得。
-    """
-    local_snapshot = empty_company_event_snapshot()
-
+    restored = normalize_company_event_snapshot(remote)
+    if not force:
+        restored = _newer_company_event_snapshot(restored, local)
     try:
-        local_snapshot = normalize_company_event_snapshot(
-            _read_json_cache_file(
-                COMPANY_EVENT_SNAPSHOT_FILE
-            )
-        )
-    except Exception:
-        local_snapshot = (
-            empty_company_event_snapshot()
-        )
-
-    if (
-        not force
-        and st.session_state.get(
-            '_company_event_cloud_loaded',
-            False
-        )
-    ):
-        return local_snapshot
-
-    gsheet_api_url = (
-        get_app_secret(
-            'gsheet_api_url'
-        )
-    )
-
-    if not gsheet_api_url:
-        st.session_state[
-            '_company_event_cloud_loaded'
-        ] = True
-
-        return local_snapshot
-
-    remote_payload, remote_error = (
-        (_fetch_remote_scope if force else _fetch_remote_scope_cached)(
-            gsheet_api_url,
-            GOOGLE_SCOPE_COMPANY,
-            timeout=6,
-        )
-    )
-
-    if isinstance(
-        remote_payload,
-        dict
-    ):
-        remote_snapshot = (
-            normalize_company_event_snapshot(
-                remote_payload
-            )
-        )
-
-        local_time = pd.Timestamp(
-            local_snapshot.get(
-                'updated_at',
-                ''
-            )
-        )
-
-        remote_time = pd.Timestamp(
-            remote_snapshot.get(
-                'updated_at',
-                ''
-            )
-        )
-
-        use_remote = False
-
-        try:
-            if (
-                remote_snapshot.get(
-                    'events'
-                )
-                and (
-                    pd.isna(
-                        local_time
-                    )
-                    or (
-                        pd.notna(
-                            remote_time
-                        )
-                        and remote_time
-                        >= local_time
-                    )
-                )
-            ):
-                use_remote = True
-        except (
-            TypeError,
-            ValueError,
-        ):
-            use_remote = bool(
-                remote_snapshot.get(
-                    'events'
-                )
-            )
-
-        if use_remote:
-            local_snapshot = (
-                remote_snapshot
-            )
-
-            try:
-                _write_json_atomic(
-                    COMPANY_EVENT_SNAPSHOT_FILE,
-                    _json_safe(
-                        local_snapshot
-                    ),
-                    indent=2,
-                )
-            except (
-                OSError,
-                TypeError,
-                ValueError,
-            ):
-                pass
-
-    st.session_state[
-        '_company_event_cloud_loaded'
-    ] = True
-
-    return local_snapshot
+        _write_json_atomic(COMPANY_EVENT_SNAPSHOT_FILE, _json_safe(restored), indent=2)
+    except (OSError, TypeError, ValueError):
+        st.session_state['_company_restore_error'] = '公司備份已讀取，伺服器儲存失敗'
+    else:
+        st.session_state.pop('_company_restore_error', None)
+    return restored
 
 
-def save_company_event_snapshot(
-    snapshot
-):
-    """
-    公司事件快照獨立保存。
+def restore_company_backup():
+    restored = load_company_event_snapshot(force=True)
+    if st.session_state.get('_company_restore_error'):
+        return
+    st.session_state.company_event_snapshot = restored
+    st.session_state.pop('_company_auto_pending_save', None)
+    st.session_state.pop('_company_pending_preferences', None)
+    st.session_state.pop('company_data_tickers', None)
+    st.session_state.pop('company_calendar_selection', None)
+    st.session_state['_company_sync_notice'] = '已從 Google Sheet 還原公司資料。'
 
-    本機 + Google Sheet company_events。
-    """
-    normalized = (
-        normalize_company_event_snapshot(
-            snapshot
-        )
-    )
 
+def save_company_event_snapshot(snapshot):
+    """Save locally first and retain failed cloud writes for the existing retry worker."""
+    normalized = normalize_company_event_snapshot(snapshot)
+    if not normalized['updated_at']:
+        normalized['updated_at'] = datetime.now(pytz.timezone('Asia/Taipei')).isoformat()
     try:
-        _write_json_atomic(
-            COMPANY_EVENT_SNAPSHOT_FILE,
-            _json_safe(
-                normalized
-            ),
-            indent=2,
-        )
-    except (
-        OSError,
-        TypeError,
-        ValueError,
-    ):
+        _write_json_atomic(COMPANY_EVENT_SNAPSHOT_FILE, _json_safe(normalized), indent=2)
+    except (OSError, TypeError, ValueError):
         return False
-
-    gsheet_api_url = (
-        get_app_secret(
-            'gsheet_api_url'
-        )
-    )
-
-    if not gsheet_api_url:
-        st.session_state[
-            '_company_event_cloud_loaded'
-        ] = True
-
-        return True
-
-    updated_at = str(
-        normalized.get(
-            'updated_at',
-            ''
-        )
-    ).strip()
-
-    if not updated_at:
-        updated_at = (
-            datetime.now(
-                pytz.timezone(
-                    'Asia/Taipei'
-                )
-            ).isoformat()
-        )
-
-        normalized[
-            'updated_at'
-        ] = updated_at
-
-    with get_data_cache_sync_lock():
-        sync_ok, _ = (
-            _save_remote_scope(
-                gsheet_api_url,
-                GOOGLE_SCOPE_COMPANY,
-                normalized,
-                updated_at=updated_at,
-                timeout=8,
-                verify=True,
-            )
-        )
-
-    st.session_state[
-        '_company_event_cloud_loaded'
-    ] = bool(sync_ok)
-
-    return sync_ok
+    url = get_app_secret('gsheet_api_url')
+    synced = not url or sync_company_background_snapshot(url, normalized, save_preferences=True)
+    if synced:
+        st.session_state.pop('_company_auto_pending_save', None)
+        st.session_state.pop('_company_pending_preferences', None)
+    else:
+        st.session_state['_company_auto_pending_save'] = normalized
+        st.session_state['_company_pending_preferences'] = True
+    return synced
 
 
 COMPANY_SYNC_MAX_TICKERS = 12
@@ -3962,19 +3807,23 @@ def apply_company_background_result(result, symbols):
             st.session_state['_company_auto_pending_save'] = merged
 
 
-def sync_company_background_snapshot(url, snapshot):
+def sync_company_background_snapshot(url, snapshot, *, save_preferences=False):
     """Keep remote calendar selection authoritative and verify the company-scope write."""
     with get_data_cache_sync_lock():
-        remote, error = _fetch_remote_scope(url, GOOGLE_SCOPE_COMPANY, timeout=6)
+        remote, error = _fetch_remote_scope(url, GOOGLE_SCOPE_COMPANY, timeout=15)
         if error:
             return False
         current = normalize_company_event_snapshot(remote) if isinstance(remote, dict) else snapshot
         current_stamp, snapshot_stamp = _cache_payload_timestamp(current), _cache_payload_timestamp(snapshot)
-        if current.get('tickers') != snapshot.get('tickers'):
-            if snapshot_stamp is None or (current_stamp is not None and current_stamp >= snapshot_stamp):
-                return False
+        older = current_stamp is not None and (snapshot_stamp is None or current_stamp > snapshot_stamp)
+        list_changed = current.get('tickers') != snapshot.get('tickers')
+        if older and list_changed:
+            return False
+        if not older and (save_preferences or list_changed):
             current = {**current, 'tickers': snapshot.get('tickers', ''),
-                       'calendar_companies': snapshot.get('calendar_companies', [])}
+                       'calendar_companies': snapshot.get('calendar_companies', []),
+                       'revenue_date_overrides': {**current.get('revenue_date_overrides', {}),
+                                                  **snapshot.get('revenue_date_overrides', {})}}
         merged = merge_company_sections(current, {k: snapshot[k] for k in (
             'earnings', 'taiwan_revenue', 'us_revenue', 'financials', 'disclosures', 'dividends')},
             prefer_existing=current_stamp is not None and (snapshot_stamp is None or current_stamp > snapshot_stamp))
@@ -3982,7 +3831,7 @@ def sync_company_background_snapshot(url, snapshot):
         merged['updated_at'] = current.get('updated_at') if current_stamp is not None and (
             snapshot_stamp is None or current_stamp > snapshot_stamp) else snapshot.get('updated_at')
         return _save_remote_scope(url, GOOGLE_SCOPE_COMPANY, merged,
-                                  updated_at=merged['updated_at'], timeout=8, verify=True)[0]
+                                  updated_at=merged['updated_at'], timeout=15, verify=True)[0]
 
 
 @st.fragment(run_every=60)
@@ -3991,6 +3840,15 @@ def render_company_tracking_status(active):
         return
     snapshot = st.session_state.company_event_snapshot
     symbols = tuple(dict.fromkeys(item.strip().upper() for item in snapshot.get('tickers', '').split(',') if item.strip()))[:COMPANY_SYNC_MAX_TICKERS]
+    pending = st.session_state.get('_company_auto_pending_save')
+    url = get_app_secret('gsheet_api_url')
+    if pending and url:
+        save_preferences = bool(st.session_state.get('_company_pending_preferences'))
+        saved = get_public_maintenance_jobs().poll(('company-save', data_version(pending), save_preferences),
+            lambda: sync_company_background_snapshot(url, pending, save_preferences=save_preferences), interval=60)
+        if saved:
+            st.session_state.pop('_company_auto_pending_save', None)
+            st.session_state.pop('_company_pending_preferences', None)
     if not symbols:
         st.caption('同步查詢後即加入背景追蹤；行事曆仍只加入勾選公司。')
         return
@@ -4004,13 +3862,6 @@ def render_company_tracking_status(active):
             st.session_state.pop('_company_auto_pending_local', None)
         except OSError:
             pass
-    pending = st.session_state.get('_company_auto_pending_save')
-    url = get_app_secret('gsheet_api_url')
-    if pending and url:
-        saved = get_public_maintenance_jobs().poll(('company-save', data_version(pending)),
-            lambda: sync_company_background_snapshot(url, pending), interval=900)
-        if saved:
-            st.session_state.pop('_company_auto_pending_save', None)
     st.caption('背景追蹤：' + (st.session_state.get('_company_auto_status') or '首次資料檢查中，頁面可繼續瀏覽'))
     if previous != st.session_state.company_event_snapshot.get('updated_at'):
         st.rerun()
@@ -14043,7 +13894,8 @@ def _fetch_remote_scope(gsheet_api_url, scope, timeout=8):
         return None, '未指定 Google Sheet scope'
 
     deadline = time.monotonic() + timeout
-    for attempt in range(2):
+    attempts = 3 if scope in ('fibo_strategy', 'company_events') else 2
+    for attempt in range(attempts):
         try:
             response = requests.get(
                 gsheet_api_url, params={'scope': scope, '_ts': time.time_ns()},
@@ -14064,9 +13916,9 @@ def _fetch_remote_scope(gsheet_api_url, scope, timeout=8):
             if payload.get('error_code') != 'busy':
                 break
             error = 'Google Sheet 服務忙碌'
-        if attempt == 1 or deadline - time.monotonic() < 1.25:
+        if attempt + 1 == attempts or deadline - time.monotonic() < 1.25:
             return None, error
-        time.sleep(0.25)
+        time.sleep(0.25 * (attempt + 1))
 
     if payload.get('success') is not True or 'data' not in payload:
         return None, str(payload.get('error') or 'Google Sheet 讀取失敗')
@@ -14116,8 +13968,26 @@ def _save_remote_scope(gsheet_api_url, scope, payload, updated_at=None, timeout=
     except (ValueError, TypeError):
         return False, None
     else:
-        if not isinstance(result, dict) or result.get('success') is not True:
+        if not isinstance(result, dict):
             return False, None
+        if result.get('success') is not True:
+            if scope not in ('fibo_strategy', 'company_events') or result.get('error_code') != 'busy':
+                return False, None
+            time.sleep(0.75)
+            try:
+                response = requests.post(gsheet_api_url, json=request_payload, timeout=timeout)
+                response.raise_for_status()
+                result = response.json()
+            except requests.RequestException as exc:
+                if not sheet_transport_is_retryable(exc):
+                    return False, None
+                if not verify:
+                    return False, None
+                result = {'success': True}
+            except (ValueError, TypeError):
+                return False, None
+            if not isinstance(result, dict) or result.get('success') is not True:
+                return False, None
         if not verify:
             _fetch_remote_scope_cached.clear()
             return True, payload
@@ -14425,7 +14295,7 @@ def save_fibo_config(save_tags=True, sync_cloud=True):
                         },
                     },
                     updated_at=updated_at,
-                    timeout=8,
+                    timeout=15,
                     verify=True,
                 )
             )
@@ -14478,23 +14348,14 @@ def _merge_unique_values(remote_values, local_values):
 
 
 def _newer_company_event_snapshot(remote_snapshot, local_snapshot):
-    """Keep the newest non-empty company snapshot when computer and phone both save."""
-    remote_snapshot = normalize_company_event_snapshot(remote_snapshot)
-    local_snapshot = normalize_company_event_snapshot(local_snapshot)
-    remote_has_events = bool(remote_snapshot.get('events'))
-    local_has_events = bool(local_snapshot.get('events'))
-    if not local_has_events:
-        return remote_snapshot
-    if not remote_has_events:
-        return local_snapshot
-    try:
-        remote_time = pd.Timestamp(remote_snapshot.get('updated_at'))
-        local_time = pd.Timestamp(local_snapshot.get('updated_at'))
-        if pd.notna(remote_time) and pd.notna(local_time):
-            return local_snapshot if local_time >= remote_time else remote_snapshot
-    except (TypeError, ValueError):
-        pass
-    return local_snapshot
+    """Prefer the current company version even when it explicitly has no events."""
+    remote = normalize_company_event_snapshot(remote_snapshot)
+    local = normalize_company_event_snapshot(local_snapshot)
+    remote_time = _cache_payload_timestamp(remote)
+    local_time = _cache_payload_timestamp(local)
+    if remote_time is not None or local_time is not None:
+        return local if local_time is not None and (remote_time is None or local_time >= remote_time) else remote
+    return local if local.get('events') or local.get('tickers') else remote
 
 
 def _cache_payload_timestamp(payload):
@@ -15296,7 +15157,7 @@ def load_fibo_tags_from_cloud(
             payload, error = _fetch_remote_scope(
                 gsheet_api_url,
                 GOOGLE_SCOPE_FIBO,
-                timeout=10,
+                timeout=18,
             )
             if isinstance(payload, dict):
                 tags = _extract_fibo_tags(payload)
@@ -29791,6 +29652,12 @@ with tab_company:
     <div class='company-room-title'>🏢 公司營收與財報</div>
     """, unsafe_allow_html=True)
     st.markdown("<div class='company-room-description'>同步查詢後會自動追蹤公司財報、營收與公開事件。需要顯示在股市行事曆的公司，請於下方另外勾選並儲存。</div>", unsafe_allow_html=True)
+    if get_app_secret('gsheet_api_url'):
+        st.button('☁️ 從 Google Sheet 還原公司資料', key='restore_company_backup', on_click=restore_company_backup)
+        if error := st.session_state.get('_company_restore_error'):
+            st.caption(f'公司資料還原未完成：{error}')
+        if st.session_state.get('_company_auto_pending_save'):
+            st.caption('公司資料已保留本機，正在等待雲端備份重試。')
     render_company_tracking_status(bool(tab_company.open or tab3.open))
 
     st.markdown("<div class='company-step'><span class='company-step-number'>1</span>查詢並同步公司</div>", unsafe_allow_html=True)
