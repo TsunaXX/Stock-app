@@ -1073,3 +1073,20 @@ def test_scoped_sheet_read_retries_busy_and_ambiguous_write_requires_matching_da
     with patch('requests.post', side_effect=error), patch('requests.get', return_value=response({'success':True, 'data':None})):
         assert ns['_save_remote_scope'](url, 'stock_strategy', data) == (False, {})
     assert len(cleared) == 1
+
+def test_company_backup_can_retry_busy_write_before_readback():
+    import requests
+    from test_core_calculations import load_app_symbols
+
+    ns = load_app_symbols('_save_remote_scope', '_remote_scope_payload_matches')
+    payload = {'tickers': '2330', 'calendar_companies': []}
+    ns.update(requests=requests, _json_safe=lambda value: dict(value), GOOGLE_SCOPE_FIBO='fibo_strategy',
+              _fetch_remote_scope=lambda *args, **kwargs: (payload, None),
+              _fetch_remote_scope_cached=SimpleNamespace(clear=lambda: None),
+              time=SimpleNamespace(sleep=lambda seconds: None))
+    busy = SimpleNamespace(raise_for_status=lambda: None, json=lambda: {'success': False, 'error_code': 'busy'})
+    accepted = SimpleNamespace(raise_for_status=lambda: None, json=lambda: {'success': True})
+    with patch('requests.post', side_effect=[busy, accepted]) as post:
+        assert ns['_save_remote_scope']('https://example.test', 'company_events', payload) == (True, payload)
+    assert post.call_count == 2
+    assert post.call_args_list[0].kwargs['json'] == post.call_args_list[1].kwargs['json']
