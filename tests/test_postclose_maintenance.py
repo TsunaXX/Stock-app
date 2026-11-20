@@ -653,7 +653,7 @@ def test_shioaji_auctions_display_before_official_without_recording_trial_trades
 
     def push(price, when, **kwargs):
         ns['_stream_payload'](api, SimpleNamespace(code='2330', close=price, price_chg=price-100,
-                                                  datetime=datetime.fromisoformat(when), volume=3, **kwargs), 'STK')
+                                                  datetime=datetime.fromisoformat(when), volume=3, total_volume=320, **kwargs), 'STK')
 
     push(101, '2026-11-12T08:54:59', simtrade=True)
     assert not state['quotes'] and not state['model_tick_buffers']['2330']
@@ -669,6 +669,7 @@ def test_shioaji_auctions_display_before_official_without_recording_trial_trades
     assert render(rows, 'stock').iloc[0]['收盤價'] == '102'
     assert '待官方核對' in shown[-1]
     assert len(state['model_tick_buffers']['2330']) == 1
+    assert state['model_tick_buffers']['2330'][0]['股票成交量'] == (3, 320)
 
     now = pd.Timestamp('2026-11-12 13:45:00', tz='Asia/Taipei')
     official = {'2330': {'price': 102.5, 'change': 2.5}}

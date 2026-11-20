@@ -51,6 +51,24 @@ def test_verified_fills_costs_loss_first_and_ambiguity():
     assert not_entered['狀態'] == '等待進場'
 
 
+@pytest.mark.parametrize(('volume', 'sequence', 'stream', 'gap'), [
+    ((2, 102), 2, 'api:0:1', False),
+    ((2, 105), 2, 'api:0:1', True),
+    (None, 2, 'api:0:1', True),
+    ((2, 102), 4, 'api:0:1', True),
+    ((2, 102), 1, 'api:1:1', True),
+])
+def test_stock_gap_uses_broker_volume_and_keeps_missing_sequences(volume, sequence, stream, gap):
+    trade = advance(new_trade(signal()), quote(100, 序號=1, 串流識別='api:0:1', 股票成交量=(1, 100)))
+    result = advance(trade, quote(111, 40, 序號=sequence, 串流識別=stream, 股票成交量=volume))
+    assert result['狀態'] == '已平倉' and result['資料缺口'] is gap
+    if sequence == 2 and gap:
+        evidence = next(e['缺漏證據'] for e in result['事件'] if e['狀態'] == '監控中斷')
+        assert evidence['間隔秒數'] == 40 and evidence['前次序號'] == 1 and evidence['目前序號'] == 2
+        if volume:
+            assert evidence['累計量差額'] == 3
+
+
 def test_short_futures_gaps_invalid_data_and_same_timestamp_ticks():
     base = signal(市場='期貨', 商品鍵='TX:202610', 方向='偏空', 進場價=100, 停損價=105, 目標價=90,
                   跳動點=1, 乘數=200, 期交稅率=.00002)

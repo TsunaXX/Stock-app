@@ -288,8 +288,11 @@ def _stream_payload(api, payload, security_type):
             sequence = state.setdefault('model_tick_sequences', {}).get(code, 0) + 1
             state['model_tick_sequences'][code] = sequence
             identity = f"{id(api)}:{state.get('model_stream_epoch', 0)}:{state.get('model_buffer_epochs', {}).get(code, 0)}"
-            buffer.append({'價格': close, '來源時間': pytz.timezone('Asia/Taipei').localize(updated_at).isoformat(),
-                           '序號': sequence, '串流識別': identity, '有效': True})
+            tick = {'價格': close, '來源時間': pytz.timezone('Asia/Taipei').localize(updated_at).isoformat(),
+                    '序號': sequence, '串流識別': identity, '有效': True}
+            if security_type == 'STK' and 'volume' in values and 'total_volume' in values:
+                tick['股票成交量'] = (values['volume'], values['total_volume'])
+            buffer.append(tick)
             auction = state.get('stock_auction_closes', {}).get(code) if security_type == 'STK' else None
             if auction and auction['time'] == updated_at and auction['price'] == close:
                 auction.update(sequence=sequence, stream=identity)
@@ -3835,7 +3838,7 @@ def sync_company_background_snapshot(url, snapshot, *, save_preferences=False):
 
 
 @st.fragment(run_every=60)
-def render_company_tracking_status(active):
+def render_company_tracking_status(active, show_status=True):
     if not active:
         return
     snapshot = st.session_state.company_event_snapshot
@@ -3849,21 +3852,27 @@ def render_company_tracking_status(active):
         if saved:
             st.session_state.pop('_company_auto_pending_save', None)
             st.session_state.pop('_company_pending_preferences', None)
-    if not symbols:
-        st.caption('同步查詢後即加入背景追蹤；行事曆仍只加入勾選公司。')
-        return
-    result = get_public_maintenance_jobs().poll(('company', symbols),
-        lambda: fetch_tracked_company_updates(symbols), interval=600)
-    previous = snapshot.get('updated_at')
-    apply_company_background_result(result, symbols)
-    if st.session_state.get('_company_auto_pending_local'):
-        try:
-            _write_json_atomic(COMPANY_EVENT_SNAPSHOT_FILE, _json_safe(st.session_state.company_event_snapshot), indent=2)
-            st.session_state.pop('_company_auto_pending_local', None)
-        except OSError:
-            pass
-    st.caption('背景追蹤：' + (st.session_state.get('_company_auto_status') or '首次資料檢查中，頁面可繼續瀏覽'))
-    if previous != st.session_state.company_event_snapshot.get('updated_at'):
+    if symbols:
+        result = get_public_maintenance_jobs().poll(('company', symbols),
+            lambda: fetch_tracked_company_updates(symbols), interval=600)
+        apply_company_background_result(result, symbols)
+        if st.session_state.get('_company_auto_pending_local'):
+            try:
+                _write_json_atomic(COMPANY_EVENT_SNAPSHOT_FILE, _json_safe(st.session_state.company_event_snapshot), indent=2)
+                st.session_state.pop('_company_auto_pending_local', None)
+            except OSError:
+                pass
+    if show_status:
+        status = []
+        error = st.session_state.get('_company_restore_error') if url else None
+        if error:
+            status.append('還原逾時' if error in ('ReadTimeout', 'ConnectTimeout') else f'還原未完成（{error}）')
+        if url and st.session_state.get('_company_auto_pending_save'):
+            status.append('備份待重試（本機已保留）')
+        tracking = (st.session_state.get('_company_auto_status') or '正在檢查') if symbols else '尚未設定'
+        status.append(f'追蹤 {tracking}')
+        st.caption('｜'.join(status))
+    if snapshot.get('updated_at') != st.session_state.company_event_snapshot.get('updated_at'):
         st.rerun()
 
 
@@ -22073,6 +22082,7 @@ def held_model_quotes(positions, state, api, stock, day, now, cursors):
         if stock:
             quote = {**last, '成交證據': list(reversed(observed)), '交易日': day, '更新秒數': 5,
                      '休市銜接': bool(after and after['time'][:10] != day)}
+            quote.pop('股票成交量', None)
         else:
             spec = {**row, '新訊號': False, '進場許可': False}
             _, sampled = operation_model_samples([spec], api, 5, now_value=now, after=cursors)
@@ -29652,13 +29662,10 @@ with tab_company:
     <div class='company-room-title'>🏢 公司營收與財報</div>
     """, unsafe_allow_html=True)
     st.markdown("<div class='company-room-description'>同步查詢後會自動追蹤公司財報、營收與公開事件。需要顯示在股市行事曆的公司，請於下方另外勾選並儲存。</div>", unsafe_allow_html=True)
-    if get_app_secret('gsheet_api_url'):
-        st.button('☁️ 從 Google Sheet 還原公司資料', key='restore_company_backup', on_click=restore_company_backup)
-        if error := st.session_state.get('_company_restore_error'):
-            st.caption(f'公司資料還原未完成：{error}')
-        if st.session_state.get('_company_auto_pending_save'):
-            st.caption('公司資料已保留本機，正在等待雲端備份重試。')
-    render_company_tracking_status(bool(tab_company.open or tab3.open))
+    with st.container(horizontal=True, vertical_alignment='center'):
+        if get_app_secret('gsheet_api_url'):
+            st.button('☁️ 從 Google Sheet 還原公司資料', key='restore_company_backup', on_click=restore_company_backup)
+        render_company_tracking_status(bool(tab_company.open or tab3.open), bool(tab_company.open))
 
     st.markdown("<div class='company-step'><span class='company-step-number'>1</span>查詢並同步公司</div>", unsafe_allow_html=True)
 

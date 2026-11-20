@@ -590,6 +590,7 @@ def advance(record, quote):
             # A received late tick advances evidence delivery, never the trade's market time or fills.
             row['最後序號'] = seq
             row.setdefault('串流序號', {})[stream] = seq
+            row.pop('前次累計成交量', None)
             created = stamp(row.get('建立時間'))
             if created is not None and ts >= created:
                 row['資料缺口'] = True
@@ -632,15 +633,35 @@ def advance(record, quote):
         if stream:
             row.setdefault('串流序號', {})[stream] = seq
     if not quote.get('有效', False) or price is None or price <= 0:
+        row.pop('前次累計成交量', None)
         if row['狀態'] != '資料不足':
             row['資料缺口'] = True
             event(row, '資料不足', text, '行情過期、來源失效或成交證據不足')
         return row
     gap_limit = max(30, float(quote.get('更新秒數', 5)) * 3)
-    rest_bridge = row.get('策略') == '波段' and quote.get('休市銜接') and stream == old_stream and seq is not None and old_seq is not None and seq == old_seq + 1
-    if prior is not None and (ts - prior).total_seconds() > gap_limit and not rest_bridge:
+    sequential = bool(stream and stream == old_stream and seq is not None and old_seq is not None and seq == old_seq + 1)
+    rest_bridge = row.get('策略') == '波段' and quote.get('休市銜接') and sequential
+    elapsed = (ts - prior).total_seconds() if prior is not None else 0
+    volume_delta = None
+    if row.get('市場') == '股票':
+        previous_total = number(row.pop('前次累計成交量', None))
+        volumes = quote.get('股票成交量')
+        if isinstance(volumes, (list, tuple)) and len(volumes) == 2:
+            tick_volume, current_total = map(number, volumes)
+            if tick_volume is not None and current_total is not None and 0 <= tick_volume <= current_total and current_total > 0:
+                row['前次累計成交量'] = current_total
+                if sequential and previous_total is not None and prior is not None and prior.date() == ts.date():
+                    volume_delta = current_total - previous_total - tick_volume
+    if (volume_delta is not None and volume_delta > 0) or (elapsed > gap_limit and not rest_bridge and volume_delta != 0):
         row['資料缺口'] = True
-        event(row, '監控中斷', text, '兩次可驗證行情之間有缺口；不回填當時進出場')
+        reason = ('券商累計成交量不連續；未確認區間不回填' if volume_delta is not None and volume_delta > 0
+                  else '兩次可驗證行情之間有缺口；不回填當時進出場')
+        evidence = {'前次來源時間': prior.isoformat(), '目前來源時間': text, '間隔秒數': round(elapsed, 3),
+                    '串流識別': stream, '前次序號': old_seq, '目前序號': seq}
+        if volume_delta is not None:
+            evidence.update(前次累計成交量=previous_total, 目前累計成交量=current_total,
+                            單筆成交量=tick_volume, 累計量差額=volume_delta)
+        event(row, '監控中斷', text, reason, evidence)
     if row['狀態'] in ('監控中斷', '資料不足'):
         event(row, '模擬持倉' if row.get('模擬進場價') is not None else '等待進場', text,
               '恢復追蹤；缺口仍保留並排除有效績效' if row.get('資料缺口') else '串流成交證據已就緒')
