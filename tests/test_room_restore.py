@@ -190,5 +190,5 @@ def test_company_cloud_restore_accepts_a_newer_empty_tracking_list_and_preserves
     symbols['restore_company_backup']()
     assert state['company_event_snapshot']['tickers'] == ''
     assert state['company_event_snapshot']['calendar_companies'] == []
-    assert 'company_data_tickers' not in state and 'company_calendar_selection' not in state
+    assert state['company_data_tickers'] == '' and 'company_calendar_selection' not in state
     assert '_company_restore_error' not in state

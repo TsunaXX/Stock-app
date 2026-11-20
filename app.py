@@ -3464,7 +3464,7 @@ def restore_company_backup():
     st.session_state.company_event_snapshot = restored
     st.session_state.pop('_company_auto_pending_save', None)
     st.session_state.pop('_company_pending_preferences', None)
-    st.session_state.pop('company_data_tickers', None)
+    st.session_state['company_data_tickers'] = restored['tickers']
     st.session_state.pop('company_calendar_selection', None)
     st.session_state['_company_sync_notice'] = '已從 Google Sheet 還原公司資料。'
 
@@ -29669,9 +29669,9 @@ with tab_company:
 
     st.markdown("<div class='company-step'><span class='company-step-number'>1</span>查詢並同步公司</div>", unsafe_allow_html=True)
 
+    st.session_state.setdefault('company_data_tickers', st.session_state.company_event_snapshot['tickers'])
     company_ticker_input = st.text_input(
         "追蹤公司或代碼（用逗號分隔，例如 2408, 台積電, META, Google, Tesla）",
-        value=st.session_state.company_event_snapshot.get("tickers", st.session_state.calendar_preferences.get("tickers", "2330.TW")),
         key="company_data_tickers",
         on_change=save_company_tracking_input,
     )
