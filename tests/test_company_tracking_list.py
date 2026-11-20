@@ -157,3 +157,33 @@ def save_company_event_snapshot(snapshot):
     app.radio(key='company_order_market').set_value('全部').run()
     assert not app.exception
     assert app.selectbox(key='company_order_item').options == ['2408', 'MU', '2330', 'META']
+
+def test_company_toolbar_combines_restore_backup_and_tracking_status():
+    from streamlit.testing.v1 import AppTest
+
+    source = (Path(__file__).parents[1] / 'app.py').read_text(encoding='utf-8')
+    start = source.index('@st.fragment(run_every=60)\ndef render_company_tracking_status')
+    end = source.index('\n\n@st.cache_data', start)
+    toolbar_start = source.index("    with st.container(horizontal=True, vertical_alignment='center'):", source.index('with tab_company:'))
+    toolbar_end = source.index('    st.markdown(', toolbar_start)
+    fixture = """
+import streamlit as st
+from types import SimpleNamespace
+COMPANY_SYNC_MAX_TICKERS = 12
+tab_company = SimpleNamespace(open=True)
+tab3 = SimpleNamespace(open=False)
+get_app_secret = lambda name: 'configured'
+restore_company_backup = lambda: None
+get_public_maintenance_jobs = lambda: SimpleNamespace(poll=lambda *a, **kw:None)
+apply_company_background_result = lambda *a: None
+data_version = lambda data: 'test'
+st.session_state.company_event_snapshot = {'tickers':'6148'}
+st.session_state._company_restore_error = 'ReadTimeout'
+st.session_state._company_auto_pending_save = {'tickers':'6148'}
+st.session_state._company_auto_status = '2026/11/20 18:28:39｜檢查完成'
+"""
+    app = AppTest.from_string(fixture + source[start:end] + '\n' + dedent(source[toolbar_start:toolbar_end])).run()
+    assert not app.exception
+    assert len(app.caption) == 1
+    assert app.button(key='restore_company_backup')
+    assert app.caption[0].value == '還原逾時｜備份待重試（本機已保留）｜追蹤 2026/11/20 18:28:39｜檢查完成'
