@@ -49,9 +49,9 @@ def test_company_calendar_excludes_equipment_and_building_even_when_selected():
 def test_actual_input_and_order_controls_persist_removal_and_empty_list():
     from streamlit.testing.v1 import AppTest
     source = Path('app.py').read_text(encoding='utf8')
-    names = {'company_calendar_key','company_display_snapshot','save_company_tracking_input','move_company_tracking_input','company_order_market_items'}
+    names = {'company_calendar_key','company_display_snapshot','save_company_tracking_input','move_company_tracking_input','company_order_market_items','restore_company_backup'}
     functions = '\n'.join(ast.unparse(n) for n in ast.parse(source).body if isinstance(n, ast.FunctionDef) and n.name in names)
-    controls = dedent(source[source.index('    company_ticker_input = st.text_input('):source.index('    sync_col, status_col = st.columns(')])
+    controls = dedent(source[source.index("    st.session_state.setdefault('company_data_tickers',"):source.index('    sync_col, status_col = st.columns(')])
     _, snapshot = fixtures()
     snapshot['tickers'] = '2330, 2408, 1815'
     setup = '''import streamlit as st
@@ -65,7 +65,11 @@ def save_company_event_snapshot(snapshot):
     st.session_state.saved_snapshots.append(snapshot)
     return True
 '''
-    script = setup + '\nst.session_state.setdefault("company_event_snapshot", ' + repr(snapshot) + ')\n' + functions + '\n' + controls
+    restore_controls = (
+        '\nload_company_event_snapshot = lambda force=False: ' + repr(snapshot) +
+        "\nst.button('還原', key='test_cloud_restore', on_click=restore_company_backup)\n"
+    )
+    script = setup + '\nst.session_state.setdefault("company_event_snapshot", ' + repr(snapshot) + ')\n' + functions + restore_controls + controls
     app = AppTest.from_string(script).run()
     app.selectbox(key='company_order_item').select('2408').run()
     app.button(key='company_order_up').click().run()
@@ -79,6 +83,13 @@ def save_company_event_snapshot(snapshot):
     assert not app.exception and app.session_state.saved_snapshots[-1]['tickers'] == ''
     app.run()
     assert app.text_input(key='company_data_tickers').value == ''
+    saves = len(app.session_state.saved_snapshots)
+    app.button(key='test_cloud_restore').click().run()
+    app.run()
+    assert not app.exception
+    assert app.text_input(key='company_data_tickers').value == snapshot['tickers']
+    assert app.session_state.company_event_snapshot['calendar_companies'] == snapshot['calendar_companies']
+    assert len(app.session_state.saved_snapshots) == saves
 
 
 def test_failed_selection_save_retries_without_restoring_removed_company():
@@ -120,7 +131,7 @@ def test_order_buttons_swap_only_same_market_and_preserve_other_positions():
              'move_company_tracking_input', 'company_order_market_items'}
     functions = '\n'.join(ast.unparse(n) for n in ast.parse(source).body
                           if isinstance(n, ast.FunctionDef) and n.name in names)
-    controls = dedent(source[source.index('    company_ticker_input = st.text_input('):
+    controls = dedent(source[source.index("    st.session_state.setdefault('company_data_tickers',"):
                              source.index('    sync_col, status_col = st.columns(')])
     _, snapshot = fixtures()
     snapshot['tickers'] = '2330, META, 2408, MU'
