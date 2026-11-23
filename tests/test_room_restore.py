@@ -206,7 +206,8 @@ def test_company_cloud_restore_accepts_explicit_empty_and_preserves_newer_local(
     assert restore({'tickers': '', 'updated_at': '2026/11/16 08:00:00'}) == '已保留較新的本機公司資料'
     assert disk['company'] == old and state['company_event_snapshot'] == old
     assert restore({'tickers': '', 'calendar_companies': [], 'updated_at': '2026-11-18T01:00:00Z'}).startswith('已從')
-    assert disk['company']['tickers'] == state['company_data_tickers'] == ''
+    assert disk['company']['tickers'] == ''
+    assert state['_company_tracking_input_generation'] == 1
     assert 'company_calendar_selection' not in state
     assert ns['_model_time_text'](disk['company']['updated_at']) == '2026/11/18 09:00:00'
 

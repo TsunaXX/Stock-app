@@ -3365,9 +3365,19 @@ def company_display_snapshot(snapshot):
     return displayed
 
 
-def save_company_tracking_input():
-    snapshot = {**st.session_state.company_event_snapshot,
-                'tickers': st.session_state.company_data_tickers,
+def company_tracking_input_key():
+    generation = st.session_state.get('_company_tracking_input_generation', 0)
+    return f'company_data_tickers_{generation}' if generation else 'company_data_tickers'
+
+
+def save_company_tracking_input(key):
+    if key != company_tracking_input_key():
+        return
+    current = st.session_state.company_event_snapshot
+    tickers = st.session_state[key]
+    if tickers == current.get('tickers'):
+        return
+    snapshot = {**current, 'tickers': tickers,
                 'updated_at': datetime.now(pytz.timezone('Asia/Taipei')).isoformat()}
     visible = {company_calendar_key(e) for e in company_display_snapshot(snapshot)['events']}
     snapshot['calendar_companies'] = [key for key in snapshot.get('calendar_companies', []) if key in visible]
@@ -3395,7 +3405,8 @@ def company_order_market_items(items, market='全部'):
 
 
 def move_company_tracking_input(offset):
-    items = list(dict.fromkeys(item.strip() for item in st.session_state.company_data_tickers.split(',') if item.strip()))
+    key = company_tracking_input_key()
+    items = list(dict.fromkeys(item.strip() for item in st.session_state[key].split(',') if item.strip()))
     market_items = company_order_market_items(items, st.session_state.get('company_order_market', '全部'))
     selected = st.session_state.get('company_order_item')
     if selected not in market_items:
@@ -3405,8 +3416,8 @@ def move_company_tracking_input(offset):
     if 0 <= market_index < len(market_items):
         destination = items.index(market_items[market_index])
         items[index], items[destination] = items[destination], items[index]
-        st.session_state.company_data_tickers = ', '.join(items)
-        save_company_tracking_input()
+        st.session_state[key] = ', '.join(items)
+        save_company_tracking_input(key)
 
 
 def parse_calendar_event_date(value):
@@ -3449,7 +3460,8 @@ def restore_company_backup(remote):
         except OSError:
             status = '已讀取公司備份，伺服器儲存失敗'
     st.session_state.company_event_snapshot = restored
-    st.session_state['company_data_tickers'] = restored['tickers']
+    # Discard delayed events from the input that existed before the restore.
+    st.session_state['_company_tracking_input_generation'] = st.session_state.get('_company_tracking_input_generation', 0) + 1
     st.session_state.pop('company_calendar_selection', None)
     return status
 
@@ -29522,11 +29534,13 @@ with tab_company:
 
     st.markdown("<div class='company-step'><span class='company-step-number'>1</span>查詢並同步公司</div>", unsafe_allow_html=True)
 
-    st.session_state.setdefault('company_data_tickers', st.session_state.company_event_snapshot['tickers'])
+    company_input_key = company_tracking_input_key()
+    st.session_state.setdefault(company_input_key, st.session_state.company_event_snapshot['tickers'])
     company_ticker_input = st.text_input(
         "追蹤公司或代碼（用逗號分隔，例如 2408, 台積電, META, Google, Tesla）",
-        key="company_data_tickers",
+        key=company_input_key,
         on_change=save_company_tracking_input,
+        args=(company_input_key,),
     )
     preview_inputs = [item.strip() for item in company_ticker_input.split(",") if item.strip()]
     if preview_inputs:
