@@ -160,11 +160,36 @@ fixture_snapshot = {'strategy_mode':'隔日／波段', 'rows': [{'代號':'2330'
             assert app.radio(key='indep_strategy_mode').value == '隔日／波段'
             assert len(app.dataframe) >= 1
 
-def test_company_cloud_restore_accepts_a_newer_empty_tracking_list_and_preserves_failed_read():
-    symbols = load_app_symbols(
-        'load_company_event_snapshot', 'restore_company_backup', 'empty_company_event_snapshot',
-        'normalize_company_event_snapshot', '_newer_company_event_snapshot', '_cache_payload_timestamp',
-    )
+@pytest.mark.parametrize('scope', ['company_events', 'fibo_strategy'])
+def test_restore_retries_timeout_and_manual_request_waits_for_new_read(scope):
+    ns = load_app_symbols('request_room_sheet_restore', 'poll_room_sheet_restore',
+                          'room_sheet_restore_pending', 'apply_room_sheet_restore')
+    state = {}
+    result = (1, (None, 'ReadTimeout'))
+    reruns = []
+    ns.update(st=SimpleNamespace(session_state=state, rerun=lambda: reruns.append(True)),
+              time=SimpleNamespace(monotonic=lambda: 10),
+              get_public_maintenance_jobs=lambda: SimpleNamespace(poll=lambda *a, **kw: result))
+    observe = ns['poll_room_sheet_restore']
+    assert '連線逾時' in observe('sheet', scope)
+    assert ns['room_sheet_restore_pending'](scope) and not reruns
+
+    ns['request_room_sheet_restore'](scope)
+    result = (9, ({'stale': True}, None))
+    assert '正在' in observe('sheet', scope) and not reruns
+    result = (11, ({'fresh': True}, None))
+    assert observe('sheet', scope) == '' and reruns == [True]
+    applied = []
+    ns['apply_room_sheet_restore'](scope, lambda payload: applied.append(payload) or '已還原')
+    ns['apply_room_sheet_restore'](scope, lambda payload: applied.append(payload))
+    assert applied == [{'fresh': True}] and observe('sheet', scope) == '已還原'
+    assert not ns['room_sheet_restore_pending'](scope)
+
+
+def test_company_cloud_restore_accepts_explicit_empty_and_preserves_newer_local():
+    ns = load_app_symbols('load_company_event_snapshot', 'restore_company_backup',
+                          'empty_company_event_snapshot', 'normalize_company_event_snapshot',
+                          '_newer_company_event_snapshot', '_cache_payload_timestamp', '_model_time_text')
 
     class State(dict):
         __setattr__ = dict.__setitem__
@@ -173,22 +198,58 @@ def test_company_cloud_restore_accepts_a_newer_empty_tracking_list_and_preserves
     state = State(company_event_snapshot=old, company_data_tickers=old['tickers'],
                   company_calendar_selection=['2330'])
     disk = {'company': old}
-    remote = {'updated_at': '2026-11-18T09:00:00+08:00', 'tickers': '', 'calendar_companies': []}
-    result = (None, 'Google Sheet 服務忙碌')
-    symbols.update(st=SimpleNamespace(session_state=state), COMPANY_EVENT_SNAPSHOT_FILE='company',
-                   GOOGLE_SCOPE_COMPANY='company_events', get_app_secret=lambda name: 'https://example.test',
-                   _read_json_cache_file=disk.get, _json_safe=lambda value: value,
-                   _fetch_remote_scope=lambda *a, **kw: result,
-                   _fetch_remote_scope_cached=lambda *a, **kw: result,
-                   _write_json_atomic=lambda name, data, **kw: disk.update({name: data}))
-    symbols['restore_company_backup']()
-    assert state['company_event_snapshot'] == old and disk['company'] == old
-    assert state['_company_restore_error'] and not state['_company_event_cloud_loaded']
+    ns.update(st=SimpleNamespace(session_state=state), COMPANY_EVENT_SNAPSHOT_FILE='company',
+              _RUNTIME_FILE_LOCK=threading.RLock(), _read_json_cache_file=disk.get, _json_safe=lambda value: value,
+              _write_json_atomic=lambda name, data, **kw: disk.update({name: data}))
+    restore = ns['restore_company_backup']
+    assert restore({}) == '雲端尚無可用的公司備份'
+    assert restore({'tickers': '', 'updated_at': '2026/11/16 08:00:00'}) == '已保留較新的本機公司資料'
+    assert disk['company'] == old and state['company_event_snapshot'] == old
+    assert restore({'tickers': '', 'calendar_companies': [], 'updated_at': '2026-11-18T01:00:00Z'}).startswith('已從')
+    assert disk['company']['tickers'] == state['company_data_tickers'] == ''
+    assert 'company_calendar_selection' not in state
+    assert ns['_model_time_text'](disk['company']['updated_at']) == '2026/11/18 09:00:00'
 
-    result = (remote, None)
-    assert symbols['load_company_event_snapshot']()['tickers'] == ''
-    symbols['restore_company_backup']()
-    assert state['company_event_snapshot']['tickers'] == ''
-    assert state['company_event_snapshot']['calendar_companies'] == []
-    assert state['company_data_tickers'] == '' and 'company_calendar_selection' not in state
-    assert '_company_restore_error' not in state
+
+def test_fibo_uses_newer_backup_and_keeps_edits_made_before_response():
+    ns = load_app_symbols('reload_fibo_tags_from_cloud', '_extract_fibo_tags',
+                          '_valid_fibo_tags', '_fibo_tag_timestamp')
+    cloud = {'fibo_tags': ['2330'] * 5, 'fibo_tags_updated_at': '2026-11-23T01:30:00Z'}
+    local = {'tags': ['6148'] * 5, 'updated_at': '2026/11/23 09:30:01'}
+    disk = {'fibo': local}
+    state = {'fibo_tags': local['tags'], 'custom_tag_1': local['tags'][0]}
+    ns.update(st=SimpleNamespace(session_state=state), FIBO_TAG_CACHE_FILE='fibo',
+              CONFIG_FILE='config', _RUNTIME_FILE_LOCK=threading.RLock(), _read_json_cache_file=disk.get,
+              load_config=lambda: {}, normalize_fibo_quick_tag=str,
+              _write_json_atomic=lambda name, data, **kw: disk.update({name: data}))
+    restore = ns['reload_fibo_tags_from_cloud']
+    assert restore(cloud) == '已保留較新的本機快速標籤'
+    assert state['custom_tag_1'] == '6148'
+    cloud['fibo_tags_updated_at'] = '2026-11-23T01:30:02Z'
+    assert restore(cloud).startswith('已從')
+    assert disk['fibo']['tags'] == state['fibo_tags'] == ['2330'] * 5
+    assert state['custom_tag_1'] == '2330' and state['_fibo_tags_source'] == 'google_sheet'
+
+def test_room_scope_read_timeout_keeps_budget_for_second_attempt():
+    import requests
+    ns = load_app_symbols('_fetch_remote_scope')
+    elapsed = 0
+    deadlines = []
+
+    def wait(seconds):
+        nonlocal elapsed
+        elapsed += seconds
+
+    def get(url, *, params, headers, timeout):
+        deadlines.append(timeout)
+        if len(deadlines) == 1:
+            wait(timeout)
+            raise requests.ReadTimeout()
+        return SimpleNamespace(raise_for_status=lambda: None,
+                               json=lambda: {'success': True, 'data': {'tickers': '2330'}})
+
+    ns.update(requests=SimpleNamespace(get=get, RequestException=requests.RequestException),
+              time=SimpleNamespace(monotonic=lambda: elapsed, time_ns=lambda: 0, sleep=wait))
+    assert ns['_fetch_remote_scope']('https://example.invalid', 'company_events', timeout=42) == (
+        {'tickers': '2330'}, None)
+    assert deadlines == [14, 14]

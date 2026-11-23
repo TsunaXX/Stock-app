@@ -170,7 +170,7 @@
 - 上市／上櫃注意與處置的最後成功名單隨 `stock_strategy` 保存，手機重連或服務重啟時先顯示已查核快照；手動更新失敗不得用空名單覆蓋。
 - 各資料區塊用自己的 `updated_at` 比較版本。股票較新不代表費波標籤或期貨快照也較新。
 - 費波標籤只有五組有效值才可取代既有資料；保存時同時寫入 `fibo_tags_backup`。沒有更新時間的部署預設值不可覆寫雲端值。
-- 費波一般啟動採裝置本機標籤優先，避免手機與電腦自動互蓋；使用者按「從 Google Sheet 重新載入」時必須只接受 `fibo_strategy`，雲端失敗不得退回本機後誤報成功。雲端保存必須 POST 成功後再 GET 回讀，五組標籤完全相同才顯示同步成功。
+- 費波及公司頁開啟後先顯示本機快照，並用共用背景工作讀取各自的 `fibo_strategy` 或 `company_events`。逾時和服務忙碌退避重試，手動還原等待按鈕按下後發出的新讀取；成功後僅套用相同或較新的雲端版本、保留本機新編輯。費波須驗證五組標籤，雲端保存依原流程回讀。公司「最近同步」以臺灣時間 yyyy/MM/dd HH:mm:ss 顯示。
 - Apps Script 的 scope 清單必須與程式一致，包含 `stock_strategy`、`fibo_strategy`、`company_events`、`strategy_signals`、`futures_strategy`；參考專案根目錄 `google_apps_script.gs`。
 - 期貨本機快照使用 `futures_strategy_cache.json`，不得再把完整 universe 寫入 `config.json`。雲端只保留常用／更新中的契約並限制整體 payload；官方清單可重新抓取，不需保存全部遠月契約。
 - 跨裝置保存採讀取、分區合併、寫入、必要時回讀驗證。遠端失敗時保留本機最後成功資料，不寫入空清單。

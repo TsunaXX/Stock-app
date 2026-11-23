@@ -2833,55 +2833,23 @@ def test_scope_readback_ignores_envelope_time_but_verifies_query_removals():
     assert actual['_scope_updated_at'] == '2026-10-06T18:05:11+08:00'
 
 
-def test_forced_fibo_cloud_import_never_falls_back_to_local_tags():
-    symbols = load_app_symbols("load_fibo_tags_from_cloud")
-
-    class FakeStreamlit:
-        session_state = {}
-
-    local_calls = []
-    symbols.update({
-        "st": FakeStreamlit(),
-        "DEFAULT_FIBO_TAGS": ["預設1", "預設2", "預設3", "預設4", "預設5"],
-        "GOOGLE_SCOPE_FIBO": "fibo_strategy",
-        "get_app_secret": lambda key: "https://example.invalid/exec",
-        "_fetch_remote_scope": lambda *args, **kwargs: (None, "Timeout"),
-        "load_fibo_tag_cache": lambda: local_calls.append(True) or ["本機1", "本機2", "本機3", "本機4", "本機5"],
-        "load_config": lambda: {"fibo_tags": ["設定1", "設定2", "設定3", "設定4", "設定5"]},
-        "_valid_fibo_tags": lambda tags: list(tags[:5]) if isinstance(tags, list) and len(tags) >= 5 else [],
-        "_extract_fibo_tags": lambda payload: [],
-        "_fibo_tag_timestamp": lambda payload: None,
-        "normalize_fibo_quick_tag": lambda value: str(value),
-    })
-    assert symbols["load_fibo_tags_from_cloud"](force=True) == []
-    assert local_calls == []
-    assert symbols["st"].session_state["_fibo_cloud_load_error"] == "Timeout"
-
-
-def test_normal_fibo_startup_keeps_device_local_tags_before_cloud():
-    symbols = load_app_symbols("load_fibo_tags_from_cloud")
-
-    class FakeStreamlit:
-        session_state = {}
-
-    remote_calls = []
-    local_tags = ["手機1", "手機2", "手機3", "手機4", "手機5"]
-    symbols.update({
-        "st": FakeStreamlit(),
-        "DEFAULT_FIBO_TAGS": ["預設1", "預設2", "預設3", "預設4", "預設5"],
-        "GOOGLE_SCOPE_FIBO": "fibo_strategy",
-        "get_app_secret": lambda key: "https://example.invalid/exec",
-        "_fetch_remote_scope": lambda *args, **kwargs: remote_calls.append(True) or ({}, None),
-        "load_fibo_tag_cache": lambda: local_tags,
-        "load_config": lambda: {},
-        "_valid_fibo_tags": lambda tags: list(tags[:5]) if isinstance(tags, list) and len(tags) >= 5 else [],
-        "_extract_fibo_tags": lambda payload: [],
-        "_fibo_tag_timestamp": lambda payload: None,
-        "normalize_fibo_quick_tag": lambda value: str(value),
-    })
-    assert symbols["load_fibo_tags_from_cloud"]() == local_tags
-    assert remote_calls == []
-    assert symbols["st"].session_state["_fibo_tags_source"] == "local_tag_cache"
+def test_fibo_local_tags_are_available_without_cloud_and_survive_failed_restore():
+    symbols = load_app_symbols('load_fibo_tags_from_local', 'reload_fibo_tags_from_cloud',
+                               '_extract_fibo_tags', '_valid_fibo_tags', '_fibo_tag_timestamp', '_newer_fibo_tag_payload')
+    local = ['手機1', '手機2', '手機3', '手機4', '手機5']
+    state = {}
+    symbols.update(
+        st=SimpleNamespace(session_state=state),
+        FIBO_TAG_CACHE_FILE='fibo', DEFAULT_FIBO_TAGS=['預設'] * 5,
+        load_fibo_tag_cache=lambda: local,
+        load_config=lambda: {},
+        _read_json_cache_file=lambda path: {'updated_at': '2026-11-20 18:30:00'},
+        normalize_fibo_quick_tag=str,
+    )
+    state['fibo_tags'] = symbols['load_fibo_tags_from_local']()
+    assert state['fibo_tags'] == local and state['_fibo_tags_source'] == 'local_tag_cache'
+    assert symbols['reload_fibo_tags_from_cloud']({}) == '雲端尚無五組有效的快速標籤'
+    assert state['fibo_tags'] == local
 
 
 def test_cache_merge_preserves_remote_device_sections():
