@@ -8,12 +8,13 @@
 | 主要倉庫 | TsunaXX/Stock-app |
 | 備份倉庫 | XTsunaX/Stock-app；本檔不代表備份已完成最新同步 |
 | 開發分支 | main |
-| 最近功能程式基準 | 2baa0a20d4c9d8027b759ec55f1b2899424ba543（股期當沖停損有缺口後重新驗證進場） |
+| 最近功能程式基準 | 6907efdd31e6f2636bd1ad558f1db2a3782d549d（費波與公司 Google Sheet 還原） |
 | 正式 Release | 本次未建立 Release |
-| 正式部署版本 | Streamlit 2026-11-23 11:40:16（Asia/Taipei）由 main 啟動，合併提交 `bc4960dee69ee13486bddcf60374aadf98e3cf03`；11:40:35 依賴準備完成。Apps Script 第 17 版於 11:29 已部署，原網址回讀確認 `model_stop_gap_reentry:1`。 |
-| 電腦本機版本／未提交修改 | 本次於 Windows 工作目錄完成指定功能與測試；日後狀態以當時 Git 狀態為準 |
+| 正式部署版本 | Streamlit 2026-11-23 18:36:12（Asia/Taipei）由 main 啟動，合併提交 `6f5e4d7cdbb16ca1bea126007a392bedf154eb18`；18:36:28 依賴準備完成。Apps Script 維持第 17 版。 |
+| 電腦本機版本／未提交修改 | 本次以獨立 Windows 工作副本完成程式及本機測試，原工作目錄未修改。 |
 
 ## 當前結果
+- [PR #118](https://github.com/TsunaXX/Stock-app/pull/118) 與 [PR #119](https://github.com/TsunaXX/Stock-app/pull/119)：費波與公司分區於首次開啟時背景讀取，暫時逾時自動重試。手動還原觸發新讀取，保護較新的本機設定。費波舊預設值無法阻擋自訂雲端標籤，還原公司時重新綁定追蹤輸入與行事曆勾選。公司「最近同步」統一顯示台北時間。依上次確認清單回復 7 家公司與行事曆勾選，Google Sheet 回讀確認保留 19 筆歷史事件。本機 34 項相關測試通過，[Python 3.12／3.14 完整 CI](https://github.com/TsunaXX/Stock-app/actions/runs/45156466987) 各 685 項通過。正式版重啟後核對費波從 Google Sheet 自動讀回 5 組標籤、公司從 Google Sheet 自動及手動還原後仍保留 7 家勾選，最近同步顯示 2026/11/23 18:27:15。重啟前模型紀錄於 18:35:28 已回讀驗證。
 - [PR #117](https://github.com/TsunaXX/Stock-app/pull/117) 股期戰略室股票／期貨當沖前筆停損有缺口時，可在同日以平倉後的新策略許可及連續成交接續原計畫。後續各次保留獨立成交、損益及進場次數；前筆歷史缺口維持參考績效。Google Sheet 驗證支援此執行鏈。定向回歸 65 項、舊版同步相容檢查及 [Python 3.12／3.14 CI](https://github.com/TsunaXX/Stock-app/actions/runs/45105746169) 各 681 項通過。正式站重啟前 11:39:10 及重啟後 11:41:38 均確認當日模型紀錄回讀，11:42 核對新版提示及永豐登入。正式成交觸發與同步新第二次進場待驗收。
 - [PR #116](https://github.com/TsunaXX/Stock-app/pull/116) 正式驗收時發現舊元件狀態可能在還原後觸發空清單寫入。改為還原時更新既有元件值，保留使用者主動清空的操作。依 11/18 已驗收設定復原公司清單與行事曆勾選，Google Sheet 回讀保留異常前取得的所有歷史事件，未回溯其他分區。正式站以還原、切到模型頁、切回公司頁驗證清單及勾選持續保留。公司後續背景備份仍可遇到雲端忙碌；頁面合併標示待重試。本機 16 項相關測試與 [Python 3.12／3.14 CI](https://github.com/TsunaXX/Stock-app/actions/runs/44725166375) 通過，兩版本各 677 項。模型追蹤 19:18:45 已回讀驗證。
 - [PR #115](https://github.com/TsunaXX/Stock-app/pull/115) 股票模型以同日同串流的逐筆與累計成交量核對長間隔，並保留對重連、跳號、行情失效的缺口判定。新缺口保留來源時間、間隔秒數、序號及可取得的量差。11/20 匯出資料顯示停利當下觸發時間間隔判定，缺少原始逐筆量，既有紀錄維持缺口參考。公司資料的還原、備份及背景追蹤狀態合併至還原按鈕旁。本機 104 項相關測試通過。[Python 3.12／3.14 CI](https://github.com/TsunaXX/Stock-app/actions/runs/44722001731) 各 677 項通過。18:56:24 正式站重啟並核對單列狀態。
