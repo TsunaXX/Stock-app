@@ -189,7 +189,8 @@ def test_restore_retries_timeout_and_manual_request_waits_for_new_read(scope):
 def test_company_cloud_restore_accepts_explicit_empty_and_preserves_newer_local():
     ns = load_app_symbols('load_company_event_snapshot', 'restore_company_backup',
                           'empty_company_event_snapshot', 'normalize_company_event_snapshot',
-                          '_newer_company_event_snapshot', '_cache_payload_timestamp', '_model_time_text')
+                          '_newer_company_event_snapshot', '_cache_payload_timestamp', '_model_time_text',
+                          'company_tracking_input_key')
 
     class State(dict):
         __setattr__ = dict.__setitem__
@@ -209,6 +210,7 @@ def test_company_cloud_restore_accepts_explicit_empty_and_preserves_newer_local(
     assert disk['company']['tickers'] == ''
     assert state['_company_tracking_input_generation'] == 1
     assert 'company_calendar_selection' not in state
+    assert ns['company_tracking_input_key']('company_calendar_selection') == 'company_calendar_selection_1'
     assert ns['_model_time_text'](disk['company']['updated_at']) == '2026/11/18 09:00:00'
 
 

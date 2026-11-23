@@ -3365,9 +3365,9 @@ def company_display_snapshot(snapshot):
     return displayed
 
 
-def company_tracking_input_key():
+def company_tracking_input_key(base_key='company_data_tickers'):
     generation = st.session_state.get('_company_tracking_input_generation', 0)
-    return f'company_data_tickers_{generation}' if generation else 'company_data_tickers'
+    return f'{base_key}_{generation}' if generation else base_key
 
 
 def save_company_tracking_input(key):
@@ -3382,7 +3382,7 @@ def save_company_tracking_input(key):
     visible = {company_calendar_key(e) for e in company_display_snapshot(snapshot)['events']}
     snapshot['calendar_companies'] = [key for key in snapshot.get('calendar_companies', []) if key in visible]
     st.session_state.company_event_snapshot = snapshot
-    st.session_state.pop('company_calendar_selection', None)
+    st.session_state[company_tracking_input_key('company_calendar_selection')] = snapshot['calendar_companies']
     if not save_company_event_snapshot(snapshot):
         st.session_state['_company_auto_pending_save'] = snapshot
         st.session_state['_company_sync_notice'] = '公司清單已保留本機；雲端保存待重試。'
@@ -3460,9 +3460,9 @@ def restore_company_backup(remote):
         except OSError:
             status = '已讀取公司備份，伺服器儲存失敗'
     st.session_state.company_event_snapshot = restored
-    # Discard delayed events from the input that existed before the restore.
+    # Delayed events from the old company inputs belong to the previous generation.
+    st.session_state.pop(company_tracking_input_key('company_calendar_selection'), None)
     st.session_state['_company_tracking_input_generation'] = st.session_state.get('_company_tracking_input_generation', 0) + 1
-    st.session_state.pop('company_calendar_selection', None)
     return status
 
 
@@ -29672,17 +29672,19 @@ with tab_company:
     st.markdown("<div class='company-step'><span class='company-step-number'>2</span>選擇加入股市行事曆的公司</div>", unsafe_allow_html=True)
     st.caption("只會加入勾選並儲存的公司；未勾選公司的查詢結果仍保留在本頁。")
     company_options = list(dict.fromkeys(company_calendar_key(e) for e in snapshot.get('events', [])))
-    if 'company_calendar_selection' in st.session_state:
-        previous_selection = st.session_state['company_calendar_selection']
-        migrated_selection = normalize_company_event_snapshot({**snapshot, 'calendar_companies':previous_selection})['calendar_companies']
-        if migrated_selection != previous_selection:
-            st.session_state['company_calendar_selection'] = migrated_selection
+    calendar_key = company_tracking_input_key('company_calendar_selection')
+    previous_selection = st.session_state.get(calendar_key, snapshot['calendar_companies'])
+    migrated_selection = normalize_company_event_snapshot({
+        **snapshot, 'calendar_companies': previous_selection,
+    })['calendar_companies']
+    visible_selection = [value for value in migrated_selection if value in company_options]
+    if calendar_key not in st.session_state or visible_selection != previous_selection:
+        st.session_state[calendar_key] = visible_selection
     select_col, save_col = st.columns([3, 1], vertical_alignment="bottom")
     with select_col:
         chosen_companies = st.multiselect(
             '加入行事曆的公司（查詢後勾選）', company_options,
-            default=[v for v in snapshot.get('calendar_companies', []) if v in company_options],
-            key='company_calendar_selection',
+            key=calendar_key,
         )
     with save_col:
         save_calendar_companies = st.button('🏢 儲存行事曆公司', key='save_calendar_companies', width='content')
