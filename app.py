@@ -22456,8 +22456,8 @@ def apply_model_protection(rows, stock, mode, room=None):
                     return f'模擬淨損益 <strong style="color:{pnl_color}">{amount}</strong>'
                 detail = re.sub(r'模擬淨損益 ([+\-]?[\d,.]+)', color_pnl, detail)
                 note = f'{time_text} <strong style="color:{color}">{headline}</strong>：{detail}'
-                if stock and mode == '當沖' and record.get('出場原因') == '停損' and record.get('資料缺口'):
-                    note += '｜前次行情有缺口，原計畫無法接續二次進場'
+                if mode == '當沖' and record.get('出場原因') == '停損' and record.get('資料缺口'):
+                    note += '｜前次停損有行情缺口，重新進場須通過新盤面驗證'
                 parent = record.get('_前次出場')
                 if parent and parent.get('狀態') == '已平倉':
                     note += html.escape(f"｜前次 {trade_display(parent)['交易狀態']} {notice_time(parent.get('結案時間'))[0]}")

@@ -96,6 +96,51 @@ def test_new_entry_keeps_strategy_freshness_and_evidence_checks(tmp_path,blocked
     assert len(tracker.records())==1
 
 
+@pytest.mark.parametrize(('market', 'mode', 'exit_price', 'can_reenter'), [
+    ('股票', '當沖', 94, True),
+    ('期貨', '當沖', 94, True),
+    ('股票', '波段', 94, False),
+    ('股票', '當沖', 111, False),
+])
+def test_stop_with_gap_requires_fresh_daytrade_and_keeps_both_results(tmp_path, market, mode, exit_price, can_reenter):
+    first = seed(market, mode)
+    key = market + '|2330'
+    tracker = ModelTracker(tmp_path / 'stop-gap.sqlite', start=False)
+    tracker.process([first], {key: sample(first, 100, 0)})
+    tracker.process([], {key: sample(first, exit_price, 2)})  # Missing sequence before the exit.
+    old = tracker.records()[0]
+    assert old['狀態'] == '已平倉' and old['資料缺口']
+    current = seed(market, mode, 進場價=97., 停損價=92., 目標價=109.)
+    tracker.process([], {key: sample(current, 97, 3, 候選已重估=False)})
+    assert len(tracker.records()) == 1
+    tracker.process([current], {key: sample(current, 97, 4)})
+    tracker.process([], {key: sample(current, 110, 5)})
+    records = sorted(tracker.records(), key=lambda row: row['進場次數'])
+    assert len(records) == (2 if can_reenter else 1)
+    assert records[0]['資料缺口'] and records[0]['模擬損益'] == old['模擬損益']
+    if can_reenter:
+        child = records[1]
+        assert child['進場次數'] == 2 and child['前次執行ID'] == old['交易ID']
+        assert child['原始計畫ID'] == old['原始計畫ID']
+        assert child['重入解除證據']['前次停損行情缺口']
+        assert not child['資料缺口'] and child['模擬損益'] > 0
+        validate_apps_script_execution_chain(records)
+
+
+def validate_apps_script_execution_chain(records):
+    import shutil, subprocess
+    node = shutil.which('node')
+    if not node:
+        pytest.skip('Node required for Apps Script validation')
+    js = '''const crypto=require('node:crypto');
+global.Utilities={DigestAlgorithm:{SHA_256:'sha256'},Charset:{UTF_8:'utf8'},computeDigest:(a,t)=>Array.from(crypto.createHash(a).update(t).digest())};
+'''
+    js += Path('google_apps_script.gs').read_text(encoding='utf-8')
+    js += '\nconst rows=' + json.dumps(records, ensure_ascii=False) + ';validateModelExecutions_(rows,rows);'
+    result = subprocess.run([node], input=js, text=True, encoding='utf-8', capture_output=True)
+    assert result.returncode == 0, result.stderr
+
+
 def test_adapter_new_version_rechecks_old_ui_text_and_publishes_candidate():
     ns=real_stock_adapter(); rows,config=stock_rows_with_evidence(ns,1)
     config['rules_version']='V1.2-exec2-test'
@@ -135,7 +180,6 @@ for stock in (True,False):
 
 
 def test_third_entry_and_apps_script_accepts_new_levels_on_same_execution_chain(tmp_path):
-    import shutil,subprocess
     tracker=ModelTracker(tmp_path/'cycles.sqlite',start=False)
     first=seed()
     for second,price,candidate in ((0,100,first),(1,111,first),
@@ -146,13 +190,7 @@ def test_third_entry_and_apps_script_accepts_new_levels_on_same_execution_chain(
     records=sorted(tracker.records(),key=lambda r:r['進場次數'])
     assert len(records)==3 and [r['進場價'] for r in records]==[100,111,124]
     assert records[-1]['狀態']=='模擬持倉' and records[-1]['進場次數']==3
-    node=shutil.which('node')
-    if not node: pytest.skip('Node required for Apps Script validation')
-    js="""const crypto=require('node:crypto');
-global.Utilities={DigestAlgorithm:{SHA_256:'sha256'},Charset:{UTF_8:'utf8'},computeDigest:(a,t)=>Array.from(crypto.createHash(a).update(t).digest())};
-"""+Path('google_apps_script.gs').read_text(encoding='utf-8')+'\nconst rows='+json.dumps(records,ensure_ascii=False)+';validateModelExecutions_(rows,rows);'
-    result=subprocess.run([node],input=js,text=True,encoding='utf-8',capture_output=True)
-    assert result.returncode==0,result.stderr
+    validate_apps_script_execution_chain(records)
 
 
 @pytest.mark.parametrize('stock',[True,False])

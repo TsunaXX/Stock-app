@@ -1494,7 +1494,10 @@ class ModelTracker:
                              and 0 <= (current-before).total_seconds() <= max(30, float(quote.get('更新秒數', 5)) * 3))
             for raw, in plans:
                 row = json.loads(raw)
-                if row['狀態'] != '已平倉' or row.get('資料缺口') or (row['策略'] == '當沖' and row['交易日'] != quote.get('交易日')):
+                stop_with_gap = (row.get('資料缺口') and fresh and row['策略'] == '當沖'
+                                 and row.get('出場原因') == '停損' and row.get('模擬進場價') is not None)
+                if (row['狀態'] != '已平倉' or (row.get('資料缺口') and not stop_with_gap)
+                        or (row['策略'] == '當沖' and row['交易日'] != quote.get('交易日'))):
                     continue
                 if quote.get('休市') or not quote.get('有效'):
                     if row.get('重入解除'):
@@ -1571,6 +1574,8 @@ class ModelTracker:
                         if fresh:
                             seed.update({field:current_candidate[field] for field in seed_fields if field in current_candidate
                                          and field not in ('重新觸發來源ID','重新觸發解除證據')})
+                        if stop_with_gap:
+                            cleared = {**cleared, '前次停損行情缺口': True}
                         seed.update({'來源時間': ts.isoformat(), '訊號價': price, '前次執行ID': row['交易ID'],
                                      '前次執行月份': row['交易日'][:7].replace('-', ''),
                                      '進場次數': row['進場次數'] + 1, '交易日': quote['交易日'],
@@ -1954,10 +1959,13 @@ class ModelTracker:
             batch, size = [], 0
             for rowid, body in rows:
                 record = json.loads(body)
-                if (record.get('識別版本') == 2 and catalog.get('model_reentry') != 1) or (record.get('重新觸發來源ID') and catalog.get('model_replan') != 1):
+                stop_gap_reentry = (record.get('重入解除證據') or {}).get('前次停損行情缺口')
+                if ((record.get('識別版本') == 2 and catalog.get('model_reentry') != 1)
+                        or (record.get('重新觸發來源ID') and catalog.get('model_replan') != 1)
+                        or (stop_gap_reentry and catalog.get('model_stop_gap_reentry') != 1)):
                     blocked = True
                     continue
-                parent_id = record.get('重新觸發來源ID')
+                parent_id = record.get('前次執行ID') if stop_gap_reentry else record.get('重新觸發來源ID')
                 if parent_id and all(r['交易ID'] != parent_id for _,r in batch):
                     with closing(self.db()) as db:
                         parent = db.execute('SELECT rowid,body FROM trades WHERE id=? AND month=? AND dirty=1',(parent_id,month)).fetchone()
@@ -1995,7 +2003,7 @@ class ModelTracker:
         self.synced_at = datetime.now(TZ).strftime('%Y/%m/%d %H:%M:%S')
         with closing(self.db()) as db, db:
             remaining = db.execute('SELECT COUNT(*) FROM trades WHERE dirty=1').fetchone()[0]
-        self.status, self.error = (f'已回讀驗證；尚有 {remaining} 筆待同步' if remaining else '已回讀驗證'), ('Apps Script 尚未支援 V1.2 執行鏈或失效重觸；新紀錄保留本機待同步' if blocked else '')
+        self.status, self.error = (f'已回讀驗證；尚有 {remaining} 筆待同步' if remaining else '已回讀驗證'), ('Apps Script 尚未支援此交易的執行鏈規則；新紀錄保留本機待同步' if blocked else '')
 
     def run(self):
         pending = None
