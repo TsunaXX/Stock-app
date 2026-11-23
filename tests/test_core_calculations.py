@@ -2835,7 +2835,8 @@ def test_scope_readback_ignores_envelope_time_but_verifies_query_removals():
 
 def test_fibo_local_tags_are_available_without_cloud_and_survive_failed_restore():
     symbols = load_app_symbols('load_fibo_tags_from_local', 'reload_fibo_tags_from_cloud',
-                               '_extract_fibo_tags', '_valid_fibo_tags', '_fibo_tag_timestamp', '_newer_fibo_tag_payload')
+                               '_extract_fibo_tags', '_valid_fibo_tags', '_fibo_tag_timestamp',
+                               '_newer_fibo_tag_payload', '_fibo_local_edit_time')
     local = ['手機1', '手機2', '手機3', '手機4', '手機5']
     state = {}
     symbols.update(
