@@ -214,7 +214,8 @@ def test_company_cloud_restore_accepts_explicit_empty_and_preserves_newer_local(
 
 def test_fibo_uses_newer_backup_and_keeps_edits_made_before_response():
     ns = load_app_symbols('reload_fibo_tags_from_cloud', '_extract_fibo_tags',
-                          '_valid_fibo_tags', '_fibo_tag_timestamp')
+                          '_valid_fibo_tags', '_fibo_tag_timestamp', '_fibo_local_edit_time',
+                          'DEFAULT_FIBO_TAGS')
     cloud = {'fibo_tags': ['2330'] * 5, 'fibo_tags_updated_at': '2026-11-23T01:30:00Z'}
     local = {'tags': ['6148'] * 5, 'updated_at': '2026/11/23 09:30:01'}
     disk = {'fibo': local}
@@ -230,6 +231,31 @@ def test_fibo_uses_newer_backup_and_keeps_edits_made_before_response():
     assert restore(cloud).startswith('已從')
     assert disk['fibo']['tags'] == state['fibo_tags'] == ['2330'] * 5
     assert state['custom_tag_1'] == '2330' and state['_fibo_tags_source'] == 'google_sheet'
+
+def test_legacy_fibo_defaults_do_not_block_saved_cloud_labels():
+    ns = load_app_symbols('reload_fibo_tags_from_cloud', '_extract_fibo_tags',
+                          '_valid_fibo_tags', '_fibo_tag_timestamp', '_fibo_local_edit_time',
+                          'DEFAULT_FIBO_TAGS')
+    defaults = ns['DEFAULT_FIBO_TAGS']
+    cloud_tags = defaults[:3] + ['4916', '4977']
+    cloud = {'fibo_tags': cloud_tags, 'fibo_tags_updated_at': '2026-11-18T01:30:00Z'}
+    local = {'tags': defaults, 'updated_at': '2026/11/23 09:30:01'}
+    state = {'fibo_tags': defaults, '_fibo_tags_updated_at': local['updated_at']}
+    disk = {'fibo': local}
+    ns.update(st=SimpleNamespace(session_state=state), FIBO_TAG_CACHE_FILE='fibo',
+              CONFIG_FILE='config', _RUNTIME_FILE_LOCK=threading.RLock(), _read_json_cache_file=disk.get,
+              load_config=lambda: {}, normalize_fibo_quick_tag=str,
+              _write_json_atomic=lambda name, data, **kw: disk.update({name: data}))
+    restore = ns['reload_fibo_tags_from_cloud']
+
+    local['fibo_tags_confirmed'] = True
+    assert restore(cloud) == '已保留較新的本機快速標籤'
+    assert state['fibo_tags'] == defaults
+
+    local.pop('fibo_tags_confirmed')
+    assert restore(cloud) == '已從 Google Sheet 還原快速標籤'
+    assert state['fibo_tags'] == cloud_tags and disk['fibo']['fibo_tags_confirmed']
+
 
 def test_room_scope_read_timeout_keeps_budget_for_second_attempt():
     import requests
