@@ -144,7 +144,7 @@ function doGet(e) {
           changed = true;
         });
         if (changed) saveScopeData_('strategy_signals', {model_active_months: active}, new Date().toISOString());
-        item.data = Object.assign({}, data, {model_reentry: 1, model_replan: 1, model_history: 1, model_events: 1, model_active_months: active});
+        item.data = Object.assign({}, data, {model_reentry: 1, model_replan: 1, model_stop_gap_reentry: 1, model_history: 1, model_events: 1, model_active_months: active});
       }
       const ids = e && e.parameter && e.parameter.trade_ids;
       if (ids !== undefined) {
@@ -549,7 +549,10 @@ function validateModelExecutions_(merged, incoming) {
       }
       const closeTime = parent && modelTime_(parent['結案時間']);
       const entryTime = modelTime_(row['進場時間']), clearTime = modelTime_(cleared['來源時間']);
-      if (!parent || parent['原始計畫ID'] !== plan || parent['狀態'] !== '已平倉' || parent['資料缺口'] ||
+      const verifiedStopReentry = parent && row['計畫來源'] === '股期戰略室' && row['策略'] === '當沖' &&
+        parent['出場原因'] === '停損' && parent['模擬進場價'] > 0 && cleared['前次停損行情缺口'] === true &&
+        cleared['型態'] === '策略重驗';
+      if (!parent || parent['原始計畫ID'] !== plan || parent['狀態'] !== '已平倉' || (parent['資料缺口'] && !verifiedStopReentry) ||
           row['進場次數'] !== parent['進場次數'] + 1 || !isFinite(closeTime) || !isFinite(entryTime) || !isFinite(clearTime) ||
           entryTime <= closeTime || clearTime <= closeTime || clearTime > entryTime ||
           (row['策略'] === '當沖' && parent['交易日'] !== row['交易日']) ||
