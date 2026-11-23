@@ -3365,9 +3365,19 @@ def company_display_snapshot(snapshot):
     return displayed
 
 
-def save_company_tracking_input():
-    snapshot = {**st.session_state.company_event_snapshot,
-                'tickers': st.session_state.company_data_tickers,
+def company_tracking_input_key():
+    generation = st.session_state.get('_company_tracking_input_generation', 0)
+    return f'company_data_tickers_{generation}' if generation else 'company_data_tickers'
+
+
+def save_company_tracking_input(key):
+    if key != company_tracking_input_key():
+        return
+    current = st.session_state.company_event_snapshot
+    tickers = st.session_state[key]
+    if tickers == current.get('tickers'):
+        return
+    snapshot = {**current, 'tickers': tickers,
                 'updated_at': datetime.now(pytz.timezone('Asia/Taipei')).isoformat()}
     visible = {company_calendar_key(e) for e in company_display_snapshot(snapshot)['events']}
     snapshot['calendar_companies'] = [key for key in snapshot.get('calendar_companies', []) if key in visible]
@@ -3395,7 +3405,8 @@ def company_order_market_items(items, market='全部'):
 
 
 def move_company_tracking_input(offset):
-    items = list(dict.fromkeys(item.strip() for item in st.session_state.company_data_tickers.split(',') if item.strip()))
+    key = company_tracking_input_key()
+    items = list(dict.fromkeys(item.strip() for item in st.session_state[key].split(',') if item.strip()))
     market_items = company_order_market_items(items, st.session_state.get('company_order_market', '全部'))
     selected = st.session_state.get('company_order_item')
     if selected not in market_items:
@@ -3405,8 +3416,8 @@ def move_company_tracking_input(offset):
     if 0 <= market_index < len(market_items):
         destination = items.index(market_items[market_index])
         items[index], items[destination] = items[destination], items[index]
-        st.session_state.company_data_tickers = ', '.join(items)
-        save_company_tracking_input()
+        st.session_state[key] = ', '.join(items)
+        save_company_tracking_input(key)
 
 
 def parse_calendar_event_date(value):
@@ -3430,43 +3441,29 @@ def parse_calendar_event_date(value):
         return None
 
 
-def load_company_event_snapshot(force=False):
-    """Restore the company snapshot, including saved selections with no events."""
-    local = normalize_company_event_snapshot(_read_json_cache_file(COMPANY_EVENT_SNAPSHOT_FILE))
-    if not force and st.session_state.get('_company_event_cloud_loaded'):
-        return local
-    url = get_app_secret('gsheet_api_url')
-    if not url:
-        return local
-    fetch = _fetch_remote_scope if force else _fetch_remote_scope_cached
-    remote, error = fetch(url, GOOGLE_SCOPE_COMPANY, timeout=15 if force else 6)
-    st.session_state['_company_event_cloud_loaded'] = error is None
-    if error or not isinstance(remote, dict) or not remote:
-        st.session_state['_company_restore_error'] = error or '雲端尚無公司備份'
-        return local
+def load_company_event_snapshot():
+    return normalize_company_event_snapshot(_read_json_cache_file(COMPANY_EVENT_SNAPSHOT_FILE))
 
+
+def restore_company_backup(remote):
+    if not isinstance(remote, dict) or not any(key in remote for key in ('updated_at', 'tickers', 'events')):
+        return '雲端尚無可用的公司備份'
     restored = normalize_company_event_snapshot(remote)
-    if not force:
-        restored = _newer_company_event_snapshot(restored, local)
-    try:
-        _write_json_atomic(COMPANY_EVENT_SNAPSHOT_FILE, _json_safe(restored), indent=2)
-    except (OSError, TypeError, ValueError):
-        st.session_state['_company_restore_error'] = '公司備份已讀取，伺服器儲存失敗'
-    else:
-        st.session_state.pop('_company_restore_error', None)
-    return restored
-
-
-def restore_company_backup():
-    restored = load_company_event_snapshot(force=True)
-    if st.session_state.get('_company_restore_error'):
-        return
+    with _RUNTIME_FILE_LOCK:
+        local = _newer_company_event_snapshot(st.session_state.get('company_event_snapshot'), load_company_event_snapshot())
+        if (st.session_state.get('_company_pending_preferences')
+                or _newer_company_event_snapshot(restored, local) != restored):
+            return '已保留較新的本機公司資料'
+        try:
+            _write_json_atomic(COMPANY_EVENT_SNAPSHOT_FILE, _json_safe(restored), indent=2)
+            status = '已從 Google Sheet 還原公司資料'
+        except OSError:
+            status = '已讀取公司備份，伺服器儲存失敗'
     st.session_state.company_event_snapshot = restored
-    st.session_state.pop('_company_auto_pending_save', None)
-    st.session_state.pop('_company_pending_preferences', None)
-    st.session_state['company_data_tickers'] = restored['tickers']
+    # Discard delayed events from the input that existed before the restore.
+    st.session_state['_company_tracking_input_generation'] = st.session_state.get('_company_tracking_input_generation', 0) + 1
     st.session_state.pop('company_calendar_selection', None)
-    st.session_state['_company_sync_notice'] = '已從 Google Sheet 還原公司資料。'
+    return status
 
 
 def save_company_event_snapshot(snapshot):
@@ -3837,14 +3834,58 @@ def sync_company_background_snapshot(url, snapshot, *, save_preferences=False):
                                   updated_at=merged['updated_at'], timeout=15, verify=True)[0]
 
 
-@st.fragment(run_every=60)
+def request_room_sheet_restore(scope):
+    st.session_state.setdefault('_room_sheet_restores', {})[scope] = {'requested_at': time.monotonic()}
+
+
+def room_sheet_restore_pending(scope):
+    return not st.session_state.get('_room_sheet_restores', {}).get(scope, {}).get('done')
+
+
+def poll_room_sheet_restore(url, scope):
+    if not url:
+        return ''
+    state = st.session_state.setdefault('_room_sheet_restores', {}).setdefault(scope, {})
+    if state.get('done'):
+        return state.get('status', '')
+
+    def read():
+        started_at = time.monotonic()
+        return started_at, _fetch_remote_scope(url, scope, timeout=42)
+
+    result = get_public_maintenance_jobs().poll(('room-sheet-restore', url, scope), read, interval=15)
+    if result is None or result[0] < state.get('requested_at', 0):
+        return '正在從 Google Sheet 還原'
+    payload, error = result[1]
+    if error:
+        reason = '連線逾時' if error in ('ReadTimeout', 'ConnectTimeout') else error
+        return f'還原待重試（{reason}）'
+    state.update(done=True, ready=payload)
+    st.rerun()
+    return ''
+
+
+def apply_room_sheet_restore(scope, restore):
+    state = st.session_state.get('_room_sheet_restores', {}).get(scope, {})
+    if 'ready' in state:
+        state['status'] = restore(state.pop('ready'))
+
+
+@st.fragment(run_every=5)
+def render_fibo_sheet_restore(url):
+    status = poll_room_sheet_restore(url, GOOGLE_SCOPE_FIBO)
+    if status:
+        st.caption(status)
+
+
 def render_company_tracking_status(active, show_status=True):
     if not active:
         return
+    url = get_app_secret('gsheet_api_url')
+    restore_status = poll_room_sheet_restore(url, GOOGLE_SCOPE_COMPANY)
     snapshot = st.session_state.company_event_snapshot
     symbols = tuple(dict.fromkeys(item.strip().upper() for item in snapshot.get('tickers', '').split(',') if item.strip()))[:COMPANY_SYNC_MAX_TICKERS]
     pending = st.session_state.get('_company_auto_pending_save')
-    url = get_app_secret('gsheet_api_url')
     if pending and url:
         save_preferences = bool(st.session_state.get('_company_pending_preferences'))
         saved = get_public_maintenance_jobs().poll(('company-save', data_version(pending), save_preferences),
@@ -3852,7 +3893,7 @@ def render_company_tracking_status(active, show_status=True):
         if saved:
             st.session_state.pop('_company_auto_pending_save', None)
             st.session_state.pop('_company_pending_preferences', None)
-    if symbols:
+    if symbols and not (url and room_sheet_restore_pending(GOOGLE_SCOPE_COMPANY)):
         result = get_public_maintenance_jobs().poll(('company', symbols),
             lambda: fetch_tracked_company_updates(symbols), interval=600)
         apply_company_background_result(result, symbols)
@@ -3863,10 +3904,7 @@ def render_company_tracking_status(active, show_status=True):
             except OSError:
                 pass
     if show_status:
-        status = []
-        error = st.session_state.get('_company_restore_error') if url else None
-        if error:
-            status.append('還原逾時' if error in ('ReadTimeout', 'ConnectTimeout') else f'還原未完成（{error}）')
+        status = [restore_status] if restore_status else []
         if url and st.session_state.get('_company_auto_pending_save'):
             status.append('備份待重試（本機已保留）')
         tracking = (st.session_state.get('_company_auto_status') or '正在檢查') if symbols else '尚未設定'
@@ -13909,7 +13947,8 @@ def _fetch_remote_scope(gsheet_api_url, scope, timeout=8):
             response = requests.get(
                 gsheet_api_url, params={'scope': scope, '_ts': time.time_ns()},
                 headers={'Cache-Control': 'no-cache, no-store, max-age=0', 'Pragma': 'no-cache'},
-                timeout=timeout if attempt == 0 else max(0.1, deadline - time.monotonic()),
+                timeout=min(14, max(0.1, deadline - time.monotonic())) if attempts == 3
+                else max(0.1, deadline - time.monotonic()),
             )
             response.raise_for_status()
             payload = response.json()
@@ -14100,6 +14139,8 @@ def _extract_fibo_tags(payload):
             timestamp = pd.Timestamp(timestamp_value)
             if pd.isna(timestamp):
                 timestamp = None
+            elif timestamp.tzinfo:
+                timestamp = timestamp.tz_convert('Asia/Taipei').tz_localize(None)
         except (TypeError, ValueError, OverflowError):
             timestamp = None
         candidates.append((valid_tags, timestamp, len(candidates)))
@@ -14154,7 +14195,7 @@ def _extract_fibo_tags(payload):
 def _fibo_tag_timestamp(payload):
     if not isinstance(payload, dict):
         return None
-    timestamp_values = [payload.get('fibo_tags_updated_at')]
+    timestamp_values = [payload.get('fibo_tags_updated_at') or payload.get('updated_at')]
     backup = payload.get('fibo_tags_backup')
     if isinstance(backup, dict):
         timestamp_values.append(backup.get('updated_at'))
@@ -14163,7 +14204,7 @@ def _fibo_tag_timestamp(payload):
         try:
             timestamp = pd.Timestamp(timestamp_value)
             if not pd.isna(timestamp):
-                timestamps.append(timestamp)
+                timestamps.append(timestamp.tz_convert('Asia/Taipei').tz_localize(None) if timestamp.tzinfo else timestamp)
         except (TypeError, ValueError, OverflowError):
             continue
     return max(timestamps) if timestamps else None
@@ -14324,9 +14365,6 @@ def save_fibo_config(save_tags=True, sync_cloud=True):
         if sync_saved and gsheet_api_url and sync_cloud
         else 'local_tag_cache'
     )
-
-    if sync_cloud:
-        st.session_state['_fibo_cloud_loaded'] = True
 
     return sync_saved
 
@@ -15127,231 +15165,51 @@ def load_data_cache(remote_result=None):
         market_risk_data,
     )
 
-def load_fibo_tags_from_cloud(
-    force=False
-):
-    """
-    一般啟動以裝置本機標籤為優先；手動匯入時只接受 fibo_strategy。
+def load_fibo_tags_from_local():
+    if '_fibo_tags_source' in st.session_state:
+        return list(st.session_state.get('fibo_tags', DEFAULT_FIBO_TAGS))
 
-    ``force=True`` 絕不退回本機或預設值，避免雲端失敗卻誤報匯入成功。
-    """
-    if (
-        not force
-        and st.session_state.get(
-            '_fibo_cloud_loaded',
-            False
-        )
-    ):
-        return list(
-            st.session_state.get(
-                'fibo_tags',
-                DEFAULT_FIBO_TAGS
-            )
-        )
-
-    gsheet_api_url = (
-        get_app_secret(
-            'gsheet_api_url'
-        )
-    )
-
-    tags = []
-    source = 'default'
-    cloud_error = ''
-
-    if force:
-        if not gsheet_api_url:
-            cloud_error = '未設定 Google Sheet 同步網址'
-        else:
-            payload, error = _fetch_remote_scope(
-                gsheet_api_url,
-                GOOGLE_SCOPE_FIBO,
-                timeout=18,
-            )
-            if isinstance(payload, dict):
-                tags = _extract_fibo_tags(payload)
-                if len(tags) >= 5:
-                    tags = [normalize_fibo_quick_tag(tag) for tag in tags]
-                    source = 'google_sheet'
-                    timestamp = _fibo_tag_timestamp(payload)
-                    updated_at = timestamp.isoformat() if timestamp is not None else ''
-                    if updated_at:
-                        st.session_state['_fibo_tags_updated_at'] = updated_at
-                else:
-                    cloud_error = 'fibo_strategy 內沒有五組有效標籤'
-            else:
-                cloud_error = error or 'Google Sheet 未回傳 fibo_strategy'
-
-        st.session_state['_fibo_cloud_load_error'] = cloud_error
-        st.session_state['_fibo_cloud_loaded'] = True
-        if len(tags) < 5:
-            return []
-    else:
-        # 手機與電腦各自保留本機操作；只有明確按「從 Google Sheet
-        # 重新載入」時，才讓另一裝置保存的標籤覆蓋本機 widget。
-        tags = _valid_fibo_tags(
-            load_fibo_tag_cache()
-        )
-
-        if len(tags) >= 5:
-            tags = [
-                normalize_fibo_quick_tag(
-                    tag
-                )
-                for tag in tags
-            ]
-
-            source = (
-                'local_tag_cache'
-            )
-
-        if len(tags) < 5:
-            config = load_config()
-
-            config_tags = _valid_fibo_tags(
-                config.get(
-                    'fibo_tags',
-                    []
-                )
-            )
-
-            if len(config_tags) >= 5:
-                tags = [
-                    normalize_fibo_quick_tag(tag)
-                    for tag in config_tags
-                ]
-                source = 'config'
-
-        if len(tags) < 5 and gsheet_api_url:
-            payload, error = _fetch_remote_scope_cached(
-                gsheet_api_url,
-                GOOGLE_SCOPE_FIBO,
-                timeout=6,
-            )
-            if isinstance(payload, dict):
-                tags = _extract_fibo_tags(payload)
-                if len(tags) >= 5:
-                    tags = [normalize_fibo_quick_tag(tag) for tag in tags]
-                    source = 'google_sheet'
-                    timestamp = _fibo_tag_timestamp(payload)
-                    if timestamp is not None:
-                        st.session_state['_fibo_tags_updated_at'] = timestamp.isoformat()
-            if len(tags) < 5:
-                cloud_error = error or 'fibo_strategy 內沒有五組有效標籤'
-
-    if len(tags) < 5:
-        tags = list(
-            DEFAULT_FIBO_TAGS
-        )
-
-        source = 'default'
-
-    st.session_state[
-        'fibo_tags'
-    ] = list(tags)
-
-    st.session_state[
-        '_fibo_tags_source'
-    ] = source
-
-    st.session_state['_fibo_cloud_loaded'] = True
-
-    st.session_state['_fibo_cloud_load_error'] = cloud_error
-
-    return list(tags)
+    cache = _read_json_cache_file(FIBO_TAG_CACHE_FILE)
+    config = load_config()
+    cached = {'tags': load_fibo_tag_cache(), 'fibo_tags_updated_at': cache.get('updated_at')}
+    selected = _newer_fibo_tag_payload(cached, config)
+    tags = _extract_fibo_tags(selected)
+    source = 'local_tag_cache' if selected is cached else 'config'
+    if not tags:
+        tags = _valid_fibo_tags(cached['tags']) or _valid_fibo_tags(config.get('fibo_tags')) or DEFAULT_FIBO_TAGS
+        source = 'local_tag_cache' if tags == cached['tags'] else 'config' if tags == config.get('fibo_tags') else 'default'
+    stamp = _fibo_tag_timestamp(selected)
+    st.session_state['_fibo_tags_source'] = source
+    if stamp is not None:
+        st.session_state['_fibo_tags_updated_at'] = stamp.isoformat()
+    return [normalize_fibo_quick_tag(tag) for tag in tags]
 
 
-def reload_fibo_tags_from_cloud():
-    """強制只從 fibo_strategy scope 還原快速標籤。"""
-    st.session_state.pop(
-        '_fibo_cloud_loaded',
-        None
-    )
-
-    tags = load_fibo_tags_from_cloud(
-        force=True
-    )
-
-    if not tags or len(tags) < 5:
-        return (
-            False,
-            st.session_state.get(
-                '_fibo_cloud_load_error',
-                '雲端尚無五組快速標籤',
-            )
-        )
-
-    if st.session_state.get('_fibo_tags_source') != 'google_sheet':
-        return False, 'Google Sheet 未回傳可用的 fibo_strategy 標籤'
-
-    st.session_state[
-        'fibo_tags'
-    ] = list(tags)
-
-    for index, tag in enumerate(
-        tags,
-        start=1
-    ):
-        st.session_state[
-            f'custom_tag_{index}'
-        ] = tag
-
-    st.session_state[
-        '_fibo_cloud_save_status'
-    ] = 'loaded'
-
-    try:
+def reload_fibo_tags_from_cloud(payload):
+    tags = _extract_fibo_tags(payload)
+    if not tags:
+        return '雲端尚無五組有效的快速標籤'
+    timestamp = _fibo_tag_timestamp(payload)
+    tags = [normalize_fibo_quick_tag(tag) for tag in tags]
+    with _RUNTIME_FILE_LOCK:
+        cache_stamp = _fibo_tag_timestamp(_read_json_cache_file(FIBO_TAG_CACHE_FILE))
+        session_stamp = _fibo_tag_timestamp({'fibo_tags_updated_at': st.session_state.get('_fibo_tags_updated_at')})
+        if any(saved is not None and (timestamp is None or saved > timestamp) for saved in (cache_stamp, session_stamp)):
+            return '已保留較新的本機快速標籤'
+        updated_at = timestamp.isoformat() if timestamp is not None else ''
         config = load_config()
+        config.update(fibo_tags=tags, fibo_tags_updated_at=updated_at)
+        try:
+            _write_json_atomic(CONFIG_FILE, config)
+            _write_json_atomic(FIBO_TAG_CACHE_FILE, {'version': 3, 'updated_at': updated_at, 'tags': tags}, indent=2)
+            status = '已從 Google Sheet 還原快速標籤'
+        except OSError:
+            status = '已讀取快速標籤，伺服器儲存失敗'
+    st.session_state.update(fibo_tags=tags, _fibo_tags_source='google_sheet', _fibo_tags_updated_at=updated_at)
+    for index, tag in enumerate(tags, 1):
+        st.session_state[f'custom_tag_{index}'] = tag
+    return status
 
-        config[
-            'fibo_tags'
-        ] = tags
-
-        updated_at = str(
-            st.session_state.get(
-                '_fibo_tags_updated_at',
-                ''
-            )
-        ).strip()
-
-        if updated_at:
-            config[
-                'fibo_tags_updated_at'
-            ] = updated_at
-
-        _write_json_atomic(
-            CONFIG_FILE,
-            config,
-        )
-
-        _write_json_atomic(
-            FIBO_TAG_CACHE_FILE,
-            {
-                'version': 3,
-                'updated_at': (
-                    updated_at
-                    or datetime.now(
-                        pytz.timezone(
-                            'Asia/Taipei'
-                        )
-                    ).isoformat()
-                ),
-                'tags': tags,
-            },
-            indent=2,
-        )
-
-    except (
-        OSError,
-        TypeError,
-        ValueError,
-    ):
-        pass
-
-    return (
-        True,
-        '已從 Google Sheet 還原快速標籤'
-    )
 
 def load_url_history():
     if os.path.exists(URL_CACHE_FILE):
@@ -15490,8 +15348,9 @@ if not isinstance(cached_stock_display_settings, dict):
 # Fibo 標籤獨立初始化
 # =========================================================
 
+apply_room_sheet_restore(GOOGLE_SCOPE_FIBO, reload_fibo_tags_from_cloud)
 fibo_tags_source = (
-    load_fibo_tags_from_cloud()
+    load_fibo_tags_from_local()
 )
 
 fibo_tags_source = [
@@ -28456,16 +28315,16 @@ with tab_fibo:
             )
             if cloud_enabled:
                 st.caption(f"☁️ Google Sheet 同步已啟用｜本次標籤來源：{fibo_source}")
-                if st.button(
-                    "☁️ 從 Google Sheet 重新載入標籤",
-                    key="reload_fibo_quick_tags_from_cloud", width='stretch',
-                ):
-                    restored, message = reload_fibo_tags_from_cloud()
-                    if restored:
-                        st.toast(message, icon="☁️")
-                        st.rerun()
+                st.button("☁️ 從 Google Sheet 重新載入標籤",
+                          key="reload_fibo_quick_tags_from_cloud", width='stretch',
+                          on_click=request_room_sheet_restore, args=(GOOGLE_SCOPE_FIBO,))
+                if tab_fibo.open and tab_fibo_chart.open:
+                    if room_sheet_restore_pending(GOOGLE_SCOPE_FIBO):
+                        render_fibo_sheet_restore(get_app_secret('gsheet_api_url'))
                     else:
-                        st.error(f"雲端標籤讀取失敗：{message}")
+                        status = st.session_state['_room_sheet_restores'][GOOGLE_SCOPE_FIBO].get('status')
+                        if status:
+                            st.caption(status)
             else:
                 st.warning("尚未設定 Google Sheet 同步；目前快速標籤只保存在伺服器。")
             c1, c2, c3, c4, c5 = st.columns(5)
@@ -29007,6 +28866,7 @@ with tab3:
         st.session_state.company_event_snapshot = load_company_event_snapshot()
     else:
         st.session_state.company_event_snapshot = normalize_company_event_snapshot(st.session_state.company_event_snapshot)
+    apply_room_sheet_restore(GOOGLE_SCOPE_COMPANY, restore_company_backup)
 
     with st.expander("🌐 網路同步與追蹤事件", expanded=False):
         st.caption("選擇要顯示的事件；公司資料只讀取獨立分頁的最近快照，不會在切換月份時重新查詢。")
@@ -29663,17 +29523,24 @@ with tab_company:
     """, unsafe_allow_html=True)
     st.markdown("<div class='company-room-description'>同步查詢後會自動追蹤公司財報、營收與公開事件。需要顯示在股市行事曆的公司，請於下方另外勾選並儲存。</div>", unsafe_allow_html=True)
     with st.container(horizontal=True, vertical_alignment='center'):
-        if get_app_secret('gsheet_api_url'):
-            st.button('☁️ 從 Google Sheet 還原公司資料', key='restore_company_backup', on_click=restore_company_backup)
-        render_company_tracking_status(bool(tab_company.open or tab3.open), bool(tab_company.open))
+        company_restore_url = get_app_secret('gsheet_api_url')
+        if company_restore_url:
+            st.button('☁️ 從 Google Sheet 還原公司資料', key='restore_company_backup',
+                      on_click=request_room_sheet_restore, args=(GOOGLE_SCOPE_COMPANY,))
+        company_tracking_active = bool(tab_company.open or tab3.open)
+        if company_tracking_active:
+            restoring = bool(company_restore_url) and room_sheet_restore_pending(GOOGLE_SCOPE_COMPANY)
+            st.fragment(render_company_tracking_status, run_every=5 if restoring else 60)(True, bool(tab_company.open))
 
     st.markdown("<div class='company-step'><span class='company-step-number'>1</span>查詢並同步公司</div>", unsafe_allow_html=True)
 
-    st.session_state.setdefault('company_data_tickers', st.session_state.company_event_snapshot['tickers'])
+    company_input_key = company_tracking_input_key()
+    st.session_state.setdefault(company_input_key, st.session_state.company_event_snapshot['tickers'])
     company_ticker_input = st.text_input(
         "追蹤公司或代碼（用逗號分隔，例如 2408, 台積電, META, Google, Tesla）",
-        key="company_data_tickers",
+        key=company_input_key,
         on_change=save_company_tracking_input,
+        args=(company_input_key,),
     )
     preview_inputs = [item.strip() for item in company_ticker_input.split(",") if item.strip()]
     if preview_inputs:
@@ -29702,8 +29569,9 @@ with tab_company:
         sync_company_data = st.button("🔄 同步公司資料", key="sync_company_financial_data", width="content")
     with status_col:
         current_snapshot = st.session_state.company_event_snapshot
-        if current_snapshot.get("updated_at"):
-            st.caption(f"最近同步：{current_snapshot['updated_at']}｜{current_snapshot.get('tickers', '')}")
+        last_synced = _model_time_text(current_snapshot.get('updated_at'))
+        if last_synced:
+            st.caption(f"最近同步：{last_synced}｜{current_snapshot.get('tickers', '')}")
         else:
             st.caption("尚未建立快照；行事曆目前不會顯示公司事件。")
     company_sync_notice = st.session_state.pop('_company_sync_notice', '')

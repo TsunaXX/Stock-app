@@ -49,14 +49,22 @@ def test_company_calendar_excludes_equipment_and_building_even_when_selected():
 def test_actual_input_and_order_controls_persist_removal_and_empty_list():
     from streamlit.testing.v1 import AppTest
     source = Path('app.py').read_text(encoding='utf8')
-    names = {'company_calendar_key','company_display_snapshot','save_company_tracking_input','move_company_tracking_input','company_order_market_items','restore_company_backup'}
+    names = {'company_calendar_key','company_display_snapshot','company_tracking_input_key','save_company_tracking_input','move_company_tracking_input','company_order_market_items','restore_company_backup'}
     functions = '\n'.join(ast.unparse(n) for n in ast.parse(source).body if isinstance(n, ast.FunctionDef) and n.name in names)
-    controls = dedent(source[source.index("    st.session_state.setdefault('company_data_tickers',"):source.index('    sync_col, status_col = st.columns(')])
+    controls = dedent(source[source.index("    company_input_key = company_tracking_input_key()"):source.index('    sync_col, status_col = st.columns(')])
     _, snapshot = fixtures()
     snapshot['tickers'] = '2330, 2408, 1815'
     setup = '''import streamlit as st
 from datetime import datetime
 import pytz
+import threading
+_RUNTIME_FILE_LOCK = threading.RLock()
+COMPANY_EVENT_SNAPSHOT_FILE = 'company'
+_json_safe = lambda value: value
+_write_json_atomic = lambda *args, **kwargs: None
+load_company_event_snapshot = lambda: {}
+normalize_company_event_snapshot = lambda value: value
+_newer_company_event_snapshot = lambda first, second: max((first, second), key=lambda s: s.get('updated_at', ''))
 def resolve_earnings_ticker(value):
     return {'input':value.strip(),'display_name':value.strip(),'candidates':(value.strip(),)}
 st.session_state.setdefault('calendar_preferences', {})
@@ -66,8 +74,9 @@ def save_company_event_snapshot(snapshot):
     return True
 '''
     restore_controls = (
-        '\nload_company_event_snapshot = lambda force=False: ' + repr(snapshot) +
-        "\nst.button('還原', key='test_cloud_restore', on_click=restore_company_backup)\n"
+        '\ncloud_snapshot = ' + repr({**snapshot, 'updated_at': '2099-11-23T08:00:00+08:00'}) +
+        "\nst.button('還原', key='test_cloud_restore', on_click=restore_company_backup, args=(cloud_snapshot,))\n"
+        "st.button('舊輸入事件', key='late_input', on_click=save_company_tracking_input, args=('company_data_tickers',))\n"
     )
     script = setup + '\nst.session_state.setdefault("company_event_snapshot", ' + repr(snapshot) + ')\n' + functions + restore_controls + controls
     app = AppTest.from_string(script).run()
@@ -85,9 +94,9 @@ def save_company_event_snapshot(snapshot):
     assert app.text_input(key='company_data_tickers').value == ''
     saves = len(app.session_state.saved_snapshots)
     app.button(key='test_cloud_restore').click().run()
-    app.run()
+    app.button(key='late_input').click().run()
     assert not app.exception
-    assert app.text_input(key='company_data_tickers').value == snapshot['tickers']
+    assert app.text_input(key='company_data_tickers_1').value == snapshot['tickers']
     assert app.session_state.company_event_snapshot['calendar_companies'] == snapshot['calendar_companies']
     assert len(app.session_state.saved_snapshots) == saves
 
@@ -127,11 +136,11 @@ def test_company_order_market_items_classify_by_resolved_ticker():
 def test_order_buttons_swap_only_same_market_and_preserve_other_positions():
     from streamlit.testing.v1 import AppTest
     source = Path('app.py').read_text(encoding='utf8')
-    names = {'company_calendar_key', 'company_display_snapshot', 'save_company_tracking_input',
+    names = {'company_calendar_key', 'company_display_snapshot', 'company_tracking_input_key', 'save_company_tracking_input',
              'move_company_tracking_input', 'company_order_market_items'}
     functions = '\n'.join(ast.unparse(n) for n in ast.parse(source).body
                           if isinstance(n, ast.FunctionDef) and n.name in names)
-    controls = dedent(source[source.index("    st.session_state.setdefault('company_data_tickers',"):
+    controls = dedent(source[source.index("    company_input_key = company_tracking_input_key()"):
                              source.index('    sync_col, status_col = st.columns(')])
     _, snapshot = fixtures()
     snapshot['tickers'] = '2330, META, 2408, MU'
@@ -173,7 +182,7 @@ def test_company_toolbar_combines_restore_backup_and_tracking_status():
     from streamlit.testing.v1 import AppTest
 
     source = (Path(__file__).parents[1] / 'app.py').read_text(encoding='utf-8')
-    start = source.index('@st.fragment(run_every=60)\ndef render_company_tracking_status')
+    start = source.index('def render_company_tracking_status')
     end = source.index('\n\n@st.cache_data', start)
     toolbar_start = source.index("    with st.container(horizontal=True, vertical_alignment='center'):", source.index('with tab_company:'))
     toolbar_end = source.index('    st.markdown(', toolbar_start)
@@ -184,12 +193,14 @@ COMPANY_SYNC_MAX_TICKERS = 12
 tab_company = SimpleNamespace(open=True)
 tab3 = SimpleNamespace(open=False)
 get_app_secret = lambda name: 'configured'
-restore_company_backup = lambda: None
+GOOGLE_SCOPE_COMPANY = 'company_events'
+request_room_sheet_restore = lambda scope: None
+room_sheet_restore_pending = lambda scope: True
+poll_room_sheet_restore = lambda *args: '還原待重試（連線逾時）'
 get_public_maintenance_jobs = lambda: SimpleNamespace(poll=lambda *a, **kw:None)
 apply_company_background_result = lambda *a: None
 data_version = lambda data: 'test'
 st.session_state.company_event_snapshot = {'tickers':'6148'}
-st.session_state._company_restore_error = 'ReadTimeout'
 st.session_state._company_auto_pending_save = {'tickers':'6148'}
 st.session_state._company_auto_status = '2026/11/20 18:28:39｜檢查完成'
 """
@@ -197,4 +208,4 @@ st.session_state._company_auto_status = '2026/11/20 18:28:39｜檢查完成'
     assert not app.exception
     assert len(app.caption) == 1
     assert app.button(key='restore_company_backup')
-    assert app.caption[0].value == '還原逾時｜備份待重試（本機已保留）｜追蹤 2026/11/20 18:28:39｜檢查完成'
+    assert app.caption[0].value == '還原待重試（連線逾時）｜備份待重試（本機已保留）｜追蹤 2026/11/20 18:28:39｜檢查完成'
