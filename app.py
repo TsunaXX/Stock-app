@@ -3365,9 +3365,9 @@ def company_display_snapshot(snapshot):
     return displayed
 
 
-def company_tracking_input_key():
+def company_tracking_input_key(base_key='company_data_tickers'):
     generation = st.session_state.get('_company_tracking_input_generation', 0)
-    return f'company_data_tickers_{generation}' if generation else 'company_data_tickers'
+    return f'{base_key}_{generation}' if generation else base_key
 
 
 def save_company_tracking_input(key):
@@ -3382,7 +3382,7 @@ def save_company_tracking_input(key):
     visible = {company_calendar_key(e) for e in company_display_snapshot(snapshot)['events']}
     snapshot['calendar_companies'] = [key for key in snapshot.get('calendar_companies', []) if key in visible]
     st.session_state.company_event_snapshot = snapshot
-    st.session_state.pop('company_calendar_selection', None)
+    st.session_state[company_tracking_input_key('company_calendar_selection')] = snapshot['calendar_companies']
     if not save_company_event_snapshot(snapshot):
         st.session_state['_company_auto_pending_save'] = snapshot
         st.session_state['_company_sync_notice'] = '公司清單已保留本機；雲端保存待重試。'
@@ -3460,9 +3460,9 @@ def restore_company_backup(remote):
         except OSError:
             status = '已讀取公司備份，伺服器儲存失敗'
     st.session_state.company_event_snapshot = restored
-    # Discard delayed events from the input that existed before the restore.
+    # Delayed events from the old company inputs belong to the previous generation.
+    st.session_state.pop(company_tracking_input_key('company_calendar_selection'), None)
     st.session_state['_company_tracking_input_generation'] = st.session_state.get('_company_tracking_input_generation', 0) + 1
-    st.session_state.pop('company_calendar_selection', None)
     return status
 
 
@@ -14285,6 +14285,7 @@ def save_fibo_config(save_tags=True, sync_cloud=True):
     config[
         'fibo_tags_updated_at'
     ] = updated_at
+    config['fibo_tags_confirmed'] = True
 
     if 'ma_w' in st.session_state:
         config[
@@ -14298,6 +14299,7 @@ def save_fibo_config(save_tags=True, sync_cloud=True):
     st.session_state[
         '_fibo_tags_updated_at'
     ] = updated_at
+    st.session_state['_fibo_tags_confirmed'] = True
 
     try:
         _write_json_atomic(
@@ -14311,6 +14313,7 @@ def save_fibo_config(save_tags=True, sync_cloud=True):
                 'version': 3,
                 'updated_at': updated_at,
                 'tags': fibo_tags,
+                'fibo_tags_confirmed': True,
             },
             indent=2,
         )
@@ -15165,14 +15168,27 @@ def load_data_cache(remote_result=None):
         market_risk_data,
     )
 
+def _fibo_local_edit_time(payload):
+    tags = _extract_fibo_tags(payload)
+    if not tags or (tags == DEFAULT_FIBO_TAGS and not payload.get('fibo_tags_confirmed')):
+        return None
+    return _fibo_tag_timestamp(payload)
+
+
 def load_fibo_tags_from_local():
     if '_fibo_tags_source' in st.session_state:
         return list(st.session_state.get('fibo_tags', DEFAULT_FIBO_TAGS))
 
     cache = _read_json_cache_file(FIBO_TAG_CACHE_FILE)
     config = load_config()
-    cached = {'tags': load_fibo_tag_cache(), 'fibo_tags_updated_at': cache.get('updated_at')}
-    selected = _newer_fibo_tag_payload(cached, config)
+    cached = {**cache, 'tags': load_fibo_tag_cache()}
+    cached_at, config_at = _fibo_local_edit_time(cached), _fibo_local_edit_time(config)
+    if cached_at is not None and (config_at is None or cached_at >= config_at):
+        selected = cached
+    elif config_at is not None:
+        selected = config
+    else:
+        selected = _newer_fibo_tag_payload(cached, config)
     tags = _extract_fibo_tags(selected)
     source = 'local_tag_cache' if selected is cached else 'config'
     if not tags:
@@ -15180,6 +15196,7 @@ def load_fibo_tags_from_local():
         source = 'local_tag_cache' if tags == cached['tags'] else 'config' if tags == config.get('fibo_tags') else 'default'
     stamp = _fibo_tag_timestamp(selected)
     st.session_state['_fibo_tags_source'] = source
+    st.session_state['_fibo_tags_confirmed'] = bool(selected.get('fibo_tags_confirmed'))
     if stamp is not None:
         st.session_state['_fibo_tags_updated_at'] = stamp.isoformat()
     return [normalize_fibo_quick_tag(tag) for tag in tags]
@@ -15192,20 +15209,26 @@ def reload_fibo_tags_from_cloud(payload):
     timestamp = _fibo_tag_timestamp(payload)
     tags = [normalize_fibo_quick_tag(tag) for tag in tags]
     with _RUNTIME_FILE_LOCK:
-        cache_stamp = _fibo_tag_timestamp(_read_json_cache_file(FIBO_TAG_CACHE_FILE))
-        session_stamp = _fibo_tag_timestamp({'fibo_tags_updated_at': st.session_state.get('_fibo_tags_updated_at')})
-        if any(saved is not None and (timestamp is None or saved > timestamp) for saved in (cache_stamp, session_stamp)):
+        config = load_config()
+        local_versions = (_read_json_cache_file(FIBO_TAG_CACHE_FILE), config, {
+            'fibo_tags': st.session_state.get('fibo_tags'),
+            'fibo_tags_updated_at': st.session_state.get('_fibo_tags_updated_at'),
+            'fibo_tags_confirmed': st.session_state.get('_fibo_tags_confirmed'),
+        })
+        if any(saved is not None and (timestamp is None or saved > timestamp)
+               for saved in map(_fibo_local_edit_time, local_versions)):
             return '已保留較新的本機快速標籤'
         updated_at = timestamp.isoformat() if timestamp is not None else ''
-        config = load_config()
-        config.update(fibo_tags=tags, fibo_tags_updated_at=updated_at)
+        config.update(fibo_tags=tags, fibo_tags_updated_at=updated_at, fibo_tags_confirmed=True)
         try:
             _write_json_atomic(CONFIG_FILE, config)
-            _write_json_atomic(FIBO_TAG_CACHE_FILE, {'version': 3, 'updated_at': updated_at, 'tags': tags}, indent=2)
+            _write_json_atomic(FIBO_TAG_CACHE_FILE, {'version': 3, 'updated_at': updated_at, 'tags': tags,
+                                                   'fibo_tags_confirmed': True}, indent=2)
             status = '已從 Google Sheet 還原快速標籤'
         except OSError:
             status = '已讀取快速標籤，伺服器儲存失敗'
-    st.session_state.update(fibo_tags=tags, _fibo_tags_source='google_sheet', _fibo_tags_updated_at=updated_at)
+    st.session_state.update(fibo_tags=tags, _fibo_tags_source='google_sheet', _fibo_tags_updated_at=updated_at,
+                            _fibo_tags_confirmed=True)
     for index, tag in enumerate(tags, 1):
         st.session_state[f'custom_tag_{index}'] = tag
     return status
@@ -28093,20 +28116,14 @@ with tab2:
 with tab_fibo:
     
     def format_fibo_tag(key):
+        slot_index = int(key.rsplit('_', 1)[-1]) - 1
+        current = st.session_state.fibo_tags[slot_index]
         val = str(st.session_state.get(key, '') or '').strip()
-        if not val:
+        st.session_state[key] = normalize_fibo_quick_tag(val) or current
+        if st.session_state[key] != current:
+            # Save edits locally. The save button backs up the five labels together.
             save_fibo_config(sync_cloud=False)
-            slot_index = max(0, min(4, int(key.rsplit('_', 1)[-1]) - 1))
             st.session_state[key] = st.session_state.fibo_tags[slot_index]
-            return
-
-        st.session_state[key] = normalize_fibo_quick_tag(val)
-        # Editing a field only updates the fast local snapshot.  The explicit
-        # save button performs the Google Sheet round-trip once all five slots
-        # are ready, avoiding a long rerun for every mobile keystroke.
-        save_fibo_config(sync_cloud=False)
-        slot_index = max(0, min(4, int(key.rsplit('_', 1)[-1]) - 1))
-        st.session_state[key] = st.session_state.fibo_tags[slot_index]
     
     tab_trade_plan, tab_option_plan, tab_fibo_thermometer, tab_fibo_chart, tab_fibo_manual = st.tabs(
         ["🧭 指數操作計畫", "📅 選擇權操作計畫", "🌡️ 市場溫度計", "📊 費波圖表", "🧮 手動費波"],
@@ -29655,17 +29672,19 @@ with tab_company:
     st.markdown("<div class='company-step'><span class='company-step-number'>2</span>選擇加入股市行事曆的公司</div>", unsafe_allow_html=True)
     st.caption("只會加入勾選並儲存的公司；未勾選公司的查詢結果仍保留在本頁。")
     company_options = list(dict.fromkeys(company_calendar_key(e) for e in snapshot.get('events', [])))
-    if 'company_calendar_selection' in st.session_state:
-        previous_selection = st.session_state['company_calendar_selection']
-        migrated_selection = normalize_company_event_snapshot({**snapshot, 'calendar_companies':previous_selection})['calendar_companies']
-        if migrated_selection != previous_selection:
-            st.session_state['company_calendar_selection'] = migrated_selection
+    calendar_key = company_tracking_input_key('company_calendar_selection')
+    previous_selection = st.session_state.get(calendar_key, snapshot['calendar_companies'])
+    migrated_selection = normalize_company_event_snapshot({
+        **snapshot, 'calendar_companies': previous_selection,
+    })['calendar_companies']
+    visible_selection = [value for value in migrated_selection if value in company_options]
+    if calendar_key not in st.session_state or visible_selection != previous_selection:
+        st.session_state[calendar_key] = visible_selection
     select_col, save_col = st.columns([3, 1], vertical_alignment="bottom")
     with select_col:
         chosen_companies = st.multiselect(
             '加入行事曆的公司（查詢後勾選）', company_options,
-            default=[v for v in snapshot.get('calendar_companies', []) if v in company_options],
-            key='company_calendar_selection',
+            key=calendar_key,
         )
     with save_col:
         save_calendar_companies = st.button('🏢 儲存行事曆公司', key='save_calendar_companies', width='content')
