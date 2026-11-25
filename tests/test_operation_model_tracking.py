@@ -402,3 +402,73 @@ def test_initial_live_plan_is_listed_before_ticks_and_first_verified_entry_can_c
         for code,p in [('P1',p1),('P2',p2),('TMFJ6',price)]: tick(state,code,p,second)
         tracker.process(*sample(ns,[plan],second))
     assert len(tracker.records()) == 1 and performance(tracker.records())[0]['有效交易數'] == 1
+
+@pytest.mark.parametrize('missing_sequence', [False, True])
+def test_resuming_index_preserves_buffered_continuity_without_replaying_entry(
+        tmp_path, missing_sequence):
+    ns, state = adapter()
+    tracker = ModelTracker(tmp_path / 'resume.sqlite', start=False)
+    now = NOW
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now.astimezone(tz) if tz else now.replace(tzinfo=None)
+    ns['datetime'] = Clock
+
+    class Recorder:
+        active_plans = tracker.active_plans
+
+        def submit(self, signals, quotes):
+            tracker.process(signals, quotes)
+            return True
+
+    plan = spec(ns)
+    cursors = {}
+    recorder = Recorder()
+
+    def refresh():
+        ns['record_operation_models']('指數操作計畫', [plan], object(), 5,
+                                      tracker=recorder, cursors=cursors)
+
+    tick(state, 'TMFJ6', 19990, 0)
+    refresh()
+    if not missing_sequence:
+        tick(state, 'TMFJ6', 20000, 1)
+    tick(state, 'TMFJ6', 19949, 2, sequence=3)
+    now = NOW + timedelta(seconds=3, milliseconds=500)
+    cursors['_record_from'] = (NOW + timedelta(seconds=3)).isoformat()
+    tick(state, 'TMFJ6', 19990, 3.5)
+    refresh()
+    row, = tracker.records()
+    assert row['狀態'] == '等待進場' and row.get('模擬進場價') is None
+    assert bool(row.get('資料缺口')) == missing_sequence
+    assert row['最後序號'] == 4
+
+    now = NOW + timedelta(seconds=4)
+    tick(state, 'TMFJ6', 20000, 4)
+    refresh()
+    row, = tracker.records()
+    assert row['狀態'] == '模擬持倉'
+    assert row['進場時間'] == now.isoformat()
+
+
+def test_index_15_minute_model_waits_for_positive_vwap_permission_and_net_rr():
+    from model_tracking import entry_economics
+    ns, _ = adapter()
+    ns['entry_economics'] = entry_economics
+    trade = {'entry_level': 20000, 'invalidation': 19950, 'target': 20200, 'can_enter': False}
+    snapshot = {'plan': {'direction': '偏多', 'trigger': '日線計畫'},
+                'live_snapshot': {'contract_code': 'TMFJ6'}, 'trade_state': trade,
+                'intraday_state': {'vwap': None}, 'short_wave': None}
+
+    def specs():
+        return ns['index_operation_model_specs'](snapshot, 1, 'default')
+
+    assert not specs()
+    trade['can_enter'] = True
+    assert not specs()
+    snapshot['intraday_state']['vwap'] = 19999
+    trade['target'] = 20050
+    assert not specs()
+    trade['target'] = 20200
+    assert specs()[0]['進場許可']
