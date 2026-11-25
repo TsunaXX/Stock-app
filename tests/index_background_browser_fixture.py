@@ -24,7 +24,7 @@ def runtime_fixture():
 f = runtime_fixture()
 ns = load_app_symbols('index_operation_snapshot', 'get_intraday_background',
                       'get_stable_index_trade_plan', 'calculate_operation_snapshot',
-                      'index_operation_model_specs', '_stream_datetime', 'parse_strategy_data_time',
+                      'index_operation_model_specs', '_safe_number', '_stream_datetime', 'parse_strategy_data_time',
                       'calculate_hourly_index_plan')
 frame = pd.DataFrame({'Close':[20000.,20100.]}, index=pd.to_datetime(['2026-10-15','2026-10-16']))
 seed = [('加權','^TWII',frame,'synthetic',{'score':50.}), ('期貨','TMF=F',frame,'synthetic',{'score':50.})]
