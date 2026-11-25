@@ -584,6 +584,8 @@ def record_operation_models(source, specs, api, seconds, **kw):
         assert not app.exception
         hourly_risk = next(m.value for m in app.markdown if '60 分 K 風險點數' in m.value)
         assert all(value in hourly_risk for value in ('2 口最大風險','$1,000','2 口預估收益','$2,000'))
+        app.number_input(key='index_scenario_seconds').set_value(1).run()
+        assert not app.exception and app.session_state['timer_seconds'] == 1
         app.number_input(key='index_scenario_seconds').set_value(9).run()
         assert not app.exception and app.session_state['timer_seconds'] == 9
         assert app.session_state['timer_room'] == 'index'

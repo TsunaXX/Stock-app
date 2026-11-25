@@ -62,7 +62,7 @@ def harness():
         calculate_market_temperature=lambda data:{'score':50.,'change':100.}, calculate_index_trade_plan=daily,
         get_live_futures_snapshot=live,
         get_cached_futures_intraday_state=lambda *a, **kw:{'vwap':20000.},
-        evaluate_trade_entry_state=lambda plan, price, *a:{'can_enter':True, 'entry_level':20000.,
+        evaluate_trade_entry_state=lambda plan, price, *a, **kw:{'can_enter':True, 'entry_level':20000.,
             'invalidation':19900., 'target':20500., 'price':price},
         resolve_short_wave_direction=lambda *a:('偏多','原方向'), get_cached_short_wave_plan=lambda *a, **kw:None,
         get_cached_index_minutes=lambda api, interval, product: pd.DataFrame(),
