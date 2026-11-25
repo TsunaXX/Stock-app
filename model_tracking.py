@@ -682,6 +682,9 @@ def advance(record, quote):
     if row['狀態'] == '等待進場':
         # Cross-device continuity compares the price and time of the same observed tick.
         row['最新價'] = price
+        if quote.get('暫停記錄新交易'):
+            row['來源時間'] = text
+            return row
         invalid = price <= stop if long else price >= stop
         if invalid or (row.get('策略') == '當沖' and str(row.get('交易日')) != str(quote.get('交易日'))):
             event(row, '訊號失效', text, '未進場前已越過停損或交易日已結束')
@@ -1534,6 +1537,9 @@ class ModelTracker:
                             closed_time, cleared = stamp(row['結案時間']), None
                         continue
                     row.update({'重入來源時間': ts.isoformat(), '重入最後序號': seq, '重入串流識別': stream})
+                    if sample.get('暫停記錄新交易'):
+                        cleared = None
+                        continue
                     if row.get('到期時間') and ts >= stamp(row['到期時間']):
                         row['重入解除'] = None
                         row['重入等待原因'] = '原契約已到期，不能重新進場'

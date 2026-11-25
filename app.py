@@ -8126,12 +8126,16 @@ def index_operation_model_specs(snapshot, quantity, profile, cost_settings=None,
     if not plan:
         return []
     trade, intraday, wave = snapshot['trade_state'], snapshot['intraday_state'], snapshot['short_wave']
-    specs = [] if trade.get('permission') == '等待微台日 K' else [operation_model_spec(
-        '指數操作計畫', '日線／15分K', live,
-        trade.get('execution_direction') or plan.get('direction'),
-        trade['entry_level'], trade['invalidation'], trade['target'], trade['can_enter'], quantity, profile,
-        {'VWAP': intraday.get('vwap'), 'ATR': plan.get('atr')}, plan['trigger'],
-        cost_settings=cost_settings, version=version)]
+    specs = []
+    if trade['can_enter'] and (_safe_number(intraday.get('vwap')) or 0) > 0:
+        main = operation_model_spec(
+            '指數操作計畫', '日線／15分K', live,
+            trade.get('execution_direction') or plan.get('direction'),
+            trade['entry_level'], trade['invalidation'], trade['target'], True, quantity, profile,
+            {'VWAP': intraday['vwap'], 'ATR': plan.get('atr')}, plan['trigger'],
+            cost_settings=cost_settings, version=version)
+        if main and not entry_economics(main, main['進場價'])['未建立原因']:
+            specs.append(main)
     if wave:
         short = operation_model_spec(
             '指數操作計畫', '短波5分K', live, snapshot['short_wave_direction'],
@@ -22534,10 +22538,14 @@ def record_operation_models(source, specs, api, seconds, tracker=None, cursors=N
     cursors = st.session_state.setdefault('_operation_model_cursors', {}) if cursors is None else cursors
     signals, quotes = operation_model_samples(specs, api, seconds, after=cursors)
     if (since := cursors.get('_record_from')):
-        # Reopening a page must not replay prices from when entry recording was paused.
-        signals = [signal for signal in signals if signal['來源時間'] >= since]
-        quotes = {key: {**quote, '成交證據': [tick for tick in quote['成交證據'] if tick['來源時間'] >= since]}
-                  for key, quote in quotes.items() if quote['來源時間'] >= since}
+        # Keep buffered ticks for continuity without admitting entries during the pause.
+        resumed_at = datetime.fromisoformat(since)
+        signals = [signal for signal in signals if datetime.fromisoformat(signal['來源時間']) >= resumed_at]
+        quotes = {key: {**quote, '成交證據': [
+            {**tick, '暫停記錄新交易': True, '進場許可': False}
+            if datetime.fromisoformat(tick['來源時間']) < resumed_at else tick
+            for tick in quote['成交證據']
+        ]} for key, quote in quotes.items() if datetime.fromisoformat(quote['來源時間']) >= resumed_at}
     if signals or quotes:
         if tracker.submit(signals, quotes):
             for spec in specs:

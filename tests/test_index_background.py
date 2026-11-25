@@ -14,7 +14,7 @@ from test_intraday_background import wait_result
 
 def harness():
     ns = load_app_symbols('index_operation_snapshot', 'calculate_operation_snapshot',
-                          'get_stable_index_trade_plan', 'index_operation_model_specs', 'calculate_hourly_index_plan')
+                          'get_stable_index_trade_plan', 'index_operation_model_specs', '_safe_number', 'calculate_hourly_index_plan')
     api = object()
     state = {'lock': threading.RLock()}
     recording = threading.Event()
@@ -66,8 +66,8 @@ def harness():
             'invalidation':19900., 'target':20500., 'price':price},
         resolve_short_wave_direction=lambda *a:('偏多','原方向'), get_cached_short_wave_plan=lambda *a, **kw:None,
         get_cached_index_minutes=lambda api, interval, product: pd.DataFrame(),
-        operation_model_spec=lambda source, kind, *a, **kw:{'商品鍵':'TMFJ6|'+kind, '進場許可':a[5]},
-        record_operation_models=record)
+        operation_model_spec=lambda source, kind, *a, **kw:{'商品鍵':'TMFJ6|'+kind, '進場價':a[2], '進場許可':a[5]},
+        entry_economics=lambda *a:{'未建立原因':''}, record_operation_models=record)
     data = pd.DataFrame({'Close':[20000.,20100.]}, index=pd.to_datetime(['2026-10-15','2026-10-16']))
     seed = [('加權','^TWII',data,'快取',{'score':50.}), ('微台','TMF=F',data,'快取',{'score':50.})]
     return ns, worker, session, state, seed, price, connected, market, builds, records, subscriptions
