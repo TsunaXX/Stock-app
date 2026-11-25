@@ -472,3 +472,48 @@ def test_index_15_minute_model_waits_for_positive_vwap_permission_and_net_rr():
     assert not specs()
     trade['target'] = 20200
     assert specs()[0]['進場許可']
+
+
+@pytest.mark.parametrize('direction,price', [('偏多', 1055), ('偏空', 945)])
+def test_aggressive_index_widens_entry_zone_without_changing_other_modes(direction, price):
+    ns = load_app_symbols('evaluate_trade_entry_state')
+    evaluate = ns['evaluate_trade_entry_state']
+    plan = {'direction': direction, 'atr': 100, 'zone_points': 20,
+            'entry_level': 1000, 'invalidation': 900 if direction == '偏多' else 1100,
+            'support': 800, 'resistance': 1200, 'target': 1200 if direction == '偏多' else 800}
+    intra = {'vwap': 1000, 'latest': 1000}
+    assert evaluate(plan, price, 0, intra, micro_plan=True)['can_enter']
+    assert not evaluate(plan, price, 0, intra)['can_enter']
+    assert not evaluate(plan, price, 0, intra, entry_profile='穩健（完整確認）', micro_plan=True)['can_enter']
+    reverse = -150 if direction == '偏多' else 150
+    assert not evaluate(plan, price, reverse, intra, micro_plan=True)['can_enter']
+
+
+def test_index_entry_alert_distinguishes_live_permission_from_model_fill_and_dedupes():
+    from model_tracking import entry_quality_reason
+    ns, _ = adapter()
+    plan = spec(ns)
+    alert = load_app_symbols('render_index_entry_alert', 'parse_strategy_data_time', '_safe_number')
+    toasts, captions = [], []
+    alert.update(st=SimpleNamespace(session_state={}, toast=lambda text, **kw:toasts.append(text),
+                                   caption=captions.append), datetime=ns['datetime'],
+                 entry_quality_reason=entry_quality_reason)
+    render = alert['render_index_entry_alert']
+    snapshot = {'fresh': True, 'live_snapshot': {'contract_code': 'TMFJ6'},
+                'live_price': 19999, 'model_specs': [plan]}
+    render(snapshot, {})
+    assert not toasts
+    render({**snapshot, 'fresh': False, 'live_price': 20000}, {})
+    assert not toasts
+    snapshot['live_price'] = 20020
+    render(snapshot, {})
+    assert not toasts  # Beyond 0.25R.
+    snapshot['live_price'] = 20000
+    render(snapshot, {})
+    render(snapshot, {})
+    assert len(toasts) == 1 and '可進場' in toasts[0] and '尚未確認成交' in captions[-1]
+    held = {plan['商品鍵']: {**plan, '狀態': '模擬持倉', '交易ID': 'new-fill',
+                         '模擬進場價': 20001., '進場時間': NOW.isoformat()}}
+    render(snapshot, held)
+    render(snapshot, held)
+    assert len(toasts) == 2 and '已進場' in toasts[-1] and '模擬' in toasts[-1]

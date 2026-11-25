@@ -46,7 +46,7 @@ from market_automation import (
     macro_results, merge_company_sections, merge_macro_results, vwap_guard,
 )
 
-from model_tracking import ModelTracker, DEFAULT_COSTS, VERSION as MODEL_VERSION, PROTECTION_POLICY, performance, plan_performance, excel_report, trade_display, event_message, normalize_costs, option_fills, option_tick, entry_economics, executable_entry_band, advance as advance_model_trade
+from model_tracking import ModelTracker, DEFAULT_COSTS, VERSION as MODEL_VERSION, PROTECTION_POLICY, performance, plan_performance, excel_report, trade_display, event_message, normalize_costs, option_fills, option_tick, entry_economics, entry_quality_reason, executable_entry_band, advance as advance_model_trade
 
 logger = logging.getLogger(__name__)
 
@@ -5101,14 +5101,15 @@ def get_cached_futures_intraday_state(api, direction, max_age_seconds=8, logged_
 
 def evaluate_trade_entry_state(
     plan, live_price, live_change, intraday_state, temperature_delta=0.0,
-    entry_profile='積極（提早確認）',
+    entry_profile='積極（提早確認）', *, micro_plan=False,
 ):
     """Separate the lagging trend regime from the immediate entry permission."""
     atr = max(float(plan.get('atr', 0) or 0), 1.0)
     shock_ratio = float(live_change or 0) / atr
     direction = plan['direction']
     is_aggressive = str(entry_profile).startswith('積極')
-    zone_tolerance = max(float(plan['zone_points']), atr * (0.45 if is_aggressive else 0.25))
+    zone_atr = (0.60 if micro_plan else 0.45) if is_aggressive else 0.25
+    zone_tolerance = max(float(plan['zone_points']), atr * zone_atr)
     near_entry = abs(float(live_price) - float(plan['entry_level'])) <= zone_tolerance
     bullish_break = bool(intraday_state.get('bullish_break'))
     bearish_break = bool(intraday_state.get('bearish_break'))
@@ -8072,7 +8073,7 @@ def calculate_operation_snapshot(seed_data, api, entry_profile, state, backgroun
     live_price = live_snapshot['price'] if live_snapshot else plan['latest']
     live_change = live_snapshot['change'] if live_snapshot else float((futures_item[4] if futures_item and futures_item[4] else {}).get('change', 0))
     intraday_state = get_cached_futures_intraday_state(
-        api, plan['direction'], max_age_seconds=0, product='TMF' if micro_plan else 'TXF',
+        api, plan['direction'], max_age_seconds=2 if micro_plan else 0, product='TMF' if micro_plan else 'TXF',
         **({'logged_in': True} if background else {}),
     )
     previous_temperature = None
@@ -8084,6 +8085,7 @@ def calculate_operation_snapshot(seed_data, api, entry_profile, state, backgroun
     )
     trade_state = evaluate_trade_entry_state(
         plan, live_price, live_change, intraday_state, temperature_delta, entry_profile,
+        micro_plan=micro_plan,
     )
     if not fresh:
         trade_state = {**trade_state, 'can_enter': False, 'permission': '等待最新串流',
@@ -8091,8 +8093,8 @@ def calculate_operation_snapshot(seed_data, api, entry_profile, state, backgroun
     short_wave_direction, short_direction_note = resolve_short_wave_direction(
         plan, trade_state, intraday_state,
     )
-    short_wave = get_cached_short_wave_plan(api, short_wave_direction, max_age_seconds=0,
-                                           precise=micro_plan)
+    short_wave = get_cached_short_wave_plan(api, short_wave_direction,
+                                           max_age_seconds=2 if micro_plan else 0, precise=micro_plan)
     if micro_plan and (not futures_item or futures_item[4] is None or futures_item[2].empty):
         trade_state = {**trade_state, 'can_enter': False, 'permission': '等待微台日 K',
                        'reason': '目前為加權參考點位；微台日 K 就緒後才開放日線／15 分 K 進場。',
@@ -8206,10 +8208,10 @@ def index_operation_snapshot(seed_data, seconds):
     seed_data = [('微型臺指期貨', 'TMF=F', pd.DataFrame(), '', None) if item[1] == 'TWF=F' else item
                  for item in seed_data]
     recording = st.session_state.setdefault('_index_model_recording', threading.Event())
-    costs, version = (load_model_tracking_costs(), get_operation_model_version('指數操作計畫')) if recording.is_set() else ({}, None)
-    tracker = get_model_tracker(get_app_secret('gsheet_api_url') or '') if version else None
+    costs, version = load_model_tracking_costs(), get_operation_model_version('指數操作計畫')
+    tracker = get_model_tracker(get_app_secret('gsheet_api_url') or '') if recording.is_set() else None
     worker = get_intraday_background()
-    signature = data_version([id(api), seconds, profile, quantity, costs, version,
+    signature = data_version([id(api), seconds, profile, quantity, costs, version, tracker is not None,
                               st.session_state.get('_index_refresh_generation', 0)])
     scope = f'index_{id(worker)}_{signature[:10]}'
     state = {'include_hourly': True}
@@ -8258,11 +8260,10 @@ def index_operation_snapshot(seed_data, seconds):
             if previous.get('plan'):
                 raise RuntimeError('index plan unavailable')
             return snapshot, 0
+        specs = index_operation_model_specs(snapshot, quantity, profile, costs, version)
+        snapshot['model_specs'] = specs
         if tracker is not None and recording.is_set():
-            specs = index_operation_model_specs(snapshot, quantity, profile, costs, version)
-            if recording.is_set():
-                record_operation_models('指數操作計畫', specs, api, seconds, tracker=tracker, cursors=cursors)
-            snapshot['model_specs'] = specs
+            record_operation_models('指數操作計畫', specs, api, seconds, tracker=tracker, cursors=cursors)
         return snapshot, int(snapshot['fresh'])
     stream = _stream_state(api)
     def ready():
@@ -8305,11 +8306,68 @@ def index_operation_snapshot(seed_data, seconds):
     age = (datetime.now(pytz.timezone('Asia/Taipei')).replace(tzinfo=None) - source.to_pydatetime()).total_seconds() if source is not None else None
     if snapshot.get('plan') and (pending or not model_market_open({'市場': '期貨', '交易時段': '日盤+夜盤'})
             or not ready() or result['outside'] or result['error'] or age is None or not 0 <= age <= 30):
+        snapshot['fresh'] = False
         snapshot['trade_state'].update(can_enter=False, permission='等待最新串流', color='#ffc107',
                                       reason='行情尚未更新；保留原點位，等待最新串流後再判斷進場。')
         if snapshot.get('short_wave'):
             snapshot['short_wave'].update(momentum_ready=False, tracking_ready=False)
     return snapshot
+
+
+def render_index_entry_alert(snapshot, protection):
+    if not snapshot.get('fresh') or not snapshot.get('live_snapshot'):
+        return
+    price = snapshot['live_price']
+    previous = st.session_state.get('_index_entry_alerts', {})
+    current = {}
+    now = time.monotonic()
+    messages = []
+    for spec in snapshot.get('model_specs', ()):
+        if not spec:
+            continue
+        kind, direction = spec['計畫類型'], spec['方向']
+        name = f"{spec['代碼']} 微台 {kind}｜{'多' if direction == '偏多' else '空'}"
+        row = protection.get(spec['商品鍵']) or {}
+        if row.get('模擬進場價') is not None and row.get('狀態') != '已平倉':
+            continue
+        levels = row if row.get('狀態') == '等待進場' and row.get('方向') == direction else spec
+        sign = 1 if direction == '偏多' else -1
+        ready = (spec['進場許可'] and sign * (price - levels['進場價']) >= 0
+                 and sign * (levels['目標價'] - price) > 0
+                 and not entry_quality_reason(levels, price))
+        old = previous.get(kind, {})
+        identity = (spec['代碼'], direction)
+        last = old.get('notified', float('-inf')) if old.get('identity') == identity else float('-inf')
+        if ready:
+            message = f"{name}｜可進場 {price:,.0f} 點（尚未確認成交）"
+            messages.append(message)
+            if now - last >= 20 and (old.get('identity') != identity or not old.get('ready')):
+                st.toast(message, icon='🔔')
+                last = now
+        current[kind] = {'identity': identity, 'ready': ready, 'notified': last}
+    for kind, old in previous.items():
+        current.setdefault(kind, {**old, 'ready': False})
+    st.session_state['_index_entry_alerts'] = current
+    confirmed = st.session_state.setdefault('_index_confirmed_alerts', {})
+    now_tw = datetime.now(pytz.timezone('Asia/Taipei')).replace(tzinfo=None)
+    for row in protection.values():
+        if row.get('狀態') != '模擬持倉' or row.get('資料缺口'):
+            continue
+        entered = parse_strategy_data_time(row.get('進場時間'))
+        trade_id, kind = row.get('交易ID'), row.get('計畫類型')
+        if not trade_id or not kind or entered is None or not 0 <= (now_tw - entered.to_pydatetime()).total_seconds() <= 15:
+            continue
+        fill = _safe_number(row.get('模擬進場價'))
+        if fill is None:
+            continue
+        name = f"{row['代碼']} 微台 {kind}｜{'多' if row.get('方向') == '偏多' else '空'}"
+        message = f"{name}｜已進場 {fill:,.0f} 點（模擬）"
+        messages.append(message)
+        if confirmed.get(kind) != trade_id:
+            confirmed[kind] = trade_id
+            st.toast(message, icon='🔔')
+    if messages:
+        st.caption('交易提醒：' + '；'.join(messages))
 
 
 def render_operation_plan(seed_data, option_page=False, seconds=5, snapshot=None, record_enabled=False):
@@ -8371,6 +8429,7 @@ def render_operation_plan(seed_data, option_page=False, seconds=5, snapshot=None
         kinds = ('短波5分K', '日線／15分K')
         model_keys = [f"{live_snapshot['contract_code']}|{kind}" for kind in kinds] if live_snapshot else []
         protection = read_operation_protection('指數操作計畫', model_keys)
+        render_index_entry_alert(snapshot, protection)
         short_model, main_model = (protection.get(key) for key in model_keys) if model_keys else (None, None)
         short_protection = index_plan_protection_card(short_model)
         recorded_short = short_model and short_model.get('狀態') in ('等待進場', '模擬持倉', '監控中斷', '資料不足')
@@ -28188,7 +28247,7 @@ with tab_fibo:
         timer_key = 'option_auto_seconds' if option_page else 'index_scenario_seconds'
         with page:
             seconds = st.number_input(
-                '自動更新間隔（秒）', 2, 300,
+                '自動更新間隔（秒）', 2 if option_page else 1, 300,
                 value=int(st.session_state.get(timer_key + '_saved', 5)), key=timer_key,
             )
             st.session_state[timer_key + '_saved'] = seconds
