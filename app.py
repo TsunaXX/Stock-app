@@ -20431,9 +20431,12 @@ def calculate_daytrade_filter_result(row, direction, attention_counts=None, disp
 
     score = daily_trend_score + vwap_score + volume_score + range_score + risk_score
     risk_blocked = is_disposed or (block_attention and attention_count >= 2)
+    # A counter-MA5 opening breakout needs participation from the stock itself.
+    against_ma5 = ma5 is not None and ma5 > 0 and (close < ma5 if is_long else close > ma5)
+    opening_volume_unconfirmed = is_opening_micro and against_ma5 and (volume_ratio is None or volume_ratio < 1)
     minimum_volume_ratio = 0.8 if is_opening_micro else 1.0
     eligible = (
-        not risk_blocked and vwap_aligned and range_broken
+        not risk_blocked and vwap_aligned and range_broken and not opening_volume_unconfirmed
         and (volume_ratio is None or volume_ratio >= minimum_volume_ratio)
     )
     guard_value = row.get('_daytrade_guard_reason')
@@ -20457,6 +20460,8 @@ def calculate_daytrade_filter_result(row, direction, attention_counts=None, disp
             f'觀察：需維持 VWAP 並接近{range_text}'
             if is_opening_micro else f'觀察：需{direction_text}{range_text}'
         )
+    elif opening_volume_unconfirmed:
+        rule = '觀察：早盤逆五日線，等待同時段量比達 1 倍'
     elif volume_ratio is not None and volume_ratio < minimum_volume_ratio:
         rule = '觀察：量能未達近期同時段平均'
     elif confirmation_missing:

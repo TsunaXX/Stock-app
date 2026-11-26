@@ -133,3 +133,19 @@ def test_signal_notification_names_do_not_change_event_identity():
     fn('futures', {'TXF 202610': '等待'}, True)
     fn('futures', {'TXF 202610': '✅ 已觸發'}, True, {'TXF 202610': '臺股期貨（TXF 202610）'})
     assert '臺股期貨' in messages[-1]
+
+
+def test_opening_counter_ma5_requires_volume_confirmation():
+    ns = load_app_symbols('calculate_daytrade_filter_result', '_as_float', 'fmt_price')
+    ns.update(get_tick_size=lambda price: .1, fmt_price=str)
+    evaluate = ns['calculate_daytrade_filter_result']
+    for direction, price, ma5 in [('多頭', 64.7, 65.2), ('空頭', 61.3, 60.8)]:
+        row = {'_daytrade_close': price, '_daytrade_open': 63, '_daytrade_vwap': 62.88,
+               '_daytrade_or_low': 61.3, '_daytrade_or_high': 64.7, '_ma5': ma5,
+               '_daytrade_phase': '開盤形成中', '_daytrade_confirmation': direction}
+        for volume in (None, .91):
+            blocked = evaluate({**row, '_daytrade_volume_ratio': volume}, direction)
+            assert not blocked['eligible'] and '逆五日線' in blocked['rule']
+        assert evaluate({**row, '_daytrade_volume_ratio': 1}, direction)['eligible']
+        aligned_ma5 = 2 * price - ma5
+        assert evaluate({**row, '_ma5': aligned_ma5, '_daytrade_volume_ratio': .91}, direction)['eligible']
